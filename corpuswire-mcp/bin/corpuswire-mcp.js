@@ -18,6 +18,7 @@ const DEFAULT_SYNC_FLUSH_TIMEOUT_MS = 60000;
 const DEFAULT_SYNC_MAX_FILE_SIZE_BYTES = 512 * 1024;
 const DEFAULT_SYNC_MAX_PENDING_PATHS = 100;
 const DEFAULT_SYNC_RECONCILE_MAX_FILES = 5000;
+const DIRECTORY_GLOB_PROBE = "__corpuswire_directory_probe__";
 const OUTPUT_MODES = new Set(["generic", "copilot", "claude-code", "sequential"]);
 const INDEXABLE_EXTENSIONS = new Set([
   ".md",
@@ -196,7 +197,7 @@ class SyncManager {
     this.ensurePendingContext(context);
 
     for (const rawPath of changedPaths) {
-      const normalized = this.normalizePath(rawPath, context.sourceRoot);
+      const normalized = this.normalizePath(rawPath, context);
       if (normalized === null) {
         skipped.push(rawPath);
         continue;
@@ -207,7 +208,7 @@ class SyncManager {
     }
 
     for (const rawPath of deletedPaths) {
-      const normalized = this.normalizePath(rawPath, context.sourceRoot);
+      const normalized = this.normalizePath(rawPath, context);
       if (normalized === null) {
         skipped.push(rawPath);
         continue;
@@ -546,7 +547,7 @@ class SyncManager {
       args.maxFiles ?? this.env.CORPUSWIRE_SYNC_RECONCILE_MAX_FILES,
       DEFAULT_SYNC_RECONCILE_MAX_FILES,
     );
-    const changedPaths = await this.collectWorkspaceFileEntries(context.sourceRoot, maxFiles);
+    const changedPaths = await this.collectWorkspaceFileEntries(context, maxFiles);
     const files = [];
     const skippedPaths = [];
     for (const entry of changedPaths) {
@@ -636,8 +637,9 @@ class SyncManager {
     };
   }
 
-  async collectWorkspaceFileEntries(sourceRoot, maxFiles) {
+  async collectWorkspaceFileEntries(context, maxFiles) {
     const result = [];
+    const { sourceRoot } = context;
     const stack = [sourceRoot];
     while (stack.length > 0) {
       const directory = stack.pop();
@@ -656,15 +658,18 @@ class SyncManager {
           continue;
         }
         const absolutePath = path.join(directory, entry.name);
+        const relativePath = path.relative(sourceRoot, absolutePath).split(path.sep).join("/");
         if (entry.isDirectory()) {
+          if (isExcludedDirectory(relativePath, context.excludeGlobs)) {
+            continue;
+          }
           stack.push(absolutePath);
           continue;
         }
         if (!entry.isFile()) {
           continue;
         }
-        const relativePath = path.relative(sourceRoot, absolutePath).split(path.sep).join("/");
-        if (!isIndexableRelativePath(relativePath)) {
+        if (!isSyncIndexableRelativePath(relativePath, context)) {
           continue;
         }
         if (result.length >= maxFiles) {
@@ -696,33 +701,35 @@ class SyncManager {
     return {
       sourceRoot: path.resolve(sourceRootRaw),
       workspaceId,
+      includeGlobs: resolveSyncGlobList(args, this.env.CORPUSWIRE_SYNC_INCLUDE_GLOBS, "includeGlobs", "include_globs"),
+      excludeGlobs: resolveSyncGlobList(args, this.env.CORPUSWIRE_SYNC_EXCLUDE_GLOBS, "excludeGlobs", "exclude_globs"),
     };
   }
 
   ensurePendingContext(context) {
-    const key = `${context.sourceRoot}\0${context.workspaceId}`;
+    const key = syncContextKey(context);
     if (this.pendingContext && this.pendingContext.key !== key && this.hasPending()) {
       throw new JsonRpcError(
         -32602,
-        "A sync batch is already queued for another sourceRoot/workspaceId. Flush it before queuing a different workspace.",
+        "A sync batch is already queued for another sourceRoot/workspaceId/filter set. Flush it before queuing a different workspace.",
       );
     }
     this.pendingContext = { ...context, key };
   }
 
-  normalizePath(rawPath, sourceRoot) {
+  normalizePath(rawPath, context) {
     if (typeof rawPath !== "string" || !rawPath.trim()) {
       return null;
     }
     const absolutePath = path.isAbsolute(rawPath)
       ? path.resolve(rawPath)
-      : path.resolve(sourceRoot, rawPath);
-    const relativePath = path.relative(sourceRoot, absolutePath);
+      : path.resolve(context.sourceRoot, rawPath);
+    const relativePath = path.relative(context.sourceRoot, absolutePath);
     if (!relativePath || relativePath === "." || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
       throw new JsonRpcError(-32602, `Path is outside sourceRoot: ${rawPath}`);
     }
     const posixRelativePath = relativePath.split(path.sep).join("/");
-    if (!isIndexableRelativePath(posixRelativePath)) {
+    if (!isSyncIndexableRelativePath(posixRelativePath, context)) {
       return null;
     }
     return { absolutePath, relativePath: posixRelativePath };
@@ -736,7 +743,9 @@ class SyncManager {
       this.pendingContext = {
         sourceRoot: batch.sourceRoot,
         workspaceId: batch.workspaceId,
-        key: `${batch.sourceRoot}\0${batch.workspaceId}`,
+        includeGlobs: batch.includeGlobs ?? [],
+        excludeGlobs: batch.excludeGlobs ?? [],
+        key: syncContextKey(batch),
       };
     }
     for (const { relativePath, absolutePath } of batch.changedPaths) {
@@ -783,6 +792,8 @@ class SyncManager {
     return {
       sourceRoot: context.sourceRoot,
       workspaceId: context.workspaceId,
+      includeGlobs: context.includeGlobs,
+      excludeGlobs: context.excludeGlobs,
       changedPaths,
       deletedPaths,
     };
@@ -1108,6 +1119,18 @@ function toolDefinitions() {
             type: "string",
             description: "Remote workspace id used by the CorpusWire index. Defaults to CORPUSWIRE_WORKSPACE_ID.",
           },
+          includeGlobs: {
+            type: "array",
+            items: { type: "string" },
+            default: [],
+            description: "Optional glob filters for changed/deleted files to include. Defaults to CORPUSWIRE_SYNC_INCLUDE_GLOBS.",
+          },
+          excludeGlobs: {
+            type: "array",
+            items: { type: "string" },
+            default: [],
+            description: "Optional glob filters for changed/deleted files to exclude. Defaults to CORPUSWIRE_SYNC_EXCLUDE_GLOBS.",
+          },
           flush: {
             type: "boolean",
             default: false,
@@ -1164,6 +1187,18 @@ function toolDefinitions() {
           workspaceId: {
             type: "string",
             description: "Remote workspace id used by the CorpusWire index. Defaults to CORPUSWIRE_WORKSPACE_ID.",
+          },
+          includeGlobs: {
+            type: "array",
+            items: { type: "string" },
+            default: [],
+            description: "Optional glob filters for files to include in the reconciliation scan. Defaults to CORPUSWIRE_SYNC_INCLUDE_GLOBS.",
+          },
+          excludeGlobs: {
+            type: "array",
+            items: { type: "string" },
+            default: [],
+            description: "Optional glob filters for files and directories to exclude from the reconciliation scan. Defaults to CORPUSWIRE_SYNC_EXCLUDE_GLOBS.",
           },
           maxWaitMs: {
             type: "integer",
@@ -1583,14 +1618,129 @@ function optionalStringArray(args, ...keys) {
     if (value === undefined || value === null) {
       continue;
     }
-    if (!Array.isArray(value)) {
-      throw new JsonRpcError(-32602, `Invalid ${key}: expected an array of strings.`);
-    }
+    return normalizeStringArray(value, key);
+  }
+  return [];
+}
+
+function resolveSyncGlobList(args, envValue, ...keys) {
+  const argumentValue = optionalStringArray(args, ...keys);
+  if (argumentValue.length > 0) {
+    return argumentValue;
+  }
+  return normalizeStringArray(envValue, keys[0], { allowString: true });
+}
+
+function normalizeStringArray(value, label, { allowString = false } = {}) {
+  if (value === undefined || value === null || value === "") {
+    return [];
+  }
+  if (Array.isArray(value)) {
     return value
       .filter((item) => typeof item === "string" && item.trim())
       .map((item) => item.trim());
   }
-  return [];
+  if (allowString && typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return [];
+    }
+    if (trimmed.startsWith("[")) {
+      let parsed;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch (error) {
+        throw new JsonRpcError(-32602, `Invalid ${label}: expected a JSON array or comma-separated glob list.`);
+      }
+      return normalizeStringArray(parsed, label);
+    }
+    return trimmed
+      .split(/[,\n]+/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  throw new JsonRpcError(-32602, `Invalid ${label}: expected an array of strings.`);
+}
+
+function syncContextKey(context) {
+  return [
+    context.sourceRoot,
+    context.workspaceId,
+    JSON.stringify(context.includeGlobs ?? []),
+    JSON.stringify(context.excludeGlobs ?? []),
+  ].join("\0");
+}
+
+function isSyncIndexableRelativePath(relativePath, context) {
+  if (!isIndexableRelativePath(relativePath)) {
+    return false;
+  }
+  const includeGlobs = context.includeGlobs ?? [];
+  if (includeGlobs.length > 0 && !matchesAnyGlob(relativePath, includeGlobs)) {
+    return false;
+  }
+  const excludeGlobs = context.excludeGlobs ?? [];
+  return excludeGlobs.length === 0 || !matchesAnyGlob(relativePath, excludeGlobs);
+}
+
+function isExcludedDirectory(relativePath, excludeGlobs) {
+  if (!relativePath || !Array.isArray(excludeGlobs) || excludeGlobs.length === 0) {
+    return false;
+  }
+  const normalized = relativePath.replaceAll("\\", "/").replace(/\/+$/, "");
+  return matchesAnyGlob(normalized, excludeGlobs)
+    || matchesAnyGlob(`${normalized}/`, excludeGlobs)
+    || matchesAnyGlob(`${normalized}/${DIRECTORY_GLOB_PROBE}`, excludeGlobs);
+}
+
+function matchesAnyGlob(relativePath, patterns) {
+  const normalizedPath = relativePath.replaceAll("\\", "/").replace(/^\.\/+/, "");
+  return patterns.some((pattern) => globToRegExp(pattern).test(normalizedPath));
+}
+
+const globRegExpCache = new Map();
+
+function globToRegExp(pattern) {
+  const normalizedPattern = String(pattern).trim().replaceAll("\\", "/").replace(/^\.\/+/, "");
+  const cacheKey = normalizedPattern;
+  const cached = globRegExpCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const effectivePattern = normalizedPattern.includes("/") ? normalizedPattern : `**/${normalizedPattern}`;
+  let source = "^";
+  for (let index = 0; index < effectivePattern.length; index += 1) {
+    const character = effectivePattern[index];
+    if (character === "*") {
+      const nextCharacter = effectivePattern[index + 1];
+      if (nextCharacter === "*") {
+        index += 1;
+        if (effectivePattern[index + 1] === "/") {
+          index += 1;
+          source += "(?:.*/)?";
+        } else {
+          source += ".*";
+        }
+      } else {
+        source += "[^/]*";
+      }
+      continue;
+    }
+    if (character === "?") {
+      source += "[^/]";
+      continue;
+    }
+    source += escapeRegExp(character);
+  }
+  source += "$";
+  const regexp = new RegExp(source);
+  globRegExpCache.set(cacheKey, regexp);
+  return regexp;
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
 }
 
 function isIndexableRelativePath(relativePath) {
