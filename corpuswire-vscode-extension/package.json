@@ -1,7 +1,7 @@
 {
   "name": "corpuswire-vscode",
   "displayName": "CorpusWire Prompt Enhancer",
-  "description": "Enhance selected prompts with CorpusWire repository context from configurable remote services.",
+  "description": "Enhance prompts and index VS Code workspaces with CorpusWire remote services.",
   "version": "0.1.2",
   "publisher": "corpuswire",
   "private": true,
@@ -14,7 +14,10 @@
   ],
   "activationEvents": [
     "onCommand:corpuswire.enhancePrompt",
-    "onCommand:corpuswire.indexWorkspace"
+    "onCommand:corpuswire.indexWorkspace",
+    "onCommand:corpuswire.openPanel",
+    "onCommand:corpuswireContextEngine.enhancePrompt",
+    "onCommand:corpuswireContextEngine.openPanel"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -26,6 +29,10 @@
       {
         "command": "corpuswire.indexWorkspace",
         "title": "CorpusWire: Index Workspace"
+      },
+      {
+        "command": "corpuswire.openPanel",
+        "title": "CorpusWire: Open Prompt Panel"
       }
     ],
     "configuration": {

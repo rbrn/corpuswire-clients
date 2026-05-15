@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import {
   CorpusWireClient,
@@ -13,6 +14,7 @@ import {
   buildRemoteServiceHeaders,
   readSettings,
 } from "./configuration.js";
+import type { ExtensionSettings } from "./configuration.js";
 
 type PromptRewriteResultWithCompatibilityFields = PromptRewriteResult & {
   augmented_prompt?: unknown;
@@ -27,6 +29,150 @@ interface PromptEnhancementOutcome {
   usedLocalFallback: boolean;
 }
 
+interface PanelEnhanceMessage {
+  type: "enhance";
+  prompt: string;
+}
+
+interface PanelInsertMessage {
+  type: "insert";
+  text: string;
+}
+
+type PanelInboundMessage = PanelEnhanceMessage | PanelInsertMessage;
+
+interface PanelResultMessage {
+  type: "result";
+  text: string;
+  usedLocalFallback: boolean;
+}
+
+interface PanelErrorMessage {
+  type: "error";
+  message: string;
+}
+
+interface PanelLoadingMessage {
+  type: "loading";
+  value: boolean;
+}
+
+interface PanelSeedMessage {
+  type: "seed";
+  prompt: string;
+}
+
+type PanelOutboundMessage =
+  | PanelResultMessage
+  | PanelErrorMessage
+  | PanelLoadingMessage
+  | PanelSeedMessage;
+
+class PromptEnhancerPanel {
+  static readonly viewType = "corpuswire.promptPanel";
+  private static current: PromptEnhancerPanel | undefined;
+
+  private readonly panel: vscode.WebviewPanel;
+  private disposables: vscode.Disposable[] = [];
+
+  static createOrShow(): void {
+    const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
+    const seed = vscode.window.activeTextEditor
+      ? vscode.window.activeTextEditor.document.getText(vscode.window.activeTextEditor.selection)
+      : "";
+
+    if (PromptEnhancerPanel.current) {
+      PromptEnhancerPanel.current.panel.reveal(column);
+      if (seed.trim()) {
+        PromptEnhancerPanel.current.post({ type: "seed", prompt: seed });
+      }
+      return;
+    }
+
+    const panel = vscode.window.createWebviewPanel(
+      PromptEnhancerPanel.viewType,
+      "CorpusWire Prompt Enhancer",
+      column,
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+        localResourceRoots: [],
+      },
+    );
+
+    PromptEnhancerPanel.current = new PromptEnhancerPanel(panel, seed);
+  }
+
+  private constructor(panel: vscode.WebviewPanel, initialSeed: string) {
+    this.panel = panel;
+    this.panel.webview.html = buildPromptPanelHtml(initialSeed);
+
+    this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
+    this.panel.webview.onDidReceiveMessage(
+      (message: unknown) => void this.handleMessage(message as PanelInboundMessage),
+      null,
+      this.disposables,
+    );
+  }
+
+  private post(message: PanelOutboundMessage): void {
+    void this.panel.webview.postMessage(message);
+  }
+
+  private async handleMessage(message: PanelInboundMessage): Promise<void> {
+    if (message.type === "insert") {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) {
+        void vscode.window.showWarningMessage("No active editor to insert into.");
+        return;
+      }
+
+      await editor.edit((builder) => builder.replace(editor.selection, message.text));
+      return;
+    }
+
+    if (message.type !== "enhance") {
+      return;
+    }
+
+    const resource = vscode.window.activeTextEditor?.document.uri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
+    const settings = readSettings(resource);
+    for (const warning of settings.configurationWarnings) {
+      void vscode.window.showWarningMessage(warning);
+    }
+
+    const enhancerService = settings.services.enhancer;
+    const client = new CorpusWireClient({
+      baseUrl: enhancerService.url,
+      endpointMode: "v1-only",
+      defaultHeaders: buildRemoteServiceHeaders(enhancerService),
+    });
+    const request = buildEnhancementRequest(message.prompt, settings);
+
+    this.post({ type: "loading", value: true });
+    try {
+      const outcome = await enhancePromptWithFallback(client, request);
+      this.post({
+        type: "result",
+        text: outcome.replacement,
+        usedLocalFallback: outcome.usedLocalFallback,
+      });
+    } catch (error) {
+      this.post({ type: "error", message: formatEnhancementError(error, enhancerService.url) });
+    } finally {
+      this.post({ type: "loading", value: false });
+    }
+  }
+
+  private dispose(): void {
+    PromptEnhancerPanel.current = undefined;
+    for (const disposable of this.disposables) {
+      disposable.dispose();
+    }
+    this.disposables = [];
+  }
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   const enhanceDisposable = vscode.commands.registerCommand(
     "corpuswire.enhancePrompt",
@@ -36,8 +182,26 @@ export function activate(context: vscode.ExtensionContext): void {
     "corpuswire.indexWorkspace",
     indexCurrentWorkspace,
   );
+  const panelDisposable = vscode.commands.registerCommand(
+    "corpuswire.openPanel",
+    () => PromptEnhancerPanel.createOrShow(),
+  );
+  const legacyEnhanceDisposable = vscode.commands.registerCommand(
+    "corpuswireContextEngine.enhancePrompt",
+    enhanceSelectedPrompt,
+  );
+  const legacyPanelDisposable = vscode.commands.registerCommand(
+    "corpuswireContextEngine.openPanel",
+    () => PromptEnhancerPanel.createOrShow(),
+  );
 
-  context.subscriptions.push(enhanceDisposable, indexDisposable);
+  context.subscriptions.push(
+    enhanceDisposable,
+    indexDisposable,
+    panelDisposable,
+    legacyEnhanceDisposable,
+    legacyPanelDisposable,
+  );
   registerRemoteIndexWatchers(context);
 }
 
@@ -243,19 +407,7 @@ async function enhanceSelectedPrompt(): Promise<void> {
     endpointMode: "v1-only",
     defaultHeaders: buildRemoteServiceHeaders(enhancerService),
   });
-
-  const request: EnhancePromptRequest = {
-    prompt: selectedText,
-    outputMode: settings.outputMode,
-    topK: settings.topK,
-    localOnly: settings.localOnly,
-  };
-
-  if (settings.remoteIndexing.enabled && settings.remoteIndexing.workspaceId) {
-    request.workspaceId = settings.remoteIndexing.workspaceId;
-  } else if (settings.repoPath) {
-    request.repoPath = settings.repoPath;
-  }
+  const request = buildEnhancementRequest(selectedText, settings);
 
   let usedLocalFallback = false;
 
@@ -288,6 +440,23 @@ async function enhanceSelectedPrompt(): Promise<void> {
   } catch (error) {
     void vscode.window.showWarningMessage(formatEnhancementError(error, enhancerService.url));
   }
+}
+
+function buildEnhancementRequest(prompt: string, settings: ExtensionSettings): EnhancePromptRequest {
+  const request: EnhancePromptRequest = {
+    prompt,
+    outputMode: settings.outputMode,
+    topK: settings.topK,
+    localOnly: settings.localOnly,
+  };
+
+  if (settings.remoteIndexing.enabled && settings.remoteIndexing.workspaceId) {
+    request.workspaceId = settings.remoteIndexing.workspaceId;
+  } else if (settings.repoPath) {
+    request.repoPath = settings.repoPath;
+  }
+
+  return request;
 }
 
 async function enhancePromptWithFallback(
@@ -377,4 +546,234 @@ function isConnectionErrorMessage(message: string): boolean {
     || message.includes("ECONNREFUSED")
     || message.includes("ECONNRESET")
     || message.includes("ENOTFOUND");
+}
+
+function buildPromptPanelHtml(initialSeed: string): string {
+  const nonce = randomUUID().replace(/-/g, "");
+  const csp = [
+    "default-src 'none'",
+    "style-src 'unsafe-inline'",
+    `script-src 'nonce-${nonce}'`,
+  ].join("; ");
+  const escapedSeed = escapeHtml(initialSeed);
+
+  return /* html */ `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="${csp}">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CorpusWire Prompt Enhancer</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      font-family: var(--vscode-font-family, sans-serif);
+      font-size: var(--vscode-font-size, 13px);
+      color: var(--vscode-foreground);
+      background: var(--vscode-editor-background);
+      margin: 0;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      height: 100vh;
+    }
+    h2 {
+      margin: 0;
+      font-size: 1.1em;
+      font-weight: 600;
+    }
+    label {
+      font-size: 0.85em;
+      color: var(--vscode-descriptionForeground);
+      margin-bottom: 4px;
+      display: block;
+    }
+    textarea {
+      width: 100%;
+      flex: 1;
+      min-height: 120px;
+      resize: vertical;
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      border: 1px solid var(--vscode-input-border, transparent);
+      border-radius: 2px;
+      padding: 8px;
+      font-family: inherit;
+      font-size: inherit;
+      line-height: 1.5;
+    }
+    textarea:focus {
+      outline: 1px solid var(--vscode-focusBorder);
+      border-color: var(--vscode-focusBorder);
+    }
+    textarea[readonly] {
+      background: var(--vscode-textBlockQuote-background, var(--vscode-input-background));
+      opacity: 0.9;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    button {
+      padding: 6px 16px;
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: none;
+      border-radius: 2px;
+      cursor: pointer;
+      font-size: inherit;
+      font-family: inherit;
+    }
+    button:hover:not(:disabled) {
+      background: var(--vscode-button-hoverBackground);
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    button.secondary {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+    }
+    button.secondary:hover:not(:disabled) {
+      background: var(--vscode-button-secondaryHoverBackground);
+    }
+    #status {
+      font-size: 0.85em;
+      min-height: 1.2em;
+      color: var(--vscode-descriptionForeground);
+    }
+    #status.error {
+      color: var(--vscode-errorForeground);
+    }
+    #result-section {
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+      flex: 1;
+    }
+    #result-section.visible {
+      display: flex;
+    }
+    .section {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      flex: 1;
+    }
+  </style>
+</head>
+<body>
+  <h2>CorpusWire Prompt Enhancer</h2>
+
+  <div class="section">
+    <label for="prompt">Base prompt</label>
+    <textarea id="prompt" rows="8" placeholder="Enter or paste a prompt, or select text in an editor first">${escapedSeed}</textarea>
+  </div>
+
+  <div class="row">
+    <button id="enhance-btn">Enhance</button>
+    <span id="status"></span>
+  </div>
+
+  <div id="result-section">
+    <div class="section">
+      <label for="result">Enhanced prompt</label>
+      <textarea id="result" rows="8" readonly></textarea>
+    </div>
+    <div class="row">
+      <button id="insert-btn">Insert into editor</button>
+      <button id="copy-btn" class="secondary">Copy</button>
+    </div>
+  </div>
+
+  <script nonce="${nonce}">
+    const vscode = acquireVsCodeApi();
+
+    const promptEl = document.getElementById('prompt');
+    const enhanceBtn = document.getElementById('enhance-btn');
+    const statusEl = document.getElementById('status');
+    const resultSection = document.getElementById('result-section');
+    const resultEl = document.getElementById('result');
+    const insertBtn = document.getElementById('insert-btn');
+    const copyBtn = document.getElementById('copy-btn');
+
+    function setStatus(text, isError) {
+      statusEl.textContent = text;
+      statusEl.className = isError ? 'error' : '';
+    }
+
+    function setLoading(value) {
+      enhanceBtn.disabled = value;
+      enhanceBtn.textContent = value ? 'Enhancing...' : 'Enhance';
+      if (value) {
+        setStatus('Sending to CorpusWire...', false);
+      }
+    }
+
+    enhanceBtn.addEventListener('click', () => {
+      const prompt = promptEl.value.trim();
+      if (!prompt) {
+        setStatus('Enter a prompt first.', true);
+        return;
+      }
+      setStatus('', false);
+      resultSection.classList.remove('visible');
+      vscode.postMessage({ type: 'enhance', prompt });
+    });
+
+    insertBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'insert', text: resultEl.value });
+    });
+
+    copyBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(resultEl.value);
+        copyBtn.textContent = 'Copied';
+        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+      } catch {
+        copyBtn.textContent = 'Copy failed';
+        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+      }
+    });
+
+    window.addEventListener('message', (event) => {
+      const message = event.data;
+      if (message.type === 'loading') {
+        setLoading(message.value);
+        return;
+      }
+      if (message.type === 'result') {
+        resultEl.value = message.text;
+        resultSection.classList.add('visible');
+        setStatus(
+          message.usedLocalFallback
+            ? 'Enhanced with local fallback.'
+            : 'Enhanced successfully.',
+          false
+        );
+        return;
+      }
+      if (message.type === 'error') {
+        setStatus(message.message, true);
+        return;
+      }
+      if (message.type === 'seed' && message.prompt.trim()) {
+        promptEl.value = message.prompt;
+      }
+    });
+  </script>
+</body>
+</html>`;
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }

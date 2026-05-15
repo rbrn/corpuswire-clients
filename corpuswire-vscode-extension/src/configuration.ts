@@ -5,6 +5,7 @@ import * as vscode from "vscode";
 import type { PromptOutputMode } from "@corpuswire/sdk";
 
 export const CONFIG_SECTION = "corpuswire";
+const LEGACY_CONTEXT_ENGINE_CONFIG_SECTION = "corpuswireContextEngine";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8000";
 const DEFAULT_OUTPUT_MODE: PromptOutputMode = "generic";
@@ -51,13 +52,28 @@ interface HomeConfiguration {
   warnings: string[];
 }
 
+interface LegacyContextEngineSettings {
+  baseUrl: string;
+  workspaceId: string;
+  outputMode: string;
+}
+
 export function readSettings(resource?: vscode.Uri): ExtensionSettings {
   const config = vscode.workspace.getConfiguration(CONFIG_SECTION, resource);
+  const legacyContextEngineSettings = readLegacyContextEngineSettings(resource);
   const homeConfiguration = loadHomeConfiguration(readConfiguredUserConfigPath(config));
   const workspaceFolder = resolveWorkspaceFolder(resource);
   const workspaceFolderPath = workspaceFolder?.uri.fsPath;
   const configuredRepoPath = readConfiguredString(config, homeConfiguration.values, "repoPath", "");
-  const baseUrl = normalizeUrl(readConfiguredString(config, homeConfiguration.values, "baseUrl", DEFAULT_BASE_URL), DEFAULT_BASE_URL);
+  const baseUrl = normalizeUrl(
+    readConfiguredString(
+      config,
+      homeConfiguration.values,
+      "baseUrl",
+      legacyContextEngineSettings.baseUrl || DEFAULT_BASE_URL,
+    ),
+    DEFAULT_BASE_URL,
+  );
   const serviceDefaults = readServiceDefaults(config, homeConfiguration.values, baseUrl);
   const configuredWorkspaceId = readConfiguredString(
     config,
@@ -65,17 +81,30 @@ export function readSettings(resource?: vscode.Uri): ExtensionSettings {
     "remoteIndexing.workspaceId",
     "",
   );
+  const workspaceId = configuredWorkspaceId || legacyContextEngineSettings.workspaceId || workspaceFolder?.uri.toString();
 
   return {
     baseUrl,
     repoPath: resolveRepoPath(configuredRepoPath, workspaceFolderPath),
     topK: normalizeTopK(readConfiguredNumber(config, homeConfiguration.values, "topK", DEFAULT_TOP_K)),
-    outputMode: normalizeOutputMode(readConfiguredString(config, homeConfiguration.values, "outputMode", DEFAULT_OUTPUT_MODE)),
+    outputMode: normalizeOutputMode(
+      readConfiguredString(
+        config,
+        homeConfiguration.values,
+        "outputMode",
+        legacyContextEngineSettings.outputMode || DEFAULT_OUTPUT_MODE,
+      ),
+    ),
     localOnly: readConfiguredBoolean(config, homeConfiguration.values, "localOnly", false),
     remoteIndexing: {
-      enabled: readConfiguredBoolean(config, homeConfiguration.values, "remoteIndexing.enabled", false),
+      enabled: readConfiguredBoolean(
+        config,
+        homeConfiguration.values,
+        "remoteIndexing.enabled",
+        Boolean(legacyContextEngineSettings.workspaceId),
+      ),
       autoWatch: readConfiguredBoolean(config, homeConfiguration.values, "remoteIndexing.autoWatch", false),
-      workspaceId: configuredWorkspaceId || workspaceFolder?.uri.toString(),
+      workspaceId,
       maxConcurrentUploads: normalizePositiveInteger(
         readConfiguredNumber(config, homeConfiguration.values, "remoteIndexing.maxConcurrentUploads", 4),
         4,
@@ -91,6 +120,16 @@ export function readSettings(resource?: vscode.Uri): ExtensionSettings {
       semanticSearch: readRemoteServiceSettings(config, homeConfiguration.values, "semanticSearch", serviceDefaults),
     },
     configurationWarnings: homeConfiguration.warnings,
+  };
+}
+
+function readLegacyContextEngineSettings(resource?: vscode.Uri): LegacyContextEngineSettings {
+  const legacyConfig = vscode.workspace.getConfiguration(LEGACY_CONTEXT_ENGINE_CONFIG_SECTION, resource);
+
+  return {
+    baseUrl: readLegacyString(legacyConfig, "baseUrl"),
+    workspaceId: readLegacyString(legacyConfig, "workspaceId"),
+    outputMode: readLegacyString(legacyConfig, "outputMode"),
   };
 }
 
@@ -156,6 +195,18 @@ function readRemoteServiceSettings(
 function readConfiguredUserConfigPath(config: vscode.WorkspaceConfiguration): string {
   const configuredPath = readVsCodeScopedValue(config, "userConfigPath");
   return typeof configuredPath === "string" ? configuredPath.trim() : "";
+}
+
+function readLegacyString(config: vscode.WorkspaceConfiguration, key: string): string {
+  const value = readVsCodeScopedValue(config, key);
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (value === undefined || value === null) {
+    return "";
+  }
+
+  return String(value).trim();
 }
 
 function loadHomeConfiguration(configuredPath: string): HomeConfiguration {

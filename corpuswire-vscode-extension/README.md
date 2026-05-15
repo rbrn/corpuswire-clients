@@ -1,6 +1,6 @@
-# CorpusWire Prompt Enhancer
+# CorpusWire VS Code Extension
 
-VS Code extension for replacing selected prompt text with a repository-context-grounded rewrite from configurable `corpuswire` services.
+VS Code extension for replacing selected prompt text with a repository-context-grounded rewrite and indexing VS Code workspaces into configurable `corpuswire` services.
 
 ## Usage
 
@@ -9,6 +9,8 @@ VS Code extension for replacing selected prompt text with a repository-context-g
 3. Run `CorpusWire: Enhance Prompt` from the command palette.
 
 The extension sends the selected text to `POST /v1/enhance` through `@corpuswire/sdk` and replaces the selected range with the returned enhanced prompt.
+
+For a prompt editing surface, run `CorpusWire: Open Prompt Panel`. The panel can be seeded from the current selection, enhance arbitrary prompt text, and insert or copy the result.
 
 To populate a remote index for VS Code Remote SSH, Dev Containers, Codespaces, or any non-local workspace, run `CorpusWire: Index Workspace`. The extension reads files through `vscode.workspace.fs` and uploads file contents to the configured indexer service with the `/v1/index/*` protocol.
 
@@ -40,6 +42,8 @@ Settings are resolved in this order:
 - `corpuswire.remoteIndexing.workspaceId`: stable workspace id. Empty uses the first workspace folder URI.
 - `corpuswire.remoteIndexing.maxConcurrentUploads`: client-side concurrency hint sent to the indexer.
 - `corpuswire.remoteIndexing.batchBytes`: target remote upload batch size.
+
+Legacy `corpuswireContextEngine.baseUrl`, `corpuswireContextEngine.workspaceId`, and `corpuswireContextEngine.outputMode` settings are still read as compatibility fallbacks. The legacy `corpuswireContextEngine.enhancePrompt` and `corpuswireContextEngine.openPanel` command IDs are also registered, but new configuration should use the `corpuswire.*` namespace.
 
 Example workspace configuration:
 
