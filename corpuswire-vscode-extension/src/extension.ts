@@ -47,11 +47,22 @@ interface PanelIndexMessage {
   type: "index-workspace";
 }
 
+interface PanelGetModelMessage {
+  type: "get-model";
+}
+
+interface PanelSetModelMessage {
+  type: "set-model";
+  model: string;
+}
+
 type PanelInboundMessage =
   | PanelEnhanceMessage
   | PanelInsertMessage
   | PanelCheckStatusMessage
-  | PanelIndexMessage;
+  | PanelIndexMessage
+  | PanelGetModelMessage
+  | PanelSetModelMessage;
 
 interface PanelResultMessage {
   type: "result";
@@ -85,12 +96,22 @@ interface PanelIndexStatusMessage {
   ageSeconds?: number | null;
 }
 
+interface PanelModelMessage {
+  type: "model";
+  ok: boolean;
+  model?: string;
+  configuredModel?: string;
+  overridden?: boolean;
+  error?: string;
+}
+
 type PanelOutboundMessage =
   | PanelResultMessage
   | PanelErrorMessage
   | PanelLoadingMessage
   | PanelSeedMessage
-  | PanelIndexStatusMessage;
+  | PanelIndexStatusMessage
+  | PanelModelMessage;
 
 class PromptEnhancerPanel {
   static readonly viewType = "corpuswire.promptPanel";
@@ -162,6 +183,16 @@ class PromptEnhancerPanel {
 
     if (message.type === "index-workspace") {
       await runIndexWorkspaceFromPanel((msg) => this.post(msg));
+      return;
+    }
+
+    if (message.type === "get-model") {
+      await runFetchModel((msg) => this.post(msg));
+      return;
+    }
+
+    if (message.type === "set-model") {
+      await runSetModel((msg) => this.post(msg), message.model);
       return;
     }
 
@@ -244,6 +275,16 @@ class PromptEnhancerViewProvider implements vscode.WebviewViewProvider {
 
     if (message.type === "index-workspace") {
       await runIndexWorkspaceFromPanel((msg) => this.post(msg));
+      return;
+    }
+
+    if (message.type === "get-model") {
+      await runFetchModel((msg) => this.post(msg));
+      return;
+    }
+
+    if (message.type === "set-model") {
+      await runSetModel((msg) => this.post(msg), message.model);
       return;
     }
 
@@ -421,6 +462,68 @@ function formatAge(ageSeconds: number | null | undefined): string {
     return `${Math.round(ageSeconds / 3600)}h`;
   }
   return `${Math.round(ageSeconds / 86400)}d`;
+}
+
+async function runFetchModel(post: (message: PanelOutboundMessage) => void): Promise<void> {
+  const resource = vscode.window.activeTextEditor?.document.uri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
+  const settings = readSettings(resource);
+  const enhancerService = settings.services.enhancer;
+  const client = new CorpusWireClient({
+    baseUrl: enhancerService.url,
+    endpointMode: "v1-only",
+    defaultHeaders: buildRemoteServiceHeaders(enhancerService),
+  });
+  try {
+    const state = await client.getLlmModel();
+    post({
+      type: "model",
+      ok: true,
+      model: state.model,
+      configuredModel: state.configured_model,
+      overridden: state.overridden,
+    });
+  } catch (error) {
+    post({
+      type: "model",
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+async function runSetModel(
+  post: (message: PanelOutboundMessage) => void,
+  model: string,
+): Promise<void> {
+  const trimmed = model.trim();
+  if (!trimmed) {
+    post({ type: "model", ok: false, error: "Model name must not be empty." });
+    return;
+  }
+  const resource = vscode.window.activeTextEditor?.document.uri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
+  const settings = readSettings(resource);
+  const enhancerService = settings.services.enhancer;
+  const client = new CorpusWireClient({
+    baseUrl: enhancerService.url,
+    endpointMode: "v1-only",
+    defaultHeaders: buildRemoteServiceHeaders(enhancerService),
+  });
+  try {
+    const state = await client.setLlmModel(trimmed);
+    post({
+      type: "model",
+      ok: true,
+      model: state.model,
+      configuredModel: state.configured_model,
+      overridden: state.overridden,
+    });
+  } catch (error) {
+    post({
+      type: "model",
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 async function runIndexWorkspaceFromPanel(post: (message: PanelOutboundMessage) => void): Promise<void> {
@@ -814,10 +917,8 @@ function isGenerationSetupRejection(error: unknown): boolean {
     .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     .join("\n");
 
-  return message.includes("OPENCLAW_MODEL or LLM_MODEL is required")
-    || message.includes("Prompt rewriting requires a configured generation backend")
-    || message.includes("Unsupported GENERATION_PROVIDER")
-    || message.includes("Unsupported OPENCLAW_EXECUTION_MODE");
+  return message.includes("Prompt rewriting requires a configured generation backend")
+    || message.includes("Unsupported GENERATION_PROVIDER");
 }
 
 function resolveFinalReplacementPrompt(result: PromptRewriteResult): string | null {
@@ -1042,6 +1143,14 @@ function buildPromptPanelHtml(initialSeed: string): string {
     </div>
   </div>
 
+  <div id="model-row" class="row">
+    <span class="label">Model:</span>
+    <span id="model-current">…</span>
+    <input id="model-input" type="text" placeholder="override model id (e.g. gpt-4o-mini)" style="flex:1;min-width:160px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border, transparent);border-radius:2px;padding:4px 6px;" />
+    <button id="model-apply" class="secondary">Apply</button>
+    <span id="model-status" style="font-size:0.85em;color:var(--vscode-descriptionForeground);"></span>
+  </div>
+
   <div class="section">
     <label for="prompt">Base prompt</label>
     <textarea id="prompt" rows="8" placeholder="Enter or paste a prompt, or select text in an editor first">${escapedSeed}</textarea>
@@ -1078,6 +1187,10 @@ function buildPromptPanelHtml(initialSeed: string): string {
     const indexMessage = document.getElementById('index-message');
     const indexBtn = document.getElementById('index-btn');
     const refreshStatusBtn = document.getElementById('refresh-status-btn');
+    const modelCurrent = document.getElementById('model-current');
+    const modelInput = document.getElementById('model-input');
+    const modelApply = document.getElementById('model-apply');
+    const modelStatus = document.getElementById('model-status');
 
     function applyIndexStatus(message) {
       indexBanner.classList.remove('hidden');
@@ -1106,6 +1219,23 @@ function buildPromptPanelHtml(initialSeed: string): string {
     });
     refreshStatusBtn.addEventListener('click', () => {
       vscode.postMessage({ type: 'check-status' });
+    });
+
+    modelApply.addEventListener('click', () => {
+      const value = modelInput.value.trim();
+      if (!value) {
+        modelStatus.textContent = 'Enter a model id.';
+        return;
+      }
+      modelApply.disabled = true;
+      modelStatus.textContent = 'Applying…';
+      vscode.postMessage({ type: 'set-model', model: value });
+    });
+    modelInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        modelApply.click();
+      }
     });
 
     function setStatus(text, isError) {
@@ -1174,10 +1304,26 @@ function buildPromptPanelHtml(initialSeed: string): string {
       if (message.type === 'index-status') {
         applyIndexStatus(message);
       }
+      if (message.type === 'model') {
+        modelApply.disabled = false;
+        if (message.ok) {
+          const overrideTag = message.overridden ? ' (override)' : '';
+          modelCurrent.textContent = (message.model || '(unset)') + overrideTag;
+          modelInput.placeholder = message.configuredModel || 'override model id';
+          if (!modelInput.value) {
+            modelInput.value = message.model || '';
+          }
+          modelStatus.textContent = '';
+        } else {
+          modelCurrent.textContent = '(error)';
+          modelStatus.textContent = message.error || 'Failed to fetch model.';
+        }
+      }
     });
 
     // Trigger initial status check on load.
     vscode.postMessage({ type: 'check-status' });
+    vscode.postMessage({ type: 'get-model' });
   </script>
 </body>
 </html>`;

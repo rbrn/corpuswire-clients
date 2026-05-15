@@ -1484,10 +1484,8 @@ function isGenerationSetupError(error) {
     .filter((value) => typeof value === "string" && value.trim())
     .join("\n");
 
-  return message.includes("OPENCLAW_MODEL or LLM_MODEL is required")
-    || message.includes("Prompt rewriting requires a configured generation backend")
-    || message.includes("Unsupported GENERATION_PROVIDER")
-    || message.includes("Unsupported OPENCLAW_EXECUTION_MODE");
+  return message.includes("Prompt rewriting requires a configured generation backend")
+    || message.includes("Unsupported GENERATION_PROVIDER");
 }
 
 function formatWarnings(warnings) {

@@ -21,7 +21,7 @@ share the same backend concepts:
 | SDK | `clients/corpuswire-sdk` | Reusable Node/TypeScript HTTP client and protocol types | Full and incremental remote indexing with `/v1/index/*` |
 | CLI | `clients/corpuswire-cli` | Terminal wrapper for health, search, enhance, and index observability | Does not index; reads index events/activity |
 | VS Code extension | `clients/corpuswire-vscode-extension` | Prompt enhancement plus remote workspace indexing for VS Code, Remote SSH, Dev Containers, and Codespaces | Full workspace upload and debounced incremental updates |
-| OpenClaw plugin | `clients/corpuswire-openclaw-plugin` | OpenClaw tools, CLI commands, and context-engine adapter | Service-local incremental `/ingest`; remote indexing must use SDK or VS Code |
+| MCP server | `clients/corpuswire-mcp` | stdio MCP server exposing CorpusWire search/enhance to Codex, Copilot, Cursor and other MCP hosts | Service-local incremental `/ingest`; remote indexing must use SDK or VS Code |
 
 ## Choosing The Right Ingestion Path
 
@@ -72,7 +72,7 @@ The local ingest path is a single `POST /ingest` call with an optional
 `repo_path`, `source_dir`, `recreate_collection`, `include_globs`,
 `exclude_globs`, and `max_file_size_bytes`.
 
-This path is exposed by the OpenClaw plugin. It is intentionally not a remote
+This path is exposed by the MCP server and Python backend CLI. It is intentionally not a remote
 upload protocol: the service walks its own filesystem, applies ingest filters,
 updates existing files, detects deletes, and reports counts such as
 `files_added`, `files_updated`, `files_deleted`, `files_unchanged`, and
@@ -86,8 +86,7 @@ local collection. Use the default `false` for incremental updates.
 All JavaScript clients require Node.js 18 or newer because they rely on the
 runtime `fetch`, `Blob`, `TextEncoder`, `AbortController`, and ES module support.
 
-VS Code extensions require VS Code `^1.90.0` and compile with TypeScript. The
-OpenClaw plugin requires OpenClaw `2026.4.20` or newer. The SDK is dependency
+VS Code extensions require VS Code `^1.90.0` and compile with TypeScript. The SDK is dependency
 free at runtime and ships committed `dist/` files for consumers.
 
 ## Credentials

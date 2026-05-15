@@ -175,8 +175,8 @@ export class CorpusWireClient {
   async enhance(request) {
     appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify(request) + "\\n", "utf8");
     if (request.localOnly !== true) {
-      const error = new CorpusWireHttpError("OPENCLAW_MODEL or LLM_MODEL is required for OpenClaw generation");
-      error.errorMessage = "OPENCLAW_MODEL or LLM_MODEL is required for OpenClaw generation";
+      const error = new CorpusWireHttpError("Prompt rewriting requires a configured generation backend");
+      error.errorMessage = "Prompt rewriting requires a configured generation backend";
       throw error;
     }
 
@@ -189,7 +189,7 @@ export class CorpusWireClient {
       enhancement_prompt: "prompt",
       enhanced_prompt: "Local deterministic rewrite",
       enhancement_backend: "local-deterministic",
-      generation_error: "OPENCLAW_MODEL or LLM_MODEL is required for OpenClaw generation"
+      generation_error: "Prompt rewriting requires a configured generation backend"
     };
   }
 }

@@ -292,13 +292,13 @@ test("health falls back to the legacy endpoint when needed", async () => {
         docs_source_dir: "/tmp/docs",
         runtime: {
           embedding_provider_preference: "auto",
-          generation_provider_preference: "openclaw",
+          generation_provider_preference: "openai",
           openai_compat_profile: "auto",
           openai_base_url: null,
           basic_auth_enabled: false,
           basic_auth_uses_fallback: false,
           embedding_order: ["hash:local-fallback"],
-          generation_order: ["openclaw:openai-codex/gpt-5.3-codex"],
+          generation_order: ["openai:gpt-4.1-mini"],
           ollama_base_url: null,
           corpuswire_enabled: true,
         },
@@ -325,7 +325,7 @@ test("health falls back to the legacy endpoint when needed", async () => {
   const result = await client.health();
 
   assert.deepEqual(calls, ["http://example.test/v1/health", "http://example.test/health"]);
-  assert.equal(result.runtime.generation_provider_preference, "openclaw");
+  assert.equal(result.runtime.generation_provider_preference, "openai");
 });
 
 test("query posts workspace_id to semantic retrieval endpoint", async () => {

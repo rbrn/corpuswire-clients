@@ -16,7 +16,7 @@ The CLI supports:
 - `index-activity` for `GET /v1/index/activity`.
 
 The CLI does not perform ingestion. Use the full VS Code extension or SDK for
-remote `/v1/index/*` indexing, and use the OpenClaw plugin or Python backend CLI
+remote `/v1/index/*` indexing, and use the Python backend CLI
 for service-local `/ingest`.
 
 ## Architecture
@@ -147,15 +147,12 @@ For complete ingestion:
   `CorpusWire: Index Workspace` for a full remote upload from VS Code.
 - Use `@corpuswire/sdk` and call `indexWorkspace({ mode: "full", ... })` from a
   custom Node client.
-- Use the OpenClaw plugin's `corpuswire_ingest` or `openclaw corpuswire ingest`
-  only when the FastAPI service can read the target path locally.
 
 For updates to already ingested content:
 
 - Use the VS Code extension's remote watcher when
   `corpuswire.remoteIndexing.autoWatch` is enabled.
 - Use the SDK with `mode: "incremental"`, changed `files`, and `deletedPaths`.
-- Use the OpenClaw plugin local `/ingest` path for service-local repositories.
 
 The CLI helps verify those flows after they run:
 

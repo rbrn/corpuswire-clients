@@ -181,6 +181,12 @@ export interface LlmProviderState {
     overridden: boolean;
     providers: string[];
 }
+export interface LlmModelState {
+    ok: boolean;
+    model: string;
+    configured_model: string;
+    overridden: boolean;
+}
 export interface AuthSummary {
     available: boolean;
     providers: unknown[];

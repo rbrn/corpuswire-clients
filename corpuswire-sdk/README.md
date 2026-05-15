@@ -30,7 +30,7 @@ The package is runtime dependency free and targets Node.js 18 or newer.
 | `src/types.ts` | Public TypeScript types for prompt, retrieval, health, and index protocol payloads |
 | `src/index.ts` | Public exports |
 | `dist/` | Committed JavaScript and declaration files used by consumers |
-| `examples/` | Integration examples, including Codex/OpenClaw orchestration |
+| `examples/` | Integration examples |
 | `tests/client.test.js` | Node test coverage for payload mapping, retries, fallback endpoints, and remote indexing |
 
 ## Install And Build
@@ -306,14 +306,3 @@ try {
 The SDK retries transient gateway and socket failures. It does not retry stable
 request errors such as invalid prompt payloads, unsupported output modes, or
 incomplete index sessions.
-
-## Codex/OpenClaw Example
-
-See `examples/codex-openclaw-workflow.ts` for a complete flow that:
-
-1. Requests an enhanced prompt from CorpusWire.
-2. Selects the best returned prompt text.
-3. Passes that prompt to `openclaw capability model run --json`.
-
-That example keeps prompt enhancement in CorpusWire while letting OpenClaw own
-model routing and provider authentication.

@@ -262,8 +262,7 @@ The command:
    `augmented_prompt`.
 8. If generation failed and `localOnly` was not already set, retries with
    `localOnly: true` and uses the deterministic `enhancement_prompt`. This
-   also covers HTTP rejections caused by missing backend generation setup, such
-   as an unset OpenClaw model.
+   also covers HTTP rejections caused by missing backend generation setup.
 
 This means prompt enhancement follows the same workspace identity as indexing:
 remote-first workspaces use `workspaceId`; service-local workflows can still use

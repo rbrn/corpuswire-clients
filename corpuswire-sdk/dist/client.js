@@ -73,6 +73,30 @@ export class CorpusWireClient {
         });
         return response.retrieved_chunks;
     }
+    async getLlmModel() {
+        return requestJson({
+            baseUrl: this.baseUrl,
+            paths: ["/llm/model"],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: { method: "GET" },
+        });
+    }
+    async setLlmModel(model) {
+        return requestJson({
+            baseUrl: this.baseUrl,
+            paths: ["/llm/model"],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ model }),
+            },
+        });
+    }
     async getIndexCapabilities() {
         return requestJson({
             baseUrl: this.baseUrl,

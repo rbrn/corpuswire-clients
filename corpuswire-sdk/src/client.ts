@@ -12,6 +12,7 @@ import type {
   IndexEventsResponse,
   IndexWorkspaceRequest,
   CorpusWireClientOptions,
+  LlmModelState,
   PromptOutputMode,
   PromptEnhancementResult,
   PromptRewriteResult,
@@ -113,6 +114,32 @@ export class CorpusWireClient {
       includeAnswer: false,
     });
     return response.retrieved_chunks;
+  }
+
+  async getLlmModel(): Promise<LlmModelState> {
+    return requestJson<LlmModelState>({
+      baseUrl: this.baseUrl,
+      paths: ["/llm/model"],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "GET" },
+    });
+  }
+
+  async setLlmModel(model: string): Promise<LlmModelState> {
+    return requestJson<LlmModelState>({
+      baseUrl: this.baseUrl,
+      paths: ["/llm/model"],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model }),
+      },
+    });
   }
 
   async getIndexCapabilities(): Promise<RemoteIndexCapabilities> {

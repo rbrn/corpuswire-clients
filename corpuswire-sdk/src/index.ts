@@ -37,6 +37,7 @@ export type {
   IndexHealth,
   CorpusWireClientOptions,
   IndexWorkspaceRequest,
+  LlmModelState,
   LlmProviderState,
   PromptOutputMode,
   PromptEnhancementResult,
