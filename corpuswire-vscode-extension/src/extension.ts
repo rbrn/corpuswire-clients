@@ -984,6 +984,35 @@ function buildPromptPanelHtml(initialSeed: string): string {
     #status.error {
       color: var(--vscode-errorForeground);
     }
+    #index-banner {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 8px 10px;
+      border-radius: 3px;
+      border: 1px solid var(--vscode-input-border, transparent);
+      background: var(--vscode-textBlockQuote-background, var(--vscode-editorWidget-background));
+      font-size: 0.85em;
+    }
+    #index-banner.hidden { display: none; }
+    #index-banner.state-not-indexed,
+    #index-banner.state-stale,
+    #index-banner.state-error {
+      border-color: var(--vscode-inputValidation-warningBorder, var(--vscode-editorWarning-foreground));
+    }
+    #index-banner.state-indexed {
+      border-color: var(--vscode-charts-green, var(--vscode-input-border, transparent));
+    }
+    #index-banner .row {
+      gap: 6px;
+    }
+    #index-banner .label {
+      font-weight: 600;
+    }
+    #index-banner .label.indexed { color: var(--vscode-charts-green, var(--vscode-foreground)); }
+    #index-banner .label.stale,
+    #index-banner .label.not-indexed,
+    #index-banner .label.error { color: var(--vscode-editorWarning-foreground, var(--vscode-foreground)); }
     #result-section {
       display: none;
       flex-direction: column;
@@ -1003,6 +1032,15 @@ function buildPromptPanelHtml(initialSeed: string): string {
 </head>
 <body>
   <h2>CorpusWire Prompt Enhancer</h2>
+
+  <div id="index-banner" class="hidden">
+    <div class="row"><span class="label" id="index-label">Checking index status…</span></div>
+    <div id="index-message"></div>
+    <div class="row">
+      <button id="index-btn" class="secondary">Index Workspace</button>
+      <button id="refresh-status-btn" class="secondary">Refresh</button>
+    </div>
+  </div>
 
   <div class="section">
     <label for="prompt">Base prompt</label>
@@ -1035,6 +1073,40 @@ function buildPromptPanelHtml(initialSeed: string): string {
     const resultEl = document.getElementById('result');
     const insertBtn = document.getElementById('insert-btn');
     const copyBtn = document.getElementById('copy-btn');
+    const indexBanner = document.getElementById('index-banner');
+    const indexLabel = document.getElementById('index-label');
+    const indexMessage = document.getElementById('index-message');
+    const indexBtn = document.getElementById('index-btn');
+    const refreshStatusBtn = document.getElementById('refresh-status-btn');
+
+    function applyIndexStatus(message) {
+      indexBanner.classList.remove('hidden');
+      indexBanner.className = 'state-' + message.state;
+      indexLabel.className = 'label ' + message.state;
+      const labels = {
+        unknown: 'Unknown',
+        checking: 'Checking…',
+        'not-indexed': 'Not indexed',
+        indexed: 'Indexed',
+        stale: 'Index may be stale',
+        indexing: 'Indexing…',
+        error: 'Index status error'
+      };
+      indexLabel.textContent = labels[message.state] || message.state;
+      indexMessage.textContent = message.message || '';
+      const showIndexBtn = ['not-indexed', 'stale', 'indexed', 'error'].includes(message.state);
+      indexBtn.style.display = showIndexBtn ? '' : 'none';
+      indexBtn.textContent = message.state === 'indexed' ? 'Re-index Workspace' : 'Index Workspace';
+      indexBtn.disabled = message.state === 'indexing' || message.state === 'checking';
+      refreshStatusBtn.disabled = message.state === 'indexing' || message.state === 'checking';
+    }
+
+    indexBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'index-workspace' });
+    });
+    refreshStatusBtn.addEventListener('click', () => {
+      vscode.postMessage({ type: 'check-status' });
+    });
 
     function setStatus(text, isError) {
       statusEl.textContent = text;
@@ -1099,7 +1171,13 @@ function buildPromptPanelHtml(initialSeed: string): string {
       if (message.type === 'seed' && message.prompt.trim()) {
         promptEl.value = message.prompt;
       }
+      if (message.type === 'index-status') {
+        applyIndexStatus(message);
+      }
     });
+
+    // Trigger initial status check on load.
+    vscode.postMessage({ type: 'check-status' });
   </script>
 </body>
 </html>`;
