@@ -154,6 +154,40 @@ Example workspace settings:
 Keep secrets out of committed `.vscode/settings.json`. Use VS Code user
 settings or the home config file for API keys and Basic Auth values.
 
+## Local Docker As A Remote Service
+
+For local end-to-end testing, point the extension at the Docker API and keep
+remote indexing enabled. This exercises the same `/v1/index/*` upload protocol
+used by a deployed service instead of relying on service-local `/ingest`.
+
+From the repository root:
+
+```bash
+APP_HOST_PORT=18080 bash ./scripts/vscode_docker_remote_smoke.sh /Users/constantinaldea/workspace/my-context-engine
+```
+
+The smoke test starts Docker, uploads workspace files using a generated
+`local-docker://...` workspace id, verifies workspace-scoped search, verifies
+prompt enhancement, and prints matching VS Code settings:
+
+```json
+{
+  "corpuswire.serviceDefaults.url": "http://127.0.0.1:18080",
+  "corpuswire.remoteIndexing.enabled": true,
+  "corpuswire.remoteIndexing.autoWatch": true,
+  "corpuswire.remoteIndexing.workspaceId": "local-docker://my-context-engine#...",
+  "corpuswire.outputMode": "claude-code",
+  "corpuswire.topK": 8,
+  "corpuswire.localOnly": true
+}
+```
+
+Optionally let the smoke test merge those keys into the workspace settings:
+
+```bash
+WRITE_VSCODE_SETTINGS=1 APP_HOST_PORT=18080 bash ./scripts/vscode_docker_remote_smoke.sh /Users/constantinaldea/workspace/my-context-engine
+```
+
 ## Complete Workspace Ingestion
 
 Run `CorpusWire: Index Workspace` to perform a full remote indexing session.
