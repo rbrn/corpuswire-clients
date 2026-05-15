@@ -66,6 +66,69 @@ test("corpuswire-mcp exposes tools and maps search requests to the SDK", async (
   }
 });
 
+test("corpuswire-mcp retries prompt enhancement with localOnly when generation setup is unavailable", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "http://mock-corpuswire",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        CORPUSWIRE_WORKSPACE_ID: "workspace-from-env",
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const enhance = await rpc({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_enhance_prompt",
+          arguments: {
+            prompt: "fix enhancer fallback",
+            localOnly: false,
+          },
+        },
+      });
+
+      assert.equal(enhance.result.isError, false);
+      assert.match(enhance.result.content[0].text, /Local deterministic rewrite/);
+      assert.match(enhance.result.content[0].text, /localFallback: retried with localOnly=true/);
+    } finally {
+      child.kill();
+    }
+
+    const requests = (await readFile(requestsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+
+    assert.deepEqual(requests, [
+      {
+        prompt: "fix enhancer fallback",
+        outputMode: "generic",
+        workspaceId: "workspace-from-env",
+        topK: 5,
+        localOnly: false,
+      },
+      {
+        prompt: "fix enhancer fallback",
+        outputMode: "generic",
+        workspaceId: "workspace-from-env",
+        topK: 5,
+        localOnly: true,
+      },
+    ]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 async function writeMockSdk(tempDir) {
   const sdkPath = path.join(tempDir, "mock-sdk.mjs");
   const requestsPath = path.join(tempDir, "requests.jsonl");
@@ -108,9 +171,32 @@ export class CorpusWireClient {
       }
     };
   }
+
+  async enhance(request) {
+    appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify(request) + "\\n", "utf8");
+    if (request.localOnly !== true) {
+      const error = new CorpusWireHttpError("OPENCLAW_MODEL or LLM_MODEL is required for OpenClaw generation");
+      error.errorMessage = "OPENCLAW_MODEL or LLM_MODEL is required for OpenClaw generation";
+      throw error;
+    }
+
+    return {
+      retrieval_query: request.prompt,
+      retrieval_backend: "qdrant_hybrid",
+      retrieved_chunks: [],
+      task_type: "bug_fix",
+      output_mode: request.outputMode,
+      enhancement_prompt: "prompt",
+      enhanced_prompt: "Local deterministic rewrite",
+      enhancement_backend: "local-deterministic",
+      generation_error: "OPENCLAW_MODEL or LLM_MODEL is required for OpenClaw generation"
+    };
+  }
 }
 
-export class CorpusWireHttpError extends Error {}
+export class CorpusWireHttpError extends Error {
+  errorMessage = null;
+}
 `.trimStart(),
     "utf8",
   );

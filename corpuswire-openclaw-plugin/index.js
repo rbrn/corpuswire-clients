@@ -84,6 +84,11 @@ const configSchema = {
       requestRetryDelayMs: { type: "integer", minimum: 0, maximum: 5000, default: 250 },
       autoContext: { type: "boolean", default: false },
       contextEngineAutoContext: { type: "boolean", default: true },
+      localOnly: {
+        type: "boolean",
+        default: true,
+        description: "Use deterministic CorpusWire prompt rewriting unless a generated rewrite is explicitly requested.",
+      },
     },
   },
   parse(value) {
@@ -169,19 +174,17 @@ const plugin = {
           try {
             const input = asRecord(params);
             const prompt = readRequiredString(input, "prompt");
-            const payload = await client.enhance(
-              {
-                prompt,
-                repoPath: readOptionalString(input, "repoPath"),
-                workspaceId: readOptionalString(input, "workspaceId"),
-                topK: readOptionalNumber(input, "topK"),
-                minScore: readOptionalNumber(input, "minScore"),
-                outputMode: readOptionalString(input, "outputMode"),
-                localOnly: readOptionalBoolean(input, "localOnly"),
-              },
-              { signal },
-            );
+            const { payload, usedLocalFallback } = await enhanceWithLocalFallback(client, {
+              prompt,
+              repoPath: readOptionalString(input, "repoPath"),
+              workspaceId: readOptionalString(input, "workspaceId"),
+              topK: readOptionalNumber(input, "topK"),
+              minScore: readOptionalNumber(input, "minScore"),
+              outputMode: readOptionalString(input, "outputMode"),
+              localOnly: readOptionalBoolean(input, "localOnly"),
+            }, { signal });
             const formatted = formatEnhanceToolResult(payload, { maxChars: config.maxContextChars * 2 });
+            formatted.details.usedLocalFallback = usedLocalFallback;
             return textResult(formatted.text, formatted.details);
           } catch (error) {
             return failedResult(`CorpusWire enhancement failed: ${formatError(error)}`, error);
@@ -269,12 +272,12 @@ const plugin = {
         .option("--local-only", "Disable LLM generation")
         .option("--json", "Print raw JSON")
         .action(async (prompt, options) => {
-          const payload = await client.enhance({
+          const { payload, usedLocalFallback } = await enhanceWithLocalFallback(client, {
             prompt,
             repoPath: options.repo,
             workspaceId: options.workspaceId,
             outputMode: options.mode,
-            localOnly: Boolean(options.localOnly),
+            localOnly: options.localOnly ? true : undefined,
           });
           if (options.json) {
             printCliResult(payload, true);
@@ -282,6 +285,9 @@ const plugin = {
           }
           const formatted = formatEnhanceToolResult(payload, { maxChars: config.maxContextChars * 2 });
           console.log(formatted.text);
+          if (usedLocalFallback) {
+            console.log("\nCorpusWire retried with localOnly=true because backend generation setup was unavailable.");
+          }
         });
 
       root
@@ -363,6 +369,34 @@ function failedResult(text, error) {
     status: "failed",
     error: formatError(error),
   });
+}
+
+async function enhanceWithLocalFallback(client, request, options = {}) {
+  try {
+    return { payload: await client.enhance(request, options), usedLocalFallback: false };
+  } catch (error) {
+    if (request.localOnly === true || !isGenerationSetupError(error)) {
+      throw error;
+    }
+    return {
+      payload: await client.enhance({ ...request, localOnly: true }, options),
+      usedLocalFallback: true,
+    };
+  }
+}
+
+function isGenerationSetupError(error) {
+  const message = [
+    error?.responseBody,
+    error?.message,
+  ]
+    .filter((value) => typeof value === "string" && value.trim())
+    .join("\n");
+
+  return message.includes("OPENCLAW_MODEL or LLM_MODEL is required")
+    || message.includes("Prompt rewriting requires a configured generation backend")
+    || message.includes("Unsupported GENERATION_PROVIDER")
+    || message.includes("Unsupported OPENCLAW_EXECUTION_MODE");
 }
 
 function printCliResult(payload, asJson) {

@@ -7,7 +7,7 @@ This package is the preferred distributable MCP entrypoint for the VS Code/Copil
 ## Tools
 
 - `corpuswire_search`: calls `POST /query` for semantic retrieval.
-- `corpuswire_enhance_prompt`: calls `POST /v1/enhance` for context-grounded prompt rewriting.
+- `corpuswire_enhance_prompt`: calls `POST /v1/enhance` for context-grounded prompt rewriting. It defaults to deterministic local rewriting and retries once with `localOnly=true` if backend generation setup is unavailable.
 - `corpuswire_health`: checks backend health.
 - `corpuswire_sync_delta`: queues changed/deleted paths for remote workspace indexing.
 - `corpuswire_sync_flush`: flushes queued sync changes.
@@ -24,6 +24,14 @@ npm run smoke
 ```
 
 The package can also run directly from this repository without `npm install` because the server first checks its vendored SDK runtime and then falls back to `clients/corpuswire-sdk/dist` for development.
+
+To test against a real local Docker CorpusWire API from the repository root:
+
+```bash
+bash ./scripts/regression_local_mcp.sh /Users/constantinaldea/workspace/my-context-engine
+```
+
+That command runs the Docker/API regression gate, then exercises the Codex wrapper path and this direct Copilot-oriented MCP path against `http://127.0.0.1:${APP_HOST_PORT:-8000}`. When the repository has `.env` with `APP_HOST_PORT`, the script uses that port.
 
 ## GitHub Copilot Chat In VS Code
 

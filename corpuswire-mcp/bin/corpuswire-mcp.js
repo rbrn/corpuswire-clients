@@ -1382,7 +1382,7 @@ async function enhancePrompt(args) {
 
   await syncManager.flushBeforeRead();
   const client = buildClient();
-  const result = await client.enhance({
+  const request = {
     prompt,
     outputMode,
     repoPath,
@@ -1390,7 +1390,8 @@ async function enhancePrompt(args) {
     topK,
     minScore,
     localOnly,
-  });
+  };
+  const { result, usedLocalFallback } = await enhanceWithLocalFallback(client, request);
 
   const enhancedPrompt = resolveEnhancedPrompt(result);
   if (!enhancedPrompt) {
@@ -1416,12 +1417,42 @@ async function enhancePrompt(args) {
     `- retrievalBackend: ${result.retrieval_backend ?? "unknown"}`,
     ...(result.retrieval_warning ? [`- retrievalWarning: ${result.retrieval_warning}`] : []),
     `- enhancementBackend: ${result.enhancement_backend ?? "unknown"}`,
+    ...(usedLocalFallback ? ["- localFallback: retried with localOnly=true after generation setup failed"] : []),
     ...(result.generation_error ? [`- generationError: ${result.generation_error}`] : []),
     ...(recoveryAdvice ? ["", "Recovery:", recoveryAdvice] : []),
     ...(Array.isArray(result.citations) && result.citations.length > 0
       ? ["", "Citations:", ...result.citations.map((citation) => `- ${citation}`)]
       : []),
   ].join("\n");
+}
+
+async function enhanceWithLocalFallback(client, request) {
+  try {
+    return { result: await client.enhance(request), usedLocalFallback: false };
+  } catch (error) {
+    if (request.localOnly || !isGenerationSetupError(error)) {
+      throw error;
+    }
+    return {
+      result: await client.enhance({ ...request, localOnly: true }),
+      usedLocalFallback: true,
+    };
+  }
+}
+
+function isGenerationSetupError(error) {
+  const message = [
+    error?.errorMessage,
+    error?.message,
+    error?.responseBody,
+  ]
+    .filter((value) => typeof value === "string" && value.trim())
+    .join("\n");
+
+  return message.includes("OPENCLAW_MODEL or LLM_MODEL is required")
+    || message.includes("Prompt rewriting requires a configured generation backend")
+    || message.includes("Unsupported GENERATION_PROVIDER")
+    || message.includes("Unsupported OPENCLAW_EXECUTION_MODE");
 }
 
 function formatWarnings(warnings) {

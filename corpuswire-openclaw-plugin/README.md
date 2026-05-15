@@ -117,14 +117,18 @@ Calls `POST /query` and returns formatted retrieved chunks.
 ### `corpuswire_enhance`
 
 Calls `POST /v1/enhance` with fallback to `/enhance`, then returns the best
-available enhanced prompt.
+available enhanced prompt. By default, the plugin requests deterministic
+CorpusWire rewriting (`localOnly: true`) so prompt enhancement does not depend
+on OpenClaw or another generation provider being configured on the backend.
+Set `localOnly: false` only when you explicitly want the backend to generate
+the rewrite.
 
 ```json
 {
   "prompt": "document the remote indexing update flow",
   "workspaceId": "github://rbrn/corpuswire#main",
   "outputMode": "claude-code",
-  "localOnly": false
+  "localOnly": true
 }
 ```
 
@@ -237,7 +241,9 @@ setting `workspaceId`.
 ## Failure And Retry Behavior
 
 The plugin retries transient gateway responses and retryable socket failures
-according to `requestRetryAttempts` and `requestRetryDelayMs`. It uses
+according to `requestRetryAttempts` and `requestRetryDelayMs`. Prompt
+enhancement also retries once with `localOnly: true` when the backend reports
+that generation setup is unavailable, such as a missing OpenClaw model. It uses
 OpenClaw's abort signal when available and applies `requestTimeoutMs` to each
 attempt.
 

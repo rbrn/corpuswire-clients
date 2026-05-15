@@ -14,6 +14,7 @@ export const DEFAULT_PLUGIN_CONFIG = Object.freeze({
   requestRetryDelayMs: 250,
   autoContext: false,
   contextEngineAutoContext: true,
+  localOnly: true,
 });
 
 export class CorpusWireHttpError extends Error {
@@ -99,7 +100,7 @@ export class CorpusWireClient {
             top_k: request.topK ?? this.config.topK,
             min_score: request.minScore ?? this.config.minScore,
             output_mode: request.outputMode ?? "generic",
-            local_only: request.localOnly ?? false,
+            local_only: request.localOnly ?? this.config.localOnly,
           }),
         ),
       },
@@ -200,6 +201,7 @@ export function normalizePluginConfig(value = {}, env = process.env) {
         DEFAULT_PLUGIN_CONFIG.contextEngineAutoContext,
         { errors },
       ),
+      localOnly: readBoolean(record, "localOnly", DEFAULT_PLUGIN_CONFIG.localOnly, { errors }),
     },
     errors,
   };

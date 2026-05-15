@@ -145,6 +145,7 @@ test("normalizePluginConfig applies local defaults and environment fallbacks", (
   assert.equal(config.topK, 7);
   assert.equal(config.autoContext, true);
   assert.equal(config.contextEngineAutoContext, true);
+  assert.equal(config.localOnly, true);
 });
 
 test("formatPromptContext escapes retrieved snippets before prompt injection", () => {
@@ -230,9 +231,11 @@ test("corpuswire_search retries transient gateway responses", async () => {
 });
 
 test("corpuswire_enhance returns the backend enhanced prompt", async () => {
+  const calls = [];
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
-    jsonResponse(200, {
+  globalThis.fetch = async (input, init) => {
+    calls.push({ input, body: JSON.parse(init.body) });
+    return jsonResponse(200, {
       ok: true,
       request_id: "req-1",
       duration_ms: 5,
@@ -255,6 +258,7 @@ test("corpuswire_enhance returns the backend enhanced prompt", async () => {
         generation_error: null,
       },
     });
+  };
 
   try {
     const fake = createFakeApi({ baseUrl: "http://engine.test" });
@@ -266,8 +270,73 @@ test("corpuswire_enhance returns the backend enhanced prompt", async () => {
       outputMode: "claude-code",
     });
 
+    assert.equal(calls[0].body.local_only, true);
     assert.equal(result.details.status, "ok");
     assert.match(result.content[0].text, /LLM enhanced prompt text/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("corpuswire_enhance retries with localOnly when backend generation setup is unavailable", async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const body = JSON.parse(init.body);
+    calls.push({ input, body });
+    if (body.local_only !== true) {
+      return jsonResponse(400, {
+        ok: false,
+        request_id: "req-failed",
+        duration_ms: 4,
+        error: {
+          code: "bad_request",
+          message: "OPENCLAW_MODEL or LLM_MODEL is required for OpenClaw generation",
+          detail: null,
+        },
+      });
+    }
+    return jsonResponse(200, {
+      ok: true,
+      request_id: "req-local",
+      duration_ms: 3,
+      result: {
+        user_prompt: "fix memory",
+        retrieval_query: "fix memory",
+        retrieval_backend: "corpuswire_qdrant_vector",
+        retrieval_warning: null,
+        retrieved_chunks: [],
+        task_type: "bug_fix",
+        task_type_source: "heuristic",
+        task_type_classification_error: null,
+        output_mode: "claude-code",
+        context_summary: null,
+        summary_generation_error: null,
+        enhancement_prompt: "Enhanced prompt text",
+        citations: [],
+        enhanced_prompt: "Local deterministic prompt",
+        enhancement_backend: "local-deterministic",
+        generation_error: "OPENCLAW_MODEL or LLM_MODEL is required for OpenClaw generation",
+      },
+    });
+  };
+
+  try {
+    const fake = createFakeApi({ baseUrl: "http://engine.test", localOnly: false });
+    plugin.register(fake.api);
+    const tool = fake.tools.find((candidate) => candidate.name === "corpuswire_enhance");
+
+    const result = await tool.execute("tool-call-fallback", {
+      prompt: "fix memory",
+      outputMode: "claude-code",
+    });
+
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].body.local_only, false);
+    assert.equal(calls[1].body.local_only, true);
+    assert.equal(result.details.status, "ok");
+    assert.equal(result.details.usedLocalFallback, true);
+    assert.match(result.content[0].text, /Local deterministic prompt/);
   } finally {
     globalThis.fetch = originalFetch;
   }
