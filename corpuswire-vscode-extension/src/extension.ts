@@ -463,7 +463,23 @@ async function enhancePromptWithFallback(
   client: CorpusWireClient,
   request: EnhancePromptRequest,
 ): Promise<PromptEnhancementOutcome> {
-  const result = await client.enhance(request);
+  let result: PromptRewriteResult;
+  try {
+    result = await client.enhance(request);
+  } catch (error) {
+    if (request.localOnly || !isGenerationSetupRejection(error)) {
+      throw error;
+    }
+
+    const localResult = await client.enhance({ ...request, localOnly: true });
+    const localReplacement = resolveReplacementPrompt(localResult);
+    if (localReplacement) {
+      return { replacement: localReplacement, usedLocalFallback: true };
+    }
+
+    throw error;
+  }
+
   const replacement = resolveFinalReplacementPrompt(result);
   if (replacement) {
     return { replacement, usedLocalFallback: false };
@@ -483,6 +499,25 @@ async function enhancePromptWithFallback(
   }
 
   throw new Error(result.generation_error ?? "corpuswire returned no enhanced prompt.");
+}
+
+function isGenerationSetupRejection(error: unknown): boolean {
+  if (!(error instanceof CorpusWireHttpError)) {
+    return false;
+  }
+
+  const message = [
+    error.errorMessage,
+    error.message,
+    error.responseBody,
+  ]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join("\n");
+
+  return message.includes("OPENCLAW_MODEL or LLM_MODEL is required")
+    || message.includes("Prompt rewriting requires a configured generation backend")
+    || message.includes("Unsupported GENERATION_PROVIDER")
+    || message.includes("Unsupported OPENCLAW_EXECUTION_MODE");
 }
 
 function resolveFinalReplacementPrompt(result: PromptRewriteResult): string | null {
