@@ -1,0 +1,259 @@
+{
+  "name": "corpuswire-vscode",
+  "displayName": "CorpusWire Prompt Enhancer",
+  "description": "Enhance selected prompts with CorpusWire repository context from configurable remote services.",
+  "version": "0.1.2",
+  "publisher": "corpuswire",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:corpuswire.enhancePrompt",
+    "onCommand:corpuswire.indexWorkspace"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "corpuswire.enhancePrompt",
+        "title": "CorpusWire: Enhance Prompt"
+      },
+      {
+        "command": "corpuswire.indexWorkspace",
+        "title": "CorpusWire: Index Workspace"
+      }
+    ],
+    "configuration": {
+      "title": "CorpusWire",
+      "properties": {
+        "corpuswire.baseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8000",
+          "scope": "resource",
+          "description": "Compatibility fallback URL used when serviceDefaults.url and service-specific URLs are unset."
+        },
+        "corpuswire.userConfigPath": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Optional path to a user-level JSON config file. Defaults to ~/.config/corpuswire/vscode-extension.json or ~/.corpuswire/vscode-extension.json."
+        },
+        "corpuswire.serviceDefaults.url": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Default remote service base URL shared by indexer, enhancer, and semantic search when a service-specific URL is unset."
+        },
+        "corpuswire.serviceDefaults.apiKey": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "markdownDescription": "Default API key shared by remote services. When apiKeyHeader is `Authorization`, the extension sends it as `Bearer <key>`."
+        },
+        "corpuswire.serviceDefaults.apiKeyHeader": {
+          "type": "string",
+          "default": "Authorization",
+          "scope": "resource",
+          "description": "Default header name used for API key authentication."
+        },
+        "corpuswire.serviceDefaults.basicAuth": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Default Basic Auth credentials in username:password form for remote services."
+        },
+        "corpuswire.serviceDefaults.headers": {
+          "type": "object",
+          "default": {},
+          "scope": "resource",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Default HTTP headers sent to remote services."
+        },
+        "corpuswire.services.indexer.url": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Remote indexer service base URL. Inherits serviceDefaults.url when unset."
+        },
+        "corpuswire.services.indexer.apiKey": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "API key for the remote indexer service. Inherits serviceDefaults.apiKey when unset."
+        },
+        "corpuswire.services.indexer.apiKeyHeader": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Header name used for the remote indexer API key. Inherits serviceDefaults.apiKeyHeader when unset."
+        },
+        "corpuswire.services.indexer.basicAuth": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Basic Auth credentials for the remote indexer service. Inherits serviceDefaults.basicAuth when unset."
+        },
+        "corpuswire.services.indexer.headers": {
+          "type": "object",
+          "default": {},
+          "scope": "resource",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Additional HTTP headers sent to the remote indexer service."
+        },
+        "corpuswire.services.enhancer.url": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Remote prompt enhancer service base URL. Inherits serviceDefaults.url when unset."
+        },
+        "corpuswire.services.enhancer.apiKey": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "API key for the remote prompt enhancer service. Inherits serviceDefaults.apiKey when unset."
+        },
+        "corpuswire.services.enhancer.apiKeyHeader": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Header name used for the remote prompt enhancer API key. Inherits serviceDefaults.apiKeyHeader when unset."
+        },
+        "corpuswire.services.enhancer.basicAuth": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Basic Auth credentials for the remote prompt enhancer service. Inherits serviceDefaults.basicAuth when unset."
+        },
+        "corpuswire.services.enhancer.headers": {
+          "type": "object",
+          "default": {},
+          "scope": "resource",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Additional HTTP headers sent to the remote prompt enhancer service."
+        },
+        "corpuswire.services.semanticSearch.url": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Remote semantic search service base URL. Inherits serviceDefaults.url when unset."
+        },
+        "corpuswire.services.semanticSearch.apiKey": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "API key for the remote semantic search service. Inherits serviceDefaults.apiKey when unset."
+        },
+        "corpuswire.services.semanticSearch.apiKeyHeader": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Header name used for the remote semantic search API key. Inherits serviceDefaults.apiKeyHeader when unset."
+        },
+        "corpuswire.services.semanticSearch.basicAuth": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Basic Auth credentials for the remote semantic search service. Inherits serviceDefaults.basicAuth when unset."
+        },
+        "corpuswire.services.semanticSearch.headers": {
+          "type": "object",
+          "default": {},
+          "scope": "resource",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Additional HTTP headers sent to the remote semantic search service."
+        },
+        "corpuswire.repoPath": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Repository path to use for retrieval. Leave empty to use the first VS Code workspace folder. Supports ${workspaceFolder}."
+        },
+        "corpuswire.topK": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "scope": "resource",
+          "description": "Number of retrieval chunks to request from CorpusWire."
+        },
+        "corpuswire.outputMode": {
+          "type": "string",
+          "default": "generic",
+          "enum": [
+            "generic",
+            "copilot",
+            "claude-code",
+            "sequential"
+          ],
+          "scope": "resource",
+          "description": "Prompt style requested from the enhancement backend."
+        },
+        "corpuswire.localOnly": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Use the backend's deterministic local prompt rewrite instead of first trying the configured generation provider."
+        },
+        "corpuswire.remoteIndexing.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Enable remote-first indexing by uploading workspace file contents over the CorpusWire HTTPS API."
+        },
+        "corpuswire.remoteIndexing.autoWatch": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Watch workspace file changes and send incremental remote indexing updates."
+        },
+        "corpuswire.remoteIndexing.workspaceId": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Stable remote workspace identifier. Empty uses the first workspace folder URI."
+        },
+        "corpuswire.remoteIndexing.maxConcurrentUploads": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "scope": "resource",
+          "description": "Maximum concurrent remote upload batches requested by the extension."
+        },
+        "corpuswire.remoteIndexing.batchBytes": {
+          "type": "number",
+          "default": 4194304,
+          "minimum": 65536,
+          "scope": "resource",
+          "description": "Target maximum file bytes to include in one remote indexing batch."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "@corpuswire/sdk": "file:../corpuswire-sdk"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^2.32.0",
+    "typescript": "^5.4.5"
+  }
+}

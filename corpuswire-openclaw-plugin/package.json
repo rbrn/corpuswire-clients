@@ -1,0 +1,35 @@
+{
+  "name": "@corpuswire/openclaw-plugin",
+  "version": "0.1.2",
+  "private": true,
+  "description": "OpenClaw plugin for CorpusWire retrieval and prompt enhancement",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ],
+    "install": {
+      "defaultChoice": "path",
+      "minHostVersion": ">=2026.4.20"
+    },
+    "compat": {
+      "pluginApi": ">=2026.4.20"
+    }
+  }
+}

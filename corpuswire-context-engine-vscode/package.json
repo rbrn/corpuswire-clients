@@ -1,0 +1,82 @@
+{
+  "name": "corpuswire-context-engine-vscode",
+  "displayName": "CorpusWire Context Engine",
+  "description": "Enhance selected prompts with CorpusWire context-engine retrieval and rewriting via POST /v1/enhance.",
+  "version": "0.1.0",
+  "publisher": "corpuswire",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:corpuswireContextEngine.enhancePrompt",
+    "onCommand:corpuswireContextEngine.openPanel"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "corpuswireContextEngine.enhancePrompt",
+        "title": "CorpusWire Context Engine: Enhance Prompt"
+      },
+      {
+        "command": "corpuswireContextEngine.openPanel",
+        "title": "CorpusWire Context Engine: Open Panel"
+      }
+    ],
+    "configuration": {
+      "title": "CorpusWire Context Engine",
+      "properties": {
+        "corpuswireContextEngine.baseUrl": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "markdownDescription": "Base URL of the CorpusWire FastAPI service (`POST /v1/enhance`). When empty the extension reads `CORPUSWIRE_BASE_URL` from the process environment, then falls back to `http://127.0.0.1:8000`."
+        },
+        "corpuswireContextEngine.workspaceId": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Remote workspace identifier forwarded in every enhance request. Leave empty to omit the field and let the server route by repository path."
+        },
+        "corpuswireContextEngine.outputMode": {
+          "type": "string",
+          "default": "generic",
+          "enum": [
+            "generic",
+            "copilot",
+            "claude-code",
+            "sequential"
+          ],
+          "enumDescriptions": [
+            "Plain context-grounded rewrite suitable for any agent.",
+            "GitHub Copilot instruction style.",
+            "Claude Code (claude.ai) instruction style.",
+            "Sequential step-by-step instruction style."
+          ],
+          "scope": "resource",
+          "description": "Prompt output style sent to the CorpusWire PromptEnhancer orchestration layer."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "@corpuswire/sdk": "file:../corpuswire-sdk"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^2.32.0",
+    "typescript": "^5.4.5"
+  }
+}

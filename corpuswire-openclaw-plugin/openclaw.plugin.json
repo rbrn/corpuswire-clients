@@ -1,0 +1,103 @@
+{
+  "id": "corpuswire",
+  "name": "CorpusWire",
+  "description": "CorpusWire retrieval, prompt enhancement, and OpenClaw context-engine adapter.",
+  "kind": "context-engine",
+  "contracts": {
+    "tools": [
+      "corpuswire_search",
+      "corpuswire_enhance",
+      "corpuswire_ingest"
+    ]
+  },
+  "uiHints": {
+    "baseUrl": {
+      "label": "CorpusWire Base URL",
+      "help": "FastAPI base URL for CorpusWire."
+    },
+    "basicAuth": {
+      "label": "Basic Auth",
+      "help": "Optional username:password for CorpusWire Basic Auth. Prefer CORPUSWIRE_BASIC_AUTH.",
+      "sensitive": true
+    },
+    "repoPath": {
+      "label": "Repository Path",
+      "help": "Optional service-local repository root used for repo-scoped retrieval."
+    },
+    "workspaceId": {
+      "label": "Workspace ID",
+      "help": "Optional remote workspace id used for remote-indexed retrieval."
+    },
+    "autoContext": {
+      "label": "Compatibility Auto Context",
+      "help": "Inject retrieved context through before_prompt_build. Leave off when using the contextEngine slot."
+    },
+    "contextEngineAutoContext": {
+      "label": "CorpusWire Auto Context",
+      "help": "Inject retrieved context when this plugin owns OpenClaw's contextEngine slot."
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:8000"
+      },
+      "basicAuth": {
+        "type": "string"
+      },
+      "repoPath": {
+        "type": "string"
+      },
+      "workspaceId": {
+        "type": "string"
+      },
+      "topK": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20,
+        "default": 5
+      },
+      "minScore": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1,
+        "default": 0.15
+      },
+      "maxContextChars": {
+        "type": "integer",
+        "minimum": 500,
+        "maximum": 50000,
+        "default": 6000
+      },
+      "requestTimeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 120000,
+        "default": 30000
+      },
+      "requestRetryAttempts": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 5,
+        "default": 2
+      },
+      "requestRetryDelayMs": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 5000,
+        "default": 250
+      },
+      "autoContext": {
+        "type": "boolean",
+        "default": false
+      },
+      "contextEngineAutoContext": {
+        "type": "boolean",
+        "default": true
+      }
+    }
+  }
+}

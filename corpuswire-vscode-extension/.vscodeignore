@@ -1,0 +1,12 @@
+.vscode/**
+.vscode-test/**
+.gitignore
+src/**
+node_modules/**/.bin/**
+node_modules/**/.cache/**
+node_modules/@corpuswire/sdk/src/**
+node_modules/@corpuswire/sdk/tests/**
+node_modules/@corpuswire/sdk/examples/**
+node_modules/@corpuswire/sdk/tsconfig.json
+*.vsix
+tsconfig.json

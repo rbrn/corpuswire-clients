@@ -1,0 +1,24 @@
+{
+  "name": "@corpuswire/sdk",
+  "version": "0.1.2",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "examples",
+    "README.md",
+    "tsconfig.json"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

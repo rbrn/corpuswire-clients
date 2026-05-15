@@ -1,0 +1,23 @@
+{
+  "name": "@corpuswire/cli",
+  "version": "0.1.2",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "corpuswire": "./bin/corpuswire.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "dependencies": {
+    "@corpuswire/sdk": "file:../corpuswire-sdk"
+  },
+  "bundledDependencies": [
+    "@corpuswire/sdk"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
