@@ -39,7 +39,19 @@ interface PanelInsertMessage {
   text: string;
 }
 
-type PanelInboundMessage = PanelEnhanceMessage | PanelInsertMessage;
+interface PanelCheckStatusMessage {
+  type: "check-status";
+}
+
+interface PanelIndexMessage {
+  type: "index-workspace";
+}
+
+type PanelInboundMessage =
+  | PanelEnhanceMessage
+  | PanelInsertMessage
+  | PanelCheckStatusMessage
+  | PanelIndexMessage;
 
 interface PanelResultMessage {
   type: "result";
@@ -62,11 +74,23 @@ interface PanelSeedMessage {
   prompt: string;
 }
 
+type IndexStatusState = "unknown" | "checking" | "not-indexed" | "indexed" | "stale" | "indexing" | "error";
+
+interface PanelIndexStatusMessage {
+  type: "index-status";
+  state: IndexStatusState;
+  message: string;
+  workspaceId?: string;
+  lastIndexedAt?: string | null;
+  ageSeconds?: number | null;
+}
+
 type PanelOutboundMessage =
   | PanelResultMessage
   | PanelErrorMessage
   | PanelLoadingMessage
-  | PanelSeedMessage;
+  | PanelSeedMessage
+  | PanelIndexStatusMessage;
 
 class PromptEnhancerPanel {
   static readonly viewType = "corpuswire.promptPanel";
