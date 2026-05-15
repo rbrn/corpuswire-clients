@@ -1,14 +1,8 @@
-import {
-  CorpusWireClient,
-  promptOutputModes,
-  requireEnhancedPrompt,
-} from "@corpuswire/sdk";
-
 const DEFAULT_BASE_URL = process.env.CORPUSWIRE_BASE_URL ?? "http://127.0.0.1:8000";
 const DEFAULT_BASIC_AUTH = process.env.CORPUSWIRE_BASIC_AUTH ?? "";
 const DEFAULT_REPO_PATH = process.env.CORPUSWIRE_REPO_PATH ?? "";
 const DEFAULT_WORKSPACE_ID = process.env.CORPUSWIRE_WORKSPACE_ID ?? "";
-const SUPPORTED_OUTPUT_MODES = new Set(promptOutputModes);
+const SUPPORTED_OUTPUT_MODES = new Set(["generic", "copilot", "claude-code", "sequential"]);
 
 export function printHelp(write = console.log) {
   write(`corpuswire
@@ -166,9 +160,10 @@ export function parseCliArgs(argv) {
 
 export async function runCliCommand(options, dependencies = {}) {
   const write = dependencies.write ?? console.log;
+  const sdk = dependencies.client ? undefined : await loadSdk();
   const client =
     dependencies.client ??
-    new CorpusWireClient({
+    new sdk.CorpusWireClient({
       baseUrl: options.apiBaseUrl,
       basicAuth: options.basicAuth,
     });
@@ -288,7 +283,30 @@ export async function runCliCommand(options, dependencies = {}) {
     return;
   }
 
-  write(requireEnhancedPrompt(response.result));
+  write((sdk?.requireEnhancedPrompt ?? requireEnhancedPromptFallback)(response.result));
+}
+
+async function loadSdk() {
+  try {
+    return await import("@corpuswire/sdk");
+  } catch (error) {
+    if (error?.code !== "ERR_MODULE_NOT_FOUND") {
+      throw error;
+    }
+    return import("../../corpuswire-sdk/dist/index.js");
+  }
+}
+
+function requireEnhancedPromptFallback(result) {
+  const prompt =
+    result?.enhanced_prompt ??
+    result?.rewritten_prompt ??
+    result?.augmented_prompt ??
+    result?.enhancement_prompt;
+  if (typeof prompt === "string" && prompt.trim()) {
+    return prompt;
+  }
+  throw new Error(result?.generation_error ?? "The service returned no enhanced prompt.");
 }
 
 function formatIndexEvent(event) {

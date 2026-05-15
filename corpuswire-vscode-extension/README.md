@@ -9,6 +9,10 @@ text with a CorpusWire rewrite.
 Use this extension for VS Code Remote SSH, Dev Containers, Codespaces, or any
 workspace where the CorpusWire service cannot read local paths directly.
 
+For GitHub Copilot Chat MCP integration, use the Node STDIO package at
+`clients/corpuswire-mcp/`. This VS Code extension is an editor command surface;
+the MCP package is the tool surface Copilot discovers.
+
 ## Capabilities
 
 - `CorpusWire: Enhance Prompt` replaces selected prompt text with a

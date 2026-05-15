@@ -1,0 +1,23 @@
+{
+  "mcpServers": {
+    "corpuswire": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "./clients/corpuswire-mcp/bin/corpuswire-mcp.js"
+      ],
+      "env": {
+        "CORPUSWIRE_BASE_URL": "https://corpuswire.onrender.com",
+        "CORPUSWIRE_WORKSPACE_ID": "github://rbrn/corpuswire#main",
+        "CORPUSWIRE_OUTPUT_MODE": "copilot",
+        "CORPUSWIRE_LOCAL_ONLY": "true",
+        "CORPUSWIRE_BASIC_AUTH": "$COPILOT_MCP_CORPUSWIRE_BASIC_AUTH"
+      },
+      "tools": [
+        "corpuswire_search",
+        "corpuswire_enhance_prompt",
+        "corpuswire_health"
+      ]
+    }
+  }
+}
