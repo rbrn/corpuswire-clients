@@ -135,33 +135,7 @@ class PromptEnhancerPanel {
       return;
     }
 
-    const resource = vscode.window.activeTextEditor?.document.uri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
-    const settings = readSettings(resource);
-    for (const warning of settings.configurationWarnings) {
-      void vscode.window.showWarningMessage(warning);
-    }
-
-    const enhancerService = settings.services.enhancer;
-    const client = new CorpusWireClient({
-      baseUrl: enhancerService.url,
-      endpointMode: "v1-only",
-      defaultHeaders: buildRemoteServiceHeaders(enhancerService),
-    });
-    const request = buildEnhancementRequest(message.prompt, settings);
-
-    this.post({ type: "loading", value: true });
-    try {
-      const outcome = await enhancePromptWithFallback(client, request);
-      this.post({
-        type: "result",
-        text: outcome.replacement,
-        usedLocalFallback: outcome.usedLocalFallback,
-      });
-    } catch (error) {
-      this.post({ type: "error", message: formatEnhancementError(error, enhancerService.url) });
-    } finally {
-      this.post({ type: "loading", value: false });
-    }
+    await runPromptEnhancement(message.prompt, (msg) => this.post(msg));
   }
 
   private dispose(): void {
@@ -170,6 +144,103 @@ class PromptEnhancerPanel {
       disposable.dispose();
     }
     this.disposables = [];
+  }
+}
+
+class PromptEnhancerViewProvider implements vscode.WebviewViewProvider {
+  static readonly viewType = "corpuswire.promptView";
+  private view: vscode.WebviewView | undefined;
+
+  resolveWebviewView(webviewView: vscode.WebviewView): void {
+    this.view = webviewView;
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [],
+    };
+
+    const seed = vscode.window.activeTextEditor
+      ? vscode.window.activeTextEditor.document.getText(vscode.window.activeTextEditor.selection)
+      : "";
+    webviewView.webview.html = buildPromptPanelHtml(seed);
+
+    webviewView.webview.onDidReceiveMessage((message: unknown) => {
+      void this.handleMessage(message as PanelInboundMessage);
+    });
+
+    webviewView.onDidDispose(() => {
+      this.view = undefined;
+    });
+  }
+
+  seedFromActiveEditor(): void {
+    if (!this.view) {
+      return;
+    }
+    const seed = vscode.window.activeTextEditor
+      ? vscode.window.activeTextEditor.document.getText(vscode.window.activeTextEditor.selection)
+      : "";
+    if (seed.trim()) {
+      void this.view.webview.postMessage({ type: "seed", prompt: seed } satisfies PanelSeedMessage);
+    }
+  }
+
+  private post(message: PanelOutboundMessage): void {
+    if (!this.view) {
+      return;
+    }
+    void this.view.webview.postMessage(message);
+  }
+
+  private async handleMessage(message: PanelInboundMessage): Promise<void> {
+    if (message.type === "insert") {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) {
+        void vscode.window.showWarningMessage("No active editor to insert into.");
+        return;
+      }
+
+      await editor.edit((builder) => builder.replace(editor.selection, message.text));
+      return;
+    }
+
+    if (message.type !== "enhance") {
+      return;
+    }
+
+    await runPromptEnhancement(message.prompt, (msg) => this.post(msg));
+  }
+}
+
+async function runPromptEnhancement(
+  prompt: string,
+  post: (message: PanelOutboundMessage) => void,
+): Promise<void> {
+  const resource = vscode.window.activeTextEditor?.document.uri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
+  const settings = readSettings(resource);
+  for (const warning of settings.configurationWarnings) {
+    void vscode.window.showWarningMessage(warning);
+  }
+
+  const enhancerService = settings.services.enhancer;
+  const client = new CorpusWireClient({
+    baseUrl: enhancerService.url,
+    endpointMode: "v1-only",
+    defaultHeaders: buildRemoteServiceHeaders(enhancerService),
+  });
+  const request = buildEnhancementRequest(prompt, settings);
+
+  post({ type: "loading", value: true });
+  try {
+    const outcome = await enhancePromptWithFallback(client, request);
+    post({
+      type: "result",
+      text: outcome.replacement,
+      usedLocalFallback: outcome.usedLocalFallback,
+    });
+  } catch (error) {
+    post({ type: "error", message: formatEnhancementError(error, enhancerService.url) });
+  } finally {
+    post({ type: "loading", value: false });
   }
 }
 
@@ -195,12 +266,35 @@ export function activate(context: vscode.ExtensionContext): void {
     () => PromptEnhancerPanel.createOrShow(),
   );
 
+  const viewProvider = new PromptEnhancerViewProvider();
+  const viewDisposable = vscode.window.registerWebviewViewProvider(
+    PromptEnhancerViewProvider.viewType,
+    viewProvider,
+    { webviewOptions: { retainContextWhenHidden: true } },
+  );
+  const focusPanelDisposable = vscode.commands.registerCommand(
+    "corpuswire.focusPanel",
+    async () => {
+      await vscode.commands.executeCommand("corpuswire.promptView.focus");
+      viewProvider.seedFromActiveEditor();
+    },
+  );
+
+  const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  statusBar.text = "$(sparkle) Enhance Prompt";
+  statusBar.tooltip = "Open the CorpusWire Prompt Enhancer widget";
+  statusBar.command = "corpuswire.focusPanel";
+  statusBar.show();
+
   context.subscriptions.push(
     enhanceDisposable,
     indexDisposable,
     panelDisposable,
     legacyEnhanceDisposable,
     legacyPanelDisposable,
+    viewDisposable,
+    focusPanelDisposable,
+    statusBar,
   );
   registerRemoteIndexWatchers(context);
 }

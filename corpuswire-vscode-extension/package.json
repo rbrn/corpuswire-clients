@@ -2,7 +2,7 @@
   "name": "corpuswire-vscode",
   "displayName": "CorpusWire Prompt Enhancer",
   "description": "Enhance prompts and index VS Code workspaces with CorpusWire remote services.",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "publisher": "corpuswire",
   "private": true,
   "type": "module",
@@ -13,9 +13,12 @@
     "Other"
   ],
   "activationEvents": [
+    "onStartupFinished",
+    "onView:corpuswire.promptView",
     "onCommand:corpuswire.enhancePrompt",
     "onCommand:corpuswire.indexWorkspace",
     "onCommand:corpuswire.openPanel",
+    "onCommand:corpuswire.focusPanel",
     "onCommand:corpuswireContextEngine.enhancePrompt",
     "onCommand:corpuswireContextEngine.openPanel"
   ],
@@ -33,8 +36,32 @@
       {
         "command": "corpuswire.openPanel",
         "title": "CorpusWire: Open Prompt Panel"
+      },
+      {
+        "command": "corpuswire.focusPanel",
+        "title": "CorpusWire: Focus Sidebar Widget"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "corpuswire",
+          "title": "CorpusWire",
+          "icon": "$(sparkle)"
+        }
+      ]
+    },
+    "views": {
+      "corpuswire": [
+        {
+          "type": "webview",
+          "id": "corpuswire.promptView",
+          "name": "Prompt Enhancer",
+          "icon": "$(sparkle)",
+          "contextualTitle": "CorpusWire Prompt Enhancer"
+        }
+      ]
+    },
     "configuration": {
       "title": "CorpusWire",
       "properties": {
