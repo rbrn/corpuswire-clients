@@ -288,6 +288,168 @@ async function runPromptEnhancement(
   }
 }
 
+const STALE_AGE_THRESHOLD_SECONDS = 60 * 60 * 24; // 24h
+
+interface ReposResponseRepo {
+  path?: string;
+  collection_name?: string;
+  source_root?: string;
+  label?: string;
+}
+
+async function runIndexStatusCheck(post: (message: PanelOutboundMessage) => void): Promise<void> {
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceFolder) {
+    post({ type: "index-status", state: "unknown", message: "No workspace folder is open." });
+    return;
+  }
+
+  const settings = readSettings(workspaceFolder.uri);
+  const indexerService = settings.services.indexer;
+  const workspaceId = settings.remoteIndexing.workspaceId || workspaceFolder.uri.toString();
+  const localPath = workspaceFolder.uri.fsPath;
+
+  post({ type: "index-status", state: "checking", message: "Checking index status…", workspaceId });
+
+  const headers = buildRemoteServiceHeaders(indexerService);
+  const baseUrl = indexerService.url.replace(/\/$/, "");
+
+  // Probe /repos for a matching workspace path
+  let isRegistered = false;
+  try {
+    const reposResponse = await fetch(`${baseUrl}/repos`, { headers });
+    if (reposResponse.ok) {
+      const body = (await reposResponse.json()) as { repos?: ReposResponseRepo[] };
+      const repos = body.repos ?? [];
+      isRegistered = repos.some((r) => {
+        const candidates = [r.path, r.source_root, r.label].filter(
+          (v): v is string => typeof v === "string" && v.length > 0,
+        );
+        return candidates.some((c) => c === localPath || c === workspaceId);
+      });
+    }
+  } catch {
+    // Ignore — fall through to activity probe
+  }
+
+  // Probe /v1/index/activity for last_success_at and gap_detected
+  const client = new CorpusWireClient({
+    baseUrl: indexerService.url,
+    endpointMode: "v1-only",
+    defaultHeaders: headers,
+  });
+
+  try {
+    const activity = await client.getIndexActivity({ workspaceId });
+    if (!activity.available) {
+      if (isRegistered) {
+        post({
+          type: "index-status",
+          state: "indexed",
+          message: "Workspace registered; activity log unavailable. Re-index to refresh.",
+          workspaceId,
+        });
+      } else {
+        post({
+          type: "index-status",
+          state: "not-indexed",
+          message: "Workspace is not indexed on the configured CorpusWire backend.",
+          workspaceId,
+        });
+      }
+      return;
+    }
+
+    const lastSuccess = activity.last_success_at ?? null;
+    const ageSeconds = activity.last_success_age_seconds ?? null;
+
+    if (!lastSuccess) {
+      post({
+        type: "index-status",
+        state: isRegistered ? "stale" : "not-indexed",
+        message: isRegistered
+          ? "Workspace registered but no successful indexing recorded. Run Index Workspace."
+          : "Workspace is not indexed. Run Index Workspace to populate the index.",
+        workspaceId,
+        lastIndexedAt: lastSuccess,
+        ageSeconds,
+      });
+      return;
+    }
+
+    const isStale = activity.gap_detected === true || (ageSeconds !== null && ageSeconds > STALE_AGE_THRESHOLD_SECONDS);
+    post({
+      type: "index-status",
+      state: isStale ? "stale" : "indexed",
+      message: isStale
+        ? `Index may be stale (last successful indexing ${formatAge(ageSeconds)} ago). Re-index to refresh.`
+        : `Indexed (last success ${formatAge(ageSeconds)} ago).`,
+      workspaceId,
+      lastIndexedAt: lastSuccess,
+      ageSeconds,
+    });
+  } catch (error) {
+    if (isRegistered) {
+      post({
+        type: "index-status",
+        state: "indexed",
+        message: "Workspace registered. Activity probe failed; re-index if results look stale.",
+        workspaceId,
+      });
+    } else {
+      post({
+        type: "index-status",
+        state: "error",
+        message: `Could not check index status: ${error instanceof Error ? error.message : String(error)}`,
+        workspaceId,
+      });
+    }
+  }
+}
+
+function formatAge(ageSeconds: number | null | undefined): string {
+  if (ageSeconds === null || ageSeconds === undefined || !Number.isFinite(ageSeconds)) {
+    return "unknown time";
+  }
+  if (ageSeconds < 60) {
+    return `${Math.round(ageSeconds)}s`;
+  }
+  if (ageSeconds < 3600) {
+    return `${Math.round(ageSeconds / 60)}m`;
+  }
+  if (ageSeconds < 86400) {
+    return `${Math.round(ageSeconds / 3600)}h`;
+  }
+  return `${Math.round(ageSeconds / 86400)}d`;
+}
+
+async function runIndexWorkspaceFromPanel(post: (message: PanelOutboundMessage) => void): Promise<void> {
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceFolder) {
+    post({ type: "index-status", state: "error", message: "Open a workspace folder before indexing." });
+    return;
+  }
+
+  const settings = readSettings(workspaceFolder.uri);
+  const workspaceId = settings.remoteIndexing.workspaceId || workspaceFolder.uri.toString();
+
+  post({ type: "index-status", state: "indexing", message: "Indexing workspace…", workspaceId });
+
+  try {
+    await indexCurrentWorkspace();
+  } catch (error) {
+    post({
+      type: "index-status",
+      state: "error",
+      message: `Indexing failed: ${error instanceof Error ? error.message : String(error)}`,
+      workspaceId,
+    });
+    return;
+  }
+
+  await runIndexStatusCheck(post);
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   const enhanceDisposable = vscode.commands.registerCommand(
     "corpuswire.enhancePrompt",
