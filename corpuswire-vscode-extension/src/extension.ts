@@ -155,6 +155,16 @@ class PromptEnhancerPanel {
       return;
     }
 
+    if (message.type === "check-status") {
+      await runIndexStatusCheck((msg) => this.post(msg));
+      return;
+    }
+
+    if (message.type === "index-workspace") {
+      await runIndexWorkspaceFromPanel((msg) => this.post(msg));
+      return;
+    }
+
     if (message.type !== "enhance") {
       return;
     }
@@ -224,6 +234,16 @@ class PromptEnhancerViewProvider implements vscode.WebviewViewProvider {
       }
 
       await editor.edit((builder) => builder.replace(editor.selection, message.text));
+      return;
+    }
+
+    if (message.type === "check-status") {
+      await runIndexStatusCheck((msg) => this.post(msg));
+      return;
+    }
+
+    if (message.type === "index-workspace") {
+      await runIndexWorkspaceFromPanel((msg) => this.post(msg));
       return;
     }
 
