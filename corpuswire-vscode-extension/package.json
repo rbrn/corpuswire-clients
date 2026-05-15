@@ -2,7 +2,7 @@
   "name": "corpuswire-vscode",
   "displayName": "CorpusWire Prompt Enhancer",
   "description": "Enhance prompts and index VS Code workspaces with CorpusWire remote services.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "corpuswire",
   "private": true,
   "type": "module",
