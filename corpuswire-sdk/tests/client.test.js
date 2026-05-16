@@ -328,6 +328,64 @@ test("health falls back to the legacy endpoint when needed", async () => {
   assert.equal(result.runtime.generation_provider_preference, "openai");
 });
 
+test("diagnoseWorkspace calls versioned diagnosis endpoint with workspace scope", async () => {
+  const calls = [];
+  const client = new CorpusWireClient({
+    baseUrl: "http://example.test",
+    fetchFn: async (input) => {
+      calls.push(input);
+      return jsonResponse(200, {
+        ok: true,
+        diagnosis: {
+          status: "blocked",
+          can_retrieve: false,
+          requested_repo_path: null,
+          requested_workspace_id: "github://rbrn/corpuswire#main",
+          resolved_context: "github://rbrn/corpuswire#main",
+          resolved_workspace_id: "github://rbrn/corpuswire#main",
+          resolution_mode: "remote",
+          collection: "local-doc-rag-poc--corpuswire-main--ad8994dc8a6e",
+          collection_exists: false,
+          point_count: 0,
+          qdrant_error: null,
+          index: {
+            path: "github://rbrn/corpuswire#main",
+            collection: "local-doc-rag-poc--corpuswire-main--ad8994dc8a6e",
+            indexed: false,
+            health_status: "degraded",
+            health_warnings: ["No indexed Qdrant points were found for this context."],
+          },
+          active_backend: {
+            default_repo_path: "/Users/constantinaldea/clawd",
+            default_collection: "local-doc-rag-poc--clawd--d0730c35d7ae",
+            requested_context: "github://rbrn/corpuswire#main",
+            matches_requested_context: false,
+          },
+          checks: [
+            {
+              name: "collection",
+              status: "error",
+              message: "Collection does not exist.",
+            },
+          ],
+          recovery_actions: ["Index or sync workspace 'github://rbrn/corpuswire#main'."],
+        },
+      });
+    },
+  });
+
+  const diagnosis = await client.diagnoseWorkspace({
+    workspaceId: "github://rbrn/corpuswire#main",
+  });
+
+  assert.deepEqual(calls, [
+    "http://example.test/v1/context/diagnose?workspace_id=github%3A%2F%2Frbrn%2Fcorpuswire%23main",
+  ]);
+  assert.equal(diagnosis.status, "blocked");
+  assert.equal(diagnosis.collection_exists, false);
+  assert.match(diagnosis.recovery_actions[0], /Index or sync workspace/);
+});
+
 test("query posts workspace_id to semantic retrieval endpoint", async () => {
   const calls = [];
   const client = new CorpusWireClient({
@@ -342,6 +400,21 @@ test("query posts workspace_id to semantic retrieval endpoint", async () => {
           retrieval_backend: "qdrant_hybrid",
           retrieval_warning: null,
           retrieved_chunks: [],
+          agent_context_packets: [
+            {
+              source_path: "clients/corpuswire-mcp/bin/corpuswire-mcp.js",
+              role: "integration",
+              inspection_order: 1,
+              score: 1.23,
+              reasons: ["integration context"],
+              symbols: ["function searchContext"],
+              line_ranges: ["1200-1240"],
+              chunk_ids: ["chunk-1"],
+              doc_type: "code",
+              package_name: "corpuswire-mcp",
+              tags: ["source-code"],
+            },
+          ],
           augmented_prompt: "Use remote indexer context.",
           citations: [],
           answer: null,
@@ -364,6 +437,8 @@ test("query posts workspace_id to semantic retrieval endpoint", async () => {
   assert.equal(calls[0].body.workspace_id, "vscode-remote://ssh/project");
   assert.equal(calls[0].body.include_answer, false);
   assert.equal(result.augmented_prompt, "Use remote indexer context.");
+  assert.equal(result.agent_context_packets[0].role, "integration");
+  assert.deepEqual(result.agent_context_packets[0].line_ranges, ["1200-1240"]);
 });
 
 test("remote indexWorkspace runs session, manifest, upload, and commit requests", async () => {

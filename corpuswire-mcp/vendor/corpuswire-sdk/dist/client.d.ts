@@ -1,4 +1,4 @@
-import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceResponseEnvelope, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexWorkspaceRequest, CorpusWireClientOptions, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexSession, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, SearchHit, StartRemoteIndexSessionRequest } from "./types.js";
+import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceResponseEnvelope, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexWorkspaceRequest, CorpusWireClientOptions, LlmModelState, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexSession, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, SearchHit, StartRemoteIndexSessionRequest, WorkspaceDiagnosis, WorkspaceDiagnosisRequest } from "./types.js";
 export declare class CorpusWireClient {
     readonly baseUrl: string;
     readonly basicAuth: string;
@@ -10,11 +10,14 @@ export declare class CorpusWireClient {
         repoPath?: string;
         workspaceId?: string;
     }): Promise<HealthResponse>;
+    diagnoseWorkspace(request?: WorkspaceDiagnosisRequest): Promise<WorkspaceDiagnosis>;
     enhance(request: string | EnhancePromptRequest): Promise<PromptRewriteResult>;
     enhanceRaw(request: string | EnhancePromptRequest): Promise<EnhanceResponseEnvelope>;
     query(request: string | QueryPromptRequest): Promise<PromptEnhancementResult>;
     queryRaw(request: string | QueryPromptRequest): Promise<QueryResponseEnvelope>;
     semanticSearch(request: string | Omit<QueryPromptRequest, "includeAnswer">): Promise<SearchHit[]>;
+    getLlmModel(): Promise<LlmModelState>;
+    setLlmModel(model: string): Promise<LlmModelState>;
     getIndexCapabilities(): Promise<RemoteIndexCapabilities>;
     getIndexEvents(request?: IndexEventQuery): Promise<IndexEvent[]>;
     getIndexActivity(request?: IndexActivityQuery): Promise<IndexActivitySummary>;

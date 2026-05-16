@@ -35,12 +35,27 @@ export interface SearchHit {
     text: string;
     metadata: ChunkMetadata;
 }
+export type AgentContextRole = "implementation" | "test" | "configuration" | "documentation" | "data" | "deployment" | "integration" | "unknown";
+export interface AgentContextPacket {
+    source_path: string;
+    role: AgentContextRole;
+    inspection_order: number;
+    score: number;
+    reasons: string[];
+    symbols: string[];
+    line_ranges: string[];
+    chunk_ids: string[];
+    doc_type: DocumentType;
+    package_name?: string | null;
+    tags: string[];
+}
 export interface PromptRewriteResult {
     user_prompt: string;
     retrieval_query: string;
     retrieval_backend: string | null;
     retrieval_warning: string | null;
     retrieved_chunks: SearchHit[];
+    agent_context_packets?: AgentContextPacket[];
     task_type: PromptTaskType;
     task_type_source: PromptTaskTypeSource;
     task_type_classification_error: string | null;
@@ -59,6 +74,7 @@ export interface PromptEnhancementResult {
     retrieval_backend: string | null;
     retrieval_warning: string | null;
     retrieved_chunks: SearchHit[];
+    agent_context_packets?: AgentContextPacket[];
     augmented_prompt: string;
     citations: string[];
     answer: string | null;
@@ -207,6 +223,45 @@ export interface HealthResponse {
     active_project?: ActiveProjectHealth;
     auth: AuthSummary;
     ui: string;
+}
+export type WorkspaceDiagnosisStatus = "ready" | "degraded" | "blocked";
+export type WorkspaceDiagnosisCheckStatus = "ok" | "warning" | "error";
+export type WorkspaceDiagnosisResolutionMode = "local" | "remote";
+export interface WorkspaceDiagnosisCheck {
+    name: string;
+    status: WorkspaceDiagnosisCheckStatus;
+    message: string;
+}
+export interface WorkspaceDiagnosis {
+    status: WorkspaceDiagnosisStatus;
+    can_retrieve: boolean;
+    requested_repo_path?: string | null;
+    requested_workspace_id?: string | null;
+    resolved_context: string;
+    resolved_workspace_id?: string | null;
+    resolution_mode: WorkspaceDiagnosisResolutionMode;
+    collection: string;
+    collection_exists?: boolean | null;
+    point_count?: number | null;
+    qdrant_error?: string | null;
+    index: IndexHealth;
+    active_backend: {
+        default_repo_path?: string;
+        default_collection?: string;
+        requested_context?: string;
+        matches_requested_context?: boolean;
+        [key: string]: unknown;
+    };
+    checks: WorkspaceDiagnosisCheck[];
+    recovery_actions: string[];
+}
+export interface WorkspaceDiagnosisEnvelope {
+    ok: boolean;
+    diagnosis: WorkspaceDiagnosis;
+}
+export interface WorkspaceDiagnosisRequest {
+    repoPath?: string;
+    workspaceId?: string;
 }
 export interface BuildInfo {
     app_version: string;

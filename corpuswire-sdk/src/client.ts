@@ -31,6 +31,9 @@ import type {
   RemoteWorkspaceFile,
   SearchHit,
   StartRemoteIndexSessionRequest,
+  WorkspaceDiagnosis,
+  WorkspaceDiagnosisEnvelope,
+  WorkspaceDiagnosisRequest,
 } from "./types.js";
 
 const RUNTIME_ENV = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {};
@@ -66,6 +69,24 @@ export class CorpusWireClient {
       basicAuth: this.basicAuth,
       init: { method: "GET" },
     });
+  }
+
+  async diagnoseWorkspace(request: WorkspaceDiagnosisRequest = {}): Promise<WorkspaceDiagnosis> {
+    const query = toQueryString({
+      repo_path: request.repoPath,
+      workspace_id: request.workspaceId,
+    });
+    const response = await requestJson<WorkspaceDiagnosisEnvelope>({
+      baseUrl: this.baseUrl,
+      paths: this.endpointMode === "v1-only"
+        ? [`/v1/context/diagnose${query}`]
+        : [`/v1/context/diagnose${query}`, `/context/diagnose${query}`],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "GET" },
+    });
+    return response.diagnosis;
   }
 
   async enhance(request: string | EnhancePromptRequest): Promise<PromptRewriteResult> {

@@ -8,6 +8,8 @@ health, index observability, or remote indexing.
 ## What It Provides
 
 - `GET /v1/health` with fallback to `GET /health`.
+- `GET /v1/context/diagnose` with fallback to `GET /context/diagnose` for
+  workspace identity, collection availability, and recovery advice.
 - `POST /query` for semantic retrieval against `repoPath` or `workspaceId`.
 - `POST /v1/enhance` with fallback to `POST /enhance` unless `endpointMode` is
   set to `v1-only`.
@@ -111,6 +113,11 @@ console.log(requireEnhancedPrompt(result));
 `enhance()` returns the `result` payload directly. Use `enhanceRaw()` when you
 need `ok`, `request_id`, or `duration_ms` from the response envelope.
 
+Enhancement results include `agent_context_packets`: ordered, file-level
+inspection packets with `source_path`, `role`, `line_ranges`, `symbols`,
+`chunk_ids`, and short selection reasons. Coding agents should treat these as
+the inspect-first list before reading raw chunks.
+
 `requireEnhancedPrompt()` returns `enhanced_prompt` when present, falls back to
 the deterministic `enhancement_prompt`, and throws if neither exists.
 
@@ -128,10 +135,30 @@ for (const hit of hits) {
 }
 ```
 
+Use `queryRaw()` instead of `semanticSearch()` when an agent needs the complete
+retrieval envelope. The raw result includes both `retrieved_chunks` and
+`agent_context_packets`, which are safer to feed into an autonomous coding
+workflow because they collapse chunk hits into ordered file roles.
+
 Use `workspaceId` for remote-indexed workspaces. Use `repoPath` only when the
 FastAPI service can read that path on its own filesystem.
 
 ## Health And Index Observability
+
+```ts
+const diagnosis = await client.diagnoseWorkspace({
+  workspaceId: "github://rbrn/corpuswire#main",
+});
+
+console.log(diagnosis.status, diagnosis.can_retrieve);
+console.log(diagnosis.recovery_actions);
+```
+
+Use `diagnoseWorkspace()` before retrieval when an agent may be pointed at a
+remote workspace, service-local path, or hosted backend with unknown freshness.
+It reports the resolved collection, whether it exists, point count, active
+backend default path, index metadata, failed checks, and concrete recovery
+actions.
 
 ```ts
 const health = await client.health({

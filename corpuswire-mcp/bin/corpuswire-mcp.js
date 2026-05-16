@@ -962,6 +962,13 @@ async function callTool(params) {
       return textToolResult(formatToolError(error, "health request"), true);
     }
   }
+  if (name === "corpuswire_diagnose_workspace") {
+    try {
+      return textToolResult(await diagnoseWorkspace(args));
+    } catch (error) {
+      return textToolResult(formatToolError(error, "workspace diagnosis request"), true);
+    }
+  }
   if (name === "corpuswire_sync_delta") {
     try {
       return textToolResult(formatSyncPayload(await syncManager.addDelta(args)));
@@ -1090,6 +1097,24 @@ function toolDefinitions() {
         type: "object",
         additionalProperties: false,
         properties: {},
+      },
+    },
+    {
+      name: "corpuswire_diagnose_workspace",
+      description: "Diagnose whether the requested repoPath or workspaceId is indexed, readable, and safe to use before retrieval.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          repoPath: {
+            type: "string",
+            description: "Service-local repository root to diagnose. Defaults to CORPUSWIRE_REPO_PATH when set.",
+          },
+          workspaceId: {
+            type: "string",
+            description: "Remote workspace id to diagnose. Defaults to CORPUSWIRE_WORKSPACE_ID when set.",
+          },
+        },
       },
     },
     {
@@ -1296,6 +1321,97 @@ async function health() {
   ].join("\n");
 }
 
+async function diagnoseWorkspace(args) {
+  const client = buildClient();
+  const repoPath = optionalString(args.repoPath ?? process.env.CORPUSWIRE_REPO_PATH);
+  const workspaceId = optionalString(args.workspaceId ?? process.env.CORPUSWIRE_WORKSPACE_ID);
+  const diagnosis = typeof client.diagnoseWorkspace === "function"
+    ? await client.diagnoseWorkspace({ repoPath, workspaceId })
+    : diagnosisFromHealth(await client.health({ repoPath, workspaceId }), { repoPath, workspaceId });
+  return formatWorkspaceDiagnosis({ baseUrl: client.baseUrl, repoPath, workspaceId, diagnosis });
+}
+
+function diagnosisFromHealth(response, { repoPath, workspaceId }) {
+  const index = response.index ?? {};
+  const activeProject = response.active_project ?? {};
+  const qdrant = response.qdrant ?? {};
+  const collectionExists = typeof qdrant.collection_exists === "boolean" ? qdrant.collection_exists : undefined;
+  const pointCount = Number.isInteger(qdrant.point_count) ? qdrant.point_count : undefined;
+  const canRetrieve = collectionExists === true && (pointCount ?? 0) > 0;
+  return {
+    status: canRetrieve ? "ready" : "blocked",
+    can_retrieve: canRetrieve,
+    requested_repo_path: repoPath ?? null,
+    requested_workspace_id: workspaceId ?? null,
+    resolved_context: activeProject.path ?? response.docs_source_dir ?? "unknown",
+    resolved_workspace_id: activeProject.workspace_id ?? workspaceId ?? null,
+    resolution_mode: workspaceId ? "remote" : "local",
+    collection: activeProject.collection ?? qdrant.collection ?? "unknown",
+    collection_exists: collectionExists,
+    point_count: pointCount,
+    qdrant_error: qdrant.error ?? null,
+    index,
+    active_backend: {
+      default_repo_path: response.docs_source_dir,
+      default_collection: qdrant.collection,
+      requested_context: activeProject.path ?? response.docs_source_dir,
+      matches_requested_context: true,
+    },
+    checks: [],
+    recovery_actions: [],
+  };
+}
+
+function formatWorkspaceDiagnosis({ baseUrl, repoPath, workspaceId, diagnosis }) {
+  const index = asRecord(diagnosis.index);
+  const activeBackend = asRecord(diagnosis.active_backend);
+  const checks = Array.isArray(diagnosis.checks) ? diagnosis.checks : [];
+  const recoveryActions = Array.isArray(diagnosis.recovery_actions) ? diagnosis.recovery_actions : [];
+  const lines = [
+    "CorpusWire workspace diagnosis:",
+    `- baseUrl: ${baseUrl}`,
+    `- status: ${diagnosis.status ?? "unknown"}`,
+    `- canRetrieve: ${diagnosis.can_retrieve ?? "unknown"}`,
+    `- requestedRepoPath: ${repoPath ?? diagnosis.requested_repo_path ?? "backend default"}`,
+    `- requestedWorkspaceId: ${workspaceId ?? diagnosis.requested_workspace_id ?? "backend default"}`,
+    `- resolvedContext: ${diagnosis.resolved_context ?? "unknown"}`,
+    `- resolvedWorkspaceId: ${diagnosis.resolved_workspace_id ?? "none"}`,
+    `- resolutionMode: ${diagnosis.resolution_mode ?? "unknown"}`,
+    `- collection: ${diagnosis.collection ?? "unknown"}`,
+    `- collectionExists: ${diagnosis.collection_exists ?? "unknown"}`,
+    `- pointCount: ${diagnosis.point_count ?? "unknown"}`,
+    `- indexedAt: ${index.indexed_at ?? "unknown"}`,
+    `- indexedCommit: ${index.indexed_commit ?? "unknown"}`,
+    `- manifestRevision: ${index.manifest_revision ?? "unknown"}`,
+    `- sourceFileCount: ${index.source_file_count ?? index.source_files ?? "unknown"}`,
+    `- activeDefaultRepoPath: ${activeBackend.default_repo_path ?? "unknown"}`,
+    `- activeDefaultCollection: ${activeBackend.default_collection ?? "unknown"}`,
+    `- backendMatchesRequestedContext: ${activeBackend.matches_requested_context ?? "unknown"}`,
+    ...(diagnosis.qdrant_error ? [`- qdrantError: ${diagnosis.qdrant_error}`] : []),
+  ];
+
+  if (checks.length > 0) {
+    lines.push("", "Checks:");
+    for (const check of checks) {
+      if (!isRecord(check)) {
+        continue;
+      }
+      lines.push(`- [${check.status ?? "unknown"}] ${check.name ?? "check"}: ${check.message ?? ""}`);
+    }
+  }
+
+  if (recoveryActions.length > 0) {
+    lines.push("", "Recovery:");
+    for (const action of recoveryActions) {
+      if (typeof action === "string" && action.trim()) {
+        lines.push(`- ${action.trim()}`);
+      }
+    }
+  }
+
+  return lines.join("\n");
+}
+
 function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minScore, maxChars, result, context, hits }) {
   const index = asRecord(context.index);
   const retrievalWarning = optionalString(result.retrieval_warning);
@@ -1330,6 +1446,14 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minSc
     return lines.join("\n");
   }
 
+  const packets = Array.isArray(result.agent_context_packets) ? result.agent_context_packets : [];
+  if (packets.length > 0) {
+    lines.push("", "Agent context packets:");
+    for (const packet of packets) {
+      lines.push(formatAgentContextPacket(packet));
+    }
+  }
+
   lines.push("", "Hits:");
   let remainingChars = maxChars;
   for (const [index, hit] of hits.entries()) {
@@ -1347,6 +1471,26 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minSc
   }
 
   return lines.join("\n");
+}
+
+function formatAgentContextPacket(packet) {
+  const symbols = Array.isArray(packet.symbols) && packet.symbols.length > 0
+    ? packet.symbols.join(", ")
+    : "none";
+  const lines = Array.isArray(packet.line_ranges) && packet.line_ranges.length > 0
+    ? packet.line_ranges.join(", ")
+    : "unknown";
+  const reasons = Array.isArray(packet.reasons) && packet.reasons.length > 0
+    ? packet.reasons.join("; ")
+    : "none";
+  return [
+    `- ${packet.inspection_order ?? "?"}. ${packet.source_path ?? "unknown"}`,
+    `  role: ${packet.role ?? "unknown"}`,
+    `  score: ${typeof packet.score === "number" ? packet.score.toFixed(4) : "unknown"}`,
+    `  lines: ${lines}`,
+    `  symbols: ${symbols}`,
+    `  reasons: ${reasons}`,
+  ].join("\n");
 }
 
 function formatSearchHit(hit, ordinal, remainingChars) {
@@ -1454,11 +1598,19 @@ async function enhancePrompt(args) {
     `- enhancementBackend: ${result.enhancement_backend ?? "unknown"}`,
     ...(usedLocalFallback ? ["- localFallback: retried with localOnly=true after generation setup failed"] : []),
     ...(result.generation_error ? [`- generationError: ${result.generation_error}`] : []),
+    ...formatAgentContextPackets(result.agent_context_packets),
     ...(recoveryAdvice ? ["", "Recovery:", recoveryAdvice] : []),
     ...(Array.isArray(result.citations) && result.citations.length > 0
       ? ["", "Citations:", ...result.citations.map((citation) => `- ${citation}`)]
       : []),
   ].join("\n");
+}
+
+function formatAgentContextPackets(packets) {
+  if (!Array.isArray(packets) || packets.length === 0) {
+    return [];
+  }
+  return ["", "Agent context packets:", ...packets.map(formatAgentContextPacket)];
 }
 
 async function enhanceWithLocalFallback(client, request) {

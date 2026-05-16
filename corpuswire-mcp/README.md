@@ -9,10 +9,17 @@ This package is the preferred distributable MCP entrypoint for the VS Code/Copil
 - `corpuswire_search`: calls `POST /query` for semantic retrieval.
 - `corpuswire_enhance_prompt`: calls `POST /v1/enhance` for context-grounded prompt rewriting. It defaults to deterministic local rewriting and retries once with `localOnly=true` if backend generation setup is unavailable.
 - `corpuswire_health`: checks backend health.
+- `corpuswire_diagnose_workspace`: checks the requested `repoPath` or `workspaceId` before retrieval and returns collection readiness plus recovery actions.
 - `corpuswire_sync_delta`: queues changed/deleted paths for remote workspace indexing.
 - `corpuswire_sync_flush`: flushes queued sync changes.
 - `corpuswire_sync_reconcile`: runs a bounded full workspace reconciliation.
 - `corpuswire_sync_status`: reports sync queue and watcher status.
+
+Search and enhancement responses render `Agent context packets` when the API
+returns them. These are ordered file-level inspection hints with roles such as
+`implementation`, `integration`, `configuration`, `documentation`, and `test`.
+Use them as the first files to inspect; raw hits remain available below the
+packet block for evidence and citations.
 
 ## Build And Test
 
@@ -66,7 +73,7 @@ Use the Copilot CLI MCP config shape in [examples/copilot-cli-mcp-config.json](e
 
 ```json
 {
-  "tools": ["corpuswire_search", "corpuswire_enhance_prompt", "corpuswire_health"]
+  "tools": ["corpuswire_search", "corpuswire_enhance_prompt", "corpuswire_health", "corpuswire_diagnose_workspace"]
 }
 ```
 

@@ -17,6 +17,8 @@ export {
 export type {
   ApiErrorPayload,
   ActiveProjectHealth,
+  AgentContextPacket,
+  AgentContextRole,
   AuthSummary,
   BuildInfo,
   ChunkMetadata,
@@ -67,4 +69,11 @@ export type {
   RuntimeSummary,
   SearchHit,
   StartRemoteIndexSessionRequest,
+  WorkspaceDiagnosis,
+  WorkspaceDiagnosisCheck,
+  WorkspaceDiagnosisCheckStatus,
+  WorkspaceDiagnosisEnvelope,
+  WorkspaceDiagnosisRequest,
+  WorkspaceDiagnosisResolutionMode,
+  WorkspaceDiagnosisStatus,
 } from "./types.js";

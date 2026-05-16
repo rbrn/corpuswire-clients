@@ -1,22 +1,42 @@
 {
   "name": "@corpuswire/cli",
   "version": "0.1.2",
-  "private": true,
+  "description": "CorpusWire command-line client for health checks, semantic search, prompt enhancement, and index observability",
   "type": "module",
   "bin": {
-    "corpuswire": "./bin/corpuswire.js"
+    "corpuswire": "bin/corpuswire.js"
   },
   "files": [
     "bin",
     "lib",
     "README.md"
   ],
-  "dependencies": {
-    "@corpuswire/sdk": "file:../corpuswire-sdk"
+  "scripts": {
+    "test": "node --test tests/*.test.js"
   },
-  "bundledDependencies": [
-    "@corpuswire/sdk"
+  "dependencies": {
+    "@corpuswire/sdk": "0.1.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rbrn/corpuswire.git",
+    "directory": "clients/corpuswire-cli"
+  },
+  "homepage": "https://github.com/rbrn/corpuswire/tree/main/clients/corpuswire-cli",
+  "bugs": {
+    "url": "https://github.com/rbrn/corpuswire/issues"
+  },
+  "keywords": [
+    "corpuswire",
+    "cli",
+    "semantic-search",
+    "rag",
+    "context-engine"
   ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=18"
   }

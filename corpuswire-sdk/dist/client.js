@@ -30,6 +30,23 @@ export class CorpusWireClient {
             init: { method: "GET" },
         });
     }
+    async diagnoseWorkspace(request = {}) {
+        const query = toQueryString({
+            repo_path: request.repoPath,
+            workspace_id: request.workspaceId,
+        });
+        const response = await requestJson({
+            baseUrl: this.baseUrl,
+            paths: this.endpointMode === "v1-only"
+                ? [`/v1/context/diagnose${query}`]
+                : [`/v1/context/diagnose${query}`, `/context/diagnose${query}`],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: { method: "GET" },
+        });
+        return response.diagnosis;
+    }
     async enhance(request) {
         const response = await this.enhanceRaw(request);
         return response.result;

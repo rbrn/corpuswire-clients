@@ -483,10 +483,11 @@ async function runFetchModel(post: (message: PanelOutboundMessage) => void): Pro
       overridden: state.overridden,
     });
   } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
     post({
       type: "model",
       ok: false,
-      error: error instanceof Error ? error.message : String(error),
+      error: `GET ${enhancerService.url}/llm/model failed: ${detail}`,
     });
   }
 }
@@ -518,10 +519,11 @@ async function runSetModel(
       overridden: state.overridden,
     });
   } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
     post({
       type: "model",
       ok: false,
-      error: error instanceof Error ? error.message : String(error),
+      error: `POST ${enhancerService.url}/llm/model failed: ${detail}`,
     });
   }
 }
@@ -1150,6 +1152,7 @@ function buildPromptPanelHtml(initialSeed: string): string {
     <button id="model-apply" class="secondary">Apply</button>
     <span id="model-status" style="font-size:0.85em;color:var(--vscode-descriptionForeground);"></span>
   </div>
+  <div id="model-error" style="display:none;font-size:0.85em;color:var(--vscode-errorForeground);word-break:break-all;"></div>
 
   <div class="section">
     <label for="prompt">Base prompt</label>
@@ -1191,6 +1194,7 @@ function buildPromptPanelHtml(initialSeed: string): string {
     const modelInput = document.getElementById('model-input');
     const modelApply = document.getElementById('model-apply');
     const modelStatus = document.getElementById('model-status');
+    const modelError = document.getElementById('model-error');
 
     function applyIndexStatus(message) {
       indexBanner.classList.remove('hidden');
@@ -1314,9 +1318,14 @@ function buildPromptPanelHtml(initialSeed: string): string {
             modelInput.value = message.model || '';
           }
           modelStatus.textContent = '';
+          modelError.style.display = 'none';
+          modelError.textContent = '';
         } else {
           modelCurrent.textContent = '(error)';
-          modelStatus.textContent = message.error || 'Failed to fetch model.';
+          modelStatus.textContent = 'See details below';
+          modelError.style.display = '';
+          modelError.textContent = message.error || 'Failed to fetch model.';
+          console.error('CorpusWire model fetch failed:', message.error);
         }
       }
     });

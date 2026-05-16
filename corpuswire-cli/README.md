@@ -25,7 +25,7 @@ for service-local `/ingest`.
 | --- | --- |
 | `bin/corpuswire.js` | Executable entrypoint |
 | `lib/cli.js` | Argument parsing, command dispatch, and terminal formatting |
-| `package.json` | Binary metadata and local SDK dependency |
+| `package.json` | Binary metadata and public SDK dependency |
 | `tests/cli.test.js` | Node tests for parsing, command dispatch, search formatting, and index observability |
 
 `runCliCommand()` constructs a `CorpusWireClient` with the resolved base URL and

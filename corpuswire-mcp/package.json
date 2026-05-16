@@ -4,7 +4,7 @@
   "description": "STDIO MCP server for CorpusWire retrieval, prompt enhancement, and remote workspace sync",
   "type": "module",
   "bin": {
-    "corpuswire-mcp": "./bin/corpuswire-mcp.js"
+    "corpuswire-mcp": "bin/corpuswire-mcp.js"
   },
   "exports": {
     ".": "./bin/corpuswire-mcp.js"
@@ -18,6 +18,26 @@
   "scripts": {
     "test": "node --test tests/*.test.js",
     "smoke": "printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\\n' | node ./bin/corpuswire-mcp.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rbrn/corpuswire.git",
+    "directory": "clients/corpuswire-mcp"
+  },
+  "homepage": "https://github.com/rbrn/corpuswire/tree/main/clients/corpuswire-mcp",
+  "bugs": {
+    "url": "https://github.com/rbrn/corpuswire/issues"
+  },
+  "keywords": [
+    "corpuswire",
+    "mcp",
+    "model-context-protocol",
+    "semantic-search",
+    "context-engine"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
   },
   "engines": {
     "node": ">=18"
