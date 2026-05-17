@@ -282,6 +282,7 @@ export interface EnhancePromptRequest {
     minScore?: number;
     outputMode?: PromptOutputMode;
     localOnly?: boolean;
+    sourceFilter?: string[];
 }
 export interface QueryPromptRequest {
     repoPath?: string;
@@ -291,6 +292,7 @@ export interface QueryPromptRequest {
     topK?: number;
     minScore?: number;
     includeAnswer?: boolean;
+    sourceFilter?: string[];
 }
 export interface CorpusWireClientOptions {
     baseUrl?: string;
@@ -373,6 +375,7 @@ export interface EnhancePromptPayload {
     min_score?: number;
     output_mode: PromptOutputMode;
     local_only: boolean;
+    source_filter?: string[];
 }
 export interface QueryPromptPayload {
     repo_path?: string;
@@ -381,6 +384,7 @@ export interface QueryPromptPayload {
     top_k?: number;
     min_score?: number;
     include_answer: boolean;
+    source_filter?: string[];
 }
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 export type RemoteIndexMode = "full" | "incremental";

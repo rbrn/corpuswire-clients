@@ -331,6 +331,7 @@ export interface EnhancePromptRequest {
   minScore?: number;
   outputMode?: PromptOutputMode;
   localOnly?: boolean;
+  sourceFilter?: string[];
 }
 
 export interface QueryPromptRequest {
@@ -341,6 +342,7 @@ export interface QueryPromptRequest {
   topK?: number;
   minScore?: number;
   includeAnswer?: boolean;
+  sourceFilter?: string[];
 }
 
 export interface CorpusWireClientOptions {
@@ -431,6 +433,7 @@ export interface EnhancePromptPayload {
   min_score?: number;
   output_mode: PromptOutputMode;
   local_only: boolean;
+  source_filter?: string[];
 }
 
 export interface QueryPromptPayload {
@@ -440,6 +443,7 @@ export interface QueryPromptPayload {
   top_k?: number;
   min_score?: number;
   include_answer: boolean;
+  source_filter?: string[];
 }
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;

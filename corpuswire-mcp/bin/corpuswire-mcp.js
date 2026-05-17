@@ -905,7 +905,7 @@ async function handleRequest(method, params) {
     case "ping":
       return {};
     case "tools/list":
-      return { tools: toolDefinitions() };
+      return { tools: await listToolsWithPlugins() };
     case "tools/call":
       return callTool(params);
     case "resources/list":
@@ -998,7 +998,87 @@ async function callTool(params) {
     }
   }
 
+  // Plugin-contributed tool: dispatch to /v1/plugins/mcp-call.
+  const pluginTools = await fetchPluginTools();
+  if (pluginTools.some((t) => t.name === name)) {
+    try {
+      return textToolResult(await dispatchPluginTool(name, args));
+    } catch (error) {
+      return textToolResult(formatToolError(error, `plugin tool ${name}`), true);
+    }
+  }
+
   throw new JsonRpcError(-32602, `Unknown tool: ${name}`);
+}
+
+async function dispatchPluginTool(name, args) {
+  const baseUrl = (process.env.CORPUSWIRE_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/$/, "");
+  const response = await fetch(`${baseUrl}/v1/plugins/mcp-call`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name, arguments: args ?? {} }),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    let detail = text;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed.detail === "string") detail = parsed.detail;
+    } catch (_err) {
+      // keep raw text
+    }
+    throw new Error(`plugin call failed (${response.status}): ${detail}`);
+  }
+  return text;
+}
+
+const PLUGIN_TOOLS_CACHE_TTL_MS = 60_000;
+let pluginToolsCache = { fetchedAt: 0, tools: [] };
+
+async function fetchPluginTools() {
+  const now = Date.now();
+  if (now - pluginToolsCache.fetchedAt < PLUGIN_TOOLS_CACHE_TTL_MS) {
+    return pluginToolsCache.tools;
+  }
+  const baseUrl = process.env.CORPUSWIRE_BASE_URL ?? DEFAULT_BASE_URL;
+  try {
+    const response = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/plugins/mcp-tools`);
+    if (!response.ok) {
+      pluginToolsCache = { fetchedAt: now, tools: [] };
+      return [];
+    }
+    const payload = await response.json();
+    const tools = Array.isArray(payload?.tools)
+      ? payload.tools
+          .filter((t) => t && typeof t.name === "string")
+          .map((t) => ({
+            name: t.name,
+            description: typeof t.description === "string" ? t.description : "",
+            inputSchema:
+              t.input_schema && typeof t.input_schema === "object"
+                ? t.input_schema
+                : { type: "object", additionalProperties: true },
+            plugin: typeof t.plugin === "string" ? t.plugin : undefined,
+          }))
+      : [];
+    pluginToolsCache = { fetchedAt: now, tools };
+    return tools;
+  } catch (_err) {
+    pluginToolsCache = { fetchedAt: now, tools: [] };
+    return [];
+  }
+}
+
+async function listToolsWithPlugins() {
+  const builtin = toolDefinitions();
+  const builtinNames = new Set(builtin.map((t) => t.name));
+  const plugin = await fetchPluginTools();
+  const merged = [...builtin];
+  for (const tool of plugin) {
+    if (builtinNames.has(tool.name)) continue;
+    merged.push(tool);
+  }
+  return merged;
 }
 
 function toolDefinitions() {
@@ -1039,6 +1119,11 @@ function toolDefinitions() {
             minimum: 200,
             default: 12000,
             description: "Maximum characters of hit text to include in the tool response.",
+          },
+          sourceFilter: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional list of source-system identifiers (e.g. plugin names) used to restrict retrieval. Plugins translate these via RetrieverHooks.extra_filters().",
           },
         },
         required: ["query"],
@@ -1085,6 +1170,11 @@ function toolDefinitions() {
             type: "boolean",
             default: true,
             description: "Use deterministic local rewriting without a generation provider.",
+          },
+          sourceFilter: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional list of source-system identifiers (e.g. plugin names) used to restrict retrieval. Plugins translate these via RetrieverHooks.extra_filters().",
           },
         },
         required: ["prompt"],
@@ -1258,6 +1348,8 @@ async function searchContext(args) {
   const minScore = optionalScore(args.minScore ?? process.env.CORPUSWIRE_MIN_SCORE);
   const repoPath = optionalString(args.repoPath ?? process.env.CORPUSWIRE_REPO_PATH);
   const workspaceId = optionalString(args.workspaceId ?? process.env.CORPUSWIRE_WORKSPACE_ID);
+  const sourceFilterRaw = optionalStringArray(args, "sourceFilter");
+  const sourceFilter = sourceFilterRaw.length > 0 ? sourceFilterRaw : undefined;
   const maxChars = Math.min(
     Math.max(optionalPositiveInteger(args.maxChars ?? process.env.CORPUSWIRE_MAX_SEARCH_CHARS, 12000), 200),
     50000,
@@ -1272,6 +1364,7 @@ async function searchContext(args) {
     topK,
     minScore,
     includeAnswer: false,
+    sourceFilter,
   };
   const response = typeof client.queryRaw === "function"
     ? await client.queryRaw(request)
@@ -1558,6 +1651,8 @@ async function enhancePrompt(args) {
   const repoPath = optionalString(args.repoPath ?? process.env.CORPUSWIRE_REPO_PATH);
   const workspaceId = optionalString(args.workspaceId ?? process.env.CORPUSWIRE_WORKSPACE_ID);
   const localOnly = optionalBoolean(args.localOnly ?? process.env.CORPUSWIRE_LOCAL_ONLY, true);
+  const sourceFilterRaw = optionalStringArray(args, "sourceFilter");
+  const sourceFilter = sourceFilterRaw.length > 0 ? sourceFilterRaw : undefined;
 
   await syncManager.flushBeforeRead();
   const client = buildClient();
@@ -1569,6 +1664,7 @@ async function enhancePrompt(args) {
     topK,
     minScore,
     localOnly,
+    sourceFilter,
   };
   const { result, usedLocalFallback } = await enhanceWithLocalFallback(client, request);
 

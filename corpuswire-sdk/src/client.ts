@@ -339,6 +339,7 @@ export function toEnhancePayload(request: string | EnhancePromptRequest): Enhanc
     min_score: normalizedRequest.minScore,
     output_mode: normalizedRequest.outputMode ?? DEFAULT_OUTPUT_MODE,
     local_only: normalizedRequest.localOnly ?? false,
+    source_filter: normalizedRequest.sourceFilter,
   };
 }
 
@@ -356,6 +357,7 @@ export function toQueryPayload(request: string | QueryPromptRequest): QueryPromp
     top_k: normalizedRequest.topK,
     min_score: normalizedRequest.minScore,
     include_answer: normalizedRequest.includeAnswer ?? false,
+    source_filter: normalizedRequest.sourceFilter,
   });
 }
 
