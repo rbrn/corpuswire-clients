@@ -282,6 +282,7 @@ export interface EnhancePromptRequest {
     minScore?: number;
     outputMode?: PromptOutputMode;
     localOnly?: boolean;
+    sourceFilter?: string[];
 }
 export interface QueryPromptRequest {
     repoPath?: string;
@@ -291,6 +292,7 @@ export interface QueryPromptRequest {
     topK?: number;
     minScore?: number;
     includeAnswer?: boolean;
+    sourceFilter?: string[];
 }
 export interface CorpusWireClientOptions {
     baseUrl?: string;
@@ -311,6 +313,9 @@ export interface IndexActivityQuery {
     collection?: string;
     windowHours?: number;
     expectedIntervalSeconds?: number;
+}
+export interface IndexSessionQuery {
+    workspaceId?: string;
 }
 export interface IndexEvent {
     event_id: string;
@@ -373,6 +378,7 @@ export interface EnhancePromptPayload {
     min_score?: number;
     output_mode: PromptOutputMode;
     local_only: boolean;
+    source_filter?: string[];
 }
 export interface QueryPromptPayload {
     repo_path?: string;
@@ -381,6 +387,7 @@ export interface QueryPromptPayload {
     top_k?: number;
     min_score?: number;
     include_answer: boolean;
+    source_filter?: string[];
 }
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 export type RemoteIndexMode = "full" | "incremental";
@@ -464,7 +471,14 @@ export interface RemoteIndexStatus {
     bytes_uploaded: number;
     bytes_skipped: number;
     queue_depth: number;
+    age_seconds?: number | null;
+    idle_seconds?: number | null;
+    idle_timeout_seconds?: number | null;
     errors: string[];
+}
+export interface RemoteIndexSessionsResponse {
+    ok: true;
+    sessions: RemoteIndexStatus[];
 }
 export interface RemoteIndexCapabilities {
     ok: true;

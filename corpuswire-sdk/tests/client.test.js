@@ -527,6 +527,53 @@ test("remote indexWorkspace runs session, manifest, upload, and commit requests"
   assert.match(String(calls[1].init.body), /"relative_path":"README.md"/);
 });
 
+test("remote indexWorkspace aborts a started session when indexing fails", async () => {
+  const calls = [];
+  const client = new CorpusWireClient({
+    baseUrl: "http://example.test",
+    fetchFn: async (input, init) => {
+      calls.push({ input, init });
+      if (input.endsWith("/v1/index/sessions")) {
+        return jsonResponse(200, {
+          ok: true,
+          result: {
+            session_id: "sess-failed",
+            workspace_id: "workspace-1",
+            collection_name: "collection-1",
+            mode: "incremental",
+            manifest_revision: 1,
+            max_batch_bytes: 1024,
+            max_file_size_bytes: 1024,
+            max_concurrent_uploads: 4,
+          },
+        });
+      }
+      if (input.endsWith("/manifest/batch")) {
+        return jsonResponse(400, { detail: "bad manifest" });
+      }
+      if (input.endsWith("/v1/index/sessions/sess-failed")) {
+        return jsonResponse(200, { ok: true, session_id: "sess-failed", phase: "aborted" });
+      }
+      throw new Error(`Unexpected request: ${input}`);
+    },
+  });
+
+  await assert.rejects(
+    client.indexWorkspace({
+      workspace: { workspaceId: "workspace-1" },
+      files: [{ relativePath: "README.md", content: "# Demo\n" }],
+    }),
+    CorpusWireHttpError,
+  );
+
+  assert.deepEqual(calls.map((call) => call.input), [
+    "http://example.test/v1/index/sessions",
+    "http://example.test/v1/index/sessions/sess-failed/manifest/batch",
+    "http://example.test/v1/index/sessions/sess-failed",
+  ]);
+  assert.equal(calls[2].init.method, "DELETE");
+});
+
 test("index event helpers query activity endpoints", async () => {
   const calls = [];
   const client = new CorpusWireClient({
@@ -575,6 +622,49 @@ test("index event helpers query activity endpoints", async () => {
   ]);
   assert.equal(events[0].event_id, "evt-1");
   assert.equal(activity.last_attempt_status, "completed");
+});
+
+test("listIndexSessions queries active remote index sessions", async () => {
+  const calls = [];
+  const client = new CorpusWireClient({
+    baseUrl: "http://example.test",
+    fetchFn: async (input) => {
+      calls.push(input);
+      return jsonResponse(200, {
+        ok: true,
+        sessions: [
+          {
+            session_id: "sess-1",
+            workspace_id: "workspace-1",
+            collection_name: "collection-1",
+            mode: "incremental",
+            manifest_revision: 1,
+            phase: "receiving_manifest",
+            files_manifested: 0,
+            files_indexed: 0,
+            files_deleted: 0,
+            files_unchanged: 0,
+            files_skipped: 0,
+            bytes_uploaded: 0,
+            bytes_skipped: 0,
+            queue_depth: 0,
+            age_seconds: 4,
+            idle_seconds: 2,
+            idle_timeout_seconds: 900,
+            errors: [],
+          },
+        ],
+      });
+    },
+  });
+
+  const sessions = await client.listIndexSessions({ workspaceId: "workspace-1" });
+
+  assert.deepEqual(calls, ["http://example.test/v1/index/sessions?workspace_id=workspace-1"]);
+  assert.equal(sessions[0].session_id, "sess-1");
+  assert.equal(sessions[0].phase, "receiving_manifest");
+  assert.equal(sessions[0].age_seconds, 4);
+  assert.equal(sessions[0].idle_seconds, 2);
 });
 
 test("createBasicAuthHeader encodes credentials for backend auth", () => {

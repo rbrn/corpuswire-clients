@@ -1,4 +1,4 @@
-import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceResponseEnvelope, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexWorkspaceRequest, CorpusWireClientOptions, LlmModelState, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexSession, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, SearchHit, StartRemoteIndexSessionRequest, WorkspaceDiagnosis, WorkspaceDiagnosisRequest } from "./types.js";
+import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceResponseEnvelope, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexSessionQuery, IndexWorkspaceRequest, CorpusWireClientOptions, LlmModelState, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexSession, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, SearchHit, StartRemoteIndexSessionRequest, WorkspaceDiagnosis, WorkspaceDiagnosisRequest } from "./types.js";
 export declare class CorpusWireClient {
     readonly baseUrl: string;
     readonly basicAuth: string;
@@ -21,6 +21,7 @@ export declare class CorpusWireClient {
     getIndexCapabilities(): Promise<RemoteIndexCapabilities>;
     getIndexEvents(request?: IndexEventQuery): Promise<IndexEvent[]>;
     getIndexActivity(request?: IndexActivityQuery): Promise<IndexActivitySummary>;
+    listIndexSessions(request?: IndexSessionQuery): Promise<RemoteIndexStatus[]>;
     startIndexSession(request: StartRemoteIndexSessionRequest): Promise<RemoteIndexSession>;
     sendManifestBatch(sessionId: string, entries: RemoteManifestEntry[]): Promise<RemoteManifestBatchResult>;
     uploadFileBatch(sessionId: string, metadata: RemoteFileBatchMetadata, files: RemoteFileContent[]): Promise<RemoteFileBatchResult>;
@@ -31,6 +32,7 @@ export declare class CorpusWireClient {
         session_id: string;
         phase: string;
     }>;
+    private abortIndexSessionQuietly;
     indexWorkspace(request: IndexWorkspaceRequest): Promise<RemoteIndexCommitResponse>;
 }
 export declare function toEnhancePayload(request: string | EnhancePromptRequest): EnhancePromptPayload;

@@ -306,13 +306,20 @@ const manifest = await client.sendManifestBatch(session.session_id, [
 console.log(manifest.upload_required);
 
 const status = await client.getIndexSessionStatus(session.session_id);
-console.log(status.phase, status.queue_depth);
+console.log(status.phase, status.queue_depth, status.age_seconds, status.idle_seconds);
 
 await client.abortIndexSession(session.session_id);
 ```
 
 The backend refuses commit while uploads are still missing. In that case,
 `commitIndexSession()` returns a `409` error through `CorpusWireHttpError`.
+The high-level `indexWorkspace()` helper hashes files before opening a remote
+session and best-effort aborts its own session when manifest, upload, or commit
+fails, so a failed client is less likely to leave a workspace locked.
+
+Use `listIndexSessions()` before manual recovery to inspect active sessions by
+workspace id. Status responses include phase, queue depth, indexed file count,
+age, idle age, and the backend idle timeout.
 
 ## Error Handling
 

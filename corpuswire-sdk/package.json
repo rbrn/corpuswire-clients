@@ -1,6 +1,6 @@
 {
   "name": "@corpuswire/sdk",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Zero-dependency Node/TypeScript SDK for CorpusWire retrieval, prompt enhancement, and remote indexing",
   "type": "module",
   "main": "./dist/index.js",

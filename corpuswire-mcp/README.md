@@ -10,10 +10,17 @@ This package is the preferred distributable MCP entrypoint for the VS Code/Copil
 - `corpuswire_enhance_prompt`: calls `POST /v1/enhance` for context-grounded prompt rewriting. It defaults to deterministic local rewriting and retries once with `localOnly=true` if backend generation setup is unavailable.
 - `corpuswire_health`: checks backend health.
 - `corpuswire_diagnose_workspace`: checks the requested `repoPath` or `workspaceId` before retrieval and returns collection readiness plus recovery actions.
+- `corpuswire_doctor`: runs a read-only readiness check across health, diagnosis, sync state, active sessions, and backend activity.
 - `corpuswire_sync_delta`: queues changed/deleted paths for remote workspace indexing.
 - `corpuswire_sync_flush`: flushes queued sync changes.
+- `corpuswire_sync_probe_paths`: classifies paths under current sync filters without queuing or uploading.
 - `corpuswire_sync_reconcile`: runs a bounded full workspace reconciliation.
-- `corpuswire_sync_status`: reports sync queue and watcher status.
+- `corpuswire_sync_git_delta`: scans `git status` and queues modified, added, deleted, renamed, and untracked paths for incremental sync.
+- `corpuswire_sync_bootstrap`: diagnoses startup freshness, sets `needsReconcile`, and can explicitly run reconciliation when requested.
+- `corpuswire_sync_status`: reports sync queue, watcher, recent event, skip-reason, and latency status.
+- `corpuswire_sync_sessions`: lists active remote index sessions visible to the backend, optionally filtered by workspace id.
+- `corpuswire_sync_abort_session`: aborts a known remote index session by id after inspection.
+- `corpuswire_index_activity`: reports persisted backend index activity and recent index events.
 
 Search and enhancement responses render `Agent context packets` when the API
 returns them. These are ordered file-level inspection hints with roles such as
@@ -91,3 +98,46 @@ Enable sync tools only when the server has the intended local workspace root and
 - `CORPUSWIRE_SYNC_ENABLED`: enable remote incremental sync
 - `CORPUSWIRE_SYNC_ROOT`: local workspace root readable by this MCP process
 - `CORPUSWIRE_SYNC_WATCH`: optional best-effort `fs.watch` watcher
+- `CORPUSWIRE_SYNC_DEBOUNCE_MS`: debounce delay for queued deltas
+- `CORPUSWIRE_SYNC_MAX_PENDING_PATHS`: pending changed/deleted path count that forces a flush
+- `CORPUSWIRE_SYNC_FLUSH_BEFORE_READ`: attempt a bounded flush before search/enhance
+- `CORPUSWIRE_SYNC_READ_FLUSH_TIMEOUT_MS`: max pre-read flush wait
+- `CORPUSWIRE_SYNC_BOOTSTRAP_CHECK`: run a startup freshness diagnosis when sync starts, default `false`
+- `CORPUSWIRE_SYNC_BOOTSTRAP_TIMEOUT_MS`: max startup/bootstrap diagnosis wait, default `5000`
+- `CORPUSWIRE_SYNC_MTIME_CACHE_ENABLED`: enable durable metadata-only mtime/hash duplicate suppression, default `false`
+- `CORPUSWIRE_SYNC_STATE_DIR`: directory for MCP sync metadata caches, default `$XDG_CACHE_HOME/corpuswire/mcp-sync` or `~/.cache/corpuswire/mcp-sync`
+- `CORPUSWIRE_SYNC_GIT_TIMEOUT_MS`: max wait for git status and metadata commands, default `5000`
+- `CORPUSWIRE_SYNC_GIT_MAX_FILES`: max git status entries processed by one git delta scan, default `1000`
+- `CORPUSWIRE_SYNC_GIT_MAX_STATUS_BYTES`: max buffered output from `git status -z`, default `1048576`
+- `CORPUSWIRE_SYNC_GIT_DELTA_BEFORE_READ`: run a bounded git delta scan and flush before search/enhance, default `false`
+- `CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK`: refresh bootstrap freshness before search/enhance, default `false`
+- `CORPUSWIRE_SYNC_READ_FRESHNESS_TIMEOUT_MS`: max read-side freshness diagnosis wait, default `5000`
+- `CORPUSWIRE_SYNC_READ_STRICT`: block search/enhance when read freshness says reconciliation is needed, default `false`
+- `CORPUSWIRE_SYNC_READ_STRICT_STALE_AFTER_MS`: optional grace period before strict mode blocks stale reads, default `0`
+- `CORPUSWIRE_SYNC_RECONCILE_INTERVAL_MS`: optional scheduled full reconciliation interval
+- `CORPUSWIRE_SYNC_RECONCILE_MAX_FILES`: max files scanned by one reconciliation run
+- `CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_ATTEMPTS`: active-session 409 retry attempts before requeueing, default `5`
+- `CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_DELAY_MS`: base active-session retry delay, default `750`
+- `CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_MAX_DELAY_MS`: active-session retry delay ceiling, default `5000`
+
+`corpuswire_sync_bootstrap` is diagnostic by default. It calls workspace diagnosis, reports `bootstrapState` and `needsReconcile` in sync status, and returns recovery actions when the remote index is stale, degraded, missing, or blocked. It uploads files only when called with `"reconcile": true`.
+
+When `CORPUSWIRE_SYNC_MTIME_CACHE_ENABLED=true`, incremental sync writes a JSON metadata cache containing relative paths, size, mtime, SHA-256, and last decision. It never stores file contents. The cache suppresses duplicate changed-file uploads across MCP restarts when size and mtime match, re-hashes same-size files when mtime changes, and is ignored while bootstrap says the remote index needs reconciliation. Full reconciliation does not use the cache because it must send a complete inventory.
+
+`corpuswire_sync_git_delta` runs `git status --porcelain=v1 -z --untracked-files=all --ignored=no`, so gitignored files are not uploaded. Renames are sent as delete-old plus upload-new. The same CorpusWire include/exclude filters and extension allowlist still apply before anything is queued.
+
+Read-side freshness preparation runs before `corpuswire_search` and `corpuswire_enhance_prompt`. It always performs the configured bounded queue flush. When enabled, it also runs git delta before retrieval and refreshes bootstrap freshness. Stale or degraded indexes are surfaced in the tool response even when hits exist. Strict mode is off by default and blocks retrieval only when explicitly enabled.
+
+If a flush reports `409 Conflict` because an index session is already active for the workspace, the MCP server retries with bounded backoff before requeueing. Retry counts and the last conflict message are visible in `corpuswire_sync_status` as `sessionConflictRetries` and `lastSessionConflict*` fields. Backend builds with remote-session idle expiry clear stale locks automatically after `REMOTE_INDEX_SESSION_IDLE_TIMEOUT_SECONDS`; SDK builds from 2026-05-17 onward also abort failed high-level sessions on the client side.
+
+Use `corpuswire_sync_sessions` when a sync stays blocked or when several agents share a remote workspace. The tool calls `GET /v1/index/sessions`, returns active session id, workspace id, collection, mode, phase, manifest revision, queue depth, indexed file count, age, idle age, timeout, and error count, and does not mutate backend state.
+
+Use `corpuswire_sync_abort_session` only when an inspected session is clearly stale, failed, or owned by an abandoned agent. It calls the backend session abort endpoint with the exact session id and releases that workspace lock.
+
+Use `corpuswire_index_activity` when process-local sync status is not enough. It reads persisted backend activity and recent events, including last attempt/success, failure counts, gap detection, operation, status, manifest revision, files indexed/deleted/skipped, bytes uploaded, duration, and errors or warnings.
+
+Use `corpuswire_sync_probe_paths` before queuing uncertain edits. It applies the same root, extension, include, exclude, size, and file-existence checks as sync, then reports `upload_candidate`, `delete_candidate`, or `skipped` with the skip reason. It does not mutate queue or backend state.
+
+Use `corpuswire_doctor` as the quick replacement-readiness check before trusting CorpusWire in a long Codex session. It returns `ready`, `attention`, or `blocked` from backend health, workspace diagnosis, process-local sync state, active sessions, and persisted activity.
+
+For the local Docker app on an existing dense-only Qdrant collection, keep `APP_QDRANT_HYBRID_ENABLED=false` unless you intentionally recreate the collection for hybrid named vectors. A dense/hybrid mismatch raises a backend writer error; current backend builds close the failed remote session so retry attempts are not blocked by a stale active-session lock.

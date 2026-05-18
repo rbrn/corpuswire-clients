@@ -368,6 +368,10 @@ export interface IndexActivityQuery {
   expectedIntervalSeconds?: number;
 }
 
+export interface IndexSessionQuery {
+  workspaceId?: string;
+}
+
 export interface IndexEvent {
   event_id: string;
   occurred_at: string;
@@ -539,7 +543,15 @@ export interface RemoteIndexStatus {
   bytes_uploaded: number;
   bytes_skipped: number;
   queue_depth: number;
+  age_seconds?: number | null;
+  idle_seconds?: number | null;
+  idle_timeout_seconds?: number | null;
   errors: string[];
+}
+
+export interface RemoteIndexSessionsResponse {
+  ok: true;
+  sessions: RemoteIndexStatus[];
 }
 
 export interface RemoteIndexCapabilities {

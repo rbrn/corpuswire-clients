@@ -146,6 +146,17 @@ export class CorpusWireClient {
         });
         return response.activity;
     }
+    async listIndexSessions(request = {}) {
+        const response = await requestJson({
+            baseUrl: this.baseUrl,
+            paths: [`/v1/index/sessions${toQueryString(toIndexSessionQueryParams(request))}`],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: { method: "GET" },
+        });
+        return response.sessions;
+    }
     async startIndexSession(request) {
         const response = await requestJson({
             baseUrl: this.baseUrl,
@@ -226,37 +237,51 @@ export class CorpusWireClient {
             init: { method: "DELETE" },
         });
     }
-    async indexWorkspace(request) {
-        const session = await this.startIndexSession(request);
-        const remoteFiles = await Promise.all(request.files.map(prepareRemoteWorkspaceFile));
-        const manifestEntries = [
-            ...remoteFiles.map(({ file, content, sha256, mtimeNs }) => ({
-                relativePath: file.relativePath,
-                op: "upsert",
-                size: content.byteLength,
-                mtimeNs,
-                sha256,
-            })),
-            ...(request.deletedPaths ?? []).map((relativePath) => ({
-                relativePath,
-                op: "delete",
-            })),
-        ];
-        const manifestResult = await this.sendManifestBatch(session.session_id, manifestEntries);
-        const uploadRequired = new Set(manifestResult.upload_required);
-        const filesToUpload = remoteFiles.filter(({ file }) => uploadRequired.has(file.relativePath));
-        if (filesToUpload.length > 0) {
-            const uploadBatches = buildUploadBatches(filesToUpload, request.batchBytes ?? session.max_batch_bytes);
-            await runWithConcurrency(uploadBatches, request.maxConcurrentUploads ?? session.max_concurrent_uploads, async (batchFiles) => {
-                await this.uploadFileBatch(session.session_id, { files: batchFiles.map((file) => file.descriptor) }, batchFiles);
-            });
+    async abortIndexSessionQuietly(sessionId) {
+        try {
+            await this.abortIndexSession(sessionId);
         }
-        return this.commitIndexSession(session.session_id);
+        catch {
+            // Best effort: preserve the original indexing failure for callers.
+        }
+    }
+    async indexWorkspace(request) {
+        const remoteFiles = await Promise.all(request.files.map(prepareRemoteWorkspaceFile));
+        const session = await this.startIndexSession(request);
+        try {
+            const manifestEntries = [
+                ...remoteFiles.map(({ file, content, sha256, mtimeNs }) => ({
+                    relativePath: file.relativePath,
+                    op: "upsert",
+                    size: content.byteLength,
+                    mtimeNs,
+                    sha256,
+                })),
+                ...(request.deletedPaths ?? []).map((relativePath) => ({
+                    relativePath,
+                    op: "delete",
+                })),
+            ];
+            const manifestResult = await this.sendManifestBatch(session.session_id, manifestEntries);
+            const uploadRequired = new Set(manifestResult.upload_required);
+            const filesToUpload = remoteFiles.filter(({ file }) => uploadRequired.has(file.relativePath));
+            if (filesToUpload.length > 0) {
+                const uploadBatches = buildUploadBatches(filesToUpload, request.batchBytes ?? session.max_batch_bytes);
+                await runWithConcurrency(uploadBatches, request.maxConcurrentUploads ?? session.max_concurrent_uploads, async (batchFiles) => {
+                    await this.uploadFileBatch(session.session_id, { files: batchFiles.map((file) => file.descriptor) }, batchFiles);
+                });
+            }
+            return await this.commitIndexSession(session.session_id);
+        }
+        catch (error) {
+            await this.abortIndexSessionQuietly(session.session_id);
+            throw error;
+        }
     }
 }
 export function toEnhancePayload(request) {
     const normalizedRequest = typeof request === "string" ? { prompt: request } : request;
-    return {
+    return removeUndefinedValues({
         repo_path: normalizedRequest.repoPath,
         workspace_id: normalizedRequest.workspaceId,
         prompt: normalizedRequest.prompt,
@@ -264,7 +289,8 @@ export function toEnhancePayload(request) {
         min_score: normalizedRequest.minScore,
         output_mode: normalizedRequest.outputMode ?? DEFAULT_OUTPUT_MODE,
         local_only: normalizedRequest.localOnly ?? false,
-    };
+        source_filter: normalizedRequest.sourceFilter,
+    });
 }
 export function toQueryPayload(request) {
     const normalizedRequest = typeof request === "string" ? { query: request } : request;
@@ -279,6 +305,7 @@ export function toQueryPayload(request) {
         top_k: normalizedRequest.topK,
         min_score: normalizedRequest.minScore,
         include_answer: normalizedRequest.includeAnswer ?? false,
+        source_filter: normalizedRequest.sourceFilter,
     });
 }
 export function toStartIndexSessionPayload(request) {
@@ -439,6 +466,11 @@ function toIndexActivityQueryParams(request) {
         collection: request.collection,
         window_hours: request.windowHours === undefined ? undefined : String(request.windowHours),
         expected_interval_seconds: request.expectedIntervalSeconds === undefined ? undefined : String(request.expectedIntervalSeconds),
+    };
+}
+function toIndexSessionQueryParams(request) {
+    return {
+        workspace_id: request.workspaceId,
     };
 }
 function toQueryString(values) {

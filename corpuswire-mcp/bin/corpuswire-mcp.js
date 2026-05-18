@@ -1,23 +1,36 @@
 #!/usr/bin/env node
 
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, watch as watchFileSystem } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 
 const JSONRPC_VERSION = "2.0";
 const PROTOCOL_VERSION = "2024-11-05";
 const SERVER_NAME = "corpuswire-context-engine";
-const SERVER_VERSION = "0.1.2";
+const SERVER_VERSION = "0.1.3";
 const DEFAULT_BASE_URL = "http://127.0.0.1:8000";
 const DEFAULT_OUTPUT_MODE = "generic";
 const DEFAULT_TOP_K = 5;
 const DEFAULT_SYNC_DEBOUNCE_MS = 1000;
 const DEFAULT_SYNC_READ_FLUSH_TIMEOUT_MS = 250;
 const DEFAULT_SYNC_FLUSH_TIMEOUT_MS = 60000;
+const DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS = 5000;
+const DEFAULT_SYNC_GIT_TIMEOUT_MS = 5000;
+const DEFAULT_SYNC_GIT_MAX_FILES = 1000;
+const DEFAULT_SYNC_GIT_MAX_STATUS_BYTES = 1024 * 1024;
 const DEFAULT_SYNC_MAX_FILE_SIZE_BYTES = 512 * 1024;
 const DEFAULT_SYNC_MAX_PENDING_PATHS = 100;
 const DEFAULT_SYNC_RECONCILE_MAX_FILES = 5000;
+const DEFAULT_SYNC_SESSION_CONFLICT_RETRY_ATTEMPTS = 5;
+const DEFAULT_SYNC_SESSION_CONFLICT_RETRY_DELAY_MS = 750;
+const DEFAULT_SYNC_SESSION_CONFLICT_RETRY_MAX_DELAY_MS = 5000;
+const DEFAULT_SYNC_RECENT_EVENTS_LIMIT = 25;
+const DEFAULT_SYNC_LATENCY_SAMPLE_LIMIT = 20;
+const DEFAULT_SYNC_CACHE_SCHEMA_VERSION = 1;
 const DIRECTORY_GLOB_PROBE = "__corpuswire_directory_probe__";
 const OUTPUT_MODES = new Set(["generic", "copilot", "claude-code", "sequential"]);
 const INDEXABLE_EXTENSIONS = new Set([
@@ -53,6 +66,7 @@ const EXCLUDED_PATH_SEGMENTS = new Set([
   ".qdrant",
 ]);
 
+const execFileAsync = promisify(execFile);
 const sdk = await loadSdk();
 
 class JsonRpcError extends Error {
@@ -108,6 +122,8 @@ class SyncManager {
     this.timer = null;
     this.activeFlush = null;
     this.activeReconcile = null;
+    this.activeBootstrapCheck = null;
+    this.activeGitDelta = null;
     this.watcher = null;
     this.reconcileTimer = null;
     this.lastResult = null;
@@ -116,6 +132,29 @@ class SyncManager {
     this.lastFlushFinishedAt = null;
     this.lastReconcileStartedAt = null;
     this.lastReconcileFinishedAt = null;
+    this.lastGitScanStartedAt = null;
+    this.lastGitScanFinishedAt = null;
+    this.lastGitScanDurationMs = null;
+    this.lastGitHead = null;
+    this.lastGitBranch = null;
+    this.lastGitDeltaCounts = null;
+    this.lastEventAt = null;
+    this.firstQueuedAt = null;
+    this.lastFlushDurationMs = null;
+    this.lastReconcileDurationMs = null;
+    this.flushDurationSamplesMs = [];
+    this.recentEvents = [];
+    this.acceptedEventCounts = { changed: 0, deleted: 0 };
+    this.skippedEventCounts = {};
+    this.cacheState = null;
+    this.cacheDecisionCounts = {};
+    this.bootstrapStatus = initialBootstrapStatus();
+    this.sessionConflictRetryCounts = { retries: 0, exhausted: 0 };
+    this.lastSessionConflictAt = null;
+    this.lastSessionConflictOperation = null;
+    this.lastSessionConflictAttempt = null;
+    this.lastSessionConflictRetryDelayMs = null;
+    this.lastSessionConflictMessage = null;
   }
 
   startWatcherIfConfigured() {
@@ -144,6 +183,7 @@ class SyncManager {
           ...delta,
           sourceRoot: context.sourceRoot,
           workspaceId: context.workspaceId,
+          eventSource: "watcher",
         }).catch((error) => this.recordError(error));
       });
       if (typeof this.watcher.unref === "function") {
@@ -174,8 +214,130 @@ class SyncManager {
     }
   }
 
+  startBootstrapCheckIfConfigured() {
+    if (!this.isEnabled() || !optionalBoolean(this.env.CORPUSWIRE_SYNC_BOOTSTRAP_CHECK, false)) {
+      return;
+    }
+
+    this.activeBootstrapCheck = this.bootstrapExplicit({
+      maxWaitMs: optionalPositiveInteger(
+        this.env.CORPUSWIRE_SYNC_BOOTSTRAP_TIMEOUT_MS,
+        DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS,
+      ),
+    })
+      .catch((error) => {
+        this.recordError(error, "bootstrap");
+        this.recordBootstrapStatus(bootstrapStatusFromError(error));
+      })
+      .finally(() => {
+        this.activeBootstrapCheck = null;
+      });
+  }
+
   isEnabled() {
     return optionalBoolean(this.env.CORPUSWIRE_SYNC_ENABLED, false);
+  }
+
+  isCacheEnabled() {
+    return optionalBoolean(
+      this.env.CORPUSWIRE_SYNC_MTIME_CACHE_ENABLED ?? this.env.CORPUSWIRE_SYNC_CACHE_ENABLED,
+      false,
+    );
+  }
+
+  isCacheUsable() {
+    if (!this.isCacheEnabled()) {
+      return false;
+    }
+    if (optionalBoolean(this.env.CORPUSWIRE_SYNC_BOOTSTRAP_CHECK, false)) {
+      if (this.activeBootstrapCheck || !this.bootstrapStatus.checkedAt) {
+        return false;
+      }
+    }
+    return this.bootstrapStatus.state !== "error" && this.bootstrapStatus.needsReconcile !== true;
+  }
+
+  async probePaths(args = {}) {
+    if (!this.isEnabled()) {
+      return {
+        enabled: false,
+        reason: "Set CORPUSWIRE_SYNC_ENABLED=true to enable sync path probing.",
+        results: [],
+        status: this.snapshot(),
+      };
+    }
+
+    const context = this.resolveContext(args);
+    const paths = optionalStringArray(args, "paths", "changedPaths", "changed_paths");
+    if (paths.length === 0) {
+      throw new JsonRpcError(-32602, "Invalid params: paths must contain at least one path.");
+    }
+
+    const maxPaths = Math.min(optionalPositiveInteger(args.maxPaths ?? args.max_paths, 100), 500);
+    const includeHash = optionalBoolean(args.includeHash ?? args.include_hash, false);
+    const maxFileSizeBytes = optionalPositiveInteger(
+      this.env.CORPUSWIRE_SYNC_MAX_FILE_SIZE_BYTES,
+      DEFAULT_SYNC_MAX_FILE_SIZE_BYTES,
+    );
+    const selectedPaths = paths.slice(0, maxPaths);
+    const results = [];
+    for (const rawPath of selectedPaths) {
+      results.push(await this.probePath(rawPath, context, { includeHash, maxFileSizeBytes }));
+    }
+
+    return {
+      enabled: true,
+      sourceRoot: context.sourceRoot,
+      workspaceId: context.workspaceId,
+      requestedPaths: paths.length,
+      probedPaths: selectedPaths.length,
+      truncated: paths.length > selectedPaths.length,
+      includeHash,
+      maxFileSizeBytes,
+      results,
+      status: this.snapshot(),
+    };
+  }
+
+  async probePath(rawPath, context, { includeHash, maxFileSizeBytes }) {
+    const classified = this.classifyPath(rawPath, context);
+    const result = {
+      rawPath,
+      relativePath: classified.relativePath ?? null,
+      pathAccepted: classified.accepted,
+      decision: classified.accepted ? "stat_pending" : "skipped",
+      reason: classified.reason,
+    };
+    if (!classified.accepted) {
+      return result;
+    }
+
+    try {
+      const fileStat = await stat(classified.absolutePath);
+      const mtimeNs = Math.trunc(fileStat.mtimeMs * 1_000_000);
+      Object.assign(result, {
+        exists: true,
+        isFile: fileStat.isFile(),
+        sizeBytes: fileStat.size,
+        mtimeNs,
+      });
+      if (!fileStat.isFile()) {
+        return { ...result, decision: "skipped", reason: "not_file" };
+      }
+      if (fileStat.size > maxFileSizeBytes) {
+        return { ...result, decision: "skipped", reason: "too_large" };
+      }
+      if (includeHash) {
+        const content = await readFile(classified.absolutePath);
+        result.sha256 = createHash("sha256").update(content).digest("hex");
+      }
+      return { ...result, decision: "upload_candidate", reason: "accepted" };
+    } catch (error) {
+      if (isMissingFileError(error)) {
+        return { ...result, exists: false, decision: "delete_candidate", reason: "missing_file" };
+      }
+      throw error;
+    }
   }
 
   async addDelta(args) {
@@ -193,29 +355,64 @@ class SyncManager {
     const acceptedChanged = [];
     const acceptedDeleted = [];
     const skipped = [];
+    const eventSource = optionalString(args.eventSource ?? args.event_source) ?? "delta";
 
     this.ensurePendingContext(context);
 
     for (const rawPath of changedPaths) {
-      const normalized = this.normalizePath(rawPath, context);
-      if (normalized === null) {
+      const normalized = this.classifyPath(rawPath, context);
+      if (!normalized.accepted) {
         skipped.push(rawPath);
+        this.recordSyncEvent({
+          source: eventSource,
+          eventType: "changed",
+          rawPath,
+          relativePath: normalized.relativePath,
+          decision: "skipped",
+          reason: normalized.reason,
+        });
         continue;
       }
       this.pendingChangedPaths.set(normalized.relativePath, normalized.absolutePath);
       this.pendingDeletedPaths.delete(normalized.relativePath);
       acceptedChanged.push(normalized.relativePath);
+      this.markQueueNonEmpty();
+      this.recordSyncEvent({
+        source: eventSource,
+        eventType: "changed",
+        rawPath,
+        relativePath: normalized.relativePath,
+        decision: "accepted",
+        reason: "accepted",
+      });
     }
 
     for (const rawPath of deletedPaths) {
-      const normalized = this.normalizePath(rawPath, context);
-      if (normalized === null) {
+      const normalized = this.classifyPath(rawPath, context);
+      if (!normalized.accepted) {
         skipped.push(rawPath);
+        this.recordSyncEvent({
+          source: eventSource,
+          eventType: "deleted",
+          rawPath,
+          relativePath: normalized.relativePath,
+          decision: "skipped",
+          reason: normalized.reason,
+        });
         continue;
       }
       this.pendingChangedPaths.delete(normalized.relativePath);
       this.pendingDeletedPaths.add(normalized.relativePath);
       acceptedDeleted.push(normalized.relativePath);
+      this.markQueueNonEmpty();
+      this.recordSyncEvent({
+        source: eventSource,
+        eventType: "deleted",
+        rawPath,
+        relativePath: normalized.relativePath,
+        decision: "accepted",
+        reason: "accepted",
+      });
     }
 
     const shouldFlush = optionalBoolean(args.flush, false);
@@ -281,10 +478,10 @@ class SyncManager {
 
   async flushBeforeRead() {
     if (!this.isEnabled() || !optionalBoolean(this.env.CORPUSWIRE_SYNC_FLUSH_BEFORE_READ, true)) {
-      return;
+      return null;
     }
     try {
-      await this.flushAll({
+      return await this.flushAll({
         maxWaitMs: optionalPositiveInteger(
           this.env.CORPUSWIRE_SYNC_READ_FLUSH_TIMEOUT_MS,
           DEFAULT_SYNC_READ_FLUSH_TIMEOUT_MS,
@@ -292,7 +489,88 @@ class SyncManager {
       });
     } catch (error) {
       this.recordError(error);
+      return {
+        enabled: true,
+        flushed: false,
+        error: error instanceof Error ? error.message : String(error),
+        status: this.snapshot(),
+      };
     }
+  }
+
+  async prepareForRead(args = {}) {
+    if (!this.isEnabled()) {
+      return {
+        enabled: false,
+        freshness: this.readFreshnessStatus(),
+      };
+    }
+
+    const flush = await this.flushBeforeRead();
+    let gitDelta = null;
+    if (optionalBoolean(this.env.CORPUSWIRE_SYNC_GIT_DELTA_BEFORE_READ, false)) {
+      gitDelta = await this.gitDeltaExplicit({
+        sourceRoot: args.sourceRoot ?? args.source_root,
+        workspaceId: args.workspaceId ?? args.workspace_id,
+        repoPath: args.repoPath ?? args.repo_path,
+        includeGlobs: args.includeGlobs ?? args.include_globs,
+        excludeGlobs: args.excludeGlobs ?? args.exclude_globs,
+        flush: true,
+        maxWaitMs: optionalPositiveInteger(
+          this.env.CORPUSWIRE_SYNC_READ_GIT_TIMEOUT_MS ?? this.env.CORPUSWIRE_SYNC_GIT_TIMEOUT_MS,
+          DEFAULT_SYNC_GIT_TIMEOUT_MS,
+        ),
+        flushMaxWaitMs: optionalPositiveInteger(
+          this.env.CORPUSWIRE_SYNC_READ_FLUSH_TIMEOUT_MS,
+          DEFAULT_SYNC_READ_FLUSH_TIMEOUT_MS,
+        ),
+      });
+    }
+    if (optionalBoolean(this.env.CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK, false)) {
+      const maxWaitMs = optionalPositiveInteger(
+        this.env.CORPUSWIRE_SYNC_READ_FRESHNESS_TIMEOUT_MS ?? this.env.CORPUSWIRE_SYNC_BOOTSTRAP_TIMEOUT_MS,
+        DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS,
+      );
+      const checked = await awaitWithTimeout(this.refreshBootstrapStatus(args), maxWaitMs);
+      if (checked.timedOut) {
+        this.recordBootstrapStatus(bootstrapStatusForTimeout(maxWaitMs));
+      }
+    }
+
+    const freshness = this.readFreshnessStatus();
+    if (freshness.strictBlocked) {
+      throw new Error(`Read-side freshness strict mode blocked retrieval: ${freshness.reason}`);
+    }
+    return {
+      enabled: true,
+      flush,
+      gitDelta,
+      freshness,
+      status: this.snapshot(),
+    };
+  }
+
+  readFreshnessStatus() {
+    const strict = optionalBoolean(this.env.CORPUSWIRE_SYNC_READ_STRICT, false);
+    const staleAfterMs = optionalNonNegativeInteger(
+      this.env.CORPUSWIRE_SYNC_READ_STRICT_STALE_AFTER_MS,
+      0,
+    );
+    const checkedAt = this.bootstrapStatus.checkedAt;
+    const checkedAtMs = checkedAt ? Date.parse(checkedAt) : NaN;
+    const freshnessAgeMs = Number.isFinite(checkedAtMs) ? Math.max(0, Date.now() - checkedAtMs) : null;
+    const isStaleForStrict = this.bootstrapStatus.needsReconcile === true
+      && (staleAfterMs === 0 || (freshnessAgeMs !== null && freshnessAgeMs >= staleAfterMs));
+    return {
+      state: this.bootstrapStatus.state,
+      needsReconcile: this.bootstrapStatus.needsReconcile,
+      checkedAt,
+      ageMs: freshnessAgeMs,
+      reason: this.bootstrapStatus.reason,
+      strict,
+      strictStaleAfterMs: staleAfterMs,
+      strictBlocked: strict && isStaleForStrict,
+    };
   }
 
   async reconcileExplicit(args = {}) {
@@ -325,6 +603,178 @@ class SyncManager {
     };
   }
 
+  async gitDeltaExplicit(args = {}) {
+    if (!this.isEnabled()) {
+      return {
+        enabled: false,
+        reason: "Set CORPUSWIRE_SYNC_ENABLED=true to enable git delta reconciliation.",
+        status: this.snapshot(),
+      };
+    }
+
+    const maxWaitMs = optionalPositiveInteger(
+      args.maxWaitMs ?? args.max_wait_ms ?? this.env.CORPUSWIRE_SYNC_GIT_TIMEOUT_MS,
+      DEFAULT_SYNC_GIT_TIMEOUT_MS,
+    );
+    if (!this.activeGitDelta) {
+      this.activeGitDelta = this.runGitDelta(args)
+        .catch((error) => {
+          this.recordError(error, "git");
+          return {
+            enabled: true,
+            scanned: false,
+            error: error instanceof Error ? error.message : String(error),
+            status: this.snapshot(),
+          };
+        })
+        .finally(() => {
+          this.activeGitDelta = null;
+        });
+    }
+
+    const waited = await awaitWithTimeout(this.activeGitDelta, maxWaitMs);
+    if (waited.timedOut) {
+      return {
+        enabled: true,
+        scanned: false,
+        timedOut: true,
+        status: this.snapshot(),
+      };
+    }
+    return waited.value;
+  }
+
+  async runGitDelta(args = {}) {
+    const startedAt = Date.now();
+    this.lastGitScanStartedAt = new Date(startedAt).toISOString();
+    const context = this.resolveContext(args);
+    const maxFiles = optionalPositiveInteger(
+      args.maxFiles ?? args.max_files ?? this.env.CORPUSWIRE_SYNC_GIT_MAX_FILES,
+      DEFAULT_SYNC_GIT_MAX_FILES,
+    );
+    const entries = await this.collectGitStatusEntries(context, {
+      maxFiles,
+      timeoutMs: optionalPositiveInteger(
+        args.gitTimeoutMs ?? args.git_timeout_ms ?? this.env.CORPUSWIRE_SYNC_GIT_TIMEOUT_MS,
+        DEFAULT_SYNC_GIT_TIMEOUT_MS,
+      ),
+      maxStatusBytes: optionalPositiveInteger(
+        args.maxStatusBytes ?? args.max_status_bytes ?? this.env.CORPUSWIRE_SYNC_GIT_MAX_STATUS_BYTES,
+        DEFAULT_SYNC_GIT_MAX_STATUS_BYTES,
+      ),
+    });
+    const delta = gitStatusEntriesToDelta(entries);
+    const metadata = await this.readGitMetadata(context.sourceRoot);
+    this.lastGitHead = metadata.git_head ?? null;
+    this.lastGitBranch = metadata.git_branch ?? null;
+    this.lastGitDeltaCounts = {
+      statusEntries: entries.length,
+      changed: delta.changedPaths.length,
+      deleted: delta.deletedPaths.length,
+      renamed: delta.renamed,
+      copied: delta.copied,
+      untracked: delta.untracked,
+    };
+    this.lastGitScanFinishedAt = new Date().toISOString();
+    this.lastGitScanDurationMs = Date.now() - startedAt;
+
+    const sync = await this.addDelta({
+      sourceRoot: context.sourceRoot,
+      workspaceId: context.workspaceId,
+      includeGlobs: context.includeGlobs,
+      excludeGlobs: context.excludeGlobs,
+      changedPaths: delta.changedPaths,
+      deletedPaths: delta.deletedPaths,
+      flush: optionalBoolean(args.flush, false),
+      maxWaitMs: optionalPositiveInteger(args.flushMaxWaitMs ?? args.maxWaitMs, DEFAULT_SYNC_FLUSH_TIMEOUT_MS),
+      eventSource: "git",
+    });
+
+    return {
+      enabled: true,
+      scanned: true,
+      timedOut: false,
+      git: {
+        statusEntries: entries.length,
+        changedPaths: delta.changedPaths,
+        deletedPaths: delta.deletedPaths,
+        renamed: delta.renamed,
+        copied: delta.copied,
+        untracked: delta.untracked,
+        head: this.lastGitHead,
+        branch: this.lastGitBranch,
+      },
+      sync,
+      status: this.snapshot(),
+    };
+  }
+
+  async bootstrapExplicit(args = {}) {
+    if (!this.isEnabled()) {
+      return {
+        enabled: false,
+        checked: false,
+        reason: "Set CORPUSWIRE_SYNC_ENABLED=true to enable bootstrap freshness checks.",
+        bootstrap: this.bootstrapStatus,
+        status: this.snapshot(),
+      };
+    }
+
+    const maxWaitMs = optionalPositiveInteger(
+      args.maxWaitMs ?? args.max_wait_ms ?? this.env.CORPUSWIRE_SYNC_BOOTSTRAP_TIMEOUT_MS,
+      DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS,
+    );
+    const checked = await awaitWithTimeout(this.refreshBootstrapStatus(args), maxWaitMs);
+    if (checked.timedOut) {
+      this.recordBootstrapStatus(bootstrapStatusForTimeout(maxWaitMs));
+      return {
+        enabled: true,
+        checked: false,
+        timedOut: true,
+        reconciled: false,
+        bootstrap: this.bootstrapStatus,
+        status: this.snapshot(),
+      };
+    }
+
+    let reconcileResult = null;
+    if (optionalBoolean(args.reconcile ?? args.runReconcile ?? args.run_reconcile, false)) {
+      reconcileResult = await this.reconcileExplicit(args);
+      const refreshed = await awaitWithTimeout(this.refreshBootstrapStatus(args), maxWaitMs);
+      if (refreshed.timedOut) {
+        this.recordBootstrapStatus(bootstrapStatusForTimeout(maxWaitMs));
+      }
+    }
+
+    return {
+      enabled: true,
+      checked: true,
+      timedOut: false,
+      reconciled: reconcileResult?.reconciled ?? false,
+      bootstrap: this.bootstrapStatus,
+      reconcile: reconcileResult?.reconcile,
+      status: this.snapshot(),
+    };
+  }
+
+  async refreshBootstrapStatus(args = {}) {
+    const context = this.resolveContext(args);
+    const repoPath = firstNonEmptyString(
+      args.repoPath,
+      args.repo_path,
+      this.env.CORPUSWIRE_REPO_PATH,
+      context.sourceRoot,
+    );
+    const workspaceId = firstNonEmptyString(args.workspaceId, args.workspace_id, context.workspaceId);
+    const client = buildClient();
+    const diagnosis = typeof client.diagnoseWorkspace === "function"
+      ? await client.diagnoseWorkspace({ repoPath, workspaceId })
+      : diagnosisFromHealth(await client.health({ repoPath, workspaceId }), { repoPath, workspaceId });
+    const bootstrapStatus = bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId });
+    this.recordBootstrapStatus(bootstrapStatus);
+    return bootstrapStatus;
+  }
+
   async reconcileAll(args = {}) {
     if (this.activeReconcile) {
       return this.activeReconcile;
@@ -333,7 +783,7 @@ class SyncManager {
     const context = this.resolveContext(args);
     this.activeReconcile = this.runReconcile(context, args)
       .catch((error) => {
-        this.recordError(error);
+        this.recordError(error, "reconcile");
         this.lastReconcileFinishedAt = new Date().toISOString();
         return {
           ok: false,
@@ -456,24 +906,43 @@ class SyncManager {
   }
 
   async runBatch(batch) {
-    this.lastFlushStartedAt = new Date().toISOString();
+    const startedAt = Date.now();
+    this.lastFlushStartedAt = new Date(startedAt).toISOString();
     const files = [];
+    const cacheEntries = [];
     const deletedPaths = new Set(batch.deletedPaths);
     const skippedPaths = [];
 
     for (const entry of batch.changedPaths) {
       try {
-        const remoteFile = await this.readRemoteFile(entry);
+        const remoteFile = await this.readRemoteFile(entry, batch, { useCache: true });
         if (remoteFile.file) {
           files.push(remoteFile.file);
+          if (remoteFile.cacheEntry) {
+            cacheEntries.push(remoteFile.cacheEntry);
+          }
         } else if (remoteFile.deleted) {
           deletedPaths.add(entry.relativePath);
         } else {
           skippedPaths.push(entry.relativePath);
+          this.recordSyncEvent({
+            source: "flush",
+            eventType: "changed",
+            relativePath: entry.relativePath,
+            decision: "skipped",
+            reason: remoteFile.reason ?? "not_indexable_file",
+          });
         }
       } catch (error) {
         if (isMissingFileError(error)) {
           deletedPaths.add(entry.relativePath);
+          this.recordSyncEvent({
+            source: "flush",
+            eventType: "deleted",
+            relativePath: entry.relativePath,
+            decision: "accepted",
+            reason: "missing_file",
+          });
         } else {
           throw error;
         }
@@ -489,8 +958,9 @@ class SyncManager {
         filesDeleted: 0,
         filesSkipped: skippedPaths.length,
         skippedPaths,
+        durationMs: Date.now() - startedAt,
       };
-      this.recordResult(result);
+      this.recordResult(result, "flush");
       return result;
     }
 
@@ -499,7 +969,8 @@ class SyncManager {
       throw new Error("@corpuswire/sdk does not expose indexWorkspace; update the SDK before enabling sync.");
     }
 
-    const response = await client.indexWorkspace({
+    const gitMetadata = await this.readGitMetadata(batch.sourceRoot);
+    const response = await this.indexWorkspaceWithSessionConflictRetry(client, {
       workspace: {
         workspaceId: batch.workspaceId,
         displayRoot: batch.sourceRoot,
@@ -510,7 +981,9 @@ class SyncManager {
         name: SERVER_NAME,
         transport: "codex-mcp",
         sourceRoot: batch.sourceRoot,
-        indexed_commit: optionalString(this.env.CORPUSWIRE_SYNC_INDEXED_COMMIT),
+        indexed_commit: optionalString(this.env.CORPUSWIRE_SYNC_INDEXED_COMMIT) ?? gitMetadata.git_head,
+        git_head: gitMetadata.git_head,
+        git_branch: gitMetadata.git_branch,
       }),
       maxConcurrentUploads: optionalPositiveInteger(
         this.env.CORPUSWIRE_SYNC_MAX_CONCURRENT_UPLOADS,
@@ -523,7 +996,9 @@ class SyncManager {
       ),
       files,
       deletedPaths: [...deletedPaths].sort(),
-    });
+    }, { operation: "flush" });
+
+    await this.applySyncCacheUploadResult(batch, cacheEntries, deletedPaths, response);
 
     const result = {
       ok: true,
@@ -534,13 +1009,15 @@ class SyncManager {
       filesSkipped: skippedPaths.length,
       skippedPaths,
       response,
+      durationMs: Date.now() - startedAt,
     };
-    this.recordResult(result);
+    this.recordResult(result, "flush");
     return result;
   }
 
   async runReconcile(context, args) {
-    this.lastReconcileStartedAt = new Date().toISOString();
+    const startedAt = Date.now();
+    this.lastReconcileStartedAt = new Date(startedAt).toISOString();
     await this.flushAll({ maxWaitMs: optionalPositiveInteger(args.flushMaxWaitMs, DEFAULT_SYNC_FLUSH_TIMEOUT_MS) });
 
     const maxFiles = optionalPositiveInteger(
@@ -552,11 +1029,18 @@ class SyncManager {
     const skippedPaths = [];
     for (const entry of changedPaths) {
       try {
-        const remoteFile = await this.readRemoteFile(entry);
+        const remoteFile = await this.readRemoteFile(entry, context, { useCache: false });
         if (remoteFile.file) {
           files.push(remoteFile.file);
         } else {
           skippedPaths.push(entry.relativePath);
+          this.recordSyncEvent({
+            source: "reconcile",
+            eventType: "changed",
+            relativePath: entry.relativePath,
+            decision: "skipped",
+            reason: remoteFile.reason ?? "not_indexable_file",
+          });
         }
       } catch (error) {
         if (!isMissingFileError(error)) {
@@ -570,7 +1054,8 @@ class SyncManager {
       throw new Error("@corpuswire/sdk does not expose indexWorkspace; update the SDK before enabling reconciliation.");
     }
 
-    const response = await client.indexWorkspace({
+    const gitMetadata = await this.readGitMetadata(context.sourceRoot);
+    const response = await this.indexWorkspaceWithSessionConflictRetry(client, {
       workspace: {
         workspaceId: context.workspaceId,
         displayRoot: context.sourceRoot,
@@ -581,7 +1066,9 @@ class SyncManager {
         name: SERVER_NAME,
         transport: "codex-mcp-reconcile",
         sourceRoot: context.sourceRoot,
-        indexed_commit: optionalString(this.env.CORPUSWIRE_SYNC_INDEXED_COMMIT),
+        indexed_commit: optionalString(this.env.CORPUSWIRE_SYNC_INDEXED_COMMIT) ?? gitMetadata.git_head,
+        git_head: gitMetadata.git_head,
+        git_branch: gitMetadata.git_branch,
       }),
       maxConcurrentUploads: optionalPositiveInteger(
         this.env.CORPUSWIRE_SYNC_MAX_CONCURRENT_UPLOADS,
@@ -594,7 +1081,7 @@ class SyncManager {
       ),
       files,
       deletedPaths: [],
-    });
+    }, { operation: "reconcile" });
 
     const result = {
       ok: true,
@@ -606,16 +1093,16 @@ class SyncManager {
       filesSkipped: skippedPaths.length,
       skippedPaths,
       response,
+      durationMs: Date.now() - startedAt,
     };
-    this.recordResult(result);
-    this.lastReconcileFinishedAt = new Date().toISOString();
+    this.recordResult(result, "reconcile");
     return result;
   }
 
-  async readRemoteFile(entry) {
+  async readRemoteFile(entry, context, { useCache = false } = {}) {
     const fileStat = await stat(entry.absolutePath);
     if (!fileStat.isFile()) {
-      return { skipped: true };
+      return { skipped: true, reason: "not_file" };
     }
 
     const maxFileSizeBytes = optionalPositiveInteger(
@@ -623,18 +1110,269 @@ class SyncManager {
       DEFAULT_SYNC_MAX_FILE_SIZE_BYTES,
     );
     if (fileStat.size > maxFileSizeBytes) {
-      return { skipped: true };
+      return { skipped: true, reason: "too_large" };
+    }
+
+    const mtimeNs = Math.trunc(fileStat.mtimeMs * 1_000_000);
+    const cached = useCache ? await this.findUsableCacheEntry(context, entry, fileStat, mtimeNs) : null;
+    if (cached?.skipReason) {
+      return { skipped: true, reason: cached.skipReason, cacheHit: true };
     }
 
     const content = await readFile(entry.absolutePath);
+    const sha256 = createHash("sha256").update(content).digest("hex");
+    if (cached?.cacheState && cached?.entry && cached.entry.sha256 === sha256) {
+      await this.updateSyncCacheEntry(cached.cacheState, {
+        relativePath: entry.relativePath,
+        size: fileStat.size,
+        mtimeNs,
+        sha256,
+        lastDecision: "unchanged_hash",
+      });
+      this.recordCacheDecision("unchanged_hash");
+      this.recordSyncEvent({
+        source: "cache",
+        eventType: "changed",
+        relativePath: entry.relativePath,
+        decision: "skipped",
+        reason: "unchanged_hash",
+      });
+      return { skipped: true, reason: "unchanged_hash", cacheHit: true };
+    }
+
+    this.recordCacheDecision(useCache ? "miss" : "disabled");
     return {
       file: {
         relativePath: entry.relativePath,
         content,
-        sha256: createHash("sha256").update(content).digest("hex"),
-        mtimeNs: Math.trunc(fileStat.mtimeMs * 1_000_000),
+        sha256,
+        mtimeNs,
+      },
+      cacheEntry: {
+        relativePath: entry.relativePath,
+        size: fileStat.size,
+        mtimeNs,
+        sha256,
       },
     };
+  }
+
+  async indexWorkspaceWithSessionConflictRetry(client, request, { operation }) {
+    const retryAttempts = optionalNonNegativeInteger(
+      this.env.CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_ATTEMPTS,
+      DEFAULT_SYNC_SESSION_CONFLICT_RETRY_ATTEMPTS,
+    );
+    const baseDelayMs = optionalNonNegativeInteger(
+      this.env.CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_DELAY_MS,
+      DEFAULT_SYNC_SESSION_CONFLICT_RETRY_DELAY_MS,
+    );
+    const maxDelayMs = optionalPositiveInteger(
+      this.env.CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_MAX_DELAY_MS,
+      DEFAULT_SYNC_SESSION_CONFLICT_RETRY_MAX_DELAY_MS,
+    );
+
+    for (let conflictAttempt = 0; ; conflictAttempt += 1) {
+      try {
+        return await client.indexWorkspace(request);
+      } catch (error) {
+        if (!isActiveSessionConflictError(error)) {
+          throw error;
+        }
+        if (conflictAttempt >= retryAttempts) {
+          this.recordSessionConflict(error, {
+            operation,
+            attempt: conflictAttempt + 1,
+            delayMs: 0,
+            exhausted: true,
+          });
+          throw error;
+        }
+
+        const retryDelayMs = calculateSessionConflictRetryDelayMs(error, {
+          attempt: conflictAttempt,
+          baseDelayMs,
+          maxDelayMs,
+        });
+        this.recordSessionConflict(error, {
+          operation,
+          attempt: conflictAttempt + 1,
+          delayMs: retryDelayMs,
+          exhausted: false,
+        });
+        await sleepMs(retryDelayMs);
+      }
+    }
+  }
+
+  async findUsableCacheEntry(context, entry, fileStat, mtimeNs) {
+    if (!this.isCacheUsable()) {
+      this.recordCacheDecision(this.isCacheEnabled() ? "unusable" : "disabled");
+      return null;
+    }
+    const cacheState = await this.loadSyncCache(context);
+    const cachedEntry = asRecord(cacheState.data.entries?.[entry.relativePath]);
+    if (!cachedEntry.sha256) {
+      this.recordCacheDecision("miss");
+      return { cacheState, entry: null };
+    }
+    if (cachedEntry.size === fileStat.size && cachedEntry.mtimeNs === mtimeNs) {
+      this.recordCacheDecision("unchanged_mtime_size");
+      this.recordSyncEvent({
+        source: "cache",
+        eventType: "changed",
+        relativePath: entry.relativePath,
+        decision: "skipped",
+        reason: "unchanged_mtime_size",
+      });
+      return { cacheState, entry: cachedEntry, skipReason: "unchanged_mtime_size" };
+    }
+    return { cacheState, entry: cachedEntry };
+  }
+
+  async applySyncCacheUploadResult(context, cacheEntries, deletedPaths, response) {
+    if (!this.isCacheEnabled()) {
+      return;
+    }
+    let cacheState;
+    try {
+      cacheState = await this.loadSyncCache(context);
+      const manifestRevision = asRecord(asRecord(response).status).manifest_revision;
+      const uploadedAt = new Date().toISOString();
+      for (const entry of cacheEntries) {
+        cacheState.data.entries[entry.relativePath] = removeUndefinedValues({
+          size: entry.size,
+          mtimeNs: entry.mtimeNs,
+          sha256: entry.sha256,
+          lastUploadedAt: uploadedAt,
+          manifestRevision,
+          lastDecision: "uploaded",
+          lastError: null,
+        });
+        this.recordCacheDecision("updated");
+      }
+      for (const relativePath of deletedPaths) {
+        if (cacheState.data.entries[relativePath]) {
+          delete cacheState.data.entries[relativePath];
+          this.recordCacheDecision("deleted");
+        }
+      }
+      await this.saveSyncCache(cacheState);
+    } catch (error) {
+      this.recordError(error, "cache");
+    }
+  }
+
+  async updateSyncCacheEntry(cacheState, entry) {
+    try {
+      cacheState.data.entries[entry.relativePath] = {
+        ...asRecord(cacheState.data.entries[entry.relativePath]),
+        size: entry.size,
+        mtimeNs: entry.mtimeNs,
+        sha256: entry.sha256,
+        lastCheckedAt: new Date().toISOString(),
+        lastDecision: entry.lastDecision,
+        lastError: null,
+      };
+      await this.saveSyncCache(cacheState);
+    } catch (error) {
+      this.recordError(error, "cache");
+    }
+  }
+
+  async loadSyncCache(context) {
+    const key = syncContextKey(context);
+    const cachePath = this.syncCachePath(context, key);
+    if (this.cacheState?.key === key && this.cacheState?.path === cachePath) {
+      return this.cacheState;
+    }
+
+    let data = null;
+    try {
+      const raw = await readFile(cachePath, "utf8");
+      const parsed = JSON.parse(raw);
+      if (isRecord(parsed)
+        && parsed.schemaVersion === DEFAULT_SYNC_CACHE_SCHEMA_VERSION
+        && parsed.contextKey === key
+        && isRecord(parsed.entries)) {
+        data = parsed;
+      }
+    } catch (error) {
+      if (!isMissingFileError(error)) {
+        this.recordError(error, "cache");
+      }
+    }
+
+    const now = new Date().toISOString();
+    this.cacheState = {
+      key,
+      path: cachePath,
+      loadedAt: now,
+      updatedAt: data?.updatedAt ?? null,
+      data: data ?? {
+        schemaVersion: DEFAULT_SYNC_CACHE_SCHEMA_VERSION,
+        contextKey: key,
+        workspaceId: context.workspaceId,
+        sourceRoot: context.sourceRoot,
+        includeGlobs: context.includeGlobs ?? [],
+        excludeGlobs: context.excludeGlobs ?? [],
+        createdAt: now,
+        updatedAt: null,
+        entries: {},
+      },
+    };
+    return this.cacheState;
+  }
+
+  async saveSyncCache(cacheState) {
+    const now = new Date().toISOString();
+    cacheState.data.updatedAt = now;
+    cacheState.updatedAt = now;
+    await mkdir(path.dirname(cacheState.path), { recursive: true });
+    const temporaryPath = `${cacheState.path}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(temporaryPath, `${JSON.stringify(cacheState.data, null, 2)}\n`, "utf8");
+    await rename(temporaryPath, cacheState.path);
+  }
+
+  syncCachePath(context, key = syncContextKey(context)) {
+    const configuredStateDir = firstNonEmptyString(
+      this.env.CORPUSWIRE_SYNC_STATE_DIR,
+      this.env.CORPUSWIRE_STATE_DIR,
+    );
+    const baseDir = configuredStateDir
+      ?? path.join(this.env.XDG_CACHE_HOME ?? path.join(homedir(), ".cache"), "corpuswire", "mcp-sync");
+    const cacheName = createHash("sha256").update(key).digest("hex").slice(0, 24);
+    return path.join(baseDir, `${cacheName}.json`);
+  }
+
+  async collectGitStatusEntries(context, { maxFiles, timeoutMs, maxStatusBytes }) {
+    const stdout = await runGit(context.sourceRoot, [
+      "status",
+      "--porcelain=v1",
+      "-z",
+      "--untracked-files=all",
+      "--ignored=no",
+    ], { timeoutMs, maxBuffer: maxStatusBytes });
+    const entries = parseGitStatusPorcelainZ(stdout);
+    if (entries.length > maxFiles) {
+      throw new Error(`Git delta scan found ${entries.length} path entries, above maxFiles ${maxFiles}. Increase CORPUSWIRE_SYNC_GIT_MAX_FILES or run a scoped sync.`);
+    }
+    return entries;
+  }
+
+  async readGitMetadata(sourceRoot) {
+    const timeoutMs = optionalPositiveInteger(
+      this.env.CORPUSWIRE_SYNC_GIT_TIMEOUT_MS,
+      DEFAULT_SYNC_GIT_TIMEOUT_MS,
+    );
+    const maxBuffer = DEFAULT_SYNC_GIT_MAX_STATUS_BYTES;
+    const [head, branch] = await Promise.all([
+      runGit(sourceRoot, ["rev-parse", "HEAD"], { timeoutMs, maxBuffer }).catch(() => ""),
+      runGit(sourceRoot, ["rev-parse", "--abbrev-ref", "HEAD"], { timeoutMs, maxBuffer }).catch(() => ""),
+    ]);
+    return removeUndefinedValues({
+      git_head: optionalString(head),
+      git_branch: optionalString(branch) && branch.trim() !== "HEAD" ? branch.trim() : undefined,
+    });
   }
 
   async collectWorkspaceFileEntries(context, maxFiles) {
@@ -717,22 +1455,42 @@ class SyncManager {
     this.pendingContext = { ...context, key };
   }
 
-  normalizePath(rawPath, context) {
+  classifyPath(rawPath, context) {
     if (typeof rawPath !== "string" || !rawPath.trim()) {
-      return null;
+      return {
+        accepted: false,
+        reason: "empty_path",
+        rawPath: typeof rawPath === "string" ? rawPath : String(rawPath),
+      };
     }
     const absolutePath = path.isAbsolute(rawPath)
       ? path.resolve(rawPath)
       : path.resolve(context.sourceRoot, rawPath);
     const relativePath = path.relative(context.sourceRoot, absolutePath);
     if (!relativePath || relativePath === "." || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
-      throw new JsonRpcError(-32602, `Path is outside sourceRoot: ${rawPath}`);
+      return {
+        accepted: false,
+        reason: "outside_source_root",
+        rawPath,
+      };
     }
     const posixRelativePath = relativePath.split(path.sep).join("/");
-    if (!isSyncIndexableRelativePath(posixRelativePath, context)) {
-      return null;
+    const classification = classifySyncRelativePath(posixRelativePath, context);
+    if (!classification.accepted) {
+      return {
+        accepted: false,
+        reason: classification.reason,
+        rawPath,
+        relativePath: posixRelativePath,
+      };
     }
-    return { absolutePath, relativePath: posixRelativePath };
+    return {
+      accepted: true,
+      reason: "accepted",
+      rawPath,
+      absolutePath,
+      relativePath: posixRelativePath,
+    };
   }
 
   requeueBatch(batch) {
@@ -751,11 +1509,13 @@ class SyncManager {
     for (const { relativePath, absolutePath } of batch.changedPaths) {
       if (!this.pendingChangedPaths.has(relativePath) && !this.pendingDeletedPaths.has(relativePath)) {
         this.pendingChangedPaths.set(relativePath, absolutePath);
+        this.markQueueNonEmpty();
       }
     }
     for (const relativePath of batch.deletedPaths) {
       if (!this.pendingChangedPaths.has(relativePath) && !this.pendingDeletedPaths.has(relativePath)) {
         this.pendingDeletedPaths.add(relativePath);
+        this.markQueueNonEmpty();
       }
     }
   }
@@ -788,6 +1548,9 @@ class SyncManager {
     this.pendingChangedPaths.clear();
     this.pendingDeletedPaths.clear();
     this.pendingContext = null;
+    if (!this.hasPending()) {
+      this.firstQueuedAt = null;
+    }
 
     return {
       sourceRoot: context.sourceRoot,
@@ -799,41 +1562,195 @@ class SyncManager {
     };
   }
 
-  requeueBatch(batch) {
-    this.pendingRetryBatches.unshift(batch);
-  }
-
-  recordResult(result) {
+  recordResult(result, operation = "flush") {
     this.lastResult = result;
     this.lastError = null;
-    this.lastFlushFinishedAt = new Date().toISOString();
+    const finishedAt = new Date().toISOString();
+    if (operation === "reconcile") {
+      this.lastReconcileFinishedAt = finishedAt;
+      this.lastReconcileDurationMs = Number.isInteger(result.durationMs) ? result.durationMs : null;
+    } else {
+      this.lastFlushFinishedAt = finishedAt;
+      this.lastFlushDurationMs = Number.isInteger(result.durationMs) ? result.durationMs : null;
+      if (Number.isInteger(result.durationMs)) {
+        this.flushDurationSamplesMs.push(result.durationMs);
+        if (this.flushDurationSamplesMs.length > DEFAULT_SYNC_LATENCY_SAMPLE_LIMIT) {
+          this.flushDurationSamplesMs.shift();
+        }
+      }
+    }
   }
 
-  recordError(error) {
+  recordError(error, operation = "flush") {
     this.lastError = error instanceof Error ? error.message : String(error);
-    this.lastFlushFinishedAt = new Date().toISOString();
+    const finishedAt = new Date().toISOString();
+    if (operation === "reconcile") {
+      this.lastReconcileFinishedAt = finishedAt;
+    } else if (operation === "bootstrap") {
+      this.bootstrapStatus = {
+        ...this.bootstrapStatus,
+        state: "error",
+        checkedAt: finishedAt,
+        reason: this.lastError,
+        lastError: this.lastError,
+      };
+    } else if (operation === "cache") {
+      // Cache failures should be visible but must not rewrite flush/reconcile timing.
+    } else if (operation === "git") {
+      this.lastGitScanFinishedAt = finishedAt;
+    } else {
+      this.lastFlushFinishedAt = finishedAt;
+    }
+  }
+
+  recordBootstrapStatus(status) {
+    this.bootstrapStatus = {
+      ...initialBootstrapStatus(),
+      ...status,
+    };
+  }
+
+  recordCacheDecision(reason) {
+    this.cacheDecisionCounts[reason] = (this.cacheDecisionCounts[reason] ?? 0) + 1;
+  }
+
+  recordSessionConflict(error, { operation, attempt, delayMs, exhausted }) {
+    const message = errorMessage(error);
+    this.lastSessionConflictAt = new Date().toISOString();
+    this.lastSessionConflictOperation = operation;
+    this.lastSessionConflictAttempt = attempt;
+    this.lastSessionConflictRetryDelayMs = delayMs;
+    this.lastSessionConflictMessage = message;
+    if (exhausted) {
+      this.sessionConflictRetryCounts.exhausted += 1;
+    } else {
+      this.sessionConflictRetryCounts.retries += 1;
+    }
+    this.recordSyncEvent({
+      source: operation,
+      eventType: "session_conflict",
+      decision: exhausted ? "failed" : "skipped",
+      reason: exhausted ? "session_conflict_exhausted" : "session_conflict_retry",
+      rawPath: message,
+    });
+  }
+
+  recordSyncEvent(event) {
+    const occurredAt = new Date().toISOString();
+    this.lastEventAt = occurredAt;
+    const compactEvent = removeUndefinedValues({
+      occurredAt,
+      source: event.source,
+      eventType: event.eventType,
+      decision: event.decision,
+      reason: event.reason,
+      relativePath: event.relativePath,
+      rawPath: event.rawPath,
+    });
+    this.recentEvents.push(compactEvent);
+    while (this.recentEvents.length > DEFAULT_SYNC_RECENT_EVENTS_LIMIT) {
+      this.recentEvents.shift();
+    }
+    if (event.decision === "accepted") {
+      if (event.eventType === "deleted") {
+        this.acceptedEventCounts.deleted += 1;
+      } else {
+        this.acceptedEventCounts.changed += 1;
+      }
+      return;
+    }
+    const reason = event.reason ?? "unknown";
+    this.skippedEventCounts[reason] = (this.skippedEventCounts[reason] ?? 0) + 1;
+  }
+
+  markQueueNonEmpty() {
+    if (!this.firstQueuedAt) {
+      this.firstQueuedAt = new Date().toISOString();
+    }
+  }
+
+  pendingOldestAgeMs() {
+    if (!this.firstQueuedAt) {
+      return 0;
+    }
+    const startedAt = Date.parse(this.firstQueuedAt);
+    if (!Number.isFinite(startedAt)) {
+      return 0;
+    }
+    return Math.max(0, Date.now() - startedAt);
+  }
+
+  averageFlushDurationMs() {
+    if (this.flushDurationSamplesMs.length === 0) {
+      return null;
+    }
+    const total = this.flushDurationSamplesMs.reduce((sum, value) => sum + value, 0);
+    return Math.round(total / this.flushDurationSamplesMs.length);
   }
 
   snapshot() {
     return {
       enabled: this.isEnabled(),
       watcherActive: this.watcher !== null,
+      bootstrapActive: this.activeBootstrapCheck !== null,
+      gitDeltaActive: this.activeGitDelta !== null,
       flushActive: this.activeFlush !== null,
       reconcileActive: this.activeReconcile !== null,
       timerActive: this.timer !== null,
       reconcileTimerActive: this.reconcileTimer !== null,
+      cacheEnabled: this.isCacheEnabled(),
+      cacheUsable: this.isCacheUsable(),
+      cachePath: this.cacheState?.path ?? null,
+      cacheEntries: this.cacheState ? Object.keys(asRecord(this.cacheState.data.entries)).length : 0,
+      cacheLoadedAt: this.cacheState?.loadedAt ?? null,
+      cacheUpdatedAt: this.cacheState?.updatedAt ?? null,
+      cacheDecisionCounts: { ...this.cacheDecisionCounts },
       pendingChanged: this.pendingChangedPaths.size,
       pendingDeleted: this.pendingDeletedPaths.size,
       pendingRetryBatches: this.pendingRetryBatches.length,
       pendingTotal: this.pendingSize(),
       pendingSourceRoot: this.pendingContext?.sourceRoot ?? null,
       pendingWorkspaceId: this.pendingContext?.workspaceId ?? null,
+      pendingOldestAgeMs: this.pendingOldestAgeMs(),
+      firstQueuedAt: this.firstQueuedAt,
+      lastEventAt: this.lastEventAt,
       lastFlushStartedAt: this.lastFlushStartedAt,
       lastFlushFinishedAt: this.lastFlushFinishedAt,
+      lastFlushDurationMs: this.lastFlushDurationMs,
+      averageFlushDurationMs: this.averageFlushDurationMs(),
       lastReconcileStartedAt: this.lastReconcileStartedAt,
       lastReconcileFinishedAt: this.lastReconcileFinishedAt,
+      lastReconcileDurationMs: this.lastReconcileDurationMs,
+      lastGitScanStartedAt: this.lastGitScanStartedAt,
+      lastGitScanFinishedAt: this.lastGitScanFinishedAt,
+      lastGitScanDurationMs: this.lastGitScanDurationMs,
+      lastGitHead: this.lastGitHead,
+      lastGitBranch: this.lastGitBranch,
+      lastGitDeltaCounts: this.lastGitDeltaCounts,
       lastError: this.lastError,
+      sessionConflictRetryCounts: { ...this.sessionConflictRetryCounts },
+      lastSessionConflictAt: this.lastSessionConflictAt,
+      lastSessionConflictOperation: this.lastSessionConflictOperation,
+      lastSessionConflictAttempt: this.lastSessionConflictAttempt,
+      lastSessionConflictRetryDelayMs: this.lastSessionConflictRetryDelayMs,
+      lastSessionConflictMessage: this.lastSessionConflictMessage,
+      bootstrapState: this.bootstrapStatus.state,
+      needsReconcile: this.bootstrapStatus.needsReconcile,
+      bootstrapCheckedAt: this.bootstrapStatus.checkedAt,
+      bootstrapReason: this.bootstrapStatus.reason,
+      bootstrapStatus: this.bootstrapStatus.status,
+      bootstrapCanRetrieve: this.bootstrapStatus.canRetrieve,
+      bootstrapCollection: this.bootstrapStatus.collection,
+      bootstrapIndexHealthStatus: this.bootstrapStatus.indexHealthStatus,
+      bootstrapIndexedAt: this.bootstrapStatus.indexedAt,
+      bootstrapIndexedCommit: this.bootstrapStatus.indexedCommit,
+      bootstrapManifestRevision: this.bootstrapStatus.manifestRevision,
+      bootstrapRecoveryActions: [...(this.bootstrapStatus.recoveryActions ?? [])],
+      bootstrapLastError: this.bootstrapStatus.lastError,
       lastResult: summarizeSyncResult(this.lastResult),
+      acceptedEventCounts: { ...this.acceptedEventCounts },
+      skippedEventCounts: { ...this.skippedEventCounts },
+      recentEvents: [...this.recentEvents].reverse().slice(0, 10),
     };
   }
 }
@@ -841,6 +1758,7 @@ class SyncManager {
 const syncManager = new SyncManager();
 syncManager.startWatcherIfConfigured();
 syncManager.startScheduledReconcileIfConfigured();
+syncManager.startBootstrapCheckIfConfigured();
 
 process.stdin.setEncoding("utf8");
 
@@ -969,6 +1887,13 @@ async function callTool(params) {
       return textToolResult(formatToolError(error, "workspace diagnosis request"), true);
     }
   }
+  if (name === "corpuswire_doctor") {
+    try {
+      return textToolResult(await doctor(args));
+    } catch (error) {
+      return textToolResult(formatToolError(error, "doctor request"), true);
+    }
+  }
   if (name === "corpuswire_sync_delta") {
     try {
       return textToolResult(formatSyncPayload(await syncManager.addDelta(args)));
@@ -983,6 +1908,13 @@ async function callTool(params) {
       return textToolResult(formatToolError(error, "sync flush request"), true);
     }
   }
+  if (name === "corpuswire_sync_probe_paths") {
+    try {
+      return textToolResult(formatPathProbePayload(await syncManager.probePaths(args)));
+    } catch (error) {
+      return textToolResult(formatToolError(error, "sync path probe request"), true);
+    }
+  }
   if (name === "corpuswire_sync_reconcile") {
     try {
       return textToolResult(formatSyncPayload(await syncManager.reconcileExplicit(args)));
@@ -990,11 +1922,46 @@ async function callTool(params) {
       return textToolResult(formatToolError(error, "sync reconcile request"), true);
     }
   }
+  if (name === "corpuswire_sync_git_delta") {
+    try {
+      return textToolResult(formatSyncPayload(await syncManager.gitDeltaExplicit(args)));
+    } catch (error) {
+      return textToolResult(formatToolError(error, "sync git delta request"), true);
+    }
+  }
+  if (name === "corpuswire_sync_bootstrap") {
+    try {
+      return textToolResult(formatSyncPayload(await syncManager.bootstrapExplicit(args)));
+    } catch (error) {
+      return textToolResult(formatToolError(error, "sync bootstrap request"), true);
+    }
+  }
   if (name === "corpuswire_sync_status") {
     try {
       return textToolResult(formatSyncPayload({ status: syncManager.snapshot() }));
     } catch (error) {
       return textToolResult(formatToolError(error, "sync status request"), true);
+    }
+  }
+  if (name === "corpuswire_sync_sessions") {
+    try {
+      return textToolResult(await listIndexSessions(args));
+    } catch (error) {
+      return textToolResult(formatToolError(error, "sync sessions request"), true);
+    }
+  }
+  if (name === "corpuswire_sync_abort_session") {
+    try {
+      return textToolResult(await abortIndexSession(args));
+    } catch (error) {
+      return textToolResult(formatToolError(error, "sync abort session request"), true);
+    }
+  }
+  if (name === "corpuswire_index_activity") {
+    try {
+      return textToolResult(await indexActivity(args));
+    } catch (error) {
+      return textToolResult(formatToolError(error, "index activity request"), true);
     }
   }
 
@@ -1208,6 +2175,33 @@ function toolDefinitions() {
       },
     },
     {
+      name: "corpuswire_doctor",
+      description: "Run a read-only CorpusWire readiness check across backend health, workspace diagnosis, sync state, active sessions, and persisted activity.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          repoPath: {
+            type: "string",
+            description: "Service-local repository root to diagnose. Defaults to CORPUSWIRE_REPO_PATH when set.",
+          },
+          workspaceId: {
+            type: "string",
+            description: "Remote workspace id to diagnose. Defaults to CORPUSWIRE_WORKSPACE_ID when set.",
+          },
+          collection: {
+            type: "string",
+            description: "Optional backend collection name filter for persisted index activity.",
+          },
+          activityWindowHours: {
+            type: "integer",
+            minimum: 1,
+            description: "Backend activity summary window in hours. Defaults to 24.",
+          },
+        },
+      },
+    },
+    {
       name: "corpuswire_sync_delta",
       description: "Queue changed and deleted workspace paths for incremental CorpusWire remote indexing.",
       inputSchema: {
@@ -1289,6 +2283,50 @@ function toolDefinitions() {
       },
     },
     {
+      name: "corpuswire_sync_probe_paths",
+      description: "Classify workspace paths under current CorpusWire sync filters without queuing or uploading them.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["paths"],
+        properties: {
+          paths: {
+            type: "array",
+            items: { type: "string" },
+            description: "Workspace-relative or absolute paths to classify.",
+          },
+          sourceRoot: {
+            type: "string",
+            description: "Optional sync root override. Defaults to CORPUSWIRE_SYNC_ROOT or CORPUSWIRE_REPO_PATH.",
+          },
+          workspaceId: {
+            type: "string",
+            description: "Optional remote workspace id. Defaults to CORPUSWIRE_WORKSPACE_ID.",
+          },
+          includeGlobs: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional include globs overriding CORPUSWIRE_SYNC_INCLUDE_GLOBS.",
+          },
+          excludeGlobs: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional exclude globs overriding CORPUSWIRE_SYNC_EXCLUDE_GLOBS.",
+          },
+          maxPaths: {
+            type: "integer",
+            minimum: 1,
+            maximum: 500,
+            description: "Maximum paths to classify. Defaults to 100.",
+          },
+          includeHash: {
+            type: "boolean",
+            description: "When true, compute SHA-256 for upload-candidate files. Defaults to false.",
+          },
+        },
+      },
+    },
+    {
       name: "corpuswire_sync_reconcile",
       description: "Run a full workspace reconciliation scan to heal missed sync events.",
       inputSchema: {
@@ -1331,12 +2369,179 @@ function toolDefinitions() {
       },
     },
     {
+      name: "corpuswire_sync_git_delta",
+      description: "Scan git status for modified, added, deleted, renamed, and untracked files, then queue matching paths for incremental sync.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          sourceRoot: {
+            type: "string",
+            description: "Local git workspace root readable by this MCP server. Defaults to CORPUSWIRE_SYNC_ROOT or CORPUSWIRE_REPO_PATH.",
+          },
+          workspaceId: {
+            type: "string",
+            description: "Remote workspace id used by the CorpusWire index. Defaults to CORPUSWIRE_WORKSPACE_ID.",
+          },
+          includeGlobs: {
+            type: "array",
+            items: { type: "string" },
+            default: [],
+            description: "Optional glob filters for git-detected files to include. Defaults to CORPUSWIRE_SYNC_INCLUDE_GLOBS.",
+          },
+          excludeGlobs: {
+            type: "array",
+            items: { type: "string" },
+            default: [],
+            description: "Optional glob filters for git-detected files to exclude. Defaults to CORPUSWIRE_SYNC_EXCLUDE_GLOBS.",
+          },
+          flush: {
+            type: "boolean",
+            default: false,
+            description: "When true, immediately flush the queued git delta before returning.",
+          },
+          maxWaitMs: {
+            type: "integer",
+            minimum: 1,
+            default: DEFAULT_SYNC_GIT_TIMEOUT_MS,
+            description: "Maximum time to wait for the git scan result.",
+          },
+          flushMaxWaitMs: {
+            type: "integer",
+            minimum: 1,
+            default: DEFAULT_SYNC_FLUSH_TIMEOUT_MS,
+            description: "Maximum time to wait for upload when flush is true.",
+          },
+          maxFiles: {
+            type: "integer",
+            minimum: 1,
+            default: DEFAULT_SYNC_GIT_MAX_FILES,
+            description: "Maximum git status entries to process.",
+          },
+        },
+      },
+    },
+    {
+      name: "corpuswire_sync_bootstrap",
+      description: "Diagnose startup sync freshness for the configured workspace and optionally run an explicit reconciliation.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          sourceRoot: {
+            type: "string",
+            description: "Local workspace root readable by this MCP server. Defaults to CORPUSWIRE_SYNC_ROOT or CORPUSWIRE_REPO_PATH.",
+          },
+          repoPath: {
+            type: "string",
+            description: "Service-local repository root to diagnose. Defaults to CORPUSWIRE_REPO_PATH or sourceRoot.",
+          },
+          workspaceId: {
+            type: "string",
+            description: "Remote workspace id used by the CorpusWire index. Defaults to CORPUSWIRE_WORKSPACE_ID.",
+          },
+          includeGlobs: {
+            type: "array",
+            items: { type: "string" },
+            default: [],
+            description: "Optional glob filters used only when reconcile is true. Defaults to CORPUSWIRE_SYNC_INCLUDE_GLOBS.",
+          },
+          excludeGlobs: {
+            type: "array",
+            items: { type: "string" },
+            default: [],
+            description: "Optional glob filters used only when reconcile is true. Defaults to CORPUSWIRE_SYNC_EXCLUDE_GLOBS.",
+          },
+          reconcile: {
+            type: "boolean",
+            default: false,
+            description: "When true, run an explicit bounded reconciliation after diagnosis.",
+          },
+          maxWaitMs: {
+            type: "integer",
+            minimum: 1,
+            default: DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS,
+            description: "Maximum time to wait for each diagnosis check.",
+          },
+          maxFiles: {
+            type: "integer",
+            minimum: 1,
+            default: DEFAULT_SYNC_RECONCILE_MAX_FILES,
+            description: "Maximum indexable files to include if reconcile is true.",
+          },
+        },
+      },
+    },
+    {
       name: "corpuswire_sync_status",
-      description: "Report CorpusWire incremental sync queue, watcher, and last flush status.",
+      description: "Report CorpusWire incremental sync queue, watcher, bootstrap, and last flush status.",
       inputSchema: {
         type: "object",
         additionalProperties: false,
         properties: {},
+      },
+    },
+    {
+      name: "corpuswire_sync_sessions",
+      description: "List active CorpusWire remote index sessions visible to the backend.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          workspaceId: {
+            type: "string",
+            description: "Optional remote workspace id used to filter active sessions. Defaults to CORPUSWIRE_WORKSPACE_ID.",
+          },
+        },
+      },
+    },
+    {
+      name: "corpuswire_sync_abort_session",
+      description: "Abort a known CorpusWire remote index session by session id.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["sessionId"],
+        properties: {
+          sessionId: {
+            type: "string",
+            description: "Remote index session id to abort. Inspect active sessions first with corpuswire_sync_sessions.",
+          },
+        },
+      },
+    },
+    {
+      name: "corpuswire_index_activity",
+      description: "Report persisted CorpusWire index activity and recent backend index events.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          workspaceId: {
+            type: "string",
+            description: "Optional remote workspace id used to filter activity. Defaults to CORPUSWIRE_WORKSPACE_ID.",
+          },
+          collection: {
+            type: "string",
+            description: "Optional backend collection name filter.",
+          },
+          windowHours: {
+            type: "integer",
+            minimum: 1,
+            description: "Activity summary window in hours. Defaults to 24.",
+          },
+          expectedIntervalSeconds: {
+            type: "integer",
+            minimum: 1,
+            description: "Optional expected sync cadence used for gap detection.",
+          },
+          limit: {
+            type: "integer",
+            minimum: 1,
+            maximum: 50,
+            description: "Maximum recent events to show. Defaults to 10.",
+          },
+        },
       },
     },
   ];
@@ -1355,7 +2560,7 @@ async function searchContext(args) {
     50000,
   );
 
-  await syncManager.flushBeforeRead();
+  const readPreparation = await syncManager.prepareForRead(args);
   const client = buildClient();
   const request = {
     query,
@@ -1384,6 +2589,7 @@ async function searchContext(args) {
     result,
     context,
     hits,
+    readPreparation,
   });
 }
 
@@ -1412,6 +2618,112 @@ async function health() {
     `- workspaceId: ${workspaceId ?? activeProject.workspace_id ?? "backend default"}`,
     ...formatWarnings(index.health_warnings),
   ].join("\n");
+}
+
+async function listIndexSessions(args) {
+  const workspaceId = optionalString(args.workspaceId ?? args.workspace_id ?? process.env.CORPUSWIRE_WORKSPACE_ID);
+  const client = buildClient();
+  if (typeof client.listIndexSessions !== "function") {
+    throw new Error("@corpuswire/sdk does not expose listIndexSessions; update the SDK before inspecting active sessions.");
+  }
+  const sessions = await client.listIndexSessions({ workspaceId });
+  return formatIndexSessions({ baseUrl: client.baseUrl, workspaceId, sessions });
+}
+
+async function abortIndexSession(args) {
+  const sessionId = optionalString(args.sessionId ?? args.session_id);
+  if (!sessionId) {
+    throw new JsonRpcError(-32602, "Invalid params: sessionId must be a non-empty string.");
+  }
+  const client = buildClient();
+  if (typeof client.abortIndexSession !== "function") {
+    throw new Error("@corpuswire/sdk does not expose abortIndexSession; update the SDK before aborting sessions.");
+  }
+  const result = await client.abortIndexSession(sessionId);
+  return formatAbortIndexSession({ baseUrl: client.baseUrl, sessionId, result });
+}
+
+async function indexActivity(args) {
+  const workspaceId = optionalString(args.workspaceId ?? args.workspace_id ?? process.env.CORPUSWIRE_WORKSPACE_ID);
+  const collection = optionalString(args.collection);
+  const windowHours = optionalPositiveInteger(args.windowHours ?? args.window_hours, 24);
+  const expectedIntervalSeconds = optionalPositiveInteger(
+    args.expectedIntervalSeconds ?? args.expected_interval_seconds,
+    undefined,
+  );
+  const limit = Math.min(optionalPositiveInteger(args.limit, 10), 50);
+  const client = buildClient();
+  if (typeof client.getIndexActivity !== "function" || typeof client.getIndexEvents !== "function") {
+    throw new Error("@corpuswire/sdk does not expose index activity helpers; update the SDK before inspecting backend activity.");
+  }
+
+  const request = { workspaceId, collection };
+  const activity = await client.getIndexActivity({ ...request, windowHours, expectedIntervalSeconds });
+  const events = await client.getIndexEvents({ ...request, limit });
+  return formatIndexActivity({ baseUrl: client.baseUrl, workspaceId, collection, windowHours, limit, activity, events });
+}
+
+async function doctor(args) {
+  const client = buildClient();
+  const repoPath = optionalString(args.repoPath ?? args.repo_path ?? process.env.CORPUSWIRE_REPO_PATH);
+  const workspaceId = optionalString(args.workspaceId ?? args.workspace_id ?? process.env.CORPUSWIRE_WORKSPACE_ID);
+  const collection = optionalString(args.collection);
+  const activityWindowHours = optionalPositiveInteger(
+    args.activityWindowHours ?? args.activity_window_hours,
+    24,
+  );
+  const errors = [];
+
+  let healthResponse = null;
+  try {
+    healthResponse = await client.health({ repoPath, workspaceId });
+  } catch (error) {
+    errors.push(`health: ${errorMessage(error)}`);
+  }
+
+  let diagnosis = null;
+  try {
+    diagnosis = typeof client.diagnoseWorkspace === "function"
+      ? await client.diagnoseWorkspace({ repoPath, workspaceId })
+      : diagnosisFromHealth(healthResponse ?? {}, { repoPath, workspaceId });
+  } catch (error) {
+    errors.push(`diagnosis: ${errorMessage(error)}`);
+  }
+
+  let sessions = [];
+  if (typeof client.listIndexSessions === "function") {
+    try {
+      sessions = await client.listIndexSessions({ workspaceId });
+    } catch (error) {
+      errors.push(`sessions: ${errorMessage(error)}`);
+    }
+  }
+
+  let activity = null;
+  if (typeof client.getIndexActivity === "function") {
+    try {
+      activity = await client.getIndexActivity({ workspaceId, collection, windowHours: activityWindowHours });
+    } catch (error) {
+      errors.push(`activity: ${errorMessage(error)}`);
+    }
+  }
+
+  const syncStatus = syncManager.snapshot();
+  const verdict = determineDoctorVerdict({ healthResponse, diagnosis, syncStatus, sessions, activity, errors });
+  return formatDoctor({
+    baseUrl: client.baseUrl,
+    repoPath,
+    workspaceId,
+    collection,
+    activityWindowHours,
+    verdict,
+    healthResponse,
+    diagnosis,
+    syncStatus,
+    sessions,
+    activity,
+    errors,
+  });
 }
 
 async function diagnoseWorkspace(args) {
@@ -1453,6 +2765,145 @@ function diagnosisFromHealth(response, { repoPath, workspaceId }) {
     checks: [],
     recovery_actions: [],
   };
+}
+
+function initialBootstrapStatus() {
+  return {
+    state: "not_checked",
+    needsReconcile: false,
+    checkedAt: null,
+    reason: "Bootstrap freshness check has not run.",
+    status: null,
+    canRetrieve: null,
+    repoPath: null,
+    workspaceId: null,
+    resolvedContext: null,
+    resolvedWorkspaceId: null,
+    collection: null,
+    collectionExists: null,
+    pointCount: null,
+    indexHealthStatus: null,
+    indexedAt: null,
+    indexedCommit: null,
+    manifestRevision: null,
+    sourceFileCount: null,
+    recoveryActions: [],
+    lastError: null,
+  };
+}
+
+function bootstrapStatusForTimeout(maxWaitMs) {
+  return {
+    ...initialBootstrapStatus(),
+    state: "unknown",
+    checkedAt: new Date().toISOString(),
+    reason: `Bootstrap freshness check timed out after ${maxWaitMs}ms.`,
+  };
+}
+
+function bootstrapStatusFromError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    ...initialBootstrapStatus(),
+    state: "error",
+    checkedAt: new Date().toISOString(),
+    reason: message,
+    lastError: message,
+  };
+}
+
+function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
+  const index = asRecord(diagnosis.index);
+  const checks = Array.isArray(diagnosis.checks) ? diagnosis.checks.filter(isRecord) : [];
+  const recoveryActions = compactStringArray(diagnosis.recovery_actions);
+  const healthWarnings = compactStringArray(index.health_warnings);
+  const checkMessages = checks
+    .map((check) => [check.name, check.status, check.message].filter(Boolean).join(" "))
+    .filter(Boolean);
+  const diagnosisStatus = optionalString(diagnosis.status);
+  const indexHealthStatus = optionalString(index.health_status);
+  const textSignals = [
+    diagnosisStatus,
+    indexHealthStatus,
+    optionalString(diagnosis.qdrant_error),
+    ...healthWarnings,
+    ...checkMessages,
+    ...recoveryActions,
+  ].filter(Boolean);
+  const hasFreshnessProblem = textSignals.some(hasBootstrapFreshnessSignal);
+  const collectionExists = typeof diagnosis.collection_exists === "boolean" ? diagnosis.collection_exists : null;
+  const canRetrieve = typeof diagnosis.can_retrieve === "boolean" ? diagnosis.can_retrieve : null;
+  const pointCount = Number.isInteger(diagnosis.point_count) ? diagnosis.point_count : null;
+  const statusLooksBlocked = ["blocked", "error", "missing"].includes((diagnosisStatus ?? "").toLowerCase());
+  const needsReconcile = hasFreshnessProblem
+    || collectionExists === false
+    || indexHealthStatus === "degraded"
+    || indexHealthStatus === "stale"
+    || (canRetrieve === false && (pointCount === 0 || pointCount === null));
+  const firstActionableSignal = textSignals.find(hasBootstrapFreshnessSignal);
+  const state = needsReconcile
+    ? "needs_reconcile"
+    : canRetrieve === true || diagnosisStatus === "ready"
+      ? "ready"
+      : statusLooksBlocked || canRetrieve === false
+        ? "blocked"
+        : "unknown";
+
+  return {
+    state,
+    needsReconcile,
+    checkedAt: new Date().toISOString(),
+    reason: firstNonEmptyString(
+      firstActionableSignal,
+      recoveryActions[0],
+      healthWarnings[0],
+      checkMessages[0],
+      diagnosisStatus ? `Diagnosis status is ${diagnosisStatus}.` : null,
+    ),
+    status: diagnosisStatus,
+    canRetrieve,
+    repoPath: repoPath ?? null,
+    workspaceId: workspaceId ?? null,
+    resolvedContext: diagnosis.resolved_context ?? null,
+    resolvedWorkspaceId: diagnosis.resolved_workspace_id ?? null,
+    collection: diagnosis.collection ?? index.collection ?? null,
+    collectionExists,
+    pointCount,
+    indexHealthStatus: indexHealthStatus ?? null,
+    indexedAt: index.indexed_at ?? null,
+    indexedCommit: index.indexed_commit ?? null,
+    manifestRevision: index.manifest_revision ?? null,
+    sourceFileCount: index.source_file_count ?? index.source_files ?? null,
+    recoveryActions: recoveryActions.slice(0, 5),
+    lastError: null,
+  };
+}
+
+function compactStringArray(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((item) => typeof item === "string" && item.trim())
+    .map((item) => item.trim());
+}
+
+function hasBootstrapFreshnessSignal(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    return false;
+  }
+  return [
+    /stale/i,
+    /degraded/i,
+    /outdated/i,
+    /reindex/i,
+    /run CorpusWire sync/i,
+    /sync workspace/i,
+    /index or sync/i,
+    /no indexed/i,
+    /collection does not exist/i,
+    /manifest is unavailable/i,
+  ].some((pattern) => pattern.test(value));
 }
 
 function formatWorkspaceDiagnosis({ baseUrl, repoPath, workspaceId, diagnosis }) {
@@ -1505,7 +2956,207 @@ function formatWorkspaceDiagnosis({ baseUrl, repoPath, workspaceId, diagnosis })
   return lines.join("\n");
 }
 
-function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minScore, maxChars, result, context, hits }) {
+function formatIndexSessions({ baseUrl, workspaceId, sessions }) {
+  const activeSessions = Array.isArray(sessions) ? sessions.filter(isRecord) : [];
+  const lines = [
+    "CorpusWire active index sessions:",
+    `- baseUrl: ${baseUrl}`,
+    `- workspaceId: ${workspaceId ?? "backend all"}`,
+    `- activeSessions: ${activeSessions.length}`,
+  ];
+  if (activeSessions.length === 0) {
+    lines.push("- status: none");
+    return lines.join("\n");
+  }
+
+  lines.push("", "Sessions:");
+  for (const [index, session] of activeSessions.entries()) {
+    lines.push(
+      [
+        `${index + 1}. sessionId: ${session.session_id ?? "unknown"}`,
+        `   workspaceId: ${session.workspace_id ?? "unknown"}`,
+        `   collection: ${session.collection_name ?? "unknown"}`,
+        `   mode: ${session.mode ?? "unknown"}`,
+        `   phase: ${session.phase ?? "unknown"}`,
+        `   manifestRevision: ${session.manifest_revision ?? "unknown"}`,
+        `   filesManifested: ${session.files_manifested ?? 0}`,
+        `   filesIndexed: ${session.files_indexed ?? 0}`,
+        `   queueDepth: ${session.queue_depth ?? 0}`,
+        `   ageSeconds: ${session.age_seconds ?? "unknown"}`,
+        `   idleSeconds: ${session.idle_seconds ?? "unknown"}`,
+        `   idleTimeoutSeconds: ${session.idle_timeout_seconds ?? "unknown"}`,
+        `   errors: ${Array.isArray(session.errors) ? session.errors.length : 0}`,
+      ].join("\n"),
+    );
+  }
+  return lines.join("\n");
+}
+
+function formatAbortIndexSession({ baseUrl, sessionId, result }) {
+  const response = isRecord(result) ? result : {};
+  return [
+    "CorpusWire abort index session:",
+    `- baseUrl: ${baseUrl}`,
+    `- requestedSessionId: ${sessionId}`,
+    `- sessionId: ${response.session_id ?? sessionId}`,
+    `- phase: ${response.phase ?? "unknown"}`,
+    `- status: ${response.ok === false ? "unknown" : "aborted"}`,
+  ].join("\n");
+}
+
+function determineDoctorVerdict({ healthResponse, diagnosis, syncStatus, sessions, activity, errors }) {
+  if (errors.length > 0) {
+    return "blocked";
+  }
+  const canRetrieve = diagnosis?.can_retrieve;
+  const diagnosisStatus = optionalString(diagnosis?.status);
+  if (healthResponse?.ok === false || canRetrieve === false || diagnosisStatus === "blocked") {
+    return "blocked";
+  }
+  const pendingTotal = Number(syncStatus?.pendingTotal ?? 0);
+  const hasActiveSessions = Array.isArray(sessions) && sessions.length > 0;
+  const hasActivityGap = activity?.gap_detected === true;
+  const consecutiveFailures = Number(activity?.consecutive_failures ?? 0);
+  if (
+    syncStatus?.needsReconcile === true
+    || pendingTotal > 0
+    || hasActiveSessions
+    || hasActivityGap
+    || consecutiveFailures > 0
+    || diagnosisStatus === "degraded"
+  ) {
+    return "attention";
+  }
+  return "ready";
+}
+
+function formatDoctor({
+  baseUrl,
+  repoPath,
+  workspaceId,
+  collection,
+  activityWindowHours,
+  verdict,
+  healthResponse,
+  diagnosis,
+  syncStatus,
+  sessions,
+  activity,
+  errors,
+}) {
+  const index = asRecord(diagnosis?.index);
+  const activeSessions = Array.isArray(sessions) ? sessions.filter(isRecord) : [];
+  const activitySummary = isRecord(activity) ? activity : {};
+  const lines = [
+    "CorpusWire doctor:",
+    `- verdict: ${verdict}`,
+    `- baseUrl: ${baseUrl}`,
+    `- repoPath: ${repoPath ?? "backend default"}`,
+    `- workspaceId: ${workspaceId ?? "backend default"}`,
+    `- collection: ${collection ?? diagnosis?.collection ?? index.collection ?? "backend default"}`,
+    `- backendOk: ${healthResponse?.ok ?? "unknown"}`,
+    `- diagnosisStatus: ${diagnosis?.status ?? "unknown"}`,
+    `- canRetrieve: ${diagnosis?.can_retrieve ?? "unknown"}`,
+    `- indexHealthStatus: ${index.health_status ?? "unknown"}`,
+    `- manifestRevision: ${index.manifest_revision ?? "unknown"}`,
+    `- syncEnabled: ${syncStatus.enabled ?? false}`,
+    `- watcherActive: ${syncStatus.watcherActive ?? false}`,
+    `- pendingTotal: ${syncStatus.pendingTotal ?? 0}`,
+    `- needsReconcile: ${syncStatus.needsReconcile ?? false}`,
+    `- activeSessions: ${activeSessions.length}`,
+    `- activityWindowHours: ${activityWindowHours}`,
+    `- lastAttemptStatus: ${activitySummary.last_attempt_status ?? "unknown"}`,
+    `- lastSuccessAgeSeconds: ${activitySummary.last_success_age_seconds ?? "unknown"}`,
+    `- consecutiveFailures: ${activitySummary.consecutive_failures ?? "unknown"}`,
+    `- gapDetected: ${activitySummary.gap_detected ?? "unknown"}`,
+  ];
+
+  if (errors.length > 0) {
+    lines.push("", "Errors:", ...errors.map((error) => `- ${error}`));
+  }
+
+  const recoveryActions = Array.isArray(diagnosis?.recovery_actions) ? diagnosis.recovery_actions : [];
+  if (recoveryActions.length > 0) {
+    lines.push("", "Recovery:");
+    for (const action of recoveryActions) {
+      if (typeof action === "string" && action.trim()) {
+        lines.push(`- ${action.trim()}`);
+      }
+    }
+  }
+
+  if (activeSessions.length > 0) {
+    lines.push("", "Active sessions:");
+    for (const session of activeSessions.slice(0, 5)) {
+      lines.push(
+        `- ${session.session_id ?? "unknown"} phase=${session.phase ?? "unknown"} idleSeconds=${session.idle_seconds ?? "unknown"} queueDepth=${session.queue_depth ?? 0}`,
+      );
+    }
+  }
+
+  return lines.join("\n");
+}
+
+function formatIndexActivity({ baseUrl, workspaceId, collection, windowHours, limit, activity, events }) {
+  const summary = isRecord(activity) ? activity : {};
+  const recentEvents = Array.isArray(events) ? events.filter(isRecord) : [];
+  const lines = [
+    "CorpusWire index activity:",
+    `- baseUrl: ${baseUrl}`,
+    `- workspaceId: ${workspaceId ?? "backend default"}`,
+    `- collection: ${collection ?? "backend default"}`,
+    `- windowHours: ${windowHours}`,
+    `- available: ${summary.available ?? "unknown"}`,
+    `- eventsInWindow: ${summary.events_in_window ?? "unknown"}`,
+    `- successfulEventsInWindow: ${summary.successful_events_in_window ?? "unknown"}`,
+    `- failedEventsInWindow: ${summary.failed_events_in_window ?? "unknown"}`,
+    `- lastAttemptAt: ${summary.last_attempt_at ?? "unknown"}`,
+    `- lastAttemptStatus: ${summary.last_attempt_status ?? "unknown"}`,
+    `- lastSuccessAt: ${summary.last_success_at ?? "unknown"}`,
+    `- lastSuccessAgeSeconds: ${summary.last_success_age_seconds ?? "unknown"}`,
+    `- consecutiveFailures: ${summary.consecutive_failures ?? "unknown"}`,
+    `- gapDetected: ${summary.gap_detected ?? "unknown"}`,
+    `- recentEventLimit: ${limit}`,
+  ];
+
+  if (summary.error) {
+    lines.push(`- error: ${summary.error}`);
+  }
+
+  if (recentEvents.length === 0) {
+    lines.push("", "Recent events:", "- none");
+    return lines.join("\n");
+  }
+
+  lines.push("", "Recent events:");
+  for (const [index, event] of recentEvents.entries()) {
+    const parts = [
+      `${index + 1}. occurredAt: ${event.occurred_at ?? "unknown"}`,
+      `   operation: ${event.operation ?? "unknown"}`,
+      `   status: ${event.status ?? "unknown"}`,
+      `   workspaceId: ${event.workspace_id ?? "unknown"}`,
+      `   mode: ${event.mode ?? "unknown"}`,
+      `   sessionId: ${event.session_id ?? "unknown"}`,
+      `   manifestRevision: ${event.manifest_revision ?? "unknown"}`,
+      `   filesIndexed: ${event.files_indexed ?? 0}`,
+      `   filesDeleted: ${event.files_deleted ?? 0}`,
+      `   filesSkipped: ${event.files_skipped ?? 0}`,
+      `   bytesUploaded: ${event.bytes_uploaded ?? 0}`,
+      `   durationMs: ${event.duration_ms ?? "unknown"}`,
+    ];
+    if (event.error) {
+      parts.push(`   error: ${event.error}`);
+    }
+    if (event.warning) {
+      parts.push(`   warning: ${event.warning}`);
+    }
+    lines.push(parts.join("\n"));
+  }
+
+  return lines.join("\n");
+}
+
+function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minScore, maxChars, result, context, hits, readPreparation }) {
   const index = asRecord(context.index);
   const retrievalWarning = optionalString(result.retrieval_warning);
   const lines = [
@@ -1528,6 +3179,7 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minSc
     `- hits: ${hits.length}`,
     ...(retrievalWarning ? [`- retrievalWarning: ${retrievalWarning}`] : []),
     ...formatWarnings(index.health_warnings),
+    ...formatReadPreparation(readPreparation),
   ];
 
   if (hits.length === 0) {
@@ -1564,6 +3216,32 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minSc
   }
 
   return lines.join("\n");
+}
+
+function formatReadPreparation(readPreparation) {
+  if (!readPreparation?.enabled) {
+    return [];
+  }
+  const freshness = readPreparation.freshness ?? {};
+  const lines = [
+    `- readFlushRan: ${readPreparation.flush?.flushed ?? false}`,
+    `- readFlushTimedOut: ${readPreparation.flush?.timedOut ?? false}`,
+    `- readGitDeltaBeforeRead: ${readPreparation.gitDelta !== null}`,
+    `- readGitDeltaScanned: ${readPreparation.gitDelta?.scanned ?? false}`,
+    `- readFreshnessState: ${freshness.state ?? "not_checked"}`,
+    `- readNeedsReconcile: ${freshness.needsReconcile ?? false}`,
+    `- readFreshnessCheckedAt: ${freshness.checkedAt ?? "never"}`,
+    `- readFreshnessAgeMs: ${freshness.ageMs ?? "unknown"}`,
+    `- readFreshnessStrict: ${freshness.strict ?? false}`,
+  ];
+  if (freshness.needsReconcile) {
+    lines.push(`- readFreshnessWarning: ${freshness.reason ?? "Index needs reconciliation before it should be trusted."}`);
+  }
+  if (readPreparation.gitDelta?.git) {
+    lines.push(`- readGitChanged: ${readPreparation.gitDelta.git.changedPaths?.length ?? 0}`);
+    lines.push(`- readGitDeleted: ${readPreparation.gitDelta.git.deletedPaths?.length ?? 0}`);
+  }
+  return lines;
 }
 
 function formatAgentContextPacket(packet) {
@@ -1654,7 +3332,7 @@ async function enhancePrompt(args) {
   const sourceFilterRaw = optionalStringArray(args, "sourceFilter");
   const sourceFilter = sourceFilterRaw.length > 0 ? sourceFilterRaw : undefined;
 
-  await syncManager.flushBeforeRead();
+  const readPreparation = await syncManager.prepareForRead(args);
   const client = buildClient();
   const request = {
     prompt,
@@ -1694,6 +3372,7 @@ async function enhancePrompt(args) {
     `- enhancementBackend: ${result.enhancement_backend ?? "unknown"}`,
     ...(usedLocalFallback ? ["- localFallback: retried with localOnly=true after generation setup failed"] : []),
     ...(result.generation_error ? [`- generationError: ${result.generation_error}`] : []),
+    ...formatReadPreparation(readPreparation),
     ...formatAgentContextPackets(result.agent_context_packets),
     ...(recoveryAdvice ? ["", "Recovery:", recoveryAdvice] : []),
     ...(Array.isArray(result.citations) && result.citations.length > 0
@@ -1918,15 +3597,27 @@ function syncContextKey(context) {
 }
 
 function isSyncIndexableRelativePath(relativePath, context) {
-  if (!isIndexableRelativePath(relativePath)) {
-    return false;
+  return classifySyncRelativePath(relativePath, context).accepted;
+}
+
+function classifySyncRelativePath(relativePath, context) {
+  const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\/+/, "");
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.some((segment) => EXCLUDED_PATH_SEGMENTS.has(segment))) {
+    return { accepted: false, reason: "excluded_segment" };
+  }
+  if (!INDEXABLE_EXTENSIONS.has(path.posix.extname(normalized).toLowerCase())) {
+    return { accepted: false, reason: "unsupported_extension" };
   }
   const includeGlobs = context.includeGlobs ?? [];
   if (includeGlobs.length > 0 && !matchesAnyGlob(relativePath, includeGlobs)) {
-    return false;
+    return { accepted: false, reason: "include_filter" };
   }
   const excludeGlobs = context.excludeGlobs ?? [];
-  return excludeGlobs.length === 0 || !matchesAnyGlob(relativePath, excludeGlobs);
+  if (excludeGlobs.length > 0 && matchesAnyGlob(relativePath, excludeGlobs)) {
+    return { accepted: false, reason: "exclude_filter" };
+  }
+  return { accepted: true, reason: "accepted" };
 }
 
 function isExcludedDirectory(relativePath, excludeGlobs) {
@@ -2006,6 +3697,198 @@ function removeUndefinedValues(record) {
   return Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined));
 }
 
+async function runGit(cwd, args, { timeoutMs, maxBuffer }) {
+  const { stdout } = await execFileAsync("git", args, {
+    cwd,
+    encoding: "utf8",
+    timeout: timeoutMs,
+    maxBuffer,
+  });
+  return typeof stdout === "string" ? stdout.trimEnd() : String(stdout).trimEnd();
+}
+
+function parseGitStatusPorcelainZ(output) {
+  if (!output) {
+    return [];
+  }
+  const fields = output.split("\0");
+  const entries = [];
+  for (let index = 0; index < fields.length; index += 1) {
+    const record = fields[index];
+    if (!record) {
+      continue;
+    }
+    if (record.length < 4) {
+      continue;
+    }
+    const status = record.slice(0, 2);
+    const relativePath = normalizeGitStatusPath(record.slice(3));
+    if (!relativePath) {
+      continue;
+    }
+    if (status.includes("R") || status.includes("C")) {
+      const oldPath = normalizeGitStatusPath(fields[index + 1] ?? "");
+      index += 1;
+      entries.push({
+        status,
+        path: relativePath,
+        oldPath,
+        kind: status.includes("R") ? "rename" : "copy",
+      });
+      continue;
+    }
+    entries.push({
+      status,
+      path: relativePath,
+      kind: status === "??" ? "untracked" : "change",
+    });
+  }
+  return entries;
+}
+
+function normalizeGitStatusPath(value) {
+  return typeof value === "string"
+    ? value.trim().replaceAll("\\", "/").replace(/^\.\/+/, "")
+    : "";
+}
+
+function gitStatusEntriesToDelta(entries) {
+  const changedPaths = new Set();
+  const deletedPaths = new Set();
+  let renamed = 0;
+  let copied = 0;
+  let untracked = 0;
+
+  for (const entry of entries) {
+    if (!entry.path || entry.status === "!!") {
+      continue;
+    }
+    if (entry.kind === "rename") {
+      renamed += 1;
+      changedPaths.add(entry.path);
+      if (entry.oldPath) {
+        deletedPaths.add(entry.oldPath);
+      }
+      continue;
+    }
+    if (entry.kind === "copy") {
+      copied += 1;
+      changedPaths.add(entry.path);
+      continue;
+    }
+    if (entry.kind === "untracked" || entry.status === "??") {
+      untracked += 1;
+      changedPaths.add(entry.path);
+      continue;
+    }
+    const indexStatus = entry.status[0];
+    const worktreeStatus = entry.status[1];
+    if (indexStatus === "D" || worktreeStatus === "D") {
+      deletedPaths.add(entry.path);
+      continue;
+    }
+    if ([indexStatus, worktreeStatus].some((status) => status && status !== " ")) {
+      changedPaths.add(entry.path);
+    }
+  }
+
+  for (const deletedPath of deletedPaths) {
+    changedPaths.delete(deletedPath);
+  }
+
+  return {
+    changedPaths: [...changedPaths].sort(),
+    deletedPaths: [...deletedPaths].sort(),
+    renamed,
+    copied,
+    untracked,
+  };
+}
+
+function isActiveSessionConflictError(error) {
+  const message = errorMessage(error);
+  if (!/409\b/.test(message) && error?.status !== 409) {
+    return false;
+  }
+  return /index session is already active/i.test(message)
+    || /already active for workspace_id/i.test(message);
+}
+
+function calculateSessionConflictRetryDelayMs(error, { attempt, baseDelayMs, maxDelayMs }) {
+  const retryAfterMs = retryAfterMsFromError(error);
+  if (retryAfterMs !== null) {
+    return Math.min(retryAfterMs, maxDelayMs);
+  }
+  return Math.min(baseDelayMs * (attempt + 1), maxDelayMs);
+}
+
+function retryAfterMsFromError(error) {
+  if (Number.isFinite(error?.retryAfterMs) && error.retryAfterMs >= 0) {
+    return Math.trunc(error.retryAfterMs);
+  }
+  if (Number.isFinite(error?.retryAfterSeconds) && error.retryAfterSeconds >= 0) {
+    return Math.trunc(error.retryAfterSeconds * 1000);
+  }
+
+  const detail = parseErrorDetail(error);
+  const retryAfterSeconds = Number(detail?.retry_after_seconds);
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
+    return Math.trunc(retryAfterSeconds * 1000);
+  }
+  return null;
+}
+
+function parseErrorDetail(error) {
+  const candidates = [
+    error?.errorDetail,
+    parseJsonObject(error?.responseBody),
+    parseJsonObject(errorMessage(error).replace(/^\d{3}\s+\w+:\s*/, "")),
+  ];
+  for (const candidate of candidates) {
+    if (!isRecord(candidate)) {
+      continue;
+    }
+    const detail = candidate.detail;
+    if (isRecord(detail)) {
+      return detail;
+    }
+    return candidate;
+  }
+  return null;
+}
+
+function parseJsonObject(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function errorMessage(error) {
+  return [
+    error?.errorMessage,
+    error?.message,
+    error?.responseBody,
+  ]
+    .filter((value) => typeof value === "string" && value.trim())
+    .join("\n")
+    || String(error);
+}
+
+async function sleepMs(delayMs) {
+  if (delayMs <= 0) {
+    return;
+  }
+  await new Promise((resolve) => {
+    setTimeout(resolve, delayMs);
+  });
+}
+
 async function awaitWithTimeout(promise, timeoutMs) {
   if (timeoutMs <= 0) {
     return { timedOut: true };
@@ -2026,26 +3909,111 @@ async function awaitWithTimeout(promise, timeoutMs) {
   }
 }
 
+function formatPathProbePayload(payload) {
+  const lines = [
+    "CorpusWire sync path probe:",
+    `- enabled: ${payload.enabled ?? "unknown"}`,
+    `- sourceRoot: ${payload.sourceRoot ?? "unknown"}`,
+    `- workspaceId: ${payload.workspaceId ?? "unknown"}`,
+    `- requestedPaths: ${payload.requestedPaths ?? 0}`,
+    `- probedPaths: ${payload.probedPaths ?? 0}`,
+    `- truncated: ${payload.truncated ?? false}`,
+    `- includeHash: ${payload.includeHash ?? false}`,
+    `- maxFileSizeBytes: ${payload.maxFileSizeBytes ?? "unknown"}`,
+  ];
+  if (payload.reason) {
+    lines.push(`- reason: ${payload.reason}`);
+  }
+
+  const results = Array.isArray(payload.results) ? payload.results.filter(isRecord) : [];
+  if (results.length === 0) {
+    lines.push("", "Paths:", "- none");
+    return lines.join("\n");
+  }
+
+  lines.push("", "Paths:");
+  for (const [index, result] of results.entries()) {
+    const parts = [
+      `${index + 1}. rawPath: ${result.rawPath ?? "unknown"}`,
+      `   relativePath: ${result.relativePath ?? "unknown"}`,
+      `   pathAccepted: ${result.pathAccepted ?? false}`,
+      `   decision: ${result.decision ?? "unknown"}`,
+      `   reason: ${result.reason ?? "unknown"}`,
+      `   exists: ${result.exists ?? "unknown"}`,
+      `   isFile: ${result.isFile ?? "unknown"}`,
+      `   sizeBytes: ${result.sizeBytes ?? "unknown"}`,
+      `   mtimeNs: ${result.mtimeNs ?? "unknown"}`,
+    ];
+    if (result.sha256) {
+      parts.push(`   sha256: ${result.sha256}`);
+    }
+    lines.push(parts.join("\n"));
+  }
+
+  return lines.join("\n");
+}
+
 function formatSyncPayload(payload) {
   const status = payload.status ?? payload.flush?.status ?? {};
   const lines = [
     "CorpusWire sync:",
     `- enabled: ${status.enabled ?? payload.enabled ?? "unknown"}`,
     `- watcherActive: ${status.watcherActive ?? false}`,
+    `- bootstrapActive: ${status.bootstrapActive ?? false}`,
+    `- gitDeltaActive: ${status.gitDeltaActive ?? false}`,
     `- flushActive: ${status.flushActive ?? false}`,
     `- reconcileActive: ${status.reconcileActive ?? false}`,
     `- timerActive: ${status.timerActive ?? false}`,
     `- reconcileTimerActive: ${status.reconcileTimerActive ?? false}`,
+    `- cacheEnabled: ${status.cacheEnabled ?? false}`,
+    `- cacheUsable: ${status.cacheUsable ?? false}`,
+    `- cachePath: ${status.cachePath ?? "not_loaded"}`,
+    `- cacheEntries: ${status.cacheEntries ?? 0}`,
+    `- cacheLoadedAt: ${status.cacheLoadedAt ?? "never"}`,
+    `- cacheUpdatedAt: ${status.cacheUpdatedAt ?? "never"}`,
+    `- cacheDecisions: ${formatSyncCountMap(status.cacheDecisionCounts)}`,
     `- pendingChanged: ${status.pendingChanged ?? 0}`,
     `- pendingDeleted: ${status.pendingDeleted ?? 0}`,
     `- pendingTotal: ${status.pendingTotal ?? 0}`,
     `- pendingSourceRoot: ${status.pendingSourceRoot ?? "none"}`,
     `- pendingWorkspaceId: ${status.pendingWorkspaceId ?? "none"}`,
+    `- pendingOldestAgeMs: ${status.pendingOldestAgeMs ?? 0}`,
+    `- firstQueuedAt: ${status.firstQueuedAt ?? "never"}`,
+    `- lastEventAt: ${status.lastEventAt ?? "never"}`,
     `- lastFlushStartedAt: ${status.lastFlushStartedAt ?? "never"}`,
     `- lastFlushFinishedAt: ${status.lastFlushFinishedAt ?? "never"}`,
+    `- lastFlushDurationMs: ${status.lastFlushDurationMs ?? "none"}`,
+    `- averageFlushDurationMs: ${status.averageFlushDurationMs ?? "none"}`,
     `- lastReconcileStartedAt: ${status.lastReconcileStartedAt ?? "never"}`,
     `- lastReconcileFinishedAt: ${status.lastReconcileFinishedAt ?? "never"}`,
+    `- lastReconcileDurationMs: ${status.lastReconcileDurationMs ?? "none"}`,
+    `- lastGitScanStartedAt: ${status.lastGitScanStartedAt ?? "never"}`,
+    `- lastGitScanFinishedAt: ${status.lastGitScanFinishedAt ?? "never"}`,
+    `- lastGitScanDurationMs: ${status.lastGitScanDurationMs ?? "none"}`,
+    `- lastGitHead: ${status.lastGitHead ?? "unknown"}`,
+    `- lastGitBranch: ${status.lastGitBranch ?? "unknown"}`,
+    `- lastGitDeltaCounts: ${formatSyncCountMap(status.lastGitDeltaCounts, ["statusEntries", "changed", "deleted", "renamed", "copied", "untracked"])}`,
     `- lastError: ${status.lastError ?? "none"}`,
+    `- sessionConflictRetries: ${formatSyncCountMap(status.sessionConflictRetryCounts, ["retries", "exhausted"])}`,
+    `- lastSessionConflictAt: ${status.lastSessionConflictAt ?? "never"}`,
+    `- lastSessionConflictOperation: ${status.lastSessionConflictOperation ?? "none"}`,
+    `- lastSessionConflictAttempt: ${status.lastSessionConflictAttempt ?? "none"}`,
+    `- lastSessionConflictRetryDelayMs: ${status.lastSessionConflictRetryDelayMs ?? "none"}`,
+    `- lastSessionConflictMessage: ${status.lastSessionConflictMessage ?? "none"}`,
+    `- bootstrapState: ${status.bootstrapState ?? "not_checked"}`,
+    `- needsReconcile: ${status.needsReconcile ?? false}`,
+    `- bootstrapCheckedAt: ${status.bootstrapCheckedAt ?? "never"}`,
+    `- bootstrapReason: ${status.bootstrapReason ?? "none"}`,
+    `- bootstrapDiagnosisStatus: ${status.bootstrapStatus ?? "unknown"}`,
+    `- bootstrapCanRetrieve: ${status.bootstrapCanRetrieve ?? "unknown"}`,
+    `- bootstrapCollection: ${status.bootstrapCollection ?? "unknown"}`,
+    `- bootstrapIndexHealthStatus: ${status.bootstrapIndexHealthStatus ?? "unknown"}`,
+    `- bootstrapIndexedAt: ${status.bootstrapIndexedAt ?? "unknown"}`,
+    `- bootstrapIndexedCommit: ${status.bootstrapIndexedCommit ?? "unknown"}`,
+    `- bootstrapManifestRevision: ${status.bootstrapManifestRevision ?? "unknown"}`,
+    `- bootstrapLastError: ${status.bootstrapLastError ?? "none"}`,
+    `- acceptedEvents: ${formatSyncCountMap(status.acceptedEventCounts, ["changed", "deleted"])}`,
+    `- skippedEvents: ${formatSyncCountMap(status.skippedEventCounts)}`,
   ];
 
   if (payload.reason) {
@@ -2063,12 +4031,35 @@ function formatSyncPayload(payload) {
   if (payload.flushReason) {
     lines.push(`- flushReason: ${payload.flushReason}`);
   }
-  if (payload.flush) {
-    lines.push(`- flushTimedOut: ${payload.flush.timedOut ?? false}`);
-    lines.push(`- flushRan: ${payload.flush.flushed ?? false}`);
-    if (Array.isArray(payload.flush.summaries) && payload.flush.summaries.length > 0) {
+  if (payload.git) {
+    lines.push(`- gitStatusEntries: ${payload.git.statusEntries ?? 0}`);
+    lines.push(`- gitChanged: ${payload.git.changedPaths?.length ?? 0}`);
+    lines.push(`- gitDeleted: ${payload.git.deletedPaths?.length ?? 0}`);
+    lines.push(`- gitRenamed: ${payload.git.renamed ?? 0}`);
+    lines.push(`- gitCopied: ${payload.git.copied ?? 0}`);
+    lines.push(`- gitUntracked: ${payload.git.untracked ?? 0}`);
+    lines.push(`- gitHead: ${payload.git.head ?? "unknown"}`);
+    lines.push(`- gitBranch: ${payload.git.branch ?? "unknown"}`);
+  }
+  if (payload.sync?.acceptedChanged) {
+    lines.push(`- acceptedChanged: ${payload.sync.acceptedChanged.length}`);
+  }
+  if (payload.sync?.acceptedDeleted) {
+    lines.push(`- acceptedDeleted: ${payload.sync.acceptedDeleted.length}`);
+  }
+  if (payload.sync?.skipped) {
+    lines.push(`- skipped: ${payload.sync.skipped.length}`);
+  }
+  if (payload.sync?.flushReason) {
+    lines.push(`- flushReason: ${payload.sync.flushReason}`);
+  }
+  const flushPayload = payload.flush ?? payload.sync?.flush;
+  if (flushPayload) {
+    lines.push(`- flushTimedOut: ${flushPayload.timedOut ?? false}`);
+    lines.push(`- flushRan: ${flushPayload.flushed ?? false}`);
+    if (Array.isArray(flushPayload.summaries) && flushPayload.summaries.length > 0) {
       lines.push("", "Flush summaries:");
-      for (const [index, summary] of payload.flush.summaries.entries()) {
+      for (const [index, summary] of flushPayload.summaries.entries()) {
         lines.push(formatSyncSummary(summary, index + 1));
       }
     }
@@ -2086,12 +4077,59 @@ function formatSyncPayload(payload) {
   if (payload.reconcile) {
     lines.push("", "Reconciliation summary:", formatSyncSummary(payload.reconcile, 1));
   }
+  if (Array.isArray(status.bootstrapRecoveryActions) && status.bootstrapRecoveryActions.length > 0) {
+    lines.push("", "Bootstrap recovery:");
+    for (const action of status.bootstrapRecoveryActions) {
+      if (typeof action === "string" && action.trim()) {
+        lines.push(`- ${action.trim()}`);
+      }
+    }
+  }
 
   if (status.lastResult) {
     lines.push("", "Last result:", indentSnippet(JSON.stringify(status.lastResult, null, 2)));
   }
+  if (Array.isArray(status.recentEvents) && status.recentEvents.length > 0) {
+    lines.push("", "Recent sync events:");
+    for (const event of status.recentEvents.slice(0, 10)) {
+      if (!isRecord(event)) {
+        continue;
+      }
+      lines.push(formatSyncEvent(event));
+    }
+  }
 
   return lines.join("\n");
+}
+
+function formatSyncCountMap(value, preferredKeys = []) {
+  if (!isRecord(value)) {
+    return "none";
+  }
+  const keys = [
+    ...preferredKeys,
+    ...Object.keys(value).filter((key) => !preferredKeys.includes(key)).sort(),
+  ];
+  const parts = [];
+  for (const key of keys) {
+    const count = value[key];
+    if (typeof count === "number" && count > 0) {
+      parts.push(`${key}=${count}`);
+    }
+  }
+  return parts.length > 0 ? parts.join(", ") : "none";
+}
+
+function formatSyncEvent(event) {
+  const pathLabel = event.relativePath ?? event.rawPath ?? "unknown";
+  return [
+    `- ${event.occurredAt ?? "unknown"}`,
+    `${event.source ?? "unknown"}`,
+    `${event.eventType ?? "event"}`,
+    `${event.decision ?? "unknown"}`,
+    `${event.reason ?? "unknown"}`,
+    pathLabel,
+  ].join(" ");
 }
 
 function formatSyncSummary(summary, ordinal) {
@@ -2122,6 +4160,7 @@ function summarizeSyncResult(result) {
     filesUploaded: result.filesUploaded ?? 0,
     filesDeleted: result.filesDeleted ?? 0,
     filesSkipped: result.filesSkipped ?? 0,
+    durationMs: result.durationMs,
     reconcile: Boolean(result.reconcile),
     error: result.error,
     collection: responseResult.collection,

@@ -10,6 +10,7 @@ import type {
   IndexEvent,
   IndexEventQuery,
   IndexEventsResponse,
+  IndexSessionQuery,
   IndexWorkspaceRequest,
   CorpusWireClientOptions,
   LlmModelState,
@@ -25,6 +26,7 @@ import type {
   RemoteIndexCapabilities,
   RemoteIndexCommitResponse,
   RemoteIndexSession,
+  RemoteIndexSessionsResponse,
   RemoteIndexStatus,
   RemoteManifestBatchResult,
   RemoteManifestEntry,
@@ -198,6 +200,18 @@ export class CorpusWireClient {
     return response.activity;
   }
 
+  async listIndexSessions(request: IndexSessionQuery = {}): Promise<RemoteIndexStatus[]> {
+    const response = await requestJson<RemoteIndexSessionsResponse>({
+      baseUrl: this.baseUrl,
+      paths: [`/v1/index/sessions${toQueryString(toIndexSessionQueryParams(request))}`],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "GET" },
+    });
+    return response.sessions;
+  }
+
   async startIndexSession(request: StartRemoteIndexSessionRequest): Promise<RemoteIndexSession> {
     const response = await requestJson<{ ok: true; result: RemoteIndexSession }>({
       baseUrl: this.baseUrl,
@@ -288,50 +302,63 @@ export class CorpusWireClient {
     });
   }
 
-  async indexWorkspace(request: IndexWorkspaceRequest): Promise<RemoteIndexCommitResponse> {
-    const session = await this.startIndexSession(request);
-    const remoteFiles = await Promise.all(request.files.map(prepareRemoteWorkspaceFile));
-    const manifestEntries: RemoteManifestEntry[] = [
-      ...remoteFiles.map(({ file, content, sha256, mtimeNs }) => ({
-        relativePath: file.relativePath,
-        op: "upsert" as const,
-        size: content.byteLength,
-        mtimeNs,
-        sha256,
-      })),
-      ...(request.deletedPaths ?? []).map((relativePath) => ({
-        relativePath,
-        op: "delete" as const,
-      })),
-    ];
-    const manifestResult = await this.sendManifestBatch(session.session_id, manifestEntries);
-    const uploadRequired = new Set(manifestResult.upload_required);
-    const filesToUpload = remoteFiles.filter(({ file }) => uploadRequired.has(file.relativePath));
-    if (filesToUpload.length > 0) {
-      const uploadBatches = buildUploadBatches(
-        filesToUpload,
-        request.batchBytes ?? session.max_batch_bytes,
-      );
-      await runWithConcurrency(
-        uploadBatches,
-        request.maxConcurrentUploads ?? session.max_concurrent_uploads,
-        async (batchFiles) => {
-          await this.uploadFileBatch(
-            session.session_id,
-            { files: batchFiles.map((file) => file.descriptor) },
-            batchFiles,
-          );
-        },
-      );
+  private async abortIndexSessionQuietly(sessionId: string): Promise<void> {
+    try {
+      await this.abortIndexSession(sessionId);
+    } catch {
+      // Best effort: preserve the original indexing failure for callers.
     }
-    return this.commitIndexSession(session.session_id);
+  }
+
+  async indexWorkspace(request: IndexWorkspaceRequest): Promise<RemoteIndexCommitResponse> {
+    const remoteFiles = await Promise.all(request.files.map(prepareRemoteWorkspaceFile));
+    const session = await this.startIndexSession(request);
+    try {
+      const manifestEntries: RemoteManifestEntry[] = [
+        ...remoteFiles.map(({ file, content, sha256, mtimeNs }) => ({
+          relativePath: file.relativePath,
+          op: "upsert" as const,
+          size: content.byteLength,
+          mtimeNs,
+          sha256,
+        })),
+        ...(request.deletedPaths ?? []).map((relativePath) => ({
+          relativePath,
+          op: "delete" as const,
+        })),
+      ];
+      const manifestResult = await this.sendManifestBatch(session.session_id, manifestEntries);
+      const uploadRequired = new Set(manifestResult.upload_required);
+      const filesToUpload = remoteFiles.filter(({ file }) => uploadRequired.has(file.relativePath));
+      if (filesToUpload.length > 0) {
+        const uploadBatches = buildUploadBatches(
+          filesToUpload,
+          request.batchBytes ?? session.max_batch_bytes,
+        );
+        await runWithConcurrency(
+          uploadBatches,
+          request.maxConcurrentUploads ?? session.max_concurrent_uploads,
+          async (batchFiles) => {
+            await this.uploadFileBatch(
+              session.session_id,
+              { files: batchFiles.map((file) => file.descriptor) },
+              batchFiles,
+            );
+          },
+        );
+      }
+      return await this.commitIndexSession(session.session_id);
+    } catch (error) {
+      await this.abortIndexSessionQuietly(session.session_id);
+      throw error;
+    }
   }
 }
 
 export function toEnhancePayload(request: string | EnhancePromptRequest): EnhancePromptPayload {
   const normalizedRequest = typeof request === "string" ? { prompt: request } : request;
 
-  return {
+  return removeUndefinedValues({
     repo_path: normalizedRequest.repoPath,
     workspace_id: normalizedRequest.workspaceId,
     prompt: normalizedRequest.prompt,
@@ -340,7 +367,7 @@ export function toEnhancePayload(request: string | EnhancePromptRequest): Enhanc
     output_mode: normalizedRequest.outputMode ?? DEFAULT_OUTPUT_MODE,
     local_only: normalizedRequest.localOnly ?? false,
     source_filter: normalizedRequest.sourceFilter,
-  };
+  });
 }
 
 export function toQueryPayload(request: string | QueryPromptRequest): QueryPromptPayload {
@@ -556,6 +583,12 @@ function toIndexActivityQueryParams(request: IndexActivityQuery): Record<string,
     collection: request.collection,
     window_hours: request.windowHours === undefined ? undefined : String(request.windowHours),
     expected_interval_seconds: request.expectedIntervalSeconds === undefined ? undefined : String(request.expectedIntervalSeconds),
+  };
+}
+
+function toIndexSessionQueryParams(request: IndexSessionQuery): Record<string, string | undefined> {
+  return {
+    workspace_id: request.workspaceId,
   };
 }
 
