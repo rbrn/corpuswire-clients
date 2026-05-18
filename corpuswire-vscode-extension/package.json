@@ -224,7 +224,7 @@
         },
         "corpuswire.outputMode": {
           "type": "string",
-          "default": "generic",
+          "default": "copilot",
           "enum": [
             "generic",
             "copilot",
@@ -242,13 +242,13 @@
         },
         "corpuswire.remoteIndexing.enabled": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "scope": "resource",
           "description": "Enable remote-first indexing by uploading workspace file contents over the CorpusWire HTTPS API."
         },
         "corpuswire.remoteIndexing.autoWatch": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "scope": "resource",
           "description": "Watch workspace file changes and send incremental remote indexing updates."
         },
