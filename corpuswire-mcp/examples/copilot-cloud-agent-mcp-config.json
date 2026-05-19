@@ -11,12 +11,16 @@
         "CORPUSWIRE_WORKSPACE_ID": "github://rbrn/corpuswire#main",
         "CORPUSWIRE_OUTPUT_MODE": "copilot",
         "CORPUSWIRE_LOCAL_ONLY": "true",
+        "CORPUSWIRE_TOP_K": "5",
+        "CORPUSWIRE_SYNC_ENABLED": "false",
         "CORPUSWIRE_BASIC_AUTH": "$COPILOT_MCP_CORPUSWIRE_BASIC_AUTH"
       },
       "tools": [
         "corpuswire_search",
         "corpuswire_enhance_prompt",
-        "corpuswire_health"
+        "corpuswire_health",
+        "corpuswire_diagnose_workspace",
+        "corpuswire_doctor"
       ]
     }
   }

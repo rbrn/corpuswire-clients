@@ -39,6 +39,82 @@ npm run smoke
 
 The package can also run directly from this repository without `npm install` because the server first checks its vendored SDK runtime and then falls back to `clients/corpuswire-sdk/dist` for development.
 
+## Install Locally With npm
+
+You can expose the same `corpuswire-mcp` binary to MCP hosts in any of these ways:
+
+### Direct checkout
+
+Use this when the host runs from the CorpusWire repository checkout.
+
+```json
+{
+  "command": "node",
+  "args": [
+    "/Users/constantinaldea/workspace/my-context-engine/clients/corpuswire-mcp/bin/corpuswire-mcp.js"
+  ]
+}
+```
+
+### Global npm install from this checkout
+
+Use this when a host prefers a command name instead of a repository-relative script path.
+
+```bash
+npm install --global /Users/constantinaldea/workspace/my-context-engine/clients/corpuswire-mcp
+corpuswire-mcp
+```
+
+Then configure the MCP host with:
+
+```json
+{
+  "command": "corpuswire-mcp",
+  "args": []
+}
+```
+
+If the host does not inherit your shell `PATH`, replace `command` with the absolute binary path under the global npm prefix. Find the prefix with:
+
+```bash
+npm prefix --global
+```
+
+For example, if the prefix is `/opt/homebrew`, use `/opt/homebrew/bin/corpuswire-mcp`.
+
+### npm package or no-global npx
+
+The package is published as `@corpuswire/mcp`, so a normal npm-managed install is also valid:
+
+```bash
+npm install --global @corpuswire/mcp
+```
+
+For a host where installing global binaries is inconvenient, use `npx`:
+
+```json
+{
+  "command": "npx",
+  "args": ["--yes", "@corpuswire/mcp"]
+}
+```
+
+For a local checkout without a global install, point `npx` at the local package:
+
+```json
+{
+  "command": "npx",
+  "args": [
+    "--yes",
+    "--package",
+    "/Users/constantinaldea/workspace/my-context-engine/clients/corpuswire-mcp",
+    "corpuswire-mcp"
+  ]
+}
+```
+
+`npx` may add startup latency and can require network access for registry installs. For long-running local agent sessions, the direct checkout path or a global npm install is usually more predictable.
+
 To test against a real local Docker CorpusWire API from the repository root:
 
 ```bash
@@ -51,7 +127,7 @@ That command runs the Docker/API regression gate, then exercises the Codex wrapp
 
 For a workspace-local example, see [../../.vscode/mcp.json.example](../../.vscode/mcp.json.example). To activate it, copy the example to `.vscode/mcp.json`, adjust paths and workspace id, then run **MCP: List Servers** or use the Start button in the VS Code MCP file.
 
-Minimal shape:
+Minimal direct-checkout shape:
 
 ```json
 {
@@ -65,26 +141,55 @@ Minimal shape:
         "CORPUSWIRE_BASE_URL": "https://corpuswire.onrender.com",
         "CORPUSWIRE_WORKSPACE_ID": "github://rbrn/corpuswire#main",
         "CORPUSWIRE_OUTPUT_MODE": "copilot",
-        "CORPUSWIRE_LOCAL_ONLY": "true"
+        "CORPUSWIRE_LOCAL_ONLY": "true",
+        "CORPUSWIRE_TOP_K": "5",
+        "CORPUSWIRE_SYNC_ENABLED": "false"
       }
     }
   }
 }
 ```
 
+When using the global npm install, use the same `env` block but set `"command": "corpuswire-mcp"` and `"args": []`. See [examples/npm-global-mcp-config.json](examples/npm-global-mcp-config.json).
+
 Keep secrets out of repository config. Put `CORPUSWIRE_BASIC_AUTH` or service tokens in user settings, environment-specific config, or the host's secret store.
 
 ## GitHub Copilot CLI
 
-Use the Copilot CLI MCP config shape in [examples/copilot-cli-mcp-config.json](examples/copilot-cli-mcp-config.json), or add it interactively with `/mcp add` as a local/STDIO server. Allowlist read-only tools first:
+Use the Copilot CLI MCP config shape in [examples/copilot-cli-mcp-config.json](examples/copilot-cli-mcp-config.json), [examples/npm-global-mcp-config.json](examples/npm-global-mcp-config.json), or add it interactively with `/mcp add` as a local/STDIO server. Allowlist read-only tools first:
 
 ```json
 {
-  "tools": ["corpuswire_search", "corpuswire_enhance_prompt", "corpuswire_health", "corpuswire_diagnose_workspace"]
+  "tools": [
+    "corpuswire_search",
+    "corpuswire_enhance_prompt",
+    "corpuswire_health",
+    "corpuswire_diagnose_workspace",
+    "corpuswire_doctor"
+  ]
 }
 ```
 
 Enable sync tools only when the server has the intended local workspace root and the target CorpusWire workspace id.
+
+## Correct Configuration
+
+Set `CORPUSWIRE_BASE_URL` to the API that should answer retrieval requests. Use `http://127.0.0.1:8000` for the local Docker/API default, or `https://corpuswire.onrender.com` for the hosted service.
+
+Choose the workspace scope deliberately:
+
+- Use `CORPUSWIRE_WORKSPACE_ID` for remote-indexed workspaces, such as `github://rbrn/corpuswire#main`. This is the right setting for hosted CorpusWire and for MCP hosts that cannot share a local filesystem path with the API.
+- Use `CORPUSWIRE_REPO_PATH` only when the CorpusWire API process can read the same local path, such as a local Docker/API regression run where the repository is mounted or visible to the service.
+- For remote incremental sync, set both `CORPUSWIRE_WORKSPACE_ID` and `CORPUSWIRE_SYNC_ROOT` to the local checkout that should be watched or scanned, then enable `CORPUSWIRE_SYNC_ENABLED=true`. Keep sync disabled for read-only Copilot/Codex configs.
+
+Recommended prompt settings:
+
+- `CORPUSWIRE_OUTPUT_MODE=copilot` for GitHub Copilot, Copilot CLI, and Auggie-like compact context handoffs.
+- `CORPUSWIRE_OUTPUT_MODE=generic` for the Codex plugin wrapper unless a host-specific style is needed.
+- `CORPUSWIRE_OUTPUT_MODE=claude-code` for autonomous coding-agent prompts that should include a short plan.
+- `CORPUSWIRE_OUTPUT_MODE=sequential` only when you want the strict Requirements, Success Criteria, Checkpoints, Acceptance Criteria, and Impact Analysis contract.
+- `CORPUSWIRE_LOCAL_ONLY=true` keeps prompt enhancement deterministic and avoids requiring a generation provider on the backend.
+- `CORPUSWIRE_TOP_K=5` is a conservative default; raise it when the task needs broader context.
 
 ## Environment
 

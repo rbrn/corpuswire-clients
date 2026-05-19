@@ -2,10 +2,8 @@
   "mcpServers": {
     "corpuswire": {
       "type": "stdio",
-      "command": "node",
-      "args": [
-        "/Users/constantinaldea/workspace/my-context-engine/clients/corpuswire-mcp/bin/corpuswire-mcp.js"
-      ],
+      "command": "corpuswire-mcp",
+      "args": [],
       "env": {
         "CORPUSWIRE_BASE_URL": "https://corpuswire.onrender.com",
         "CORPUSWIRE_WORKSPACE_ID": "github://rbrn/corpuswire#main",
