@@ -797,11 +797,14 @@ class SyncManager {
       })
       .finally(() => {
         this.activeReconcile = null;
+        if (this.hasPending()) {
+          this.scheduleFlush(0);
+        }
       });
     return this.activeReconcile;
   }
 
-  async flushAll({ maxWaitMs }) {
+  async flushAll({ maxWaitMs, allowDuringReconcile = false }) {
     const summaries = [];
     const deadline = Date.now() + maxWaitMs;
 
@@ -811,6 +814,20 @@ class SyncManager {
     }
 
     while (true) {
+      if (this.activeReconcile && !allowDuringReconcile) {
+        const waited = await awaitWithTimeout(this.activeReconcile, Math.max(0, deadline - Date.now()));
+        if (waited.timedOut) {
+          return {
+            enabled: true,
+            flushed: false,
+            timedOut: true,
+            summaries,
+            status: this.snapshot(),
+          };
+        }
+        continue;
+      }
+
       if (this.activeFlush) {
         const waited = await awaitWithTimeout(this.activeFlush, Math.max(0, deadline - Date.now()));
         if (waited.timedOut) {
@@ -1018,7 +1035,10 @@ class SyncManager {
   async runReconcile(context, args) {
     const startedAt = Date.now();
     this.lastReconcileStartedAt = new Date(startedAt).toISOString();
-    await this.flushAll({ maxWaitMs: optionalPositiveInteger(args.flushMaxWaitMs, DEFAULT_SYNC_FLUSH_TIMEOUT_MS) });
+    await this.flushAll({
+      maxWaitMs: optionalPositiveInteger(args.flushMaxWaitMs, DEFAULT_SYNC_FLUSH_TIMEOUT_MS),
+      allowDuringReconcile: true,
+    });
 
     const maxFiles = optionalPositiveInteger(
       args.maxFiles ?? this.env.CORPUSWIRE_SYNC_RECONCILE_MAX_FILES,
