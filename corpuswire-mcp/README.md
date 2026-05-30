@@ -227,6 +227,8 @@ Recommended prompt settings:
 
 `corpuswire_sync_bootstrap` is diagnostic by default. It calls workspace diagnosis, reports `bootstrapState` and `needsReconcile` in sync status, and returns recovery actions when the remote index is stale, degraded, missing, or blocked. It uploads files only when called with `"reconcile": true`.
 
+`corpuswire_sync_reconcile` normally runs a full manifest reconciliation without deleting and recreating the Qdrant collection. Pass `"recreateCollection": true` only for an intentional clean rebuild, such as when the existing workspace collection was created with an embedding dimension that no longer matches the active provider.
+
 When `CORPUSWIRE_SYNC_MTIME_CACHE_ENABLED=true`, incremental sync writes a JSON metadata cache containing relative paths, size, mtime, SHA-256, and last decision. It never stores file contents. The cache suppresses duplicate changed-file uploads across MCP restarts when size and mtime match, re-hashes same-size files when mtime changes, and is ignored while bootstrap says the remote index needs reconciliation. Full reconciliation does not use the cache because it must send a complete inventory.
 
 `corpuswire_sync_git_delta` runs `git status --porcelain=v1 -z --untracked-files=all --ignored=no`, so gitignored files are not uploaded. Renames are sent as delete-old plus upload-new. The same CorpusWire include/exclude filters and extension allowlist still apply before anything is queued.

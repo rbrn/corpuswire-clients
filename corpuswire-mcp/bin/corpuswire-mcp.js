@@ -1035,6 +1035,10 @@ class SyncManager {
   async runReconcile(context, args) {
     const startedAt = Date.now();
     this.lastReconcileStartedAt = new Date(startedAt).toISOString();
+    const recreateCollection = optionalBoolean(
+      args.recreateCollection ?? args.recreate_collection ?? this.env.CORPUSWIRE_SYNC_RECREATE_COLLECTION,
+      false,
+    );
     await this.flushAll({
       maxWaitMs: optionalPositiveInteger(args.flushMaxWaitMs, DEFAULT_SYNC_FLUSH_TIMEOUT_MS),
       allowDuringReconcile: true,
@@ -1099,6 +1103,7 @@ class SyncManager {
         this.env.CORPUSWIRE_SYNC_MAX_FILE_SIZE_BYTES,
         DEFAULT_SYNC_MAX_FILE_SIZE_BYTES,
       ),
+      recreateCollection,
       files,
       deletedPaths: [],
     }, { operation: "reconcile" });
@@ -1112,6 +1117,7 @@ class SyncManager {
       filesDeleted: 0,
       filesSkipped: skippedPaths.length,
       skippedPaths,
+      recreateCollection,
       response,
       durationMs: Date.now() - startedAt,
     };
@@ -2384,6 +2390,11 @@ function toolDefinitions() {
             minimum: 1,
             default: DEFAULT_SYNC_RECONCILE_MAX_FILES,
             description: "Maximum number of indexable files to include in one reconciliation scan.",
+          },
+          recreateCollection: {
+            type: "boolean",
+            default: false,
+            description: "Recreate the target workspace collection before indexing uploaded files. Use only for intentional clean rebuilds, such as embedding dimension changes.",
           },
         },
       },

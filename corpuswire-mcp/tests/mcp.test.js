@@ -245,6 +245,68 @@ test("corpuswire-mcp retries prompt enhancement with localOnly when generation s
   }
 });
 
+test("corpuswire-mcp reconcile can request a clean collection rebuild", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
+  try {
+    await writeFile(path.join(tempDir, "README.md"), "# Reconcile\n\nCorpusWire rebuild test.\n", "utf8");
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "http://mock-corpuswire",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        CORPUSWIRE_WORKSPACE_ID: "workspace-from-env",
+        CORPUSWIRE_REPO_PATH: tempDir,
+        CORPUSWIRE_SYNC_ENABLED: "true",
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const reconcile = await rpc({
+        jsonrpc: "2.0",
+        id: 5,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_sync_reconcile",
+          arguments: {
+            includeGlobs: ["README.md"],
+            maxFiles: 5,
+            maxWaitMs: 10000,
+            recreateCollection: true,
+          },
+        },
+      });
+
+      assert.equal(reconcile.result.isError, false);
+      assert.match(reconcile.result.content[0].text, /reconcileRan: true/);
+      assert.match(reconcile.result.content[0].text, /Reconciliation summary:/);
+    } finally {
+      child.kill();
+    }
+
+    const requests = (await readFile(requestsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+
+    assert.deepEqual(requests, [
+      {
+        kind: "indexWorkspace",
+        workspaceId: "workspace-from-env",
+        mode: "full",
+        recreateCollection: true,
+        files: ["README.md"],
+        deletedPaths: [],
+      },
+    ]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 async function writeMockSdk(tempDir) {
   const sdkPath = path.join(tempDir, "mock-sdk.mjs");
   const requestsPath = path.join(tempDir, "requests.jsonl");
@@ -398,6 +460,30 @@ export class CorpusWireClient {
       enhanced_prompt: "Local deterministic rewrite",
       enhancement_backend: "local-deterministic",
       generation_error: "Prompt rewriting requires a configured generation backend"
+    };
+  }
+
+  async indexWorkspace(request) {
+    appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
+      kind: "indexWorkspace",
+      workspaceId: request.workspace.workspaceId,
+      mode: request.mode,
+      recreateCollection: request.recreateCollection,
+      files: request.files.map((file) => file.relativePath),
+      deletedPaths: request.deletedPaths ?? [],
+    }) + "\\n", "utf8");
+    return {
+      result: {
+        collection: "corpuswire-test",
+        documents_indexed: request.files.length,
+        files_added: request.files.length,
+        files_updated: 0,
+      },
+      status: {
+        manifest_revision: 12,
+        files_indexed: request.files.length,
+        files_deleted: 0,
+      },
     };
   }
 }
