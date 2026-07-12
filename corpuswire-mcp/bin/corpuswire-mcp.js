@@ -2334,7 +2334,7 @@ function toolDefinitions() {
     },
     {
       name: "corpuswire_enhance_prompt",
-      description: "Enhance a base Codex prompt with local repository context using corpuswire /v1/enhance.",
+      description: "Preview a base Codex prompt enhanced with local repository context. Returns the original prompt, augmented prompt, context sources, and retrieval metadata.",
       inputSchema: {
         type: "object",
         additionalProperties: false,
@@ -3694,10 +3694,26 @@ async function enhancePrompt(args) {
     context: { repo_path: result.repo_path, workspace_id: result.workspace_id },
     retrievalWarning: optionalString(result.retrieval_warning),
   });
+  const contextUsed = Array.isArray(result.agent_context_packets)
+    ? result.agent_context_packets.slice(0, 10).map((packet) => {
+      const sourcePath = optionalString(packet?.source_path) ?? "unknown source";
+      const role = optionalString(packet?.role) ?? "context";
+      const score = Number.isFinite(Number(packet?.score)) ? Number(packet.score).toFixed(3) : "unknown";
+      return `- \`${sourcePath}\` (role: ${role}; score: ${score})`;
+    })
+    : [];
 
   return [
-    "Enhanced prompt:",
-    enhancedPrompt,
+    "Prompt augmentation preview",
+    "",
+    "Original prompt:",
+    indentPreviewBlock(prompt.trim()),
+    "",
+    "Augmented prompt:",
+    indentPreviewBlock(enhancedPrompt),
+    "",
+    "Context used:",
+    ...(contextUsed.length > 0 ? contextUsed : ["- No repository context was selected."]),
     "",
     "Retrieval metadata:",
     `- baseUrl: ${client.baseUrl}`,
@@ -3721,6 +3737,13 @@ async function enhancePrompt(args) {
       ? ["", "Citations:", ...result.citations.map((citation) => `- ${citation}`)]
       : []),
   ].join("\n");
+}
+
+function indentPreviewBlock(text) {
+  return text
+    .split("\n")
+    .map((line) => `    ${line}`)
+    .join("\n");
 }
 
 async function recordQualityResult(args) {
