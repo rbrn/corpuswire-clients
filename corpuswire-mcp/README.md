@@ -1,6 +1,6 @@
 # `@corpuswire/mcp`
 
-Node/TypeScript-friendly STDIO MCP server for CorpusWire. It exposes CorpusWire retrieval, prompt enhancement, health, and remote-index sync tools to MCP-compatible hosts such as GitHub Copilot Chat in VS Code, GitHub Copilot CLI, Codex, Cursor, and Claude Desktop.
+Node/TypeScript-friendly STDIO MCP server for CorpusWire. It exposes secure local or remote retrieval, prompt enhancement, health, and workspace sync tools to MCP-compatible hosts such as GitHub Copilot Chat in VS Code, GitHub Copilot CLI, Codex, Cursor, and Claude Desktop.
 
 This package is the preferred distributable MCP entrypoint for the VS Code/Copilot ecosystem. It vendors the built `@corpuswire/sdk` runtime and talks to a running CorpusWire API over HTTP.
 
@@ -8,18 +8,20 @@ This package is the preferred distributable MCP entrypoint for the VS Code/Copil
 
 - `corpuswire_search`: calls `POST /query` for semantic retrieval.
 - `corpuswire_enhance_prompt`: calls `POST /v1/enhance` for context-grounded prompt rewriting. It defaults to deterministic local rewriting and retries once with `localOnly=true` if backend generation setup is unavailable.
+- `corpuswire_rate_result`: records a 1-5 semantic-retrieval or prompt-enhancement scorecard for any engine in the central cross-workspace quality ledger.
+- `corpuswire_quality_review`: reviews central ratings by engine, workspace, work type, and quality dimension, then reports recurring improvements and recommended actions.
 - `corpuswire_health`: checks backend health.
-- `corpuswire_diagnose_workspace`: checks the requested `repoPath` or `workspaceId` before retrieval and returns collection readiness plus recovery actions.
+- `corpuswire_diagnose_workspace`: checks the requested local `repoPath` or workspace id before retrieval and returns collection readiness plus recovery actions.
 - `corpuswire_doctor`: runs a read-only readiness check across health, diagnosis, sync state, active sessions, and backend activity.
-- `corpuswire_sync_delta`: queues changed/deleted paths for remote workspace indexing.
+- `corpuswire_sync_delta`: queues changed/deleted paths for local API workspace indexing.
 - `corpuswire_sync_flush`: flushes queued sync changes.
 - `corpuswire_sync_probe_paths`: classifies paths under current sync filters without queuing or uploading.
 - `corpuswire_sync_reconcile`: runs a bounded full workspace reconciliation.
 - `corpuswire_sync_git_delta`: scans `git status` and queues modified, added, deleted, renamed, and untracked paths for incremental sync.
 - `corpuswire_sync_bootstrap`: diagnoses startup freshness, sets `needsReconcile`, and can explicitly run reconciliation when requested.
 - `corpuswire_sync_status`: reports sync queue, watcher, recent event, skip-reason, and latency status.
-- `corpuswire_sync_sessions`: lists active remote index sessions visible to the backend, optionally filtered by workspace id.
-- `corpuswire_sync_abort_session`: aborts a known remote index session by id after inspection.
+- `corpuswire_sync_sessions`: lists active index sessions visible to the local backend, optionally filtered by workspace id.
+- `corpuswire_sync_abort_session`: aborts a known index session by id after inspection.
 - `corpuswire_index_activity`: reports persisted backend index activity and recent index events.
 
 Search and enhancement responses render `Agent context packets` when the API
@@ -125,7 +127,7 @@ That command runs the Docker/API regression gate, then exercises the Codex wrapp
 
 ## GitHub Copilot Chat In VS Code
 
-For a workspace-local example, see [../../.vscode/mcp.json.example](../../.vscode/mcp.json.example). To activate it, copy the example to `.vscode/mcp.json`, adjust paths and workspace id, then run **MCP: List Servers** or use the Start button in the VS Code MCP file.
+For a workspace-local example, see [../../.vscode/mcp.json.example](../../.vscode/mcp.json.example). To activate it, copy the example to `.vscode/mcp.json`, adjust paths, then run **MCP: List Servers** or use the Start button in the VS Code MCP file.
 
 Minimal direct-checkout shape:
 
@@ -138,12 +140,13 @@ Minimal direct-checkout shape:
         "${workspaceFolder}/clients/corpuswire-mcp/bin/corpuswire-mcp.js"
       ],
       "env": {
-        "CORPUSWIRE_BASE_URL": "https://corpuswire.onrender.com",
-        "CORPUSWIRE_WORKSPACE_ID": "github://rbrn/corpuswire#main",
+        "CORPUSWIRE_BASE_URL": "http://127.0.0.1:8000",
+        "CORPUSWIRE_REPO_PATH": "${workspaceFolder}",
         "CORPUSWIRE_OUTPUT_MODE": "copilot",
         "CORPUSWIRE_LOCAL_ONLY": "true",
         "CORPUSWIRE_TOP_K": "5",
-        "CORPUSWIRE_SYNC_ENABLED": "false"
+        "CORPUSWIRE_SYNC_ENABLED": "false",
+        "CORPUSWIRE_BASIC_AUTH": ""
       }
     }
   }
@@ -152,7 +155,7 @@ Minimal direct-checkout shape:
 
 When using the global npm install, use the same `env` block but set `"command": "corpuswire-mcp"` and `"args": []`. See [examples/npm-global-mcp-config.json](examples/npm-global-mcp-config.json).
 
-Keep secrets out of repository config. Put `CORPUSWIRE_BASIC_AUTH` or service tokens in user settings, environment-specific config, or the host's secret store.
+Keep secrets out of repository config. If the local API is protected with `BASIC_AUTH_USERNAME` and `BASIC_AUTH_PASSWORD`, put `CORPUSWIRE_BASIC_AUTH=username:password` in user settings, environment-specific config, or the host's secret store.
 
 ## GitHub Copilot CLI
 
@@ -170,17 +173,17 @@ Use the Copilot CLI MCP config shape in [examples/copilot-cli-mcp-config.json](e
 }
 ```
 
-Enable sync tools only when the server has the intended local workspace root and the target CorpusWire workspace id.
+Enable sync tools only when the server has the intended local workspace root and the target local CorpusWire workspace id.
 
 ## Correct Configuration
 
-Set `CORPUSWIRE_BASE_URL` to the API that should answer retrieval requests. Use `http://127.0.0.1:8000` for the local Docker/API default, or `https://corpuswire.onrender.com` for the hosted service.
+Set `CORPUSWIRE_BASE_URL` to the API that should answer retrieval requests. Use `http://127.0.0.1:8000` for the local Docker/API default. Remote access is fail-closed: set `CORPUSWIRE_REMOTE_ENABLED=true`, use HTTPS, list the exact origin in `CORPUSWIRE_ALLOWED_ORIGINS`, and provide `CORPUSWIRE_BEARER_TOKEN` or legacy `CORPUSWIRE_BASIC_AUTH`. Redirects are rejected.
 
 Choose the workspace scope deliberately:
 
-- Use `CORPUSWIRE_WORKSPACE_ID` for remote-indexed workspaces, such as `github://rbrn/corpuswire#main`. This is the right setting for hosted CorpusWire and for MCP hosts that cannot share a local filesystem path with the API.
-- Use `CORPUSWIRE_REPO_PATH` only when the CorpusWire API process can read the same local path, such as a local Docker/API regression run where the repository is mounted or visible to the service.
-- For remote incremental sync, set both `CORPUSWIRE_WORKSPACE_ID` and `CORPUSWIRE_SYNC_ROOT` to the local checkout that should be watched or scanned, then enable `CORPUSWIRE_SYNC_ENABLED=true`. Keep sync disabled for read-only Copilot/Codex configs.
+- Use `CORPUSWIRE_REPO_PATH` when the local CorpusWire API process can read the same path, such as a local Docker/API run where the repository is mounted or visible to the service.
+- Use `CORPUSWIRE_WORKSPACE_ID` only for workspace ids already indexed into the same local API.
+- For incremental sync into the local API, set `CORPUSWIRE_WORKSPACE_ID` and `CORPUSWIRE_SYNC_ROOT` to the local checkout that should be watched or scanned, then enable `CORPUSWIRE_SYNC_ENABLED=true`. Keep sync disabled for read-only Copilot/Codex configs.
 
 Recommended prompt settings:
 
@@ -194,13 +197,17 @@ Recommended prompt settings:
 ## Environment
 
 - `CORPUSWIRE_BASE_URL`: backend URL, default `http://127.0.0.1:8000`
-- `CORPUSWIRE_WORKSPACE_ID`: remote workspace id for retrieval and sync
+- `CORPUSWIRE_WORKSPACE_ID`: local API workspace id for retrieval and sync
 - `CORPUSWIRE_REPO_PATH`: service-local repository path for retrieval
 - `CORPUSWIRE_OUTPUT_MODE`: `generic`, `copilot`, `claude-code`, or `sequential`
 - `CORPUSWIRE_TOP_K`: retrieval chunk count
 - `CORPUSWIRE_LOCAL_ONLY`: deterministic rewrite mode, default `true`
-- `CORPUSWIRE_BASIC_AUTH`: optional `username:password`
-- `CORPUSWIRE_SYNC_ENABLED`: enable remote incremental sync
+- `CORPUSWIRE_BASIC_AUTH`: optional `username:password`, sent as HTTP Basic Auth to the local API and plugin MCP routes
+- `CORPUSWIRE_BEARER_TOKEN`: preferred scoped service or OIDC token for hosted APIs
+- `CORPUSWIRE_REMOTE_ENABLED`: opt in to a non-loopback backend; default `false`
+- `CORPUSWIRE_ALLOWED_ORIGINS`: comma-separated exact HTTPS origins permitted for remote use
+- `CORPUSWIRE_REMOTE_SYNC_ENABLED`: separately allow local workspace content upload to an approved remote API
+- `CORPUSWIRE_SYNC_ENABLED`: enable incremental sync into the local API
 - `CORPUSWIRE_SYNC_ROOT`: local workspace root readable by this MCP process
 - `CORPUSWIRE_SYNC_WATCH`: optional best-effort `fs.watch` watcher
 - `CORPUSWIRE_SYNC_DEBOUNCE_MS`: debounce delay for queued deltas
@@ -225,11 +232,13 @@ Recommended prompt settings:
 - `CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_DELAY_MS`: base active-session retry delay, default `750`
 - `CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_MAX_DELAY_MS`: active-session retry delay ceiling, default `5000`
 
-`corpuswire_sync_bootstrap` is diagnostic by default. It calls workspace diagnosis, reports `bootstrapState` and `needsReconcile` in sync status, and returns recovery actions when the remote index is stale, degraded, missing, or blocked. It uploads files only when called with `"reconcile": true`.
+`corpuswire_sync_bootstrap` is diagnostic by default. It calls workspace diagnosis, reports `bootstrapState` and `needsReconcile` in sync status, and returns recovery actions when the local API workspace index is stale, degraded, missing, or blocked. It uploads files only when called with `"reconcile": true`.
 
-`corpuswire_sync_reconcile` normally runs a full manifest reconciliation without deleting and recreating the Qdrant collection. Pass `"recreateCollection": true` only for an intentional clean rebuild, such as when the existing workspace collection was created with an embedding dimension that no longer matches the active provider.
+`corpuswire_sync_reconcile` normally runs a full manifest reconciliation without deleting and recreating the Qdrant collection. Pass `"recreateCollection": true` only for an intentional clean rebuild, such as when the existing workspace collection was created with an embedding dimension that no longer matches the active provider. The first uploaded batch recreates the physical collection, so that workspace can be temporarily unavailable until the full manifest commits.
 
-When `CORPUSWIRE_SYNC_MTIME_CACHE_ENABLED=true`, incremental sync writes a JSON metadata cache containing relative paths, size, mtime, SHA-256, and last decision. It never stores file contents. The cache suppresses duplicate changed-file uploads across MCP restarts when size and mtime match, re-hashes same-size files when mtime changes, and is ignored while bootstrap says the remote index needs reconciliation. Full reconciliation does not use the cache because it must send a complete inventory.
+For a large workspace, set `maxWaitMs` to the full expected indexing budget. The MCP server passes that value through as the SDK background-processing timeout; `processingTimeoutMs` may be set separately when the operator wait and server processing budgets must differ.
+
+When `CORPUSWIRE_SYNC_MTIME_CACHE_ENABLED=true`, incremental sync writes a JSON metadata cache containing relative paths, size, mtime, SHA-256, and last decision. It never stores file contents. The cache suppresses duplicate changed-file uploads across MCP restarts when size and mtime match, re-hashes same-size files when mtime changes, and is ignored while bootstrap says the local API workspace index needs reconciliation. Full reconciliation does not use the cache because it must send a complete inventory.
 
 `corpuswire_sync_git_delta` runs `git status --porcelain=v1 -z --untracked-files=all --ignored=no`, so gitignored files are not uploaded. Renames are sent as delete-old plus upload-new. The same CorpusWire include/exclude filters and extension allowlist still apply before anything is queued.
 
@@ -237,7 +246,7 @@ Read-side freshness preparation runs before `corpuswire_search` and `corpuswire_
 
 If a flush reports `409 Conflict` because an index session is already active for the workspace, the MCP server retries with bounded backoff before requeueing. Retry counts and the last conflict message are visible in `corpuswire_sync_status` as `sessionConflictRetries` and `lastSessionConflict*` fields. Backend builds with remote-session idle expiry clear stale locks automatically after `REMOTE_INDEX_SESSION_IDLE_TIMEOUT_SECONDS`; SDK builds from 2026-05-17 onward also abort failed high-level sessions on the client side.
 
-Use `corpuswire_sync_sessions` when a sync stays blocked or when several agents share a remote workspace. The tool calls `GET /v1/index/sessions`, returns active session id, workspace id, collection, mode, phase, manifest revision, queue depth, indexed file count, age, idle age, timeout, and error count, and does not mutate backend state.
+Use `corpuswire_sync_sessions` when a sync stays blocked or when several agents share a local API workspace. The tool calls `GET /v1/index/sessions`, returns active session id, workspace id, collection, mode, phase, manifest revision, queue depth, indexed file count, age, idle age, timeout, and error count, and does not mutate backend state.
 
 Use `corpuswire_sync_abort_session` only when an inspected session is clearly stale, failed, or owned by an abandoned agent. It calls the backend session abort endpoint with the exact session id and releases that workspace lock.
 
@@ -247,4 +256,4 @@ Use `corpuswire_sync_probe_paths` before queuing uncertain edits. It applies the
 
 Use `corpuswire_doctor` as the quick replacement-readiness check before trusting CorpusWire in a long Codex session. It returns `ready`, `attention`, or `blocked` from backend health, workspace diagnosis, process-local sync state, active sessions, and persisted activity.
 
-For the local Docker app on an existing dense-only Qdrant collection, keep `APP_QDRANT_HYBRID_ENABLED=false` unless you intentionally recreate the collection for hybrid named vectors. A dense/hybrid mismatch raises a backend writer error; current backend builds close the failed remote session so retry attempts are not blocked by a stale active-session lock.
+For the local Docker app on an existing dense-only Qdrant collection, keep `APP_QDRANT_HYBRID_ENABLED=false` unless you intentionally recreate the collection for hybrid named vectors. A dense/hybrid mismatch raises a backend writer error; current backend builds close the failed index session so retry attempts are not blocked by a stale active-session lock.

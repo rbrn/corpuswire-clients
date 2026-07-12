@@ -54,6 +54,9 @@ export interface PromptRewriteResult {
     retrieval_query: string;
     retrieval_backend: string | null;
     retrieval_warning: string | null;
+    retrieval_confidence?: number | null;
+    retrieval_not_found?: boolean;
+    score_semantics?: string | null;
     retrieved_chunks: SearchHit[];
     agent_context_packets?: AgentContextPacket[];
     task_type: PromptTaskType;
@@ -73,6 +76,9 @@ export interface PromptEnhancementResult {
     retrieval_query: string;
     retrieval_backend: string | null;
     retrieval_warning: string | null;
+    retrieval_confidence?: number | null;
+    retrieval_not_found?: boolean;
+    score_semantics?: string | null;
     retrieved_chunks: SearchHit[];
     agent_context_packets?: AgentContextPacket[];
     augmented_prompt: string;
@@ -297,6 +303,7 @@ export interface QueryPromptRequest {
 export interface CorpusWireClientOptions {
     baseUrl?: string;
     basicAuth?: string;
+    bearerToken?: string;
     endpointMode?: "compat" | "v1-only";
     fetchFn?: FetchLike;
     defaultHeaders?: Record<string, string>;
@@ -389,6 +396,123 @@ export interface QueryPromptPayload {
     include_answer: boolean;
     source_filter?: string[];
 }
+export type QualityWorkType = "semantic_retrieval" | "prompt_enhancement";
+export interface QualityScorecard {
+    relevance: number;
+    fileSpecificity: number;
+    coverage: number;
+    freshness: number;
+    actionability: number;
+}
+export interface QualityEventRequest {
+    workspaceId: string;
+    workType: QualityWorkType;
+    engine: string;
+    scorecard: QualityScorecard;
+    query?: string;
+    surface?: string;
+    roundId?: string;
+    resultPaths?: string[];
+    warning?: string;
+    improvement?: string;
+    notes?: string;
+    issueUrl?: string;
+    metadata?: Record<string, unknown>;
+}
+export interface QualityEventPayload {
+    workspace_id: string;
+    work_type: QualityWorkType;
+    engine: string;
+    scorecard: {
+        relevance: number;
+        file_specificity: number;
+        coverage: number;
+        freshness: number;
+        actionability: number;
+    };
+    query: string;
+    surface?: string;
+    round_id?: string;
+    result_paths: string[];
+    warning?: string;
+    improvement?: string;
+    notes?: string;
+    issue_url?: string;
+    metadata: Record<string, unknown>;
+}
+export interface QualityEvent {
+    event_id: string;
+    occurred_at: string;
+    workspace_id: string;
+    work_type: QualityWorkType;
+    engine: string;
+    surface?: string | null;
+    round_id?: string | null;
+    query: string;
+    query_terms: string[];
+    relevance: number;
+    file_specificity: number;
+    coverage: number;
+    freshness: number;
+    actionability: number;
+    overall: number;
+    result_paths: string[];
+    warning?: string | null;
+    improvement?: string | null;
+    notes?: string | null;
+    issue_url?: string | null;
+    metadata: Record<string, unknown>;
+}
+export interface QualityEventsQuery {
+    workspaceId?: string;
+    workType?: QualityWorkType;
+    engine?: string;
+    days?: number;
+    limit?: number;
+}
+export interface QualityReviewQuery {
+    workspaceId?: string;
+    workType?: QualityWorkType;
+    engine?: string;
+    days?: number;
+}
+export interface QualityReview {
+    window_days: number;
+    filters: Record<string, unknown>;
+    event_count: number;
+    overall_average: number;
+    dimension_averages: Record<string, number>;
+    by_engine: Record<string, unknown>;
+    by_workspace: Record<string, unknown>;
+    by_work_type: Record<string, unknown>;
+    weak_dimensions: Array<{
+        dimension: string;
+        average: number;
+    }>;
+    recurring_improvements: Array<{
+        value: string;
+        count: number;
+    }>;
+    recurring_warnings: Array<{
+        value: string;
+        count: number;
+    }>;
+    recommended_actions: string[];
+    low_score_events: Array<Record<string, unknown>>;
+    generated_at: string;
+}
+export interface QualityEventResponse {
+    ok: true;
+    event: QualityEvent;
+}
+export interface QualityEventsResponse {
+    ok: true;
+    events: QualityEvent[];
+}
+export interface QualityReviewResponse {
+    ok: true;
+    review: QualityReview;
+}
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 export type RemoteIndexMode = "full" | "incremental";
 export type RemoteManifestOp = "upsert" | "delete";
@@ -413,6 +537,7 @@ export interface RemoteIndexSession {
     mode: RemoteIndexMode;
     manifest_revision: number;
     max_batch_bytes: number;
+    max_batch_files?: number;
     max_file_size_bytes: number;
     max_concurrent_uploads: number;
 }
@@ -455,6 +580,9 @@ export interface RemoteFileBatchResult {
     bytes_uploaded: number;
     bytes_skipped: number;
     errors: string[];
+    queued?: boolean;
+    job_id?: string | null;
+    phase?: string | null;
 }
 export interface RemoteIndexStatus {
     session_id: string;
@@ -471,6 +599,10 @@ export interface RemoteIndexStatus {
     bytes_uploaded: number;
     bytes_skipped: number;
     queue_depth: number;
+    pending_batches?: number;
+    active_batches?: number;
+    completed_batches?: number;
+    failed_batches?: number;
     age_seconds?: number | null;
     idle_seconds?: number | null;
     idle_timeout_seconds?: number | null;
@@ -484,12 +616,16 @@ export interface RemoteIndexCapabilities {
     ok: true;
     protocol_version: string;
     max_batch_bytes: number;
+    max_batch_files?: number;
     max_file_size_bytes: number;
     max_concurrent_uploads: number;
     supported_extensions: string[];
     manifest_compression: string[];
     file_batch_content_types: string[];
     payload_compression: string[];
+    background_file_batches?: boolean;
+    worker_count?: number;
+    max_queued_batches?: number;
 }
 export interface RemoteIndexCommitResponse {
     ok: true;
@@ -508,4 +644,6 @@ export interface IndexWorkspaceRequest extends Omit<StartRemoteIndexSessionReque
     deletedPaths?: string[];
     batchBytes?: number;
     maxConcurrentUploads?: number;
+    processingTimeoutMs?: number;
+    processingPollMs?: number;
 }

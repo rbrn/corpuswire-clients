@@ -1,7 +1,8 @@
-import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceResponseEnvelope, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexSessionQuery, IndexWorkspaceRequest, CorpusWireClientOptions, LlmModelState, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexSession, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, SearchHit, StartRemoteIndexSessionRequest, WorkspaceDiagnosis, WorkspaceDiagnosisRequest } from "./types.js";
+import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceResponseEnvelope, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexSessionQuery, IndexWorkspaceRequest, CorpusWireClientOptions, LlmModelState, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, QualityEvent, QualityEventPayload, QualityEventRequest, QualityEventsQuery, QualityReview, QualityReviewQuery, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexSession, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, SearchHit, StartRemoteIndexSessionRequest, WorkspaceDiagnosis, WorkspaceDiagnosisRequest } from "./types.js";
 export declare class CorpusWireClient {
     readonly baseUrl: string;
     readonly basicAuth: string;
+    readonly bearerToken: string;
     readonly endpointMode: "compat" | "v1-only";
     readonly fetchFn: CorpusWireClientOptions["fetchFn"];
     readonly defaultHeaders: Record<string, string>;
@@ -16,6 +17,9 @@ export declare class CorpusWireClient {
     query(request: string | QueryPromptRequest): Promise<PromptEnhancementResult>;
     queryRaw(request: string | QueryPromptRequest): Promise<QueryResponseEnvelope>;
     semanticSearch(request: string | Omit<QueryPromptRequest, "includeAnswer">): Promise<SearchHit[]>;
+    recordQualityEvent(request: QualityEventRequest): Promise<QualityEvent>;
+    listQualityEvents(request?: QualityEventsQuery): Promise<QualityEvent[]>;
+    reviewQuality(request?: QualityReviewQuery): Promise<QualityReview>;
     getLlmModel(): Promise<LlmModelState>;
     setLlmModel(model: string): Promise<LlmModelState>;
     getIndexCapabilities(): Promise<RemoteIndexCapabilities>;
@@ -33,8 +37,10 @@ export declare class CorpusWireClient {
         phase: string;
     }>;
     private abortIndexSessionQuietly;
+    private waitForIndexSessionProcessing;
     indexWorkspace(request: IndexWorkspaceRequest): Promise<RemoteIndexCommitResponse>;
 }
+export declare function toQualityEventPayload(request: QualityEventRequest): QualityEventPayload;
 export declare function toEnhancePayload(request: string | EnhancePromptRequest): EnhancePromptPayload;
 export declare function toQueryPayload(request: string | QueryPromptRequest): QueryPromptPayload;
 export declare function toStartIndexSessionPayload(request: StartRemoteIndexSessionRequest): Record<string, unknown>;

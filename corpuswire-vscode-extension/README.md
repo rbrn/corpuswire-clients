@@ -19,6 +19,8 @@ the MCP package is the tool surface Copilot discovers.
   context-grounded rewrite from `/v1/enhance`.
 - `CorpusWire: Index Workspace` performs a complete remote indexing session for
   the current workspace.
+- `CorpusWire: Rebuild Workspace Index` performs an explicit clean rebuild for
+  embedding-model or vector-dimension changes.
 - Optional file watcher sends incremental updates for changed and deleted files.
 - Service-specific configuration for indexer, enhancer, and semantic search
   endpoints.
@@ -134,9 +136,19 @@ no Authorization header has already been provided.
 | --- | --- | --- |
 | `corpuswire.remoteIndexing.enabled` | `false` | Enables remote-first indexing and sends `workspace_id` in enhancement requests |
 | `corpuswire.remoteIndexing.autoWatch` | `false` | Watches file create/change/delete events and sends incremental updates |
-| `corpuswire.remoteIndexing.workspaceId` | first workspace folder URI | Stable workspace identity for remote indexing |
+| `corpuswire.remoteIndexing.workspaceId` | `local-docker://<folder-slug>#main` for local folders; folder URI otherwise | Stable workspace identity for remote indexing |
 | `corpuswire.remoteIndexing.maxConcurrentUploads` | `4` | Client concurrency hint for SDK upload batches |
 | `corpuswire.remoteIndexing.batchBytes` | `4194304` | Target maximum bytes per upload batch |
+| `corpuswire.remoteIndexing.maxFileSizeBytes` | `524288` | Maximum single file size read and sent by the extension |
+| `corpuswire.remoteIndexing.autoWatchDebounceMs` | `1000` | Debounce delay for file watcher incremental updates |
+| `corpuswire.remoteIndexing.maxAutoWatchFiles` | `50` | Maximum file events in one automatic watcher update |
+
+Remote indexing is strictly opt-in. Legacy `corpuswireContextEngine.workspaceId`
+settings can still provide a workspace identity, but they do not enable remote
+indexing or file watching unless `corpuswire.remoteIndexing.enabled` is set.
+An explicit workspace ID always wins. When it is absent, local file workspaces
+derive a stable slug identity instead of indexing under a machine-specific
+`file://` URI; remote or virtual workspaces retain their folder URI.
 
 Example workspace settings:
 
@@ -168,7 +180,10 @@ APP_HOST_PORT=18080 bash ./scripts/vscode_docker_remote_smoke.sh /Users/constant
 
 The smoke test starts Docker, uploads workspace files using a generated
 `local-docker://...` workspace id, verifies workspace-scoped search, verifies
-prompt enhancement, and prints matching VS Code settings:
+prompt enhancement, and prints matching VS Code settings. Its disposable
+collection is cleanly rebuilt by default to prevent stale embedding dimensions;
+set `VSCODE_REMOTE_SMOKE_RECREATE_COLLECTION=false` only to test reuse of an
+already compatible collection.
 
 ```json
 {
@@ -190,12 +205,14 @@ WRITE_VSCODE_SETTINGS=1 APP_HOST_PORT=18080 bash ./scripts/vscode_docker_remote_
 
 ## Complete Workspace Ingestion
 
-Run `CorpusWire: Index Workspace` to perform a full remote indexing session.
+Run `CorpusWire: Index Workspace` to perform a full remote indexing session
+without deleting and recreating the target collection.
 
 The command:
 
 1. Reads settings for the first workspace folder.
-2. Requires a stable `remoteIndexing.workspaceId`.
+2. Uses the configured stable `remoteIndexing.workspaceId`, or the derived
+   local-folder identity when no explicit value is set.
 3. Creates `CorpusWireClient` for the configured indexer service with
    `endpointMode: "v1-only"`.
 4. Finds workspace files with:
@@ -205,13 +222,19 @@ The command:
    `__pycache__`.
 6. Reads file bytes through `vscode.workspace.fs`, so remote and virtual VS Code
    file systems work.
-7. Calls `client.indexWorkspace({ mode: "full", files, ... })`.
+7. Skips files larger than `remoteIndexing.maxFileSizeBytes`.
+8. Calls `client.indexWorkspace({ mode: "full", recreateCollection: false, files, ... })`.
 
 In full mode, the SDK sends a complete manifest. The backend compares the new
 manifest generation with stored records, skips unchanged files, asks the client
 to upload only changed or new files, and deletes stale records during commit.
 This is the correct path for initial indexing and complete reconciliation after
 large workspace changes.
+
+Use `CorpusWire: Rebuild Workspace Index` only for intentional clean rebuilds,
+such as switching from a 384-dimensional local-lite collection to a 1024-
+dimensional BAAI/bge-m3 collection. The command asks for confirmation and then
+calls the same full indexing flow with `recreateCollection: true`.
 
 ## Incremental Updates To Already Ingested Content
 
@@ -227,7 +250,7 @@ Enable automatic updates:
 
 When enabled at activation time, the extension creates a VS Code file-system
 watcher for the same include glob used by full indexing. It batches events for
-one second:
+`remoteIndexing.autoWatchDebounceMs` milliseconds:
 
 - Created and changed files are deduplicated by URI and uploaded as changed
   `files`.
@@ -235,6 +258,13 @@ one second:
 - If a file is created or changed and then deleted before flush, the delete wins
   for that URI.
 - The SDK sends `mode: "incremental"`.
+- Watcher flushes are serialized; a new flush waits until the active upload
+  finishes.
+- Automatic watcher updates are bounded by `remoteIndexing.maxAutoWatchFiles`.
+  Larger event bursts are skipped with a warning; run `CorpusWire: Index
+  Workspace` for full reconciliation.
+- Files above `remoteIndexing.maxFileSizeBytes` are skipped before the extension
+  reads file bytes.
 
 Incremental mode updates only mentioned files and deleted paths. It does not
 remove stale files that were never mentioned in the update batch. Run
@@ -263,6 +293,17 @@ The command:
 8. If generation failed and `localOnly` was not already set, retries with
    `localOnly: true` and uses the deterministic `enhancement_prompt`. This
    also covers HTTP rejections caused by missing backend generation setup.
+9. Assesses the returned retrieval metadata and labels the result as:
+   - **grounded** when workspace chunks and citations are present with no
+     retrieval warning;
+   - **degraded** when the index reports a warning, confidence is below 35%,
+     or citations are missing;
+   - **ungrounded** when no workspace context was found.
+
+The editor command and prompt panel show the quality verdict. Degraded or
+ungrounded rewrites remain available, but they are displayed as warnings rather
+than an unqualified success. Reconcile or re-index the workspace before relying
+on repository-specific details in those results.
 
 This means prompt enhancement follows the same workspace identity as indexing:
 remote-first workspaces use `workspaceId`; service-local workflows can still use
@@ -277,6 +318,19 @@ Initial remote index and prompt enhancement:
 3. Set a stable `remoteIndexing.workspaceId`.
 4. Run `CorpusWire: Index Workspace`.
 5. Select a prompt and run `CorpusWire: Enhance Prompt`.
+
+Local Docker example:
+
+```json
+{
+  "corpuswire.serviceDefaults.url": "http://127.0.0.1:18080",
+  "corpuswire.localOnly": true,
+  "corpuswire.outputMode": "copilot",
+  "corpuswire.remoteIndexing.enabled": true,
+  "corpuswire.remoteIndexing.autoWatch": true,
+  "corpuswire.remoteIndexing.workspaceId": "local-docker://my-workspace#main"
+}
+```
 
 Keep a remote index current:
 
@@ -303,8 +357,10 @@ valid for hosted services that cannot mount the local path.
 
 - `remoteIndexing.workspaceId` should be stable across sessions. Changing it
   creates or targets a different remote collection.
-- Full indexing is the only extension command that performs complete stale-file
-  reconciliation.
+- `CorpusWire: Index Workspace` performs complete stale-file reconciliation
+  without recreating the collection.
+- `CorpusWire: Rebuild Workspace Index` recreates the collection and should be
+  reserved for embedding-source or vector-dimension changes.
 - Watcher updates are best-effort and incremental. They are not a substitute for
   periodic full reconciliation when file state may have changed while VS Code
   was closed.

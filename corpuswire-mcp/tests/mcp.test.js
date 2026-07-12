@@ -16,7 +16,7 @@ test("corpuswire-mcp exposes tools and maps search requests to the SDK", async (
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...globalThis.process.env,
-        CORPUSWIRE_BASE_URL: "http://mock-corpuswire",
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
         CORPUSWIRE_SDK_PATH: sdkPath,
         CORPUSWIRE_WORKSPACE_ID: "workspace-from-env",
         MOCK_REQUESTS_PATH: requestsPath,
@@ -28,6 +28,8 @@ test("corpuswire-mcp exposes tools and maps search requests to the SDK", async (
       const tools = await rpc({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
       assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_search"), true);
       assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_diagnose_workspace"), true);
+      assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_rate_result"), true);
+      assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_quality_review"), true);
 
       const search = await rpc({
         jsonrpc: "2.0",
@@ -77,7 +79,7 @@ test("corpuswire-mcp diagnoses workspace collection mismatches", async () => {
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...globalThis.process.env,
-        CORPUSWIRE_BASE_URL: "http://mock-corpuswire",
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
         CORPUSWIRE_SDK_PATH: sdkPath,
         CORPUSWIRE_WORKSPACE_ID: "workspace-from-env",
         MOCK_REQUESTS_PATH: requestsPath,
@@ -131,7 +133,7 @@ test("corpuswire-mcp keeps empty search output focused on recovery instead of pa
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...globalThis.process.env,
-        CORPUSWIRE_BASE_URL: "http://mock-corpuswire",
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
         CORPUSWIRE_SDK_PATH: sdkPath,
         CORPUSWIRE_WORKSPACE_ID: "workspace-from-env",
         MOCK_REQUESTS_PATH: requestsPath,
@@ -189,7 +191,7 @@ test("corpuswire-mcp retries prompt enhancement with localOnly when generation s
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...globalThis.process.env,
-        CORPUSWIRE_BASE_URL: "http://mock-corpuswire",
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
         CORPUSWIRE_SDK_PATH: sdkPath,
         CORPUSWIRE_WORKSPACE_ID: "workspace-from-env",
         MOCK_REQUESTS_PATH: requestsPath,
@@ -245,6 +247,181 @@ test("corpuswire-mcp retries prompt enhancement with localOnly when generation s
   }
 });
 
+test("corpuswire-mcp records and reviews central quality ratings", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        CORPUSWIRE_WORKSPACE_ID: "workspace-from-env",
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const recorded = await rpc({
+        jsonrpc: "2.0",
+        id: 20,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_rate_result",
+          arguments: {
+            workType: "semantic_retrieval",
+            engine: "augment",
+            relevance: 5,
+            fileSpecificity: 5,
+            coverage: 4,
+            freshness: 5,
+            actionability: 5,
+            roundId: "round-mcp-1",
+            query: "find exact quality ledger files",
+            resultPaths: ["src/corpuswire/observability/quality_ledger.py"],
+          },
+        },
+      });
+      assert.equal(recorded.result.isError, false);
+      assert.match(recorded.result.content[0].text, /overall: 4.8/);
+      assert.match(recorded.result.content[0].text, /queryStoredAs: sha256:/);
+
+      const review = await rpc({
+        jsonrpc: "2.0",
+        id: 21,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_quality_review",
+          arguments: { days: 14 },
+        },
+      });
+      assert.equal(review.result.isError, false);
+      assert.match(review.result.content[0].text, /eventCount: 1/);
+      assert.match(review.result.content[0].text, /augment: 4.8/);
+      assert.match(review.result.content[0].text, /Recommended actions:/);
+    } finally {
+      child.kill();
+    }
+
+    const requests = (await readFile(requestsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(requests[0].kind, "recordQualityEvent");
+    assert.equal(requests[0].workspaceId, "workspace-from-env");
+    assert.deepEqual(requests[1], { kind: "reviewQuality", days: 14 });
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("corpuswire-mcp health tool checks backend reachability", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        CORPUSWIRE_WORKSPACE_ID: "workspace-from-env",
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const health = await rpc({
+        jsonrpc: "2.0",
+        id: 4,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_health",
+          arguments: {},
+        },
+      });
+
+      assert.equal(health.result.isError, false);
+      const text = health.result.content[0].text;
+      assert.match(text, /corpuswire health:/);
+      assert.match(text, /status: ok/);
+      assert.match(text, /baseUrl: http:\/\/127\.0\.0\.1:8000/);
+      assert.match(text, /qdrant_collection:/);
+    } finally {
+      child.kill();
+    }
+
+    const requests = (await readFile(requestsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+
+    assert.deepEqual(requests, [
+      {
+        kind: "health",
+        workspaceId: "workspace-from-env",
+      },
+    ]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("corpuswire-mcp doctor tool combines health diagnosis and activity", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        CORPUSWIRE_WORKSPACE_ID: "workspace-from-env",
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const doctor = await rpc({
+        jsonrpc: "2.0",
+        id: 5,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_doctor",
+          arguments: {},
+        },
+      });
+
+      assert.equal(doctor.result.isError, false);
+      const text = doctor.result.content[0].text;
+      assert.match(text, /CorpusWire doctor:/);
+      assert.match(text, /verdict: blocked/);
+      assert.match(text, /backendOk: true/);
+      assert.match(text, /diagnosisStatus: blocked/);
+      assert.match(text, /canRetrieve: false/);
+      assert.match(text, /Recovery:/);
+    } finally {
+      child.kill();
+    }
+
+    const requests = (await readFile(requestsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+
+    // Doctor calls health, diagnoseWorkspace, potentially sessions and activity
+    assert.ok(requests.some(r => r.kind === "health"));
+    assert.ok(requests.some(r => r.kind === "diagnoseWorkspace"));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("corpuswire-mcp reconcile can request a clean collection rebuild", async () => {
   const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
   try {
@@ -254,7 +431,7 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...globalThis.process.env,
-        CORPUSWIRE_BASE_URL: "http://mock-corpuswire",
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
         CORPUSWIRE_SDK_PATH: sdkPath,
         CORPUSWIRE_WORKSPACE_ID: "workspace-from-env",
         CORPUSWIRE_REPO_PATH: tempDir,
@@ -267,7 +444,7 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
     try {
       const reconcile = await rpc({
         jsonrpc: "2.0",
-        id: 5,
+        id: 6,
         method: "tools/call",
         params: {
           name: "corpuswire_sync_reconcile",
@@ -298,10 +475,227 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
         workspaceId: "workspace-from-env",
         mode: "full",
         recreateCollection: true,
+        processingTimeoutMs: 10000,
         files: ["README.md"],
         deletedPaths: [],
       },
     ]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("corpuswire-mcp sends basic auth to plugin discovery and calls", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
+  const expectedAuth = "Basic dXNlcjpwYXNz";
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const fetchRequestsPath = path.join(tempDir, "fetch-requests.jsonl");
+    const fetchMockPath = path.join(tempDir, "mock-fetch.mjs");
+    await writeFile(fetchRequestsPath, "", "utf8");
+    await writeFile(
+      fetchMockPath,
+      `
+import { appendFileSync } from "node:fs";
+
+globalThis.fetch = async (url, init = {}) => {
+  const headers = {};
+  new Headers(init.headers ?? {}).forEach((value, key) => {
+    headers[key] = value;
+  });
+  appendFileSync(process.env.MOCK_FETCH_REQUESTS_PATH, JSON.stringify({
+    url: String(url),
+    method: init.method ?? "GET",
+    authorization: headers.authorization ?? "",
+  }) + "\\n", "utf8");
+
+  if (String(url).endsWith("/v1/plugins/mcp-tools")) {
+    return new Response(JSON.stringify({
+      tools: [
+        {
+          name: "corpuswire_plugin_echo",
+          description: "Echo from a plugin.",
+          input_schema: { type: "object", additionalProperties: true },
+          plugin: "test-plugin",
+        },
+      ],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  }
+
+  if (String(url).endsWith("/v1/plugins/mcp-call")) {
+    return new Response(JSON.stringify({ ok: true, text: "plugin-ok" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  return new Response(JSON.stringify({ detail: "not found" }), {
+    status: 404,
+    headers: { "content-type": "application/json" },
+  });
+};
+`.trimStart(),
+      "utf8",
+    );
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        NODE_OPTIONS: `${globalThis.process.env.NODE_OPTIONS ?? ""} --import ${fetchMockPath}`.trim(),
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+        CORPUSWIRE_BASIC_AUTH: "user:pass",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        MOCK_FETCH_REQUESTS_PATH: fetchRequestsPath,
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const tools = await rpc({ jsonrpc: "2.0", id: 7, method: "tools/list", params: {} });
+      assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_plugin_echo"), true);
+
+      const result = await rpc({
+        jsonrpc: "2.0",
+        id: 8,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_plugin_echo",
+          arguments: { message: "hello" },
+        },
+      });
+      assert.equal(result.result.isError, false);
+      assert.match(result.result.content[0].text, /plugin-ok/);
+    } finally {
+      child.kill();
+    }
+
+    const seenRequests = (await readFile(fetchRequestsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(seenRequests.map(({ method, url, authorization }) => ({ method, url, authorization })), [
+      { method: "GET", url: "http://127.0.0.1:8000/v1/plugins/mcp-tools", authorization: expectedAuth },
+      { method: "POST", url: "http://127.0.0.1:8000/v1/plugins/mcp-call", authorization: expectedAuth },
+    ]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("corpuswire-mcp rejects non-local backend URLs", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "https://corpuswire.onrender.com",
+        CORPUSWIRE_REMOTE_ENABLED: "false",
+        CORPUSWIRE_BASIC_AUTH: "",
+        CORPUSWIRE_BEARER_TOKEN: "",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const result = await rpc({
+        jsonrpc: "2.0",
+        id: 9,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_search",
+          arguments: { query: "should stay local" },
+        },
+      });
+      assert.equal(result.result.isError, true);
+      assert.match(result.result.content[0].text, /Remote CorpusWire access is disabled/);
+    } finally {
+      child.kill();
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("corpuswire-mcp permits an authenticated allow-listed remote backend", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "https://corpuswire.onrender.com",
+        CORPUSWIRE_REMOTE_ENABLED: "true",
+        CORPUSWIRE_ALLOWED_ORIGINS: "https://corpuswire.onrender.com",
+        CORPUSWIRE_BASIC_AUTH: "",
+        CORPUSWIRE_BEARER_TOKEN: "scoped-service-token",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const result = await rpc({
+        jsonrpc: "2.0",
+        id: 10,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_search",
+          arguments: { query: "remote indexing policy" },
+        },
+      });
+      assert.equal(result.result.isError, false);
+      assert.match(result.result.content[0].text, /router\.py/);
+    } finally {
+      child.kill();
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("corpuswire-mcp blocks remote workspace sync without its explicit capability flag", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "https://corpuswire.onrender.com",
+        CORPUSWIRE_REMOTE_ENABLED: "true",
+        CORPUSWIRE_ALLOWED_ORIGINS: "https://corpuswire.onrender.com",
+        CORPUSWIRE_BASIC_AUTH: "",
+        CORPUSWIRE_BEARER_TOKEN: "scoped-service-token",
+        CORPUSWIRE_SYNC_ENABLED: "true",
+        CORPUSWIRE_REMOTE_SYNC_ENABLED: "false",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const result = await rpc({
+        jsonrpc: "2.0",
+        id: 11,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_sync_delta",
+          arguments: {},
+        },
+      });
+      assert.equal(result.result.isError, false);
+      assert.match(result.result.content[0].text, /CORPUSWIRE_REMOTE_SYNC_ENABLED=true/);
+    } finally {
+      child.kill();
+    }
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -385,6 +779,44 @@ export class CorpusWireClient {
     };
   }
 
+  async health(request = {}) {
+    appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
+      kind: "health",
+      repoPath: request.repoPath,
+      workspaceId: request.workspaceId,
+    }) + "\\n", "utf8");
+    return {
+      ok: true,
+      build: { version: "0.1.0" },
+      docs_source_dir: "/workspace",
+      runtime: { generation_provider_preference: "openai" },
+      ollama: {},
+      corpuswire: { enabled: true, reachable: true },
+      qdrant: {
+        collection: "corpuswire-test",
+        collection_exists: true,
+        point_count: 42,
+        indexed: true,
+        indexed_at: "2025-01-15T10:00:00Z",
+        indexed_commit: "abc123",
+        manifest_revision: 7,
+      },
+      index: {
+        collection: "corpuswire-test",
+        indexed: true,
+        health_status: "ready",
+        manifest_revision: 7,
+      },
+      active_project: {
+        path: request.repoPath ?? "/workspace",
+        workspace_id: request.workspaceId ?? null,
+        collection: "corpuswire-test",
+      },
+      auth: { enabled: false },
+      ui: "http://localhost:8000",
+    };
+  }
+
   async diagnoseWorkspace(request) {
     appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
       kind: "diagnoseWorkspace",
@@ -427,6 +859,31 @@ export class CorpusWireClient {
     };
   }
 
+  async listIndexSessions(request = {}) {
+    appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
+      kind: "listIndexSessions",
+      workspaceId: request.workspaceId,
+    }) + "\\n", "utf8");
+    return [];
+  }
+
+  async getIndexActivity(request = {}) {
+    appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
+      kind: "getIndexActivity",
+      workspaceId: request.workspaceId,
+      windowHours: request.windowHours,
+    }) + "\\n", "utf8");
+    return {
+      workspace_id: request.workspaceId ?? null,
+      collection: "corpuswire-test",
+      window_hours: request.windowHours ?? 24,
+      last_attempt_at: "2025-01-15T10:00:00Z",
+      last_attempt_status: "completed",
+      consecutive_failures: 0,
+      gap_detected: false,
+    };
+  }
+
   async enhance(request) {
     appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify(request) + "\\n", "utf8");
     if (request.localOnly !== true) {
@@ -463,12 +920,56 @@ export class CorpusWireClient {
     };
   }
 
+  async recordQualityEvent(request) {
+    appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
+      kind: "recordQualityEvent",
+      ...request,
+    }) + "\\n", "utf8");
+    return {
+      event_id: "quality-1",
+      workspace_id: request.workspaceId,
+      work_type: request.workType,
+      engine: request.engine,
+      relevance: request.scorecard.relevance,
+      file_specificity: request.scorecard.fileSpecificity,
+      coverage: request.scorecard.coverage,
+      freshness: request.scorecard.freshness,
+      actionability: request.scorecard.actionability,
+      overall: 4.8,
+      query: "sha256:abc123",
+    };
+  }
+
+  async reviewQuality(request) {
+    appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
+      kind: "reviewQuality",
+      ...request,
+    }) + "\\n", "utf8");
+    return {
+      window_days: request.days ?? 30,
+      event_count: 1,
+      overall_average: 4.8,
+      dimension_averages: {
+        relevance: 5,
+        file_specificity: 5,
+        coverage: 4,
+        freshness: 5,
+        actionability: 5,
+      },
+      by_engine: { augment: { count: 1, overall_average: 4.8 } },
+      recommended_actions: [],
+      recurring_improvements: [],
+      low_score_events: [],
+    };
+  }
+
   async indexWorkspace(request) {
     appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
       kind: "indexWorkspace",
       workspaceId: request.workspace.workspaceId,
       mode: request.mode,
       recreateCollection: request.recreateCollection,
+      processingTimeoutMs: request.processingTimeoutMs,
       files: request.files.map((file) => file.relativePath),
       deletedPaths: request.deletedPaths ?? [],
     }) + "\\n", "utf8");

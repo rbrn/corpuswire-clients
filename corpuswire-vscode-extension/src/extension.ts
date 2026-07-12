@@ -15,18 +15,26 @@ import {
   readSettings,
 } from "./configuration.js";
 import type { ExtensionSettings } from "./configuration.js";
+import {
+  assessEnhancementQuality,
+} from "./enhancement-quality.js";
+import type {
+  EnhancementQuality,
+  EnhancementQualityStatus,
+} from "./enhancement-quality.js";
 
 type PromptRewriteResultWithCompatibilityFields = PromptRewriteResult & {
   augmented_prompt?: unknown;
   rewritten_prompt?: unknown;
 };
 
-const INDEX_INCLUDE_GLOB = "**/*.{md,txt,csv,pdf,java,py,sh,cjs,js,jsx,mjs,ts,tsx,json,toml,yaml,yml}";
+const INDEX_INCLUDE_GLOB = "**/*.{md,txt,csv,pdf,java,py,sh,cjs,js,jsx,mjs,ts,tsx,json,jsonl,ndjson,toml,yaml,yml}";
 const INDEX_EXCLUDE_GLOB = "{**/.git/**,**/.vscode/**,**/node_modules/**,**/dist/**,**/build/**,**/target/**,**/__pycache__/**}";
 
 interface PromptEnhancementOutcome {
   replacement: string;
   usedLocalFallback: boolean;
+  quality: EnhancementQuality;
 }
 
 interface PanelEnhanceMessage {
@@ -68,6 +76,8 @@ interface PanelResultMessage {
   type: "result";
   text: string;
   usedLocalFallback: boolean;
+  qualityStatus: EnhancementQualityStatus;
+  qualityMessage: string;
 }
 
 interface PanelErrorMessage {
@@ -321,6 +331,8 @@ async function runPromptEnhancement(
       type: "result",
       text: outcome.replacement,
       usedLocalFallback: outcome.usedLocalFallback,
+      qualityStatus: outcome.quality.status,
+      qualityMessage: outcome.quality.message,
     });
   } catch (error) {
     post({ type: "error", message: formatEnhancementError(error, enhancerService.url) });
@@ -336,6 +348,11 @@ interface ReposResponseRepo {
   collection_name?: string;
   source_root?: string;
   label?: string;
+}
+
+interface CollectedWorkspaceFiles {
+  files: RemoteWorkspaceFile[];
+  skippedLargeFiles: number;
 }
 
 async function runIndexStatusCheck(post: (message: PanelOutboundMessage) => void): Promise<void> {
@@ -562,7 +579,11 @@ export function activate(context: vscode.ExtensionContext): void {
   );
   const indexDisposable = vscode.commands.registerCommand(
     "corpuswire.indexWorkspace",
-    indexCurrentWorkspace,
+    () => indexCurrentWorkspace(),
+  );
+  const rebuildDisposable = vscode.commands.registerCommand(
+    "corpuswire.rebuildWorkspaceIndex",
+    rebuildCurrentWorkspaceIndex,
   );
   const panelDisposable = vscode.commands.registerCommand(
     "corpuswire.openPanel",
@@ -600,6 +621,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     enhanceDisposable,
     indexDisposable,
+    rebuildDisposable,
     panelDisposable,
     legacyEnhanceDisposable,
     legacyPanelDisposable,
@@ -614,7 +636,24 @@ export function deactivate(): void {
   // VS Code does not require cleanup for this extension.
 }
 
-async function indexCurrentWorkspace(): Promise<void> {
+interface IndexWorkspaceOptions {
+  recreateCollection?: boolean;
+}
+
+async function rebuildCurrentWorkspaceIndex(): Promise<void> {
+  const selection = await vscode.window.showWarningMessage(
+    "Rebuild the CorpusWire workspace index by recreating the target collection. Use this only after an embedding-model or vector-dimension change.",
+    { modal: true },
+    "Rebuild Index",
+  );
+  if (selection !== "Rebuild Index") {
+    return;
+  }
+
+  await indexCurrentWorkspace({ recreateCollection: true });
+}
+
+async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}): Promise<void> {
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceFolder) {
     void vscode.window.showWarningMessage("Open a workspace before running CorpusWire: Index Workspace.");
@@ -636,14 +675,21 @@ async function indexCurrentWorkspace(): Promise<void> {
   });
 
   try {
+    let skippedLargeFiles = 0;
     await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
-        title: "Indexing workspace with CorpusWire",
-        cancellable: false,
+        title: options.recreateCollection
+          ? "Rebuilding workspace index with CorpusWire"
+          : "Indexing workspace with CorpusWire",
+        cancellable: true,
       },
-      async () => {
-        const files = await collectWorkspaceFiles(workspaceFolder);
+      async (_progress, token) => {
+        const collected = await collectWorkspaceFiles(workspaceFolder, settings.remoteIndexing.maxFileSizeBytes);
+        skippedLargeFiles = collected.skippedLargeFiles;
+        if (token.isCancellationRequested) {
+          throw new Error("Indexing cancelled before upload started.");
+        }
         await client.indexWorkspace({
           workspace: {
             workspaceId,
@@ -656,14 +702,24 @@ async function indexCurrentWorkspace(): Promise<void> {
             transport: "vscode.workspace.fs",
             maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
             batchBytes: settings.remoteIndexing.batchBytes,
+            maxFileSizeBytes: settings.remoteIndexing.maxFileSizeBytes,
           },
           maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
           batchBytes: settings.remoteIndexing.batchBytes,
-          files,
+          maxFileSizeBytes: settings.remoteIndexing.maxFileSizeBytes,
+          recreateCollection: options.recreateCollection === true,
+          files: collected.files,
         } satisfies IndexWorkspaceRequest);
       },
     );
-    void vscode.window.showInformationMessage("Workspace indexed with CorpusWire.");
+    const skippedSuffix = skippedLargeFiles > 0
+      ? ` Skipped ${skippedLargeFiles} file(s) above the configured size limit.`
+      : "";
+    void vscode.window.showInformationMessage(
+      options.recreateCollection
+        ? `Workspace index rebuilt with CorpusWire.${skippedSuffix}`
+        : `Workspace indexed with CorpusWire.${skippedSuffix}`,
+    );
   } catch (error) {
     void vscode.window.showWarningMessage(formatIndexingError(error, indexerService.url));
   }
@@ -678,20 +734,52 @@ function registerRemoteIndexWatchers(context: vscode.ExtensionContext): void {
   const pendingChangedUris = new Map<string, vscode.Uri>();
   const pendingDeletedPaths = new Set<string>();
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let updateInFlight = false;
+  let flushAgain = false;
 
   const flush = (): void => {
+    timer = undefined;
+    if (updateInFlight) {
+      flushAgain = true;
+      return;
+    }
+
     const changedUris = [...pendingChangedUris.values()];
     const deletedPaths = [...pendingDeletedPaths.values()];
+    const eventCount = changedUris.length + deletedPaths.length;
+    if (eventCount === 0) {
+      return;
+    }
+
     pendingChangedUris.clear();
     pendingDeletedPaths.clear();
-    timer = undefined;
-    void sendIncrementalIndexUpdate(changedUris, deletedPaths);
+    if (eventCount > settings.remoteIndexing.maxAutoWatchFiles) {
+      void vscode.window.showWarningMessage(
+        `CorpusWire skipped an auto-index batch with ${eventCount} file events. Run CorpusWire: Index Workspace for bounded full reconciliation.`,
+      );
+      return;
+    }
+
+    updateInFlight = true;
+    void sendIncrementalIndexUpdate(changedUris, deletedPaths)
+      .catch((error) => {
+        void vscode.window.showWarningMessage(
+          `CorpusWire auto-index update failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      })
+      .finally(() => {
+        updateInFlight = false;
+        if (flushAgain || pendingChangedUris.size > 0 || pendingDeletedPaths.size > 0) {
+          flushAgain = false;
+          schedule();
+        }
+      });
   };
   const schedule = (): void => {
     if (timer) {
       clearTimeout(timer);
     }
-    timer = setTimeout(flush, 1000);
+    timer = setTimeout(flush, settings.remoteIndexing.autoWatchDebounceMs);
   };
 
   const watcher = vscode.workspace.createFileSystemWatcher(INDEX_INCLUDE_GLOB);
@@ -728,7 +816,10 @@ async function sendIncrementalIndexUpdate(changedUris: vscode.Uri[], deletedPath
     endpointMode: "v1-only",
     defaultHeaders: buildRemoteServiceHeaders(indexerService),
   });
-  const files = await collectUriFiles(changedUris);
+  const collected = await collectUriFiles(changedUris, settings.remoteIndexing.maxFileSizeBytes);
+  if (collected.files.length === 0 && deletedPaths.length === 0) {
+    return;
+  }
   await client.indexWorkspace({
     workspace: {
       workspaceId: settings.remoteIndexing.workspaceId,
@@ -742,31 +833,41 @@ async function sendIncrementalIndexUpdate(changedUris: vscode.Uri[], deletedPath
     },
     maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
     batchBytes: settings.remoteIndexing.batchBytes,
-    files,
+    maxFileSizeBytes: settings.remoteIndexing.maxFileSizeBytes,
+    files: collected.files,
     deletedPaths,
   });
 }
 
-async function collectWorkspaceFiles(workspaceFolder: vscode.WorkspaceFolder): Promise<RemoteWorkspaceFile[]> {
+async function collectWorkspaceFiles(
+  workspaceFolder: vscode.WorkspaceFolder,
+  maxFileSizeBytes: number,
+): Promise<CollectedWorkspaceFiles> {
   const uris = await vscode.workspace.findFiles(
     new vscode.RelativePattern(workspaceFolder, INDEX_INCLUDE_GLOB),
     new vscode.RelativePattern(workspaceFolder, INDEX_EXCLUDE_GLOB),
   );
-  return collectUriFiles(uris);
+  return collectUriFiles(uris, maxFileSizeBytes);
 }
 
-async function collectUriFiles(uris: vscode.Uri[]): Promise<RemoteWorkspaceFile[]> {
+async function collectUriFiles(uris: vscode.Uri[], maxFileSizeBytes: number): Promise<CollectedWorkspaceFiles> {
   const files: RemoteWorkspaceFile[] = [];
+  let skippedLargeFiles = 0;
   for (const uri of uris) {
     const relativePath = relativePathForUri(uri);
     if (!relativePath) {
       continue;
     }
     try {
-      const [stat, content] = await Promise.all([
-        vscode.workspace.fs.stat(uri),
-        vscode.workspace.fs.readFile(uri),
-      ]);
+      const stat = await vscode.workspace.fs.stat(uri);
+      if ((stat.type & vscode.FileType.Directory) !== 0) {
+        continue;
+      }
+      if (stat.size > maxFileSizeBytes) {
+        skippedLargeFiles += 1;
+        continue;
+      }
+      const content = await vscode.workspace.fs.readFile(uri);
       files.push({
         relativePath,
         content,
@@ -776,7 +877,7 @@ async function collectUriFiles(uris: vscode.Uri[]): Promise<RemoteWorkspaceFile[
       // Files can disappear between watcher events and upload; the next event heals state.
     }
   }
-  return files;
+  return { files, skippedLargeFiles };
 }
 
 function relativePathForUri(uri: vscode.Uri): string | null {
@@ -814,7 +915,7 @@ async function enhanceSelectedPrompt(): Promise<void> {
   });
   const request = buildEnhancementRequest(selectedText, settings);
 
-  let usedLocalFallback = false;
+  let outcome: PromptEnhancementOutcome | undefined;
 
   try {
     await vscode.window.withProgress(
@@ -824,11 +925,11 @@ async function enhanceSelectedPrompt(): Promise<void> {
         cancellable: false,
       },
       async () => {
-        const outcome = await enhancePromptWithFallback(client, request);
-        usedLocalFallback = outcome.usedLocalFallback;
+        const enhancementOutcome = await enhancePromptWithFallback(client, request);
+        outcome = enhancementOutcome;
 
         const replaced = await editor.edit((editBuilder) => {
-          editBuilder.replace(selection, outcome.replacement);
+          editBuilder.replace(selection, enhancementOutcome.replacement);
         });
 
         if (!replaced) {
@@ -837,11 +938,17 @@ async function enhanceSelectedPrompt(): Promise<void> {
       },
     );
 
-    void vscode.window.showInformationMessage(
-      usedLocalFallback
-        ? "Prompt enhanced with CorpusWire local fallback because generation was unavailable."
-        : "Prompt enhanced with CorpusWire.",
-    );
+    if (!outcome) {
+      throw new Error("CorpusWire returned no prompt enhancement outcome.");
+    }
+    const resultMessage = outcome.usedLocalFallback
+      ? `Prompt enhanced with CorpusWire local fallback. ${outcome.quality.message}`
+      : `Prompt enhanced with CorpusWire. ${outcome.quality.message}`;
+    if (outcome.quality.status === "grounded") {
+      void vscode.window.showInformationMessage(resultMessage);
+    } else {
+      void vscode.window.showWarningMessage(resultMessage);
+    }
   } catch (error) {
     void vscode.window.showWarningMessage(formatEnhancementError(error, enhancerService.url));
   }
@@ -879,7 +986,11 @@ async function enhancePromptWithFallback(
     const localResult = await client.enhance({ ...request, localOnly: true });
     const localReplacement = resolveReplacementPrompt(localResult);
     if (localReplacement) {
-      return { replacement: localReplacement, usedLocalFallback: true };
+      return {
+        replacement: localReplacement,
+        usedLocalFallback: true,
+        quality: assessEnhancementQuality(localResult),
+      };
     }
 
     throw error;
@@ -887,20 +998,32 @@ async function enhancePromptWithFallback(
 
   const replacement = resolveFinalReplacementPrompt(result);
   if (replacement) {
-    return { replacement, usedLocalFallback: false };
+    return {
+      replacement,
+      usedLocalFallback: false,
+      quality: assessEnhancementQuality(result),
+    };
   }
 
   if (!request.localOnly && result.generation_error) {
     const localResult = await client.enhance({ ...request, localOnly: true });
     const localReplacement = resolveReplacementPrompt(localResult);
     if (localReplacement) {
-      return { replacement: localReplacement, usedLocalFallback: true };
+      return {
+        replacement: localReplacement,
+        usedLocalFallback: true,
+        quality: assessEnhancementQuality(localResult),
+      };
     }
   }
 
   const fallbackPrompt = resolveFallbackPrompt(result);
   if (fallbackPrompt) {
-    return { replacement: fallbackPrompt, usedLocalFallback: false };
+    return {
+      replacement: fallbackPrompt,
+      usedLocalFallback: false,
+      quality: assessEnhancementQuality(result),
+    };
   }
 
   throw new Error(result.generation_error ?? "corpuswire returned no enhanced prompt.");
@@ -1290,12 +1413,8 @@ function buildPromptPanelHtml(initialSeed: string): string {
       if (message.type === 'result') {
         resultEl.value = message.text;
         resultSection.classList.add('visible');
-        setStatus(
-          message.usedLocalFallback
-            ? 'Enhanced with local fallback.'
-            : 'Enhanced successfully.',
-          false
-        );
+        const fallbackLabel = message.usedLocalFallback ? 'Local fallback. ' : '';
+        setStatus(fallbackLabel + message.qualityMessage, message.qualityStatus !== 'grounded');
         return;
       }
       if (message.type === 'error') {

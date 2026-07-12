@@ -5,9 +5,17 @@ export {
   resolveEnhancedPrompt,
   toEnhancePayload,
   toQueryPayload,
+  toQualityEventPayload,
   toStartIndexSessionPayload,
 } from "./client.js";
-export { CorpusWireHttpError, buildHeaders, createBasicAuthHeader, normalizeBaseUrl, requestJson } from "./http.js";
+export {
+  CorpusWireHttpError,
+  buildHeaders,
+  createBasicAuthHeader,
+  createBearerAuthHeader,
+  normalizeBaseUrl,
+  requestJson,
+} from "./http.js";
 export {
   documentTypes,
   promptOutputModes,
@@ -50,6 +58,17 @@ export type {
   QueryPromptRequest,
   QueryResponseContext,
   QueryResponseEnvelope,
+  QualityEvent,
+  QualityEventPayload,
+  QualityEventRequest,
+  QualityEventResponse,
+  QualityEventsQuery,
+  QualityEventsResponse,
+  QualityReview,
+  QualityReviewQuery,
+  QualityReviewResponse,
+  QualityScorecard,
+  QualityWorkType,
   QdrantHealth,
   LlmSessionHealth,
   RemoteFileBatchMetadata,
