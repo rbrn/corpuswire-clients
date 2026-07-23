@@ -153,6 +153,42 @@ export class CorpusWireClient {
         });
         return response.review;
     }
+    async confirmQueryValue(request) {
+        const response = await requestJson({
+            baseUrl: this.baseUrl,
+            paths: [`/v1/value/events/${encodeURIComponent(request.eventId)}/confirm`],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    minutes_saved: request.minutesSaved,
+                    confirmed_value: request.confirmedValue,
+                    confirmed_by: request.confirmedBy,
+                }),
+            },
+        });
+        return response.event;
+    }
+    async valueRollup(request = {}) {
+        const query = toQueryString({
+            period: request.period,
+            days: request.days?.toString(),
+            workspace_id: request.workspaceId,
+            hourly_rate: request.hourlyRate?.toString(),
+        });
+        const response = await requestJson({
+            baseUrl: this.baseUrl,
+            paths: [`/v1/value/rollup${query}`],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: { method: "GET" },
+        });
+        return response.rollup;
+    }
     async getLlmModel() {
         return requestJson({
             baseUrl: this.baseUrl,

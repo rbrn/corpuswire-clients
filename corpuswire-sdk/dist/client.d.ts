@@ -1,4 +1,4 @@
-import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceResponseEnvelope, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexSessionQuery, IndexWorkspaceRequest, CorpusWireClientOptions, LlmModelState, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, QualityEvent, QualityEventPayload, QualityEventRequest, QualityEventsQuery, QualityReview, QualityReviewQuery, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexSession, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, SearchHit, StartRemoteIndexSessionRequest, WorkspaceDiagnosis, WorkspaceDiagnosisRequest } from "./types.js";
+import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceResponseEnvelope, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexSessionQuery, IndexWorkspaceRequest, CorpusWireClientOptions, LlmModelState, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, QualityEvent, QualityEventPayload, QualityEventRequest, QualityEventsQuery, QualityReview, QualityReviewQuery, QueryValueEvent, ValueFeedbackRequest, ValueRollup, ValueRollupQuery, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexSession, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, SearchHit, StartRemoteIndexSessionRequest, WorkspaceDiagnosis, WorkspaceDiagnosisRequest } from "./types.js";
 export declare class CorpusWireClient {
     readonly baseUrl: string;
     readonly basicAuth: string;
@@ -20,6 +20,8 @@ export declare class CorpusWireClient {
     recordQualityEvent(request: QualityEventRequest): Promise<QualityEvent>;
     listQualityEvents(request?: QualityEventsQuery): Promise<QualityEvent[]>;
     reviewQuality(request?: QualityReviewQuery): Promise<QualityReview>;
+    confirmQueryValue(request: ValueFeedbackRequest): Promise<QueryValueEvent>;
+    valueRollup(request?: ValueRollupQuery): Promise<ValueRollup>;
     getLlmModel(): Promise<LlmModelState>;
     setLlmModel(model: string): Promise<LlmModelState>;
     getIndexCapabilities(): Promise<RemoteIndexCapabilities>;

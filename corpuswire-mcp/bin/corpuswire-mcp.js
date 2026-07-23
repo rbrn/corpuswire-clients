@@ -3881,7 +3881,13 @@ async function reviewQueryValue(args) {
   if (hourlyRate !== undefined && (!Number.isFinite(hourlyRate) || hourlyRate < 0)) {
     throw new JsonRpcError(-32602, "hourlyRate must be a non-negative number.");
   }
-  const rollup = await buildClient().valueRollup({
+  const client = buildClient();
+  if (typeof client.valueRollup !== "function") {
+    throw new Error(
+      "@corpuswire/sdk does not expose valueRollup; rebuild and re-vendor the SDK so the MCP runtime matches its advertised tools.",
+    );
+  }
+  const rollup = await client.valueRollup({
     period,
     days: optionalPositiveInteger(args.days, 30),
     workspaceId: optionalString(args.workspaceId),

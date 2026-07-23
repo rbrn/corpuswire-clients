@@ -55,6 +55,7 @@ export interface PromptRewriteResult {
     retrieval_backend: string | null;
     retrieval_warning: string | null;
     retrieval_confidence?: number | null;
+    retrieval_event_id?: string | null;
     retrieval_not_found?: boolean;
     score_semantics?: string | null;
     retrieved_chunks: SearchHit[];
@@ -77,6 +78,7 @@ export interface PromptEnhancementResult {
     retrieval_backend: string | null;
     retrieval_warning: string | null;
     retrieval_confidence?: number | null;
+    retrieval_event_id?: string | null;
     retrieval_not_found?: boolean;
     score_semantics?: string | null;
     retrieved_chunks: SearchHit[];
@@ -512,6 +514,33 @@ export interface QualityEventsResponse {
 export interface QualityReviewResponse {
     ok: true;
     review: QualityReview;
+}
+export interface ValueFeedbackRequest {
+    eventId: string;
+    minutesSaved: number;
+    confirmedValue?: number;
+    confirmedBy?: string;
+}
+export interface QueryValueEvent {
+    event_id: string;
+    workspace_id?: string | null;
+    estimated_minutes_saved: number;
+    confirmed_minutes_saved?: number | null;
+    actual_cost: number;
+    confirmed_value?: number | null;
+    value_status: "estimated" | "sampled" | "user_confirmed";
+}
+export interface ValueRollupQuery {
+    period?: "day" | "week" | "month";
+    days?: number;
+    workspaceId?: string;
+    hourlyRate?: number;
+}
+export interface ValueRollup {
+    period: "day" | "week" | "month";
+    days: number;
+    hourly_rate?: number | null;
+    buckets: Array<Record<string, unknown>>;
 }
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 export type RemoteIndexMode = "full" | "incremental";

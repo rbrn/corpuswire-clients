@@ -30,6 +30,7 @@ test("corpuswire-mcp exposes tools and maps search requests to the SDK", async (
       assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_diagnose_workspace"), true);
       assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_rate_result"), true);
       assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_quality_review"), true);
+      assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_value_rollup"), true);
 
       const search = await rpc({
         jsonrpc: "2.0",
@@ -49,6 +50,24 @@ test("corpuswire-mcp exposes tools and maps search requests to the SDK", async (
       assert.match(search.result.content[0].text, /corpuswire_remote_indexer\/router\.py/);
       assert.match(search.result.content[0].text, /Agent context packets:/);
       assert.match(search.result.content[0].text, /role: integration/);
+
+      const valueRollup = await rpc({
+        jsonrpc: "2.0",
+        id: 12,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_value_rollup",
+          arguments: {
+            period: "week",
+            days: 30,
+            workspaceId: "workspace-explicit",
+            hourlyRate: 100,
+          },
+        },
+      });
+      assert.equal(valueRollup.result.isError, false);
+      assert.match(valueRollup.result.content[0].text, /CorpusWire value rollup:/);
+      assert.match(valueRollup.result.content[0].text, /period: week/);
     } finally {
       child.kill();
     }
@@ -64,6 +83,13 @@ test("corpuswire-mcp exposes tools and maps search requests to the SDK", async (
         workspaceId: "workspace-explicit",
         topK: 3,
         includeAnswer: false,
+      },
+      {
+        kind: "valueRollup",
+        period: "week",
+        days: 30,
+        workspaceId: "workspace-explicit",
+        hourlyRate: 100,
       },
     ]);
   } finally {
@@ -701,6 +727,41 @@ test("corpuswire-mcp blocks remote workspace sync without its explicit capabilit
   }
 });
 
+test("corpuswire-mcp reports explicit SDK skew for a missing valueRollup capability", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        MOCK_REQUESTS_PATH: requestsPath,
+        MOCK_MISSING_VALUE_ROLLUP: "true",
+      },
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const result = await rpc({
+        jsonrpc: "2.0",
+        id: 13,
+        method: "tools/call",
+        params: { name: "corpuswire_value_rollup", arguments: {} },
+      });
+      assert.equal(result.result.isError, true);
+      assert.match(result.result.content[0].text, /does not expose valueRollup/);
+      assert.match(result.result.content[0].text, /rebuild and re-vendor the SDK/);
+      assert.doesNotMatch(result.result.content[0].text, /is not a function/);
+    } finally {
+      child.kill();
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 async function writeMockSdk(tempDir) {
   const sdkPath = path.join(tempDir, "mock-sdk.mjs");
   const requestsPath = path.join(tempDir, "requests.jsonl");
@@ -713,6 +774,9 @@ import { appendFileSync } from "node:fs";
 export class CorpusWireClient {
   constructor(options = {}) {
     this.baseUrl = options.baseUrl ?? "http://mock-corpuswire";
+    if (process.env.MOCK_MISSING_VALUE_ROLLUP === "true") {
+      this.valueRollup = undefined;
+    }
   }
 
   async queryRaw(request) {
@@ -814,6 +878,21 @@ export class CorpusWireClient {
       },
       auth: { enabled: false },
       ui: "http://localhost:8000",
+    };
+  }
+
+  async valueRollup(request = {}) {
+    appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
+      kind: "valueRollup",
+      ...request,
+    }) + "\\n", "utf8");
+    return {
+      period: request.period ?? "day",
+      days: request.days ?? 30,
+      workspace_id: request.workspaceId ?? null,
+      hourly_rate: request.hourlyRate ?? null,
+      totals: { queries: 7, estimated_value: 125 },
+      buckets: [],
     };
   }
 
