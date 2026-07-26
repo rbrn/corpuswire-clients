@@ -27,6 +27,7 @@ export type {
   ActiveProjectHealth,
   AgentContextPacket,
   AgentContextRole,
+  ActionResponseContext,
   AuthSummary,
   BuildInfo,
   ChunkMetadata,

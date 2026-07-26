@@ -31,6 +31,12 @@ test("corpuswire-mcp exposes tools and maps search requests to the SDK", async (
       assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_rate_result"), true);
       assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_quality_review"), true);
       assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_value_rollup"), true);
+      for (const name of ["corpuswire_search", "corpuswire_enhance_prompt"]) {
+        const tool = tools.result.tools.find((candidate) => candidate.name === name);
+        assert.equal(tool.inputSchema.additionalProperties, false);
+        assert.equal("tenantId" in tool.inputSchema.properties, false);
+        assert.equal("userId" in tool.inputSchema.properties, false);
+      }
 
       const search = await rpc({
         jsonrpc: "2.0",
@@ -452,6 +458,9 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
   const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
   try {
     await writeFile(path.join(tempDir, "README.md"), "# Reconcile\n\nCorpusWire rebuild test.\n", "utf8");
+    await writeFile(path.join(tempDir, "Bridge.kt"), "class Bridge { fun readSteps() = 0 }\n", "utf8");
+    await writeFile(path.join(tempDir, "health-check.kts"), "fun verifyReadOnly() = true\n", "utf8");
+    await writeFile(path.join(tempDir, "Reader.scala"), "object Reader { def readSteps(): Int = 0 }\n", "utf8");
     const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
     const child = spawn("node", [SERVER_BIN], {
       stdio: ["pipe", "pipe", "pipe"],
@@ -475,7 +484,7 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
         params: {
           name: "corpuswire_sync_reconcile",
           arguments: {
-            includeGlobs: ["README.md"],
+            includeGlobs: ["README.md", "*.kt", "*.kts", "*.scala"],
             maxFiles: 5,
             maxWaitMs: 10000,
             recreateCollection: true,
@@ -502,7 +511,7 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
         mode: "full",
         recreateCollection: true,
         processingTimeoutMs: 10000,
-        files: ["README.md"],
+        files: ["Bridge.kt", "health-check.kts", "Reader.scala", "README.md"],
         deletedPaths: [],
       },
     ]);

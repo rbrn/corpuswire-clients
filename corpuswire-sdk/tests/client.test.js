@@ -503,17 +503,23 @@ test("query posts workspace_id to semantic retrieval endpoint", async () => {
           generation_error: null,
         },
         context: {
+          request_id: "request-123",
+          tenant_id: "tenant-a",
+          user_id: "user-123",
+          actor_kind: "human",
           workspace_id: "vscode-remote://ssh/project",
+          membership_role: "viewer",
           collection: "remote-project",
         },
       });
     },
   });
 
-  const result = await client.query({
+  const response = await client.queryRaw({
     workspaceId: "vscode-remote://ssh/project",
     query: "find remote indexer",
   });
+  const result = response.result;
 
   assert.equal(calls[0].input, "http://example.test/query");
   assert.equal(calls[0].body.workspace_id, "vscode-remote://ssh/project");
@@ -521,6 +527,9 @@ test("query posts workspace_id to semantic retrieval endpoint", async () => {
   assert.equal(result.augmented_prompt, "Use remote indexer context.");
   assert.equal(result.agent_context_packets[0].role, "integration");
   assert.deepEqual(result.agent_context_packets[0].line_ranges, ["1200-1240"]);
+  assert.equal(response.context.tenant_id, "tenant-a");
+  assert.equal(response.context.user_id, "user-123");
+  assert.equal(response.context.workspace_id, "vscode-remote://ssh/project");
 });
 
 test("remote indexWorkspace runs session, manifest, upload, and commit requests", async () => {

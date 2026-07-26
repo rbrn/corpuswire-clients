@@ -97,6 +97,13 @@ export interface PromptRewriteResult {
   enhanced_prompt: string | null;
   enhancement_backend: string | null;
   generation_error: string | null;
+  request_id?: string;
+  tenant_id?: string;
+  user_id?: string | null;
+  actor_kind?: "human" | "service" | "basic" | "anonymous-local";
+  workspace_id?: string;
+  storage_workspace_id?: string;
+  membership_role?: "owner" | "editor" | "viewer" | null;
 }
 
 export interface PromptEnhancementResult {
@@ -116,9 +123,18 @@ export interface PromptEnhancementResult {
   generation_error: string | null;
 }
 
-export interface QueryResponseContext {
-  repo_path?: string | null;
+export interface ActionResponseContext {
+  request_id?: string;
+  tenant_id?: string;
+  user_id?: string | null;
+  actor_kind?: "human" | "service" | "basic" | "anonymous-local";
   workspace_id?: string | null;
+  storage_workspace_id?: string;
+  membership_role?: "owner" | "editor" | "viewer" | null;
+}
+
+export interface QueryResponseContext extends ActionResponseContext {
+  repo_path?: string | null;
   collection: string;
   index?: IndexHealth;
 }
@@ -262,6 +278,7 @@ export interface HealthResponse {
   ok: boolean;
   build?: BuildInfo;
   docs_source_dir: string;
+  context?: ActionResponseContext;
   runtime: RuntimeSummary;
   ollama: Record<string, unknown>;
   corpuswire: CorpusWireHealth;

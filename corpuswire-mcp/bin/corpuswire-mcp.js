@@ -40,6 +40,9 @@ const INDEXABLE_EXTENSIONS = new Set([
   ".csv",
   ".pdf",
   ".java",
+  ".kt",
+  ".kts",
+  ".scala",
   ".py",
   ".sh",
   ".cjs",
@@ -2938,11 +2941,16 @@ async function health() {
   const qdrant = response.qdrant ?? {};
   const index = response.index ?? {};
   const activeProject = response.active_project ?? {};
+  const context = response.context ?? {};
 
   return [
     "corpuswire health:",
     `- status: ${response.ok ? "ok" : "unknown"}`,
     `- baseUrl: ${client.baseUrl}`,
+    `- tenantId: ${context.tenant_id ?? "unknown"}`,
+    `- userId: ${context.user_id ?? "anonymous-local"}`,
+    `- actorKind: ${context.actor_kind ?? "unknown"}`,
+    `- workspaceId: ${context.workspace_id ?? activeProject.workspace_id ?? "unknown"}`,
     `- indexStatus: ${index.health_status ?? "unknown"}`,
     `- corpuswire_enabled: ${runtime.corpuswire_enabled ?? "unknown"}`,
     `- qdrant_collection: ${qdrant.collection ?? "unknown"}`,
@@ -3504,6 +3512,10 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minSc
     `- requestedWorkspaceId: ${workspaceId ?? "backend default"}`,
     `- resolvedContext: ${context.repo_path ?? context.workspace_id ?? "unknown"}`,
     `- contextWorkspaceId: ${context.workspace_id ?? "unknown"}`,
+    `- tenantId: ${context.tenant_id ?? "unknown"}`,
+    `- userId: ${context.user_id ?? "anonymous-local"}`,
+    `- actorKind: ${context.actor_kind ?? "unknown"}`,
+    `- membershipRole: ${context.membership_role ?? "none"}`,
     `- collection: ${context.collection ?? "unknown"}`,
     `- indexedAt: ${index.indexed_at ?? "unknown"}`,
     `- indexedCommit: ${index.indexed_commit ?? "unknown"}`,
@@ -3719,6 +3731,10 @@ async function enhancePrompt(args) {
     `- baseUrl: ${client.baseUrl}`,
     `- repoPath: ${repoPath ?? "backend default"}`,
     `- workspaceId: ${workspaceId ?? result.workspace_id ?? "backend default"}`,
+    `- tenantId: ${result.tenant_id ?? "unknown"}`,
+    `- userId: ${result.user_id ?? "anonymous-local"}`,
+    `- actorKind: ${result.actor_kind ?? "unknown"}`,
+    `- membershipRole: ${result.membership_role ?? "none"}`,
     `- outputMode: ${result.output_mode ?? outputMode}`,
     `- topK: ${topK}`,
     `- taskType: ${result.task_type ?? "unknown"}`,
