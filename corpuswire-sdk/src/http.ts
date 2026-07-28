@@ -61,6 +61,14 @@ export function createBasicAuthHeader(credentials: string): string {
   return `Basic ${base64Encode(credentials)}`;
 }
 
+export function createBearerAuthHeader(token: string): string {
+  const normalized = token.trim();
+  if (!normalized) {
+    throw new Error("Bearer token must not be empty.");
+  }
+  return `Bearer ${normalized}`;
+}
+
 export function buildHeaders(
   defaultHeaders: Record<string, string> = {},
   basicAuth?: string,

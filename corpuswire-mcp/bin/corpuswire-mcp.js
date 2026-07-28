@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { execFile } from "node:child_process";
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { existsSync, watch as watchFileSystem } from "node:fs";
 import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
@@ -39,6 +40,9 @@ const INDEXABLE_EXTENSIONS = new Set([
   ".csv",
   ".pdf",
   ".java",
+  ".kt",
+  ".kts",
+  ".scala",
   ".py",
   ".sh",
   ".cjs",
@@ -48,6 +52,8 @@ const INDEXABLE_EXTENSIONS = new Set([
   ".ts",
   ".tsx",
   ".json",
+  ".jsonl",
+  ".ndjson",
   ".toml",
   ".yaml",
   ".yml",
@@ -65,6 +71,8 @@ const EXCLUDED_PATH_SEGMENTS = new Set([
   ".ruff_cache",
   ".qdrant",
 ]);
+const SAFE_INDEXABLE_PATHS = new Set([".vscode/mcp.json.example"]);
+const CONFIG_EXAMPLE_SUFFIXES = new Set([".json.example"]);
 
 const execFileAsync = promisify(execFile);
 const sdk = await loadSdk();
@@ -235,7 +243,34 @@ class SyncManager {
   }
 
   isEnabled() {
-    return optionalBoolean(this.env.CORPUSWIRE_SYNC_ENABLED, false);
+    return optionalBoolean(this.env.CORPUSWIRE_SYNC_ENABLED, false) && this.syncCapability().allowed;
+  }
+
+  syncCapability() {
+    try {
+      const policy = resolveBackendPolicy(this.env);
+      if (policy.isLocal || policy.remoteSyncEnabled) {
+        return { allowed: true, reason: null, backendMode: policy.isLocal ? "local" : "remote" };
+      }
+      return {
+        allowed: false,
+        reason: "Remote workspace sync requires CORPUSWIRE_REMOTE_SYNC_ENABLED=true.",
+        backendMode: "remote",
+      };
+    } catch (error) {
+      return {
+        allowed: false,
+        reason: error instanceof Error ? error.message : String(error),
+        backendMode: "invalid",
+      };
+    }
+  }
+
+  disabledReason(operation) {
+    if (!optionalBoolean(this.env.CORPUSWIRE_SYNC_ENABLED, false)) {
+      return `Set CORPUSWIRE_SYNC_ENABLED=true to enable ${operation}.`;
+    }
+    return this.syncCapability().reason ?? `CorpusWire sync is unavailable for ${operation}.`;
   }
 
   isCacheEnabled() {
@@ -261,7 +296,7 @@ class SyncManager {
     if (!this.isEnabled()) {
       return {
         enabled: false,
-        reason: "Set CORPUSWIRE_SYNC_ENABLED=true to enable sync path probing.",
+        reason: this.disabledReason("sync path probing"),
         results: [],
         status: this.snapshot(),
       };
@@ -344,7 +379,7 @@ class SyncManager {
     if (!this.isEnabled()) {
       return {
         enabled: false,
-        reason: "Set CORPUSWIRE_SYNC_ENABLED=true to enable incremental sync.",
+        reason: this.disabledReason("incremental sync"),
         status: this.snapshot(),
       };
     }
@@ -419,6 +454,10 @@ class SyncManager {
     if (shouldFlush) {
       const flush = await this.flushAll({
         maxWaitMs: optionalPositiveInteger(args.maxWaitMs, DEFAULT_SYNC_FLUSH_TIMEOUT_MS),
+        processingTimeoutMs: optionalPositiveInteger(
+          args.processingTimeoutMs ?? args.processing_timeout_ms ?? args.maxWaitMs,
+          undefined,
+        ),
       });
       return {
         enabled: true,
@@ -438,6 +477,10 @@ class SyncManager {
     if (this.pendingSize() >= maxPendingPaths) {
       const flush = await this.flushAll({
         maxWaitMs: optionalPositiveInteger(args.maxWaitMs, DEFAULT_SYNC_FLUSH_TIMEOUT_MS),
+        processingTimeoutMs: optionalPositiveInteger(
+          args.processingTimeoutMs ?? args.processing_timeout_ms ?? args.maxWaitMs,
+          undefined,
+        ),
       });
       return {
         enabled: true,
@@ -469,11 +512,17 @@ class SyncManager {
     if (!this.isEnabled()) {
       return {
         enabled: false,
-        reason: "Set CORPUSWIRE_SYNC_ENABLED=true to enable incremental sync.",
+        reason: this.disabledReason("incremental sync"),
         status: this.snapshot(),
       };
     }
-    return this.flushAll({ maxWaitMs: optionalPositiveInteger(args.maxWaitMs, DEFAULT_SYNC_FLUSH_TIMEOUT_MS) });
+    return this.flushAll({
+      maxWaitMs: optionalPositiveInteger(args.maxWaitMs, DEFAULT_SYNC_FLUSH_TIMEOUT_MS),
+      processingTimeoutMs: optionalPositiveInteger(
+        args.processingTimeoutMs ?? args.processing_timeout_ms ?? args.maxWaitMs,
+        undefined,
+      ),
+    });
   }
 
   async flushBeforeRead() {
@@ -577,7 +626,7 @@ class SyncManager {
     if (!this.isEnabled()) {
       return {
         enabled: false,
-        reason: "Set CORPUSWIRE_SYNC_ENABLED=true to enable reconciliation.",
+        reason: this.disabledReason("reconciliation"),
         status: this.snapshot(),
       };
     }
@@ -607,7 +656,7 @@ class SyncManager {
     if (!this.isEnabled()) {
       return {
         enabled: false,
-        reason: "Set CORPUSWIRE_SYNC_ENABLED=true to enable git delta reconciliation.",
+        reason: this.disabledReason("git delta reconciliation"),
         status: this.snapshot(),
       };
     }
@@ -714,7 +763,7 @@ class SyncManager {
       return {
         enabled: false,
         checked: false,
-        reason: "Set CORPUSWIRE_SYNC_ENABLED=true to enable bootstrap freshness checks.",
+        reason: this.disabledReason("bootstrap freshness checks"),
         bootstrap: this.bootstrapStatus,
         status: this.snapshot(),
       };
@@ -804,7 +853,7 @@ class SyncManager {
     return this.activeReconcile;
   }
 
-  async flushAll({ maxWaitMs, allowDuringReconcile = false }) {
+  async flushAll({ maxWaitMs, allowDuringReconcile = false, processingTimeoutMs = undefined }) {
     const summaries = [];
     const deadline = Date.now() + maxWaitMs;
 
@@ -864,7 +913,7 @@ class SyncManager {
       }
 
       const batch = this.takePendingBatch();
-      const flush = this.runBatch(batch)
+      const flush = this.runBatch(batch, { processingTimeoutMs })
         .catch((error) => {
           this.requeueBatch(batch);
           this.scheduleFlush(DEFAULT_SYNC_DEBOUNCE_MS);
@@ -922,7 +971,7 @@ class SyncManager {
     }
   }
 
-  async runBatch(batch) {
+  async runBatch(batch, { processingTimeoutMs = undefined } = {}) {
     const startedAt = Date.now();
     this.lastFlushStartedAt = new Date(startedAt).toISOString();
     const files = [];
@@ -1004,6 +1053,10 @@ class SyncManager {
       }),
       maxConcurrentUploads: optionalPositiveInteger(
         this.env.CORPUSWIRE_SYNC_MAX_CONCURRENT_UPLOADS,
+        undefined,
+      ),
+      processingTimeoutMs: optionalPositiveInteger(
+        processingTimeoutMs,
         undefined,
       ),
       batchBytes: optionalPositiveInteger(this.env.CORPUSWIRE_SYNC_BATCH_BYTES, undefined),
@@ -1096,6 +1149,10 @@ class SyncManager {
       }),
       maxConcurrentUploads: optionalPositiveInteger(
         this.env.CORPUSWIRE_SYNC_MAX_CONCURRENT_UPLOADS,
+        undefined,
+      ),
+      processingTimeoutMs: optionalPositiveInteger(
+        args.processingTimeoutMs ?? args.processing_timeout_ms ?? args.maxWaitMs,
         undefined,
       ),
       batchBytes: optionalPositiveInteger(this.env.CORPUSWIRE_SYNC_BATCH_BYTES, undefined),
@@ -1418,12 +1475,15 @@ class SyncManager {
       }
       entries.sort((left, right) => left.name.localeCompare(right.name));
       for (const entry of entries) {
-        if (EXCLUDED_PATH_SEGMENTS.has(entry.name)) {
-          continue;
-        }
         const absolutePath = path.join(directory, entry.name);
         const relativePath = path.relative(sourceRoot, absolutePath).split(path.sep).join("/");
         if (entry.isDirectory()) {
+          if (
+            EXCLUDED_PATH_SEGMENTS.has(entry.name)
+            && !isSafeIndexableDirectoryAncestor(relativePath)
+          ) {
+            continue;
+          }
           if (isExcludedDirectory(relativePath, context.excludeGlobs)) {
             continue;
           }
@@ -1715,8 +1775,12 @@ class SyncManager {
   }
 
   snapshot() {
+    const syncCapability = this.syncCapability();
     return {
       enabled: this.isEnabled(),
+      capabilityAllowed: syncCapability.allowed,
+      capabilityReason: syncCapability.reason,
+      backendMode: syncCapability.backendMode,
       watcherActive: this.watcher !== null,
       bootstrapActive: this.activeBootstrapCheck !== null,
       gitDeltaActive: this.activeGitDelta !== null,
@@ -1899,6 +1963,34 @@ async function callTool(params) {
       return textToolResult(formatToolError(error, "enhancement request"), true);
     }
   }
+  if (name === "corpuswire_rate_result") {
+    try {
+      return textToolResult(await recordQualityResult(args));
+    } catch (error) {
+      return textToolResult(formatToolError(error, "quality rating request"), true);
+    }
+  }
+  if (name === "corpuswire_quality_review") {
+    try {
+      return textToolResult(await reviewQualityResults(args));
+    } catch (error) {
+      return textToolResult(formatToolError(error, "quality review request"), true);
+    }
+  }
+  if (name === "corpuswire_confirm_value") {
+    try {
+      return textToolResult(await confirmQueryValue(args));
+    } catch (error) {
+      return textToolResult(formatToolError(error, "value confirmation request"), true);
+    }
+  }
+  if (name === "corpuswire_value_rollup") {
+    try {
+      return textToolResult(await reviewQueryValue(args));
+    } catch (error) {
+      return textToolResult(formatToolError(error, "value rollup request"), true);
+    }
+  }
   if (name === "corpuswire_health") {
     try {
       return textToolResult(await health());
@@ -2005,10 +2097,11 @@ async function callTool(params) {
 }
 
 async function dispatchPluginTool(name, args) {
-  const baseUrl = (process.env.CORPUSWIRE_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/$/, "");
+  const baseUrl = resolveBackendPolicy().baseUrl.replace(/\/$/, "");
   const response = await fetch(`${baseUrl}/v1/plugins/mcp-call`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: corpuswireHttpHeaders({ "content-type": "application/json" }),
+    redirect: "error",
     body: JSON.stringify({ name, arguments: args ?? {} }),
   });
   const text = await response.text();
@@ -2033,9 +2126,12 @@ async function fetchPluginTools() {
   if (now - pluginToolsCache.fetchedAt < PLUGIN_TOOLS_CACHE_TTL_MS) {
     return pluginToolsCache.tools;
   }
-  const baseUrl = process.env.CORPUSWIRE_BASE_URL ?? DEFAULT_BASE_URL;
+  const baseUrl = resolveBackendPolicy().baseUrl;
   try {
-    const response = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/plugins/mcp-tools`);
+    const response = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/plugins/mcp-tools`, {
+      headers: corpuswireHttpHeaders(),
+      redirect: "error",
+    });
     if (!response.ok) {
       pluginToolsCache = { fetchedAt: now, tools: [] };
       return [];
@@ -2062,6 +2158,128 @@ async function fetchPluginTools() {
   }
 }
 
+function corpuswireHttpHeaders(headers = {}, env = process.env) {
+  const result = { ...headers };
+  const { basicAuth, bearerToken } = resolveAuthConfiguration(env);
+  if (bearerToken && !hasHeader(result, "authorization")) {
+    result.Authorization = typeof sdk.createBearerAuthHeader === "function"
+      ? sdk.createBearerAuthHeader(bearerToken)
+      : `Bearer ${bearerToken}`;
+  }
+  if (basicAuth && !hasHeader(result, "authorization")) {
+    result.Authorization = typeof sdk.createBasicAuthHeader === "function"
+      ? sdk.createBasicAuthHeader(basicAuth)
+      : `Basic ${Buffer.from(basicAuth, "utf8").toString("base64")}`;
+  }
+  return result;
+}
+
+function hasHeader(headers, name) {
+  const expected = name.toLowerCase();
+  return Object.keys(headers).some((key) => key.toLowerCase() === expected);
+}
+
+function resolveAuthConfiguration(env = process.env) {
+  const basicAuth = (env.CORPUSWIRE_BASIC_AUTH ?? "").trim();
+  const bearerToken = (env.CORPUSWIRE_BEARER_TOKEN ?? "").trim();
+  if (basicAuth && bearerToken) {
+    throw new JsonRpcError(
+      -32602,
+      "Configure only one of CORPUSWIRE_BASIC_AUTH or CORPUSWIRE_BEARER_TOKEN.",
+    );
+  }
+  return { basicAuth, bearerToken };
+}
+
+function resolveBackendPolicy(env = process.env) {
+  const baseUrl = env.CORPUSWIRE_BASE_URL ?? DEFAULT_BASE_URL;
+  let parsed;
+  try {
+    parsed = new URL(baseUrl);
+  } catch (error) {
+    throw new JsonRpcError(-32602, `Invalid CORPUSWIRE_BASE_URL: ${baseUrl}`);
+  }
+
+  if (parsed.username || parsed.password) {
+    throw new JsonRpcError(-32602, "CORPUSWIRE_BASE_URL must not contain embedded credentials.");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new JsonRpcError(-32602, "CORPUSWIRE_BASE_URL must use HTTP or HTTPS.");
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  const isLocalhost = hostname === "localhost" || hostname.endsWith(".localhost");
+  const isLoopback = hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
+  const isLocal = isLocalhost || isLoopback;
+  if (isLocal) {
+    return {
+      baseUrl,
+      origin: parsed.origin,
+      isLocal: true,
+      remoteSyncEnabled: false,
+      authMode: resolveAuthMode(env),
+    };
+  }
+
+  if (parsed.protocol !== "https:") {
+    throw new JsonRpcError(-32602, "Remote CORPUSWIRE_BASE_URL values must use HTTPS.");
+  }
+  if (!optionalBoolean(env.CORPUSWIRE_REMOTE_ENABLED, false)) {
+    throw new JsonRpcError(
+      -32602,
+      "Remote CorpusWire access is disabled; set CORPUSWIRE_REMOTE_ENABLED=true after configuring an allow-listed HTTPS origin.",
+    );
+  }
+  const allowedOrigins = parseAllowedOrigins(env.CORPUSWIRE_ALLOWED_ORIGINS ?? "");
+  if (!allowedOrigins.has(parsed.origin)) {
+    throw new JsonRpcError(
+      -32602,
+      `Remote CorpusWire origin ${parsed.origin} is not present in CORPUSWIRE_ALLOWED_ORIGINS.`,
+    );
+  }
+  const authMode = resolveAuthMode(env);
+  if (authMode === "none") {
+    throw new JsonRpcError(
+      -32602,
+      "Remote CorpusWire access requires CORPUSWIRE_BEARER_TOKEN or CORPUSWIRE_BASIC_AUTH.",
+    );
+  }
+  return {
+    baseUrl,
+    origin: parsed.origin,
+    isLocal: false,
+    remoteSyncEnabled: optionalBoolean(env.CORPUSWIRE_REMOTE_SYNC_ENABLED, false),
+    authMode,
+  };
+}
+
+function resolveAuthMode(env = process.env) {
+  const { basicAuth, bearerToken } = resolveAuthConfiguration(env);
+  if (bearerToken) return "bearer";
+  if (basicAuth) return "basic";
+  return "none";
+}
+
+function parseAllowedOrigins(value) {
+  const origins = new Set();
+  for (const entry of value.split(",").map((item) => item.trim()).filter(Boolean)) {
+    let parsed;
+    try {
+      parsed = new URL(entry);
+    } catch (_error) {
+      throw new JsonRpcError(-32602, `Invalid origin in CORPUSWIRE_ALLOWED_ORIGINS: ${entry}`);
+    }
+    if (parsed.protocol !== "https:" || parsed.pathname !== "/" || parsed.search || parsed.hash) {
+      throw new JsonRpcError(
+        -32602,
+        `CORPUSWIRE_ALLOWED_ORIGINS entries must be HTTPS origins without paths: ${entry}`,
+      );
+    }
+    origins.add(parsed.origin);
+  }
+  return origins;
+}
+
 async function listToolsWithPlugins() {
   const builtin = toolDefinitions();
   const builtinNames = new Set(builtin.map((t) => t.name));
@@ -2078,14 +2296,14 @@ function toolDefinitions() {
   return [
     {
       name: "corpuswire_search",
-      description: "Search the CorpusWire index for repository or remote workspace context using corpuswire /query without answer generation.",
+      description: "Search the configured CorpusWire index for repository context without answer generation.",
       inputSchema: {
         type: "object",
         additionalProperties: false,
         properties: {
           query: {
             type: "string",
-            description: "Semantic retrieval query to run against a local or remote workspace index.",
+            description: "Semantic retrieval query to run against the configured CorpusWire workspace index.",
           },
           repoPath: {
             type: "string",
@@ -2093,7 +2311,7 @@ function toolDefinitions() {
           },
           workspaceId: {
             type: "string",
-            description: "Remote workspace id used to scope retrieval. Defaults to CORPUSWIRE_WORKSPACE_ID when set.",
+            description: "Local API workspace id used to scope retrieval. Defaults to CORPUSWIRE_WORKSPACE_ID when set.",
           },
           topK: {
             type: "integer",
@@ -2124,7 +2342,7 @@ function toolDefinitions() {
     },
     {
       name: "corpuswire_enhance_prompt",
-      description: "Enhance a base Codex prompt with repository or remote workspace context using corpuswire /v1/enhance.",
+      description: "Preview a base Codex prompt enhanced with local repository context. Returns the original prompt, augmented prompt, context sources, and retrieval metadata.",
       inputSchema: {
         type: "object",
         additionalProperties: false,
@@ -2145,7 +2363,7 @@ function toolDefinitions() {
           },
           workspaceId: {
             type: "string",
-            description: "Remote workspace id used to scope retrieval. Defaults to CORPUSWIRE_WORKSPACE_ID when set.",
+            description: "Local API workspace id used to scope retrieval. Defaults to CORPUSWIRE_WORKSPACE_ID when set.",
           },
           topK: {
             type: "integer",
@@ -2171,6 +2389,96 @@ function toolDefinitions() {
           },
         },
         required: ["prompt"],
+      },
+    },
+    {
+      name: "corpuswire_rate_result",
+      description: "Record a 1-5 quality scorecard for Augment, CorpusWire, Auggie, or another engine in the central cross-workspace quality ledger.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          workspaceId: {
+            type: "string",
+            description: "Stable workspace identity. Defaults to CORPUSWIRE_WORKSPACE_ID.",
+          },
+          workType: {
+            type: "string",
+            enum: ["semantic_retrieval", "prompt_enhancement"],
+            description: "Whether this rating assesses semantic retrieval or prompt enhancement.",
+          },
+          engine: {
+            type: "string",
+            description: "Engine being rated, such as augment, corpuswire, or auggie.",
+          },
+          relevance: { type: "number", minimum: 1, maximum: 5 },
+          fileSpecificity: { type: "number", minimum: 1, maximum: 5 },
+          coverage: { type: "number", minimum: 1, maximum: 5 },
+          freshness: { type: "number", minimum: 1, maximum: 5 },
+          actionability: { type: "number", minimum: 1, maximum: 5 },
+          query: {
+            type: "string",
+            description: "Evaluated query or base prompt. The server redacts it by default before persistence.",
+          },
+          surface: { type: "string", description: "Calling surface, for example codex, vscode, copilot, or cli." },
+          roundId: { type: "string", description: "Shared id linking the engines evaluated in one comparison round." },
+          resultPaths: { type: "array", items: { type: "string" }, default: [] },
+          warning: { type: "string" },
+          improvement: { type: "string", description: "Concrete improvement derived from this result." },
+          notes: { type: "string" },
+          issueUrl: { type: "string" },
+          metadata: { type: "object", additionalProperties: true },
+        },
+        required: ["workType", "engine", "relevance", "fileSpecificity", "coverage", "freshness", "actionability"],
+      },
+    },
+    {
+      name: "corpuswire_quality_review",
+      description: "Review central semantic and prompt-enhancement ratings to identify weak dimensions, recurring patterns, and recommended improvements.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          workspaceId: {
+            type: "string",
+            description: "Optional workspace filter. Omit for the central cross-workspace review.",
+          },
+          workType: {
+            type: "string",
+            enum: ["semantic_retrieval", "prompt_enhancement"],
+          },
+          engine: { type: "string" },
+          days: { type: "integer", minimum: 1, maximum: 3650, default: 30 },
+        },
+      },
+    },
+    {
+      name: "corpuswire_confirm_value",
+      description: "Confirm time or monetary value delivered by one CorpusWire retrieval event.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          eventId: { type: "string" },
+          minutesSaved: { type: "number", minimum: 0 },
+          confirmedValue: { type: "number", minimum: 0 },
+          confirmedBy: { type: "string" },
+        },
+        required: ["eventId", "minutesSaved"],
+      },
+    },
+    {
+      name: "corpuswire_value_rollup",
+      description: "Aggregate CorpusWire query cost and estimated/confirmed value by day, week, or month.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          period: { type: "string", enum: ["day", "week", "month"], default: "day" },
+          days: { type: "integer", minimum: 1, maximum: 3650, default: 30 },
+          workspaceId: { type: "string" },
+          hourlyRate: { type: "number", minimum: 0 },
+        },
       },
     },
     {
@@ -2229,7 +2537,7 @@ function toolDefinitions() {
     },
     {
       name: "corpuswire_sync_delta",
-      description: "Queue changed and deleted workspace paths for incremental CorpusWire remote indexing.",
+      description: "Queue changed and deleted local workspace paths for incremental indexing by the configured CorpusWire API.",
       inputSchema: {
         type: "object",
         additionalProperties: false,
@@ -2252,7 +2560,7 @@ function toolDefinitions() {
           },
           workspaceId: {
             type: "string",
-            description: "Remote workspace id used by the CorpusWire index. Defaults to CORPUSWIRE_WORKSPACE_ID.",
+            description: "Local API workspace id used by the CorpusWire index. Defaults to CORPUSWIRE_WORKSPACE_ID.",
           },
           includeGlobs: {
             type: "array",
@@ -2294,7 +2602,7 @@ function toolDefinitions() {
     },
     {
       name: "corpuswire_sync_flush",
-      description: "Flush queued CorpusWire incremental sync changes to the remote indexer.",
+      description: "Flush queued CorpusWire incremental sync changes to the configured API indexer.",
       inputSchema: {
         type: "object",
         additionalProperties: false,
@@ -2327,7 +2635,7 @@ function toolDefinitions() {
           },
           workspaceId: {
             type: "string",
-            description: "Optional remote workspace id. Defaults to CORPUSWIRE_WORKSPACE_ID.",
+            description: "Optional CorpusWire workspace id. Defaults to CORPUSWIRE_WORKSPACE_ID.",
           },
           includeGlobs: {
             type: "array",
@@ -2383,7 +2691,12 @@ function toolDefinitions() {
             type: "integer",
             minimum: 1,
             default: DEFAULT_SYNC_FLUSH_TIMEOUT_MS,
-            description: "Maximum time to wait for reconciliation to finish.",
+            description: "Maximum time to wait for reconciliation and background indexing to finish.",
+          },
+          processingTimeoutMs: {
+            type: "integer",
+            minimum: 1,
+            description: "Optional SDK background-index processing budget; defaults to maxWaitMs.",
           },
           maxFiles: {
             type: "integer",
@@ -2514,21 +2827,21 @@ function toolDefinitions() {
     },
     {
       name: "corpuswire_sync_sessions",
-      description: "List active CorpusWire remote index sessions visible to the backend.",
+      description: "List active CorpusWire index sessions visible to the local backend.",
       inputSchema: {
         type: "object",
         additionalProperties: false,
         properties: {
           workspaceId: {
             type: "string",
-            description: "Optional remote workspace id used to filter active sessions. Defaults to CORPUSWIRE_WORKSPACE_ID.",
+            description: "Optional CorpusWire workspace id used to filter active sessions. Defaults to CORPUSWIRE_WORKSPACE_ID.",
           },
         },
       },
     },
     {
       name: "corpuswire_sync_abort_session",
-      description: "Abort a known CorpusWire remote index session by session id.",
+      description: "Abort a known CorpusWire index session by session id.",
       inputSchema: {
         type: "object",
         additionalProperties: false,
@@ -2536,7 +2849,7 @@ function toolDefinitions() {
         properties: {
           sessionId: {
             type: "string",
-            description: "Remote index session id to abort. Inspect active sessions first with corpuswire_sync_sessions.",
+            description: "Index session id to abort. Inspect active sessions first with corpuswire_sync_sessions.",
           },
         },
       },
@@ -2550,7 +2863,7 @@ function toolDefinitions() {
         properties: {
           workspaceId: {
             type: "string",
-            description: "Optional remote workspace id used to filter activity. Defaults to CORPUSWIRE_WORKSPACE_ID.",
+            description: "Optional CorpusWire workspace id used to filter activity. Defaults to CORPUSWIRE_WORKSPACE_ID.",
           },
           collection: {
             type: "string",
@@ -2633,11 +2946,16 @@ async function health() {
   const qdrant = response.qdrant ?? {};
   const index = response.index ?? {};
   const activeProject = response.active_project ?? {};
+  const context = response.context ?? {};
 
   return [
     "corpuswire health:",
     `- status: ${response.ok ? "ok" : "unknown"}`,
     `- baseUrl: ${client.baseUrl}`,
+    `- tenantId: ${context.tenant_id ?? "unknown"}`,
+    `- userId: ${context.user_id ?? "anonymous-local"}`,
+    `- actorKind: ${context.actor_kind ?? "unknown"}`,
+    `- workspaceId: ${context.workspace_id ?? activeProject.workspace_id ?? "unknown"}`,
     `- indexStatus: ${index.health_status ?? "unknown"}`,
     `- corpuswire_enabled: ${runtime.corpuswire_enabled ?? "unknown"}`,
     `- qdrant_collection: ${qdrant.collection ?? "unknown"}`,
@@ -3199,6 +3517,10 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minSc
     `- requestedWorkspaceId: ${workspaceId ?? "backend default"}`,
     `- resolvedContext: ${context.repo_path ?? context.workspace_id ?? "unknown"}`,
     `- contextWorkspaceId: ${context.workspace_id ?? "unknown"}`,
+    `- tenantId: ${context.tenant_id ?? "unknown"}`,
+    `- userId: ${context.user_id ?? "anonymous-local"}`,
+    `- actorKind: ${context.actor_kind ?? "unknown"}`,
+    `- membershipRole: ${context.membership_role ?? "none"}`,
     `- collection: ${context.collection ?? "unknown"}`,
     `- indexedAt: ${index.indexed_at ?? "unknown"}`,
     `- indexedCommit: ${index.indexed_commit ?? "unknown"}`,
@@ -3207,6 +3529,9 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minSc
     `- topK: ${topK}`,
     `- minScore: ${minScore ?? "none"}`,
     `- retrievalBackend: ${result.retrieval_backend ?? "unknown"}`,
+    `- retrievalConfidence: ${result.retrieval_confidence ?? "unknown"}`,
+    `- retrievalNotFound: ${result.retrieval_not_found ?? hits.length === 0}`,
+    `- scoreSemantics: ${result.score_semantics ?? "backend-specific rank score"}`,
     `- hits: ${hits.length}`,
     ...(retrievalWarning ? [`- retrievalWarning: ${retrievalWarning}`] : []),
     ...formatWarnings(index.health_warnings),
@@ -3386,19 +3711,42 @@ async function enhancePrompt(args) {
     context: { repo_path: result.repo_path, workspace_id: result.workspace_id },
     retrievalWarning: optionalString(result.retrieval_warning),
   });
+  const contextUsed = Array.isArray(result.agent_context_packets)
+    ? result.agent_context_packets.slice(0, 10).map((packet) => {
+      const sourcePath = optionalString(packet?.source_path) ?? "unknown source";
+      const role = optionalString(packet?.role) ?? "context";
+      const score = Number.isFinite(Number(packet?.score)) ? Number(packet.score).toFixed(3) : "unknown";
+      return `- \`${sourcePath}\` (role: ${role}; score: ${score})`;
+    })
+    : [];
 
   return [
-    "Enhanced prompt:",
-    enhancedPrompt,
+    "Prompt augmentation preview",
+    "",
+    "Original prompt:",
+    indentPreviewBlock(prompt.trim()),
+    "",
+    "Augmented prompt:",
+    indentPreviewBlock(enhancedPrompt),
+    "",
+    "Context used:",
+    ...(contextUsed.length > 0 ? contextUsed : ["- No repository context was selected."]),
     "",
     "Retrieval metadata:",
     `- baseUrl: ${client.baseUrl}`,
     `- repoPath: ${repoPath ?? "backend default"}`,
     `- workspaceId: ${workspaceId ?? result.workspace_id ?? "backend default"}`,
+    `- tenantId: ${result.tenant_id ?? "unknown"}`,
+    `- userId: ${result.user_id ?? "anonymous-local"}`,
+    `- actorKind: ${result.actor_kind ?? "unknown"}`,
+    `- membershipRole: ${result.membership_role ?? "none"}`,
     `- outputMode: ${result.output_mode ?? outputMode}`,
     `- topK: ${topK}`,
     `- taskType: ${result.task_type ?? "unknown"}`,
     `- retrievalBackend: ${result.retrieval_backend ?? "unknown"}`,
+    `- retrievalConfidence: ${result.retrieval_confidence ?? "unknown"}`,
+    `- retrievalNotFound: ${result.retrieval_not_found ?? false}`,
+    `- scoreSemantics: ${result.score_semantics ?? "backend-specific rank score"}`,
     ...(result.retrieval_warning ? [`- retrievalWarning: ${result.retrieval_warning}`] : []),
     `- enhancementBackend: ${result.enhancement_backend ?? "unknown"}`,
     ...(usedLocalFallback ? ["- localFallback: retried with localOnly=true after generation setup failed"] : []),
@@ -3410,6 +3758,177 @@ async function enhancePrompt(args) {
       ? ["", "Citations:", ...result.citations.map((citation) => `- ${citation}`)]
       : []),
   ].join("\n");
+}
+
+function indentPreviewBlock(text) {
+  return text
+    .split("\n")
+    .map((line) => `    ${line}`)
+    .join("\n");
+}
+
+async function recordQualityResult(args) {
+  const workspaceId = optionalString(args.workspaceId ?? process.env.CORPUSWIRE_WORKSPACE_ID);
+  if (!workspaceId) {
+    throw new JsonRpcError(-32602, "Quality ratings require workspaceId or CORPUSWIRE_WORKSPACE_ID.");
+  }
+  const workType = requiredString(args, "workType").toLowerCase();
+  if (!["semantic_retrieval", "prompt_enhancement"].includes(workType)) {
+    throw new JsonRpcError(-32602, "workType must be semantic_retrieval or prompt_enhancement.");
+  }
+  const engine = requiredString(args, "engine").toLowerCase();
+  const client = buildClient();
+  const event = await client.recordQualityEvent({
+    workspaceId,
+    workType,
+    engine,
+    scorecard: {
+      relevance: qualityDimension(args.relevance, "relevance"),
+      fileSpecificity: qualityDimension(args.fileSpecificity, "fileSpecificity"),
+      coverage: qualityDimension(args.coverage, "coverage"),
+      freshness: qualityDimension(args.freshness, "freshness"),
+      actionability: qualityDimension(args.actionability, "actionability"),
+    },
+    query: optionalString(args.query) ?? "",
+    surface: optionalString(args.surface) ?? "codex",
+    roundId: optionalString(args.roundId),
+    resultPaths: optionalStringArray(args, "resultPaths"),
+    warning: optionalString(args.warning),
+    improvement: optionalString(args.improvement),
+    notes: optionalString(args.notes),
+    issueUrl: optionalString(args.issueUrl),
+    metadata: isRecord(args.metadata) ? args.metadata : {},
+  });
+  return [
+    "CorpusWire quality rating recorded:",
+    `- eventId: ${event.event_id}`,
+    `- workspaceId: ${event.workspace_id}`,
+    `- workType: ${event.work_type}`,
+    `- engine: ${event.engine}`,
+    `- overall: ${event.overall}`,
+    `- relevance: ${event.relevance}`,
+    `- fileSpecificity: ${event.file_specificity}`,
+    `- coverage: ${event.coverage}`,
+    `- freshness: ${event.freshness}`,
+    `- actionability: ${event.actionability}`,
+    `- queryStoredAs: ${event.query}`,
+    ...(event.improvement ? [`- improvement: ${event.improvement}`] : []),
+    ...(event.issue_url ? [`- issueUrl: ${event.issue_url}`] : []),
+  ].join("\n");
+}
+
+async function reviewQualityResults(args) {
+  const client = buildClient();
+  const workspaceId = optionalString(args.workspaceId);
+  const workType = optionalString(args.workType);
+  if (workType && !["semantic_retrieval", "prompt_enhancement"].includes(workType)) {
+    throw new JsonRpcError(-32602, "workType must be semantic_retrieval or prompt_enhancement.");
+  }
+  const review = await client.reviewQuality({
+    workspaceId,
+    workType,
+    engine: optionalString(args.engine),
+    days: optionalPositiveInteger(args.days, 30),
+  });
+  const lines = [
+    "CorpusWire central quality review:",
+    `- windowDays: ${review.window_days}`,
+    `- eventCount: ${review.event_count}`,
+    `- overallAverage: ${review.overall_average}`,
+    `- workspaceFilter: ${workspaceId ?? "all"}`,
+    `- workTypeFilter: ${workType ?? "all"}`,
+    `- engineFilter: ${optionalString(args.engine) ?? "all"}`,
+    "",
+    "Dimension averages:",
+  ];
+  for (const [name, value] of Object.entries(review.dimension_averages ?? {})) {
+    lines.push(`- ${name}: ${value}`);
+  }
+  lines.push("", "Engine averages:");
+  for (const [name, summary] of Object.entries(review.by_engine ?? {})) {
+    lines.push(`- ${name}: ${summary?.overall_average ?? "unknown"} (${summary?.count ?? 0} event(s))`);
+  }
+  lines.push("", "Recommended actions:");
+  const actions = Array.isArray(review.recommended_actions) ? review.recommended_actions : [];
+  lines.push(...(actions.length > 0 ? actions.map((action) => `- ${action}`) : ["- none yet"]));
+  const improvements = Array.isArray(review.recurring_improvements) ? review.recurring_improvements : [];
+  if (improvements.length > 0) {
+    lines.push("", "Recurring improvements:");
+    for (const item of improvements.slice(0, 10)) {
+      lines.push(`- ${item.value} (${item.count})`);
+    }
+  }
+  const lowScores = Array.isArray(review.low_score_events) ? review.low_score_events : [];
+  if (lowScores.length > 0) {
+    lines.push("", "Low-score events:");
+    for (const event of lowScores.slice(0, 10)) {
+      lines.push(`- ${event.event_id} ${event.workspace_id} ${event.engine} overall=${event.overall}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+async function confirmQueryValue(args) {
+  const eventId = requiredString(args, "eventId");
+  const minutesSaved = Number(args.minutesSaved);
+  const confirmedValue = args.confirmedValue === undefined ? undefined : Number(args.confirmedValue);
+  if (!Number.isFinite(minutesSaved) || minutesSaved < 0) {
+    throw new JsonRpcError(-32602, "minutesSaved must be a non-negative number.");
+  }
+  if (confirmedValue !== undefined && (!Number.isFinite(confirmedValue) || confirmedValue < 0)) {
+    throw new JsonRpcError(-32602, "confirmedValue must be a non-negative number.");
+  }
+  const event = await buildClient().confirmQueryValue({
+    eventId,
+    minutesSaved,
+    confirmedValue,
+    confirmedBy: optionalString(args.confirmedBy),
+  });
+  return [
+    "CorpusWire query value confirmed:",
+    `- eventId: ${event.event_id}`,
+    `- minutesSaved: ${event.confirmed_minutes_saved}`,
+    `- confirmedValue: ${event.confirmed_value ?? "not provided"}`,
+    `- status: ${event.value_status}`,
+  ].join("\n");
+}
+
+async function reviewQueryValue(args) {
+  const period = optionalString(args.period) ?? "day";
+  if (!["day", "week", "month"].includes(period)) {
+    throw new JsonRpcError(-32602, "period must be day, week, or month.");
+  }
+  const hourlyRate = args.hourlyRate === undefined ? undefined : Number(args.hourlyRate);
+  if (hourlyRate !== undefined && (!Number.isFinite(hourlyRate) || hourlyRate < 0)) {
+    throw new JsonRpcError(-32602, "hourlyRate must be a non-negative number.");
+  }
+  const client = buildClient();
+  if (typeof client.valueRollup !== "function") {
+    throw new Error(
+      "@corpuswire/sdk does not expose valueRollup; rebuild and re-vendor the SDK so the MCP runtime matches its advertised tools.",
+    );
+  }
+  const rollup = await client.valueRollup({
+    period,
+    days: optionalPositiveInteger(args.days, 30),
+    workspaceId: optionalString(args.workspaceId),
+    hourlyRate,
+  });
+  return [
+    "CorpusWire value rollup:",
+    `- period: ${rollup.period}`,
+    `- days: ${rollup.days}`,
+    `- hourlyRate: ${rollup.hourly_rate ?? "not configured"}`,
+    `- buckets: ${JSON.stringify(rollup.buckets)}`,
+  ].join("\n");
+}
+
+function qualityDimension(value, name) {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 5) {
+    throw new JsonRpcError(-32602, `${name} must be a number between 1 and 5.`);
+  }
+  return parsed;
 }
 
 function formatAgentContextPackets(packets) {
@@ -3464,7 +3983,7 @@ function retrievalRecoveryAdvice({ result, context, retrievalWarning }) {
 
   const resolvedContext = optionalString(context?.repo_path) ?? optionalString(context?.workspace_id) ?? "this workspace";
   if (/stale remote index/i.test(warning) || /filtered \d+ stale/i.test(warning)) {
-    return `Reindex or sync ${resolvedContext}; the remote collection exists, but all candidate hits were filtered as stale.`;
+    return `Reindex or sync ${resolvedContext}; the configured API collection exists, but all candidate hits were filtered as stale.`;
   }
 
   return `Check that ${resolvedContext} is indexed and that the requested repoPath/workspaceId matches the intended workspace.`;
@@ -3484,6 +4003,7 @@ function buildClient() {
     basicAuth,
     defaultHeaders: bearerToken ? { Authorization: `Bearer ${bearerToken}` } : {},
     endpointMode: "v1-only",
+    fetchFn: (input, init = {}) => fetch(input, { ...init, redirect: "error" }),
   });
 }
 
@@ -3643,21 +4163,48 @@ function isSyncIndexableRelativePath(relativePath, context) {
 function classifySyncRelativePath(relativePath, context) {
   const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\/+/, "");
   const segments = normalized.split("/").filter(Boolean);
-  if (segments.some((segment) => EXCLUDED_PATH_SEGMENTS.has(segment))) {
+  if (
+    segments.some((segment) => EXCLUDED_PATH_SEGMENTS.has(segment))
+    && !SAFE_INDEXABLE_PATHS.has(normalized)
+  ) {
     return { accepted: false, reason: "excluded_segment" };
   }
-  if (!INDEXABLE_EXTENSIONS.has(path.posix.extname(normalized).toLowerCase())) {
+  const effectivePath = effectiveIndexableRelativePath(normalized);
+  if (!INDEXABLE_EXTENSIONS.has(path.posix.extname(effectivePath).toLowerCase())) {
     return { accepted: false, reason: "unsupported_extension" };
   }
   const includeGlobs = context.includeGlobs ?? [];
-  if (includeGlobs.length > 0 && !matchesAnyGlob(relativePath, includeGlobs)) {
+  if (includeGlobs.length > 0 && !matchesAnySyncGlob(normalized, includeGlobs)) {
     return { accepted: false, reason: "include_filter" };
   }
   const excludeGlobs = context.excludeGlobs ?? [];
-  if (excludeGlobs.length > 0 && matchesAnyGlob(relativePath, excludeGlobs)) {
+  if (excludeGlobs.length > 0 && matchesAnySyncGlob(normalized, excludeGlobs)) {
     return { accepted: false, reason: "exclude_filter" };
   }
   return { accepted: true, reason: "accepted" };
+}
+
+function effectiveIndexableRelativePath(relativePath) {
+  const loweredPath = relativePath.toLowerCase();
+  for (const suffix of CONFIG_EXAMPLE_SUFFIXES) {
+    if (loweredPath.endsWith(suffix)) {
+      return relativePath.slice(0, -".example".length);
+    }
+  }
+  return relativePath;
+}
+
+function isSafeIndexableDirectoryAncestor(relativePath) {
+  const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\/+|\/+$/g, "");
+  return [...SAFE_INDEXABLE_PATHS].some((safePath) => safePath.startsWith(`${normalized}/`));
+}
+
+function matchesAnySyncGlob(relativePath, patterns) {
+  if (matchesAnyGlob(relativePath, patterns)) {
+    return true;
+  }
+  const effectivePath = effectiveIndexableRelativePath(relativePath);
+  return effectivePath !== relativePath && matchesAnyGlob(effectivePath, patterns);
 }
 
 function isExcludedDirectory(relativePath, excludeGlobs) {
@@ -3721,12 +4268,17 @@ function escapeRegExp(value) {
 }
 
 function isIndexableRelativePath(relativePath) {
-  const normalized = relativePath.replaceAll("\\", "/");
+  const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\/+/, "");
   const segments = normalized.split("/").filter(Boolean);
-  if (segments.some((segment) => EXCLUDED_PATH_SEGMENTS.has(segment))) {
+  if (
+    segments.some((segment) => EXCLUDED_PATH_SEGMENTS.has(segment))
+    && !SAFE_INDEXABLE_PATHS.has(normalized)
+  ) {
     return false;
   }
-  return INDEXABLE_EXTENSIONS.has(path.posix.extname(normalized).toLowerCase());
+  return INDEXABLE_EXTENSIONS.has(
+    path.posix.extname(effectiveIndexableRelativePath(normalized)).toLowerCase(),
+  );
 }
 
 function isMissingFileError(error) {

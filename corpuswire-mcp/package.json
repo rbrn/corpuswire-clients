@@ -1,7 +1,7 @@
 {
   "name": "@corpuswire/mcp",
   "version": "0.1.3",
-  "description": "STDIO MCP server for CorpusWire retrieval, prompt enhancement, and remote workspace sync",
+  "description": "STDIO MCP server for secure local or remote CorpusWire retrieval, prompt enhancement, and workspace sync",
   "type": "module",
   "bin": {
     "corpuswire-mcp": "bin/corpuswire-mcp.js"

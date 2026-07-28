@@ -30,5 +30,6 @@ export interface RequestJsonOptions {
 }
 export declare function normalizeBaseUrl(baseUrl: string): string;
 export declare function createBasicAuthHeader(credentials: string): string;
+export declare function createBearerAuthHeader(token: string): string;
 export declare function buildHeaders(defaultHeaders?: Record<string, string>, basicAuth?: string, initHeaders?: HeadersInit): Headers;
 export declare function requestJson<T>(options: RequestJsonOptions): Promise<T>;

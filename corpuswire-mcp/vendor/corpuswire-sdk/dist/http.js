@@ -31,6 +31,13 @@ export function normalizeBaseUrl(baseUrl) {
 export function createBasicAuthHeader(credentials) {
     return `Basic ${base64Encode(credentials)}`;
 }
+export function createBearerAuthHeader(token) {
+    const normalized = token.trim();
+    if (!normalized) {
+        throw new Error("Bearer token must not be empty.");
+    }
+    return `Bearer ${normalized}`;
+}
 export function buildHeaders(defaultHeaders = {}, basicAuth, initHeaders) {
     const headers = new Headers(defaultHeaders);
     if (basicAuth) {

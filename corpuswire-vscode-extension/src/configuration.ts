@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { PromptOutputMode } from "@corpuswire/sdk";
+import { deriveDefaultWorkspaceId } from "./workspace-identity.js";
 
 export const CONFIG_SECTION = "corpuswire";
 const LEGACY_CONTEXT_ENGINE_CONFIG_SECTION = "corpuswireContextEngine";
@@ -45,6 +46,9 @@ export interface RemoteIndexingSettings {
   workspaceId?: string;
   maxConcurrentUploads: number;
   batchBytes: number;
+  maxFileSizeBytes: number;
+  autoWatchDebounceMs: number;
+  maxAutoWatchFiles: number;
 }
 
 interface HomeConfiguration {
@@ -81,7 +85,17 @@ export function readSettings(resource?: vscode.Uri): ExtensionSettings {
     "remoteIndexing.workspaceId",
     "",
   );
-  const workspaceId = configuredWorkspaceId || legacyContextEngineSettings.workspaceId || workspaceFolder?.uri.toString();
+  const workspaceId = configuredWorkspaceId
+    || legacyContextEngineSettings.workspaceId
+    || deriveDefaultWorkspaceId(
+      workspaceFolder
+        ? {
+            scheme: workspaceFolder.uri.scheme,
+            name: workspaceFolder.name,
+            uri: workspaceFolder.uri.toString(),
+          }
+        : undefined,
+    );
 
   return {
     baseUrl,
@@ -101,7 +115,7 @@ export function readSettings(resource?: vscode.Uri): ExtensionSettings {
         config,
         homeConfiguration.values,
         "remoteIndexing.enabled",
-        Boolean(legacyContextEngineSettings.workspaceId),
+        false,
       ),
       autoWatch: readConfiguredBoolean(config, homeConfiguration.values, "remoteIndexing.autoWatch", false),
       workspaceId,
@@ -112,6 +126,18 @@ export function readSettings(resource?: vscode.Uri): ExtensionSettings {
       batchBytes: normalizePositiveInteger(
         readConfiguredNumber(config, homeConfiguration.values, "remoteIndexing.batchBytes", 4_194_304),
         4_194_304,
+      ),
+      maxFileSizeBytes: normalizePositiveInteger(
+        readConfiguredNumber(config, homeConfiguration.values, "remoteIndexing.maxFileSizeBytes", 524_288),
+        524_288,
+      ),
+      autoWatchDebounceMs: normalizePositiveInteger(
+        readConfiguredNumber(config, homeConfiguration.values, "remoteIndexing.autoWatchDebounceMs", 1_000),
+        1_000,
+      ),
+      maxAutoWatchFiles: normalizePositiveInteger(
+        readConfiguredNumber(config, homeConfiguration.values, "remoteIndexing.maxAutoWatchFiles", 50),
+        50,
       ),
     },
     services: {

@@ -2,7 +2,7 @@
   "name": "corpuswire-vscode",
   "displayName": "CorpusWire Prompt Enhancer",
   "description": "Enhance prompts and index VS Code workspaces with CorpusWire remote services.",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "publisher": "corpuswire",
   "private": true,
   "type": "module",
@@ -17,6 +17,7 @@
     "onView:corpuswire.promptView",
     "onCommand:corpuswire.enhancePrompt",
     "onCommand:corpuswire.indexWorkspace",
+    "onCommand:corpuswire.rebuildWorkspaceIndex",
     "onCommand:corpuswire.openPanel",
     "onCommand:corpuswire.focusPanel",
     "onCommand:corpuswireContextEngine.enhancePrompt",
@@ -32,6 +33,10 @@
       {
         "command": "corpuswire.indexWorkspace",
         "title": "CorpusWire: Index Workspace"
+      },
+      {
+        "command": "corpuswire.rebuildWorkspaceIndex",
+        "title": "CorpusWire: Rebuild Workspace Index"
       },
       {
         "command": "corpuswire.openPanel",
@@ -242,13 +247,13 @@
         },
         "corpuswire.remoteIndexing.enabled": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "scope": "resource",
           "description": "Enable remote-first indexing by uploading workspace file contents over the CorpusWire HTTPS API."
         },
         "corpuswire.remoteIndexing.autoWatch": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "scope": "resource",
           "description": "Watch workspace file changes and send incremental remote indexing updates."
         },
@@ -271,12 +276,34 @@
           "minimum": 65536,
           "scope": "resource",
           "description": "Target maximum file bytes to include in one remote indexing batch."
+        },
+        "corpuswire.remoteIndexing.maxFileSizeBytes": {
+          "type": "number",
+          "default": 524288,
+          "minimum": 1024,
+          "scope": "resource",
+          "description": "Maximum single file size the VS Code extension reads and sends for remote indexing."
+        },
+        "corpuswire.remoteIndexing.autoWatchDebounceMs": {
+          "type": "number",
+          "default": 1000,
+          "minimum": 250,
+          "scope": "resource",
+          "description": "Debounce delay before the remote indexing file watcher flushes incremental changes."
+        },
+        "corpuswire.remoteIndexing.maxAutoWatchFiles": {
+          "type": "number",
+          "default": 50,
+          "minimum": 1,
+          "scope": "resource",
+          "description": "Maximum file create/change/delete events allowed in one automatic watcher update. Larger batches are skipped and require CorpusWire: Index Workspace."
         }
       }
     }
   },
   "scripts": {
     "compile": "tsc -p ./",
+    "test": "npm run compile && node --test tests/*.test.mjs",
     "watch": "tsc -watch -p ./",
     "package": "vsce package",
     "vscode:prepublish": "npm run compile"

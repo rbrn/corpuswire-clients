@@ -1,4 +1,4 @@
-import { requestJson } from "./http.js";
+import { createBearerAuthHeader, requestJson } from "./http.js";
 import type {
   EnhancePromptPayload,
   EnhancePromptRequest,
@@ -20,6 +20,19 @@ import type {
   QueryPromptPayload,
   QueryPromptRequest,
   QueryResponseEnvelope,
+  QualityEvent,
+  QualityEventPayload,
+  QualityEventRequest,
+  QualityEventResponse,
+  QualityEventsQuery,
+  QualityEventsResponse,
+  QualityReview,
+  QualityReviewQuery,
+  QualityReviewResponse,
+  QueryValueEvent,
+  ValueFeedbackRequest,
+  ValueRollup,
+  ValueRollupQuery,
   RemoteFileBatchMetadata,
   RemoteFileBatchResult,
   RemoteFileContent,
@@ -41,11 +54,13 @@ import type {
 const RUNTIME_ENV = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {};
 const DEFAULT_BASE_URL = RUNTIME_ENV.CORPUSWIRE_BASE_URL ?? "http://127.0.0.1:8000";
 const DEFAULT_BASIC_AUTH = RUNTIME_ENV.CORPUSWIRE_BASIC_AUTH ?? "";
+const DEFAULT_BEARER_TOKEN = RUNTIME_ENV.CORPUSWIRE_BEARER_TOKEN ?? "";
 const DEFAULT_OUTPUT_MODE: PromptOutputMode = "generic";
 
 export class CorpusWireClient {
   readonly baseUrl: string;
   readonly basicAuth: string;
+  readonly bearerToken: string;
   readonly endpointMode: "compat" | "v1-only";
   readonly fetchFn: CorpusWireClientOptions["fetchFn"];
   readonly defaultHeaders: Record<string, string>;
@@ -53,9 +68,22 @@ export class CorpusWireClient {
   constructor(options: CorpusWireClientOptions = {}) {
     this.baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
     this.basicAuth = options.basicAuth ?? DEFAULT_BASIC_AUTH;
+    this.bearerToken = options.bearerToken ?? DEFAULT_BEARER_TOKEN;
     this.endpointMode = options.endpointMode ?? "compat";
     this.fetchFn = options.fetchFn;
     this.defaultHeaders = { ...(options.defaultHeaders ?? {}) };
+    const configuredAuthorization = Object.keys(this.defaultHeaders).some(
+      (name) => name.toLowerCase() === "authorization",
+    );
+    const authMethodCount = Number(Boolean(this.basicAuth))
+      + Number(Boolean(this.bearerToken))
+      + Number(configuredAuthorization);
+    if (authMethodCount > 1) {
+      throw new Error("Configure exactly one CorpusWire authorization method.");
+    }
+    if (this.bearerToken) {
+      this.defaultHeaders.Authorization = createBearerAuthHeader(this.bearerToken);
+    }
   }
 
   async health(request: { repoPath?: string; workspaceId?: string } = {}): Promise<HealthResponse> {
@@ -137,6 +165,97 @@ export class CorpusWireClient {
       includeAnswer: false,
     });
     return response.retrieved_chunks;
+  }
+
+  async recordQualityEvent(request: QualityEventRequest): Promise<QualityEvent> {
+    const response = await requestJson<QualityEventResponse>({
+      baseUrl: this.baseUrl,
+      paths: ["/v1/quality/events"],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(toQualityEventPayload(request)),
+      },
+    });
+    return response.event;
+  }
+
+  async listQualityEvents(request: QualityEventsQuery = {}): Promise<QualityEvent[]> {
+    const query = toQueryString({
+      workspace_id: request.workspaceId,
+      work_type: request.workType,
+      engine: request.engine,
+      days: request.days?.toString(),
+      limit: request.limit?.toString(),
+    });
+    const response = await requestJson<QualityEventsResponse>({
+      baseUrl: this.baseUrl,
+      paths: [`/v1/quality/events${query}`],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "GET" },
+    });
+    return response.events;
+  }
+
+  async reviewQuality(request: QualityReviewQuery = {}): Promise<QualityReview> {
+    const query = toQueryString({
+      workspace_id: request.workspaceId,
+      work_type: request.workType,
+      engine: request.engine,
+      days: request.days?.toString(),
+    });
+    const response = await requestJson<QualityReviewResponse>({
+      baseUrl: this.baseUrl,
+      paths: [`/v1/quality/review${query}`],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "GET" },
+    });
+    return response.review;
+  }
+
+  async confirmQueryValue(request: ValueFeedbackRequest): Promise<QueryValueEvent> {
+    const response = await requestJson<{ ok: true; event: QueryValueEvent }>({
+      baseUrl: this.baseUrl,
+      paths: [`/v1/value/events/${encodeURIComponent(request.eventId)}/confirm`],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          minutes_saved: request.minutesSaved,
+          confirmed_value: request.confirmedValue,
+          confirmed_by: request.confirmedBy,
+        }),
+      },
+    });
+    return response.event;
+  }
+
+  async valueRollup(request: ValueRollupQuery = {}): Promise<ValueRollup> {
+    const query = toQueryString({
+      period: request.period,
+      days: request.days?.toString(),
+      workspace_id: request.workspaceId,
+      hourly_rate: request.hourlyRate?.toString(),
+    });
+    const response = await requestJson<{ ok: true; rollup: ValueRollup }>({
+      baseUrl: this.baseUrl,
+      paths: [`/v1/value/rollup${query}`],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "GET" },
+    });
+    return response.rollup;
   }
 
   async getLlmModel(): Promise<LlmModelState> {
@@ -261,7 +380,10 @@ export class CorpusWireClient {
       basicAuth: this.basicAuth,
       init: {
         method: "POST",
-        headers: { "Content-Type": multipart.contentType },
+        headers: {
+          "Content-Type": multipart.contentType,
+          Prefer: "respond-async",
+        },
         body: new Blob([toArrayBuffer(multipart.body)]),
       },
     });
@@ -310,6 +432,35 @@ export class CorpusWireClient {
     }
   }
 
+  private async waitForIndexSessionProcessing(
+    sessionId: string,
+    timeoutMs: number,
+    pollMs: number,
+  ): Promise<RemoteIndexStatus> {
+    const deadline = Date.now() + Math.max(1, timeoutMs);
+    for (;;) {
+      const status = await this.getIndexSessionStatus(sessionId);
+      if (["failed", "incomplete", "aborted", "expired"].includes(status.phase)) {
+        throw new Error(
+          `Remote index session ${sessionId} entered ${status.phase}: ${status.errors.join("; ") || "unknown error"}`,
+        );
+      }
+      const pendingBatches = status.pending_batches ?? 0;
+      const activeBatches = status.active_batches ?? 0;
+      if (pendingBatches === 0 && activeBatches === 0 && status.queue_depth === 0) {
+        return status;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `Timed out waiting for remote index session ${sessionId}: ` +
+            `phase=${status.phase}; queue_depth=${status.queue_depth}; ` +
+            `pending_batches=${pendingBatches}; active_batches=${activeBatches}`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.max(10, pollMs)));
+    }
+  }
+
   async indexWorkspace(request: IndexWorkspaceRequest): Promise<RemoteIndexCommitResponse> {
     const remoteFiles = await Promise.all(request.files.map(prepareRemoteWorkspaceFile));
     const session = await this.startIndexSession(request);
@@ -330,21 +481,31 @@ export class CorpusWireClient {
       const manifestResult = await this.sendManifestBatch(session.session_id, manifestEntries);
       const uploadRequired = new Set(manifestResult.upload_required);
       const filesToUpload = remoteFiles.filter(({ file }) => uploadRequired.has(file.relativePath));
+      let queuedBackgroundWork = false;
       if (filesToUpload.length > 0) {
         const uploadBatches = buildUploadBatches(
           filesToUpload,
           request.batchBytes ?? session.max_batch_bytes,
+          session.max_batch_files,
         );
         await runWithConcurrency(
           uploadBatches,
           request.maxConcurrentUploads ?? session.max_concurrent_uploads,
           async (batchFiles) => {
-            await this.uploadFileBatch(
+            const result = await this.uploadFileBatch(
               session.session_id,
               { files: batchFiles.map((file) => file.descriptor) },
               batchFiles,
             );
+            queuedBackgroundWork ||= result.queued === true;
           },
+        );
+      }
+      if (queuedBackgroundWork) {
+        await this.waitForIndexSessionProcessing(
+          session.session_id,
+          request.processingTimeoutMs ?? 15 * 60 * 1000,
+          request.processingPollMs ?? 250,
         );
       }
       return await this.commitIndexSession(session.session_id);
@@ -353,6 +514,30 @@ export class CorpusWireClient {
       throw error;
     }
   }
+}
+
+export function toQualityEventPayload(request: QualityEventRequest): QualityEventPayload {
+  return removeUndefinedValues({
+    workspace_id: request.workspaceId,
+    work_type: request.workType,
+    engine: request.engine,
+    scorecard: {
+      relevance: request.scorecard.relevance,
+      file_specificity: request.scorecard.fileSpecificity,
+      coverage: request.scorecard.coverage,
+      freshness: request.scorecard.freshness,
+      actionability: request.scorecard.actionability,
+    },
+    query: request.query ?? "",
+    surface: request.surface,
+    round_id: request.roundId,
+    result_paths: request.resultPaths ?? [],
+    warning: request.warning,
+    improvement: request.improvement,
+    notes: request.notes,
+    issue_url: request.issueUrl,
+    metadata: request.metadata ?? {},
+  }) as unknown as QualityEventPayload;
 }
 
 export function toEnhancePayload(request: string | EnhancePromptRequest): EnhancePromptPayload {
@@ -474,8 +659,12 @@ async function prepareRemoteWorkspaceFile(
 function buildUploadBatches(
   files: Array<{ file: RemoteWorkspaceFile; content: Uint8Array; sha256: string; mtimeNs: number }>,
   batchBytes: number,
+  batchFiles?: number,
 ): RemoteFileContent[][] {
   const maxBatchBytes = Math.max(1, Math.floor(batchBytes));
+  const maxBatchFiles = batchFiles === undefined
+    ? Number.POSITIVE_INFINITY
+    : Math.max(1, Math.floor(batchFiles));
   const batches: RemoteFileContent[][] = [];
   let currentBatch: RemoteFileContent[] = [];
   let currentBytes = 0;
@@ -484,7 +673,10 @@ function buildUploadBatches(
   for (const preparedFile of files) {
     const nextFile = toRemoteFileContent(preparedFile, `file-${fileIndex}`);
     fileIndex += 1;
-    if (currentBatch.length > 0 && currentBytes + preparedFile.content.byteLength > maxBatchBytes) {
+    if (
+      currentBatch.length > 0 &&
+      (currentBytes + preparedFile.content.byteLength > maxBatchBytes || currentBatch.length >= maxBatchFiles)
+    ) {
       batches.push(currentBatch);
       currentBatch = [];
       currentBytes = 0;
