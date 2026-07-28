@@ -3471,9 +3471,18 @@ function retrievalRecoveryAdvice({ result, context, retrievalWarning }) {
 }
 
 function buildClient() {
+  const basicAuth = (process.env.CORPUSWIRE_BASIC_AUTH ?? "").trim();
+  const bearerToken = (process.env.CORPUSWIRE_BEARER_TOKEN ?? "").trim();
+  if (basicAuth && bearerToken) {
+    throw new JsonRpcError(
+      -32602,
+      "Configure only one of CORPUSWIRE_BASIC_AUTH or CORPUSWIRE_BEARER_TOKEN.",
+    );
+  }
   return new sdk.CorpusWireClient({
     baseUrl: process.env.CORPUSWIRE_BASE_URL ?? DEFAULT_BASE_URL,
-    basicAuth: process.env.CORPUSWIRE_BASIC_AUTH ?? "",
+    basicAuth,
+    defaultHeaders: bearerToken ? { Authorization: `Bearer ${bearerToken}` } : {},
     endpointMode: "v1-only",
   });
 }

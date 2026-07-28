@@ -154,6 +154,10 @@ When using the global npm install, use the same `env` block but set `"command": 
 
 Keep secrets out of repository config. Put `CORPUSWIRE_BASIC_AUTH` or service tokens in user settings, environment-specific config, or the host's secret store.
 
+For scoped service-token authentication, set `CORPUSWIRE_BEARER_TOKEN` in the
+MCP host's secure input or environment. Configure exactly one of
+`CORPUSWIRE_BEARER_TOKEN` and `CORPUSWIRE_BASIC_AUTH`.
+
 ## GitHub Copilot CLI
 
 Use the Copilot CLI MCP config shape in [examples/copilot-cli-mcp-config.json](examples/copilot-cli-mcp-config.json), [examples/npm-global-mcp-config.json](examples/npm-global-mcp-config.json), or add it interactively with `/mcp add` as a local/STDIO server. Allowlist read-only tools first:
@@ -200,6 +204,7 @@ Recommended prompt settings:
 - `CORPUSWIRE_TOP_K`: retrieval chunk count
 - `CORPUSWIRE_LOCAL_ONLY`: deterministic rewrite mode, default `true`
 - `CORPUSWIRE_BASIC_AUTH`: optional `username:password`
+- `CORPUSWIRE_BEARER_TOKEN`: optional scoped bearer token
 - `CORPUSWIRE_SYNC_ENABLED`: enable remote incremental sync
 - `CORPUSWIRE_SYNC_ROOT`: local workspace root readable by this MCP process
 - `CORPUSWIRE_SYNC_WATCH`: optional best-effort `fs.watch` watcher
