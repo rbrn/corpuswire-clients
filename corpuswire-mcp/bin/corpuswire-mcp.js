@@ -71,6 +71,8 @@ const EXCLUDED_PATH_SEGMENTS = new Set([
   ".ruff_cache",
   ".qdrant",
 ]);
+const SAFE_INDEXABLE_PATHS = new Set([".vscode/mcp.json.example"]);
+const CONFIG_EXAMPLE_SUFFIXES = new Set([".json.example"]);
 
 const execFileAsync = promisify(execFile);
 const sdk = await loadSdk();
@@ -1473,12 +1475,15 @@ class SyncManager {
       }
       entries.sort((left, right) => left.name.localeCompare(right.name));
       for (const entry of entries) {
-        if (EXCLUDED_PATH_SEGMENTS.has(entry.name)) {
-          continue;
-        }
         const absolutePath = path.join(directory, entry.name);
         const relativePath = path.relative(sourceRoot, absolutePath).split(path.sep).join("/");
         if (entry.isDirectory()) {
+          if (
+            EXCLUDED_PATH_SEGMENTS.has(entry.name)
+            && !isSafeIndexableDirectoryAncestor(relativePath)
+          ) {
+            continue;
+          }
           if (isExcludedDirectory(relativePath, context.excludeGlobs)) {
             continue;
           }
@@ -4152,21 +4157,48 @@ function isSyncIndexableRelativePath(relativePath, context) {
 function classifySyncRelativePath(relativePath, context) {
   const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\/+/, "");
   const segments = normalized.split("/").filter(Boolean);
-  if (segments.some((segment) => EXCLUDED_PATH_SEGMENTS.has(segment))) {
+  if (
+    segments.some((segment) => EXCLUDED_PATH_SEGMENTS.has(segment))
+    && !SAFE_INDEXABLE_PATHS.has(normalized)
+  ) {
     return { accepted: false, reason: "excluded_segment" };
   }
-  if (!INDEXABLE_EXTENSIONS.has(path.posix.extname(normalized).toLowerCase())) {
+  const effectivePath = effectiveIndexableRelativePath(normalized);
+  if (!INDEXABLE_EXTENSIONS.has(path.posix.extname(effectivePath).toLowerCase())) {
     return { accepted: false, reason: "unsupported_extension" };
   }
   const includeGlobs = context.includeGlobs ?? [];
-  if (includeGlobs.length > 0 && !matchesAnyGlob(relativePath, includeGlobs)) {
+  if (includeGlobs.length > 0 && !matchesAnySyncGlob(normalized, includeGlobs)) {
     return { accepted: false, reason: "include_filter" };
   }
   const excludeGlobs = context.excludeGlobs ?? [];
-  if (excludeGlobs.length > 0 && matchesAnyGlob(relativePath, excludeGlobs)) {
+  if (excludeGlobs.length > 0 && matchesAnySyncGlob(normalized, excludeGlobs)) {
     return { accepted: false, reason: "exclude_filter" };
   }
   return { accepted: true, reason: "accepted" };
+}
+
+function effectiveIndexableRelativePath(relativePath) {
+  const loweredPath = relativePath.toLowerCase();
+  for (const suffix of CONFIG_EXAMPLE_SUFFIXES) {
+    if (loweredPath.endsWith(suffix)) {
+      return relativePath.slice(0, -".example".length);
+    }
+  }
+  return relativePath;
+}
+
+function isSafeIndexableDirectoryAncestor(relativePath) {
+  const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\/+|\/+$/g, "");
+  return [...SAFE_INDEXABLE_PATHS].some((safePath) => safePath.startsWith(`${normalized}/`));
+}
+
+function matchesAnySyncGlob(relativePath, patterns) {
+  if (matchesAnyGlob(relativePath, patterns)) {
+    return true;
+  }
+  const effectivePath = effectiveIndexableRelativePath(relativePath);
+  return effectivePath !== relativePath && matchesAnyGlob(effectivePath, patterns);
 }
 
 function isExcludedDirectory(relativePath, excludeGlobs) {
@@ -4230,12 +4262,17 @@ function escapeRegExp(value) {
 }
 
 function isIndexableRelativePath(relativePath) {
-  const normalized = relativePath.replaceAll("\\", "/");
+  const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\/+/, "");
   const segments = normalized.split("/").filter(Boolean);
-  if (segments.some((segment) => EXCLUDED_PATH_SEGMENTS.has(segment))) {
+  if (
+    segments.some((segment) => EXCLUDED_PATH_SEGMENTS.has(segment))
+    && !SAFE_INDEXABLE_PATHS.has(normalized)
+  ) {
     return false;
   }
-  return INDEXABLE_EXTENSIONS.has(path.posix.extname(normalized).toLowerCase());
+  return INDEXABLE_EXTENSIONS.has(
+    path.posix.extname(effectiveIndexableRelativePath(normalized)).toLowerCase(),
+  );
 }
 
 function isMissingFileError(error) {

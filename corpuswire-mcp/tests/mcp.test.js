@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -461,6 +461,17 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
     await writeFile(path.join(tempDir, "Bridge.kt"), "class Bridge { fun readSteps() = 0 }\n", "utf8");
     await writeFile(path.join(tempDir, "health-check.kts"), "fun verifyReadOnly() = true\n", "utf8");
     await writeFile(path.join(tempDir, "Reader.scala"), "object Reader { def readSteps(): Int = 0 }\n", "utf8");
+    await mkdir(path.join(tempDir, ".vscode"));
+    await writeFile(
+      path.join(tempDir, ".vscode", "mcp.json.example"),
+      '{"servers":{"corpuswire":{"command":"node"}}}\n',
+      "utf8",
+    );
+    await writeFile(
+      path.join(tempDir, ".vscode", "mcp.json"),
+      '{"servers":{"private":{}}}\n',
+      "utf8",
+    );
     const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
     const child = spawn("node", [SERVER_BIN], {
       stdio: ["pipe", "pipe", "pipe"],
@@ -484,7 +495,7 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
         params: {
           name: "corpuswire_sync_reconcile",
           arguments: {
-            includeGlobs: ["README.md", "*.kt", "*.kts", "*.scala"],
+            includeGlobs: ["README.md", "*.kt", "*.kts", "*.scala", "**/*.json"],
             maxFiles: 5,
             maxWaitMs: 10000,
             recreateCollection: true,
@@ -511,7 +522,13 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
         mode: "full",
         recreateCollection: true,
         processingTimeoutMs: 10000,
-        files: ["Bridge.kt", "health-check.kts", "Reader.scala", "README.md"],
+        files: [
+          ".vscode/mcp.json.example",
+          "Bridge.kt",
+          "health-check.kts",
+          "Reader.scala",
+          "README.md",
+        ],
         deletedPaths: [],
       },
     ]);
