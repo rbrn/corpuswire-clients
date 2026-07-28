@@ -113,7 +113,7 @@ test("corpuswire-mcp passes bearer authentication to the SDK", async () => {
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...globalThis.process.env,
-        CORPUSWIRE_BASE_URL: "http://mock-corpuswire",
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
         CORPUSWIRE_BEARER_TOKEN: "scoped-test-token",
         CORPUSWIRE_BASIC_AUTH: "",
         CORPUSWIRE_SDK_PATH: sdkPath,
@@ -146,7 +146,8 @@ test("corpuswire-mcp passes bearer authentication to the SDK", async () => {
     assert.deepEqual(options, [
       {
         basicAuth: "",
-        defaultHeaders: { Authorization: "Bearer scoped-test-token" },
+        bearerToken: "scoped-test-token",
+        defaultHeaders: {},
       },
     ]);
   } finally {
@@ -162,7 +163,7 @@ test("corpuswire-mcp rejects conflicting authentication methods", async () => {
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...globalThis.process.env,
-        CORPUSWIRE_BASE_URL: "http://mock-corpuswire",
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
         CORPUSWIRE_BEARER_TOKEN: "scoped-test-token",
         CORPUSWIRE_BASIC_AUTH: "user:pass",
         CORPUSWIRE_SDK_PATH: sdkPath,
@@ -892,9 +893,13 @@ import { appendFileSync } from "node:fs";
 export class CorpusWireClient {
   constructor(options = {}) {
     this.baseUrl = options.baseUrl ?? "http://mock-corpuswire";
+    if (process.env.MOCK_MISSING_VALUE_ROLLUP === "true") {
+      this.valueRollup = undefined;
+    }
     if (process.env.MOCK_CLIENT_OPTIONS_PATH) {
       appendFileSync(process.env.MOCK_CLIENT_OPTIONS_PATH, JSON.stringify({
         basicAuth: options.basicAuth ?? "",
+        bearerToken: options.bearerToken ?? "",
         defaultHeaders: options.defaultHeaders ?? {},
       }) + "\\n", "utf8");
     }

@@ -25,6 +25,7 @@ the MCP package is the tool surface Copilot discovers.
 - Service-specific configuration for indexer, enhancer, and semantic search
   endpoints.
 - API key, Basic Auth, and custom header support.
+- Shared OS-keyring bearer-token authentication through the CorpusWire CLI.
 - Optional home config at `~/.config/corpuswire/vscode-extension.json` or
   `~/.corpuswire/vscode-extension.json`.
 - Local fallback enhancement when generation is unavailable but the backend can
@@ -107,6 +108,7 @@ or prefixed:
 | Setting | Default | Description |
 | --- | --- | --- |
 | `corpuswire.baseUrl` | `http://127.0.0.1:8000` | Compatibility fallback URL when service URLs are unset |
+| `corpuswire.auth.cliPath` | `corpuswire` | CorpusWire CLI used to retrieve the bearer token from the OS keyring |
 | `corpuswire.userConfigPath` | empty | Optional explicit home config file |
 | `corpuswire.repoPath` | first workspace folder | Service-local path used only when remote indexing is disabled |
 | `corpuswire.topK` | `5` | Retrieval chunk count for prompt enhancement |
@@ -129,6 +131,21 @@ When `apiKeyHeader` is `Authorization`, the extension sends
 `Authorization: Bearer <apiKey>`. Otherwise it sends the raw API key as the
 configured header value. Basic Auth is encoded as `Authorization: Basic ...` if
 no Authorization header has already been provided.
+
+The recommended bearer-token setup uses the same OS-keyring credential as the
+CorpusWire MCP client. Log in once for each service URL:
+
+```bash
+corpuswire login \
+  --base-url https://context.example.com \
+  --workspace-id github://owner/repository#main
+```
+
+The extension invokes `corpuswire auth token` without placing the credential in
+workspace settings, command arguments, or logs. An explicitly configured
+Authorization header, API key, or Basic Auth value still takes precedence.
+Set `corpuswire.auth.cliPath` to the absolute CLI path when `corpuswire` is not
+available on the VS Code extension host's `PATH`.
 
 ## Remote Indexing Settings
 
@@ -163,8 +180,9 @@ Example workspace settings:
 }
 ```
 
-Keep secrets out of committed `.vscode/settings.json`. Use VS Code user
-settings or the home config file for API keys and Basic Auth values.
+Keep secrets out of committed `.vscode/settings.json`. Prefer `corpuswire
+login`, which stores bearer tokens in the OS keyring. Legacy API-key and Basic
+Auth settings remain available in VS Code user settings or the home config file.
 
 ## Local Docker As A Remote Service
 

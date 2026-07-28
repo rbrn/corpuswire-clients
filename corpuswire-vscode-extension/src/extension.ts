@@ -14,7 +14,10 @@ import {
   buildRemoteServiceHeaders,
   readSettings,
 } from "./configuration.js";
-import type { ExtensionSettings } from "./configuration.js";
+import type {
+  ExtensionSettings,
+  RemoteServiceSettings,
+} from "./configuration.js";
 import {
   assessEnhancementQuality,
 } from "./enhancement-quality.js";
@@ -22,6 +25,10 @@ import type {
   EnhancementQuality,
   EnhancementQualityStatus,
 } from "./enhancement-quality.js";
+import {
+  hasAuthorizationHeader,
+  resolveCliBearerToken,
+} from "./service-auth.js";
 
 type PromptRewriteResultWithCompatibilityFields = PromptRewriteResult & {
   augmented_prompt?: unknown;
@@ -35,6 +42,21 @@ interface PromptEnhancementOutcome {
   replacement: string;
   usedLocalFallback: boolean;
   quality: EnhancementQuality;
+}
+
+async function buildAuthenticatedServiceHeaders(
+  settings: ExtensionSettings,
+  service: RemoteServiceSettings,
+): Promise<Record<string, string>> {
+  const headers = buildRemoteServiceHeaders(service);
+  if (hasAuthorizationHeader(headers)) {
+    return headers;
+  }
+  const token = await resolveCliBearerToken(service.url, settings.auth.cliPath);
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  return headers;
 }
 
 interface PanelEnhanceMessage {
@@ -320,7 +342,7 @@ async function runPromptEnhancement(
   const client = new CorpusWireClient({
     baseUrl: enhancerService.url,
     endpointMode: "v1-only",
-    defaultHeaders: buildRemoteServiceHeaders(enhancerService),
+    defaultHeaders: await buildAuthenticatedServiceHeaders(settings, enhancerService),
   });
   const request = buildEnhancementRequest(prompt, settings);
 
@@ -369,7 +391,7 @@ async function runIndexStatusCheck(post: (message: PanelOutboundMessage) => void
 
   post({ type: "index-status", state: "checking", message: "Checking index status…", workspaceId });
 
-  const headers = buildRemoteServiceHeaders(indexerService);
+  const headers = await buildAuthenticatedServiceHeaders(settings, indexerService);
   const baseUrl = indexerService.url.replace(/\/$/, "");
 
   // Probe /repos for a matching workspace path
@@ -488,7 +510,7 @@ async function runFetchModel(post: (message: PanelOutboundMessage) => void): Pro
   const client = new CorpusWireClient({
     baseUrl: enhancerService.url,
     endpointMode: "v1-only",
-    defaultHeaders: buildRemoteServiceHeaders(enhancerService),
+    defaultHeaders: await buildAuthenticatedServiceHeaders(settings, enhancerService),
   });
   try {
     const state = await client.getLlmModel();
@@ -524,7 +546,7 @@ async function runSetModel(
   const client = new CorpusWireClient({
     baseUrl: enhancerService.url,
     endpointMode: "v1-only",
-    defaultHeaders: buildRemoteServiceHeaders(enhancerService),
+    defaultHeaders: await buildAuthenticatedServiceHeaders(settings, enhancerService),
   });
   try {
     const state = await client.setLlmModel(trimmed);
@@ -671,7 +693,7 @@ async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}): Promi
   const client = new CorpusWireClient({
     baseUrl: indexerService.url,
     endpointMode: "v1-only",
-    defaultHeaders: buildRemoteServiceHeaders(indexerService),
+    defaultHeaders: await buildAuthenticatedServiceHeaders(settings, indexerService),
   });
 
   try {
@@ -814,7 +836,7 @@ async function sendIncrementalIndexUpdate(changedUris: vscode.Uri[], deletedPath
   const client = new CorpusWireClient({
     baseUrl: indexerService.url,
     endpointMode: "v1-only",
-    defaultHeaders: buildRemoteServiceHeaders(indexerService),
+    defaultHeaders: await buildAuthenticatedServiceHeaders(settings, indexerService),
   });
   const collected = await collectUriFiles(changedUris, settings.remoteIndexing.maxFileSizeBytes);
   if (collected.files.length === 0 && deletedPaths.length === 0) {
@@ -911,7 +933,7 @@ async function enhanceSelectedPrompt(): Promise<void> {
   const client = new CorpusWireClient({
     baseUrl: enhancerService.url,
     endpointMode: "v1-only",
-    defaultHeaders: buildRemoteServiceHeaders(enhancerService),
+    defaultHeaders: await buildAuthenticatedServiceHeaders(settings, enhancerService),
   });
   const request = buildEnhancementRequest(selectedText, settings);
 

@@ -3990,18 +3990,12 @@ function retrievalRecoveryAdvice({ result, context, retrievalWarning }) {
 }
 
 function buildClient() {
-  const basicAuth = (process.env.CORPUSWIRE_BASIC_AUTH ?? "").trim();
-  const bearerToken = (process.env.CORPUSWIRE_BEARER_TOKEN ?? "").trim();
-  if (basicAuth && bearerToken) {
-    throw new JsonRpcError(
-      -32602,
-      "Configure only one of CORPUSWIRE_BASIC_AUTH or CORPUSWIRE_BEARER_TOKEN.",
-    );
-  }
+  const policy = resolveBackendPolicy();
+  const { basicAuth, bearerToken } = resolveAuthConfiguration();
   return new sdk.CorpusWireClient({
-    baseUrl: process.env.CORPUSWIRE_BASE_URL ?? DEFAULT_BASE_URL,
+    baseUrl: policy.baseUrl,
     basicAuth,
-    defaultHeaders: bearerToken ? { Authorization: `Bearer ${bearerToken}` } : {},
+    bearerToken,
     endpointMode: "v1-only",
     fetchFn: (input, init = {}) => fetch(input, { ...init, redirect: "error" }),
   });
