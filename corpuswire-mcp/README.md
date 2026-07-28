@@ -157,6 +157,10 @@ When using the global npm install, use the same `env` block but set `"command": 
 
 Keep secrets out of repository config. If the local API is protected with `BASIC_AUTH_USERNAME` and `BASIC_AUTH_PASSWORD`, put `CORPUSWIRE_BASIC_AUTH=username:password` in user settings, environment-specific config, or the host's secret store.
 
+For scoped service-token authentication, set `CORPUSWIRE_BEARER_TOKEN` in the
+MCP host's secure input or environment. Configure exactly one of
+`CORPUSWIRE_BEARER_TOKEN` and `CORPUSWIRE_BASIC_AUTH`.
+
 ## GitHub Copilot CLI
 
 Use the Copilot CLI MCP config shape in [examples/copilot-cli-mcp-config.json](examples/copilot-cli-mcp-config.json), [examples/npm-global-mcp-config.json](examples/npm-global-mcp-config.json), or add it interactively with `/mcp add` as a local/STDIO server. Allowlist read-only tools first:
@@ -202,12 +206,9 @@ Recommended prompt settings:
 - `CORPUSWIRE_OUTPUT_MODE`: `generic`, `copilot`, `claude-code`, or `sequential`
 - `CORPUSWIRE_TOP_K`: retrieval chunk count
 - `CORPUSWIRE_LOCAL_ONLY`: deterministic rewrite mode, default `true`
-- `CORPUSWIRE_BASIC_AUTH`: optional `username:password`, sent as HTTP Basic Auth to the local API and plugin MCP routes
-- `CORPUSWIRE_BEARER_TOKEN`: preferred scoped service or OIDC token for hosted APIs
-- `CORPUSWIRE_REMOTE_ENABLED`: opt in to a non-loopback backend; default `false`
-- `CORPUSWIRE_ALLOWED_ORIGINS`: comma-separated exact HTTPS origins permitted for remote use
-- `CORPUSWIRE_REMOTE_SYNC_ENABLED`: separately allow local workspace content upload to an approved remote API
-- `CORPUSWIRE_SYNC_ENABLED`: enable incremental sync into the local API
+- `CORPUSWIRE_BASIC_AUTH`: optional `username:password`
+- `CORPUSWIRE_BEARER_TOKEN`: optional scoped bearer token
+- `CORPUSWIRE_SYNC_ENABLED`: enable remote incremental sync
 - `CORPUSWIRE_SYNC_ROOT`: local workspace root readable by this MCP process
 - `CORPUSWIRE_SYNC_WATCH`: optional best-effort `fs.watch` watcher
 - `CORPUSWIRE_SYNC_DEBOUNCE_MS`: debounce delay for queued deltas

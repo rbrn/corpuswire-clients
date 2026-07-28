@@ -103,6 +103,98 @@ test("corpuswire-mcp exposes tools and maps search requests to the SDK", async (
   }
 });
 
+test("corpuswire-mcp passes bearer authentication to the SDK", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const clientOptionsPath = path.join(tempDir, "client-options.jsonl");
+    await writeFile(clientOptionsPath, "", "utf8");
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "http://mock-corpuswire",
+        CORPUSWIRE_BEARER_TOKEN: "scoped-test-token",
+        CORPUSWIRE_BASIC_AUTH: "",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        CORPUSWIRE_WORKSPACE_ID: "workspace-from-env",
+        MOCK_CLIENT_OPTIONS_PATH: clientOptionsPath,
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const search = await rpc({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_search",
+          arguments: { query: "bearer authentication" },
+        },
+      });
+      assert.equal(search.result.isError, false);
+    } finally {
+      child.kill();
+    }
+
+    const options = (await readFile(clientOptionsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(options, [
+      {
+        basicAuth: "",
+        defaultHeaders: { Authorization: "Bearer scoped-test-token" },
+      },
+    ]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("corpuswire-mcp rejects conflicting authentication methods", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "http://mock-corpuswire",
+        CORPUSWIRE_BEARER_TOKEN: "scoped-test-token",
+        CORPUSWIRE_BASIC_AUTH: "user:pass",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        CORPUSWIRE_WORKSPACE_ID: "workspace-from-env",
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const search = await rpc({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_search",
+          arguments: { query: "conflicting authentication" },
+        },
+      });
+      assert.equal(search.result.isError, true);
+      assert.match(
+        search.result.content[0].text,
+        /Configure only one of CORPUSWIRE_BASIC_AUTH or CORPUSWIRE_BEARER_TOKEN/,
+      );
+    } finally {
+      child.kill();
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("corpuswire-mcp diagnoses workspace collection mismatches", async () => {
   const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
   try {
@@ -800,8 +892,11 @@ import { appendFileSync } from "node:fs";
 export class CorpusWireClient {
   constructor(options = {}) {
     this.baseUrl = options.baseUrl ?? "http://mock-corpuswire";
-    if (process.env.MOCK_MISSING_VALUE_ROLLUP === "true") {
-      this.valueRollup = undefined;
+    if (process.env.MOCK_CLIENT_OPTIONS_PATH) {
+      appendFileSync(process.env.MOCK_CLIENT_OPTIONS_PATH, JSON.stringify({
+        basicAuth: options.basicAuth ?? "",
+        defaultHeaders: options.defaultHeaders ?? {},
+      }) + "\\n", "utf8");
     }
   }
 
