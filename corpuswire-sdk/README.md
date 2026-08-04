@@ -16,6 +16,8 @@ health, index observability, or remote indexing.
 - `GET /v1/index/capabilities` for remote indexing limits.
 - `GET /v1/index/events` and `GET /v1/index/activity` for index observability.
 - Full remote indexing session helpers for `/v1/index/*`.
+- Typed Codebase, GitHub binding, review-context request/polling, review-status,
+  telemetry-summary, and overlay-purge helpers for the opt-in review sidecar.
 - Bounded retries for transient `502`, `503`, `504`, connection reset, timeout,
   refused connection, pipe, and Undici socket failures.
 - Stable error parsing through `CorpusWireHttpError`, including backend request
@@ -86,6 +88,59 @@ Constructor options:
 | `endpointMode` | `compat` | `compat` tries versioned then legacy endpoints where supported; `v1-only` disables legacy fallback |
 | `fetchFn` | `globalThis.fetch` | Useful for tests or nonstandard runtimes |
 | `defaultHeaders` | `{}` | Applied to every request; request-specific headers can override |
+
+## Codebases And Review Context
+
+The SDK exposes the provider-neutral review-sidecar control plane through
+`createCodebase`, `listCodebases`, `getCodebase`, `updateCodebase`,
+`deleteCodebase`, and `listCodebaseRepositories`. GitHub bindings use
+`bindGitHubProvider` and `revokeGitHubProvider`. Review work uses
+`getReviewContextCapabilities`, `requestReviewContext`,
+`requestReviewContextAndWait`, `getReviewContextJob`,
+`pollReviewContextJob`, `cancelReviewContextJob`, `getReviewTelemetrySummary`,
+`getReviewStatus`, and `purgeReviewOverlay`.
+
+```ts
+const codebase = await client.createCodebase({ displayName: "Payments" });
+
+await client.bindGitHubProvider(codebase.codebase_id, {
+  installationId: "12345",
+  displayName: "Acme GitHub",
+  repositoryAllowlist: null,
+});
+
+const context = await client.requestReviewContextAndWait(
+  {
+    codebaseId: codebase.codebase_id,
+    targetRepositoryId: "repository-42",
+    providerReviewId: "314",
+    expectedHeadSha: null,
+    objective: "Find affected consumers across the Codebase",
+    budgets: { graphHops: 2, evidenceItems: 40 },
+  },
+  {
+    timeoutMs: 60_000,
+    pollIntervalMs: 1_000,
+    onJob: (job) => console.log(job.state, job.attempts),
+  },
+);
+```
+
+Repository allowlists preserve tri-state intent. On a new binding, omission or
+`null` selects all repositories. On update, omission preserves the current
+selection, `null` selects all, `[]` selects none, and a non-empty list selects
+exactly those provider repository IDs. The SDK omits fields whose value is
+`undefined`; it preserves explicit `null` and empty arrays on the wire.
+
+`requestReviewContext()` returns either an immediate `ReviewContextResponseV1`
+or a durable `ReviewContextJobV1`. `requestReviewContextAndWait()` polls queued
+and running jobs, honors server `retry_after_seconds`, supports `AbortSignal`,
+and throws `ReviewContextPollingTimeoutError` or
+`ReviewContextPollingCancelledError` for client-side termination. A terminal
+job remains a typed job result; callers should inspect its `state` and
+`partial_reasons`. Backend failures, including bounded `413` review requests,
+are surfaced as `CorpusWireHttpError` with the stable error code, request ID,
+retry metadata, and recovery guidance.
 
 ## Prompt Enhancement
 

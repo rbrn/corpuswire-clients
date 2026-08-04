@@ -34,6 +34,12 @@ const DEFAULT_SYNC_LATENCY_SAMPLE_LIMIT = 20;
 const DEFAULT_SYNC_CACHE_SCHEMA_VERSION = 1;
 const DIRECTORY_GLOB_PROBE = "__corpuswire_directory_probe__";
 const OUTPUT_MODES = new Set(["generic", "copilot", "claude-code", "sequential"]);
+const QUALITY_WORK_TYPES = Object.freeze([
+  "semantic_retrieval",
+  "prompt_enhancement",
+  "review_context",
+]);
+const QUALITY_WORK_TYPE_SET = new Set(QUALITY_WORK_TYPES);
 const INDEXABLE_EXTENSIONS = new Set([
   ".md",
   ".txt",
@@ -44,6 +50,7 @@ const INDEXABLE_EXTENSIONS = new Set([
   ".kts",
   ".scala",
   ".py",
+  ".pyi",
   ".sh",
   ".cjs",
   ".js",
@@ -51,12 +58,49 @@ const INDEXABLE_EXTENSIONS = new Set([
   ".mjs",
   ".ts",
   ".tsx",
+  ".mts",
+  ".cts",
+  ".html",
+  ".htm",
+  ".tf",
+  ".hcl",
+  ".bat",
   ".json",
   ".jsonl",
   ".ndjson",
   ".toml",
   ".yaml",
   ".yml",
+]);
+const INDEXABLE_FILENAMES = new Set(["gradlew", "mvnw"]);
+const DISCOVERY_ONLY_FILENAMES = new Set([
+  ".terraform.lock.hcl",
+  "angular.json",
+  "bun.lock",
+  "bun.lockb",
+  "build.gradle",
+  "build.gradle.kts",
+  "dependencies.lock",
+  "gradle.lockfile",
+  "gradle.properties",
+  "jsconfig.json",
+  "libs.versions.toml",
+  "npm-shrinkwrap.json",
+  "package-lock.json",
+  "package.json",
+  "pdm.lock",
+  "pipfile",
+  "pipfile.lock",
+  "pnpm-lock.yaml",
+  "poetry.lock",
+  "pom.xml",
+  "pyproject.toml",
+  "setup.cfg",
+  "setup.py",
+  "settings.gradle",
+  "settings.gradle.kts",
+  "uv.lock",
+  "yarn.lock",
 ]);
 const EXCLUDED_PATH_SEGMENTS = new Set([
   ".git",
@@ -163,6 +207,10 @@ class SyncManager {
     this.lastSessionConflictAttempt = null;
     this.lastSessionConflictRetryDelayMs = null;
     this.lastSessionConflictMessage = null;
+    this.supportedFileRegistryVersion = "fallback-v1";
+    this.indexableExtensions = new Set(INDEXABLE_EXTENSIONS);
+    this.indexableFilenames = new Set(INDEXABLE_FILENAMES);
+    this.supportedFileCapabilitiesPromise = null;
   }
 
   startWatcherIfConfigured() {
@@ -280,6 +328,41 @@ class SyncManager {
     );
   }
 
+  async refreshSupportedFileCapabilities() {
+    if (this.supportedFileCapabilitiesPromise) {
+      return this.supportedFileCapabilitiesPromise;
+    }
+    this.supportedFileCapabilitiesPromise = (async () => {
+      const client = buildClient();
+      if (typeof client.getIndexCapabilities !== "function") {
+        return;
+      }
+      try {
+        const capabilities = asRecord(await client.getIndexCapabilities());
+        const extensions = boundedSupportedFileValues(
+          capabilities.supported_extensions,
+          /^\\.[a-z0-9.]+$/,
+        );
+        const filenames = boundedSupportedFileValues(
+          capabilities.supported_filenames,
+          /^[a-z0-9][a-z0-9._-]*$/,
+        );
+        if (extensions.length > 0) {
+          this.indexableExtensions = new Set(extensions);
+        }
+        if (Array.isArray(capabilities.supported_filenames)) {
+          this.indexableFilenames = new Set(filenames);
+        }
+        if (typeof capabilities.supported_file_registry_version === "string") {
+          this.supportedFileRegistryVersion = capabilities.supported_file_registry_version.slice(0, 128);
+        }
+      } catch {
+        // The local fallback remains safe when an older server lacks capabilities.
+      }
+    })();
+    return this.supportedFileCapabilitiesPromise;
+  }
+
   isCacheUsable() {
     if (!this.isCacheEnabled()) {
       return false;
@@ -302,6 +385,7 @@ class SyncManager {
       };
     }
 
+    await this.refreshSupportedFileCapabilities();
     const context = this.resolveContext(args);
     const paths = optionalStringArray(args, "paths", "changedPaths", "changed_paths");
     if (paths.length === 0) {
@@ -384,6 +468,7 @@ class SyncManager {
       };
     }
 
+    await this.refreshSupportedFileCapabilities();
     const context = this.resolveContext(args);
     const changedPaths = optionalStringArray(args, "changedPaths", "changed_paths");
     const deletedPaths = optionalStringArray(args, "deletedPaths", "deleted_paths");
@@ -829,6 +914,7 @@ class SyncManager {
       return this.activeReconcile;
     }
 
+    await this.refreshSupportedFileCapabilities();
     const context = this.resolveContext(args);
     this.activeReconcile = this.runReconcile(context, args)
       .catch((error) => {
@@ -1479,7 +1565,7 @@ class SyncManager {
         const relativePath = path.relative(sourceRoot, absolutePath).split(path.sep).join("/");
         if (entry.isDirectory()) {
           if (
-            EXCLUDED_PATH_SEGMENTS.has(entry.name)
+            (EXCLUDED_PATH_SEGMENTS.has(entry.name) || entry.name.startsWith("."))
             && !isSafeIndexableDirectoryAncestor(relativePath)
           ) {
             continue;
@@ -1527,6 +1613,8 @@ class SyncManager {
       workspaceId,
       includeGlobs: resolveSyncGlobList(args, this.env.CORPUSWIRE_SYNC_INCLUDE_GLOBS, "includeGlobs", "include_globs"),
       excludeGlobs: resolveSyncGlobList(args, this.env.CORPUSWIRE_SYNC_EXCLUDE_GLOBS, "excludeGlobs", "exclude_globs"),
+      indexableExtensions: this.indexableExtensions,
+      indexableFilenames: this.indexableFilenames,
     };
   }
 
@@ -1781,6 +1869,7 @@ class SyncManager {
       capabilityAllowed: syncCapability.allowed,
       capabilityReason: syncCapability.reason,
       backendMode: syncCapability.backendMode,
+      supportedFileRegistryVersion: this.supportedFileRegistryVersion,
       watcherActive: this.watcher !== null,
       bootstrapActive: this.activeBootstrapCheck !== null,
       gitDeltaActive: this.activeGitDelta !== null,
@@ -1954,6 +2043,20 @@ async function callTool(params) {
       return textToolResult(await searchContext(args));
     } catch (error) {
       return textToolResult(formatToolError(error, "search request"), true);
+    }
+  }
+  if (name === "corpuswire_review_context") {
+    try {
+      return textToolResult(await reviewContext(args));
+    } catch (error) {
+      return textToolResult(formatToolError(error, "review context request"), true);
+    }
+  }
+  if (name === "corpuswire_codebase_status") {
+    try {
+      return textToolResult(await codebaseStatus(args));
+    } catch (error) {
+      return textToolResult(formatToolError(error, "Codebase status request"), true);
     }
   }
   if (name === "corpuswire_enhance_prompt") {
@@ -2295,6 +2398,64 @@ async function listToolsWithPlugins() {
 function toolDefinitions() {
   return [
     {
+      name: "corpuswire_review_context",
+      description: "Build or poll a bounded, provenance-bearing multi-repository evidence pack for one code review.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          codebaseId: { type: "string", minLength: 1, maxLength: 256, description: "Opaque Codebase identifier." },
+          targetRepositoryId: { type: "string", minLength: 1, maxLength: 256, description: "Immutable target Repository identifier." },
+          providerReviewId: { type: "string", minLength: 1, maxLength: 256, description: "Provider review or pull-request identifier." },
+          expectedHeadSha: { type: ["string", "null"], pattern: "^[0-9a-f]{40,64}$" },
+          objective: { type: "string", minLength: 1, maxLength: 16000, description: "Review objective used to rank related evidence." },
+          strictFreshness: { type: "boolean", default: true },
+          budgets: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              graphHops: { type: "integer", minimum: 0, maximum: 4, default: 2 },
+              candidateRepositories: { type: "integer", minimum: 1, maximum: 100, default: 25 },
+              preRankCandidates: { type: "integer", minimum: 1, maximum: 5000, default: 500 },
+              evidenceItems: { type: "integer", minimum: 1, maximum: 500, default: 40 },
+              serializedTokens: { type: "integer", minimum: 256, maximum: 100000, default: 12000 },
+              waitMs: { type: "integer", minimum: 0, maximum: 60000, default: 2500 },
+            },
+          },
+          outputCharacterLimit: {
+            type: ["integer", "null"],
+            minimum: 256,
+            maximum: 2000000,
+            description: "Server evidence and MCP text formatting character limit.",
+          },
+          waitForCompletion: {
+            type: "boolean",
+            default: true,
+            description: "Poll durable work until usable or terminal when true.",
+          },
+          timeoutMs: { type: "integer", minimum: 0, default: 60000 },
+          pollIntervalMs: { type: "integer", minimum: 0, default: 1000 },
+        },
+        required: ["codebaseId", "targetRepositoryId", "providerReviewId", "objective"],
+      },
+    },
+    {
+      name: "corpuswire_codebase_status",
+      description: "Inspect one authorized Codebase, repository selection, review capabilities, and optional review status.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          codebaseId: { type: "string", description: "Opaque Codebase identifier." },
+          reviewId: { type: "string", description: "Optional provider review identifier." },
+          includeRepositories: { type: "boolean", default: true },
+          includeCapabilities: { type: "boolean", default: true },
+          maxRepositories: { type: "integer", minimum: 1, maximum: 500, default: 100 },
+        },
+        required: ["codebaseId"],
+      },
+    },
+    {
       name: "corpuswire_search",
       description: "Search the configured CorpusWire index for repository context without answer generation.",
       inputSchema: {
@@ -2404,8 +2565,8 @@ function toolDefinitions() {
           },
           workType: {
             type: "string",
-            enum: ["semantic_retrieval", "prompt_enhancement"],
-            description: "Whether this rating assesses semantic retrieval or prompt enhancement.",
+            enum: [...QUALITY_WORK_TYPES],
+            description: "Whether this rating assesses semantic retrieval, prompt enhancement, or review context.",
           },
           engine: {
             type: "string",
@@ -2434,7 +2595,7 @@ function toolDefinitions() {
     },
     {
       name: "corpuswire_quality_review",
-      description: "Review central semantic and prompt-enhancement ratings to identify weak dimensions, recurring patterns, and recommended improvements.",
+      description: "Review central retrieval, prompt-enhancement, and review-context ratings to identify weak dimensions, recurring patterns, and recommended improvements.",
       inputSchema: {
         type: "object",
         additionalProperties: false,
@@ -2445,7 +2606,7 @@ function toolDefinitions() {
           },
           workType: {
             type: "string",
-            enum: ["semantic_retrieval", "prompt_enhancement"],
+            enum: [...QUALITY_WORK_TYPES],
           },
           engine: { type: "string" },
           days: { type: "integer", minimum: 1, maximum: 3650, default: 30 },
@@ -2889,6 +3050,342 @@ function toolDefinitions() {
       },
     },
   ];
+}
+
+async function reviewContext(args) {
+  const codebaseId = requiredString(args, "codebaseId");
+  const targetRepositoryId = requiredString(args, "targetRepositoryId");
+  const providerReviewId = requiredString(args, "providerReviewId");
+  const objective = requiredString(args, "objective");
+  const budgets = reviewBudgets(args.budgets);
+  const expectedHeadSha = args.expectedHeadSha === null
+    ? null
+    : optionalString(args.expectedHeadSha);
+  const outputCharacterLimit = nullableBoundedInteger(
+    args.outputCharacterLimit,
+    "outputCharacterLimit",
+    256,
+    2_000_000,
+  );
+  const waitForCompletion = optionalBoolean(args.waitForCompletion, true);
+  const timeoutMs = optionalNonNegativeInteger(args.timeoutMs, 60_000);
+  const pollIntervalMs = optionalNonNegativeInteger(args.pollIntervalMs, 1_000);
+  const client = buildClient();
+  if (
+    typeof client.requestReviewContext !== "function"
+    || typeof client.requestReviewContextAndWait !== "function"
+  ) {
+    throw new Error(
+      "@corpuswire/sdk does not expose review-context methods; rebuild and re-vendor the SDK.",
+    );
+  }
+  const request = {
+    codebaseId,
+    targetRepositoryId,
+    providerReviewId,
+    expectedHeadSha,
+    objective,
+    strictFreshness: optionalBoolean(args.strictFreshness, true),
+    budgets,
+    outputCharacterLimit,
+  };
+  const result = waitForCompletion
+    ? await client.requestReviewContextAndWait(request, { timeoutMs, pollIntervalMs })
+    : await client.requestReviewContext(request);
+  const maxChars = outputCharacterLimit ?? 12_000;
+  return formatReviewContextResult({ result, maxChars });
+}
+
+async function codebaseStatus(args) {
+  const codebaseId = requiredString(args, "codebaseId");
+  const reviewId = optionalString(args.reviewId);
+  const includeRepositories = optionalBoolean(args.includeRepositories, true);
+  const includeCapabilities = optionalBoolean(args.includeCapabilities, true);
+  const maxRepositories = optionalBoundedInteger(
+    args.maxRepositories,
+    "maxRepositories",
+    1,
+    500,
+  ) ?? 100;
+  const client = buildClient();
+  if (typeof client.getCodebase !== "function") {
+    throw new Error(
+      "@corpuswire/sdk does not expose Codebase methods; rebuild and re-vendor the SDK.",
+    );
+  }
+  const codebase = await client.getCodebase(codebaseId);
+  const [repositoriesResult, capabilitiesResult, reviewResult] = await Promise.all([
+    includeRepositories && typeof client.listCodebaseRepositories === "function"
+      ? optionalSdkResult(() => client.listCodebaseRepositories(codebaseId))
+      : Promise.resolve({ value: null, error: null }),
+    includeCapabilities && typeof client.getReviewContextCapabilities === "function"
+      ? optionalSdkResult(() => client.getReviewContextCapabilities())
+      : Promise.resolve({ value: null, error: null }),
+    reviewId && typeof client.getReviewStatus === "function"
+      ? optionalSdkResult(() => client.getReviewStatus(codebaseId, reviewId))
+      : Promise.resolve({ value: null, error: null }),
+  ]);
+  return formatCodebaseStatus({
+    codebase,
+    repositoriesResult,
+    capabilitiesResult,
+    reviewResult,
+    maxRepositories,
+  });
+}
+
+async function optionalSdkResult(operation) {
+  try {
+    return { value: await operation(), error: null };
+  } catch (error) {
+    return { value: null, error: formatToolError(error, "optional status request") };
+  }
+}
+
+function reviewBudgets(value) {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (!isRecord(value)) {
+    throw new JsonRpcError(-32602, "Invalid params: budgets must be an object.");
+  }
+  return removeUndefinedValues({
+    graphHops: optionalBoundedInteger(value.graphHops, "graphHops", 0, 4),
+    candidateRepositories: optionalBoundedInteger(
+      value.candidateRepositories,
+      "candidateRepositories",
+      1,
+      100,
+    ),
+    preRankCandidates: optionalBoundedInteger(
+      value.preRankCandidates,
+      "preRankCandidates",
+      1,
+      5_000,
+    ),
+    evidenceItems: optionalBoundedInteger(value.evidenceItems, "evidenceItems", 1, 500),
+    serializedTokens: optionalBoundedInteger(
+      value.serializedTokens,
+      "serializedTokens",
+      256,
+      100_000,
+    ),
+    waitMs: optionalBoundedInteger(value.waitMs, "waitMs", 0, 60_000),
+  });
+}
+
+function formatReviewContextResult({ result, maxChars }) {
+  if (!isRecord(result)) {
+    throw new Error("CorpusWire returned an invalid review-context result.");
+  }
+  if (typeof result.state === "string" && typeof result.job_id === "string") {
+    return truncateText([
+      "CorpusWire review context job:",
+      `- jobId: ${result.job_id}`,
+      `- requestId: ${result.request_id ?? "unknown"}`,
+      `- codebaseId: ${result.codebase_id ?? "unknown"}`,
+      `- state: ${result.state}`,
+      `- attempts: ${result.attempts ?? 0}`,
+      `- statusUrl: ${result.status_url ?? "unknown"}`,
+      `- retryAfterSeconds: ${result.retry_after_seconds ?? "none"}`,
+      `- partialReasons: ${stringList(result.partial_reasons) || "none"}`,
+    ].join("\n"), maxChars);
+  }
+
+  const evidence = Array.isArray(result.evidence) ? result.evidence.filter(isRecord) : [];
+  const lines = [
+    "CorpusWire review context:",
+    `- requestId: ${result.request_id ?? "unknown"}`,
+    `- telemetryId: ${result.telemetry_id ?? "unknown"}`,
+    `- jobId: ${result.job_id ?? "none"}`,
+    `- reviewId: ${result.review_id ?? "unknown"}`,
+    `- targetRepositoryId: ${result.target_repository_id ?? "unknown"}`,
+    `- baseSha: ${result.base_sha ?? "unknown"}`,
+    `- headSha: ${result.head_sha ?? "unknown"}`,
+    `- snapshot: ${result.snapshot_id ?? "unknown"}@${result.snapshot_generation ?? "unknown"}`,
+    `- overlay: ${result.overlay_id ?? "unknown"}@${result.overlay_generation ?? "unknown"}`,
+    `- freshness: ${result.freshness ?? "unknown"}`,
+    `- repositories: ${result.repository_count ?? 0}`,
+    `- candidates: ${result.candidate_count ?? 0}`,
+    `- serializedTokens: ${result.serialized_token_count ?? 0}`,
+    `- truncated: ${result.truncated ?? false}`,
+    `- changedSymbols: ${stringList(result.changed_symbols) || "none"}`,
+    `- relatedSymbols: ${stringList(result.related_symbols) || "none"}`,
+    `- omissions: ${stringList(result.omissions) || "none"}`,
+    `- warnings: ${stringList(result.warnings) || "none"}`,
+    ...(result.retry_guidance ? [`- retryGuidance: ${result.retry_guidance}`] : []),
+    "",
+    `Evidence (${evidence.length}):`,
+  ];
+  let remaining = Math.max(0, maxChars - lines.join("\n").length);
+  for (const [index, item] of evidence.entries()) {
+    const formatted = formatReviewEvidence(item, index + 1, remaining);
+    lines.push(formatted.text);
+    remaining = formatted.remaining;
+    if (remaining <= 0 && index < evidence.length - 1) {
+      lines.push(`- ${evidence.length - index - 1} additional evidence item(s) omitted by MCP formatting limit.`);
+      break;
+    }
+  }
+  if (evidence.length === 0) {
+    lines.push("- none");
+  }
+  return truncateText(lines.join("\n"), maxChars);
+}
+
+function formatReviewEvidence(item, ordinal, remaining) {
+  const range = asRecord(item.source_range);
+  const provenance = asRecord(item.provenance);
+  const score = asRecord(item.score);
+  const relationship = Array.isArray(item.relationship_path)
+    ? item.relationship_path.filter(isRecord).map((step) => (
+        `${step.relationship_kind ?? "edge"}:`
+        + `${step.source_symbol_id ?? "?"}->${step.target_symbol_id ?? "?"}`
+        + `@${step.graph_distance ?? "?"}`
+      )).join(" | ")
+    : "";
+  const prefix = [
+    `${ordinal}. evidenceId: ${item.evidence_id ?? "unknown"}`,
+    `   repository: ${item.repository_id ?? "unknown"}`,
+    `   revision: ${item.revision ?? "unknown"}`,
+    `   layer: ${item.layer ?? "unknown"}`,
+    `   location: ${item.path ?? "unknown"}:${range.start_line ?? "?"}-${range.end_line ?? "?"}`,
+    `   contentHash: ${item.content_hash ?? "unknown"}`,
+    `   symbol: ${item.symbol_id ?? "none"}`,
+    `   freshness: ${item.freshness ?? "unknown"}`,
+    `   confidence: ${item.confidence ?? "unknown"}`,
+    `   selectionReason: ${item.selection_reason ?? "unknown"}`,
+    `   graphDistance: ${item.graph_distance ?? "none"}`,
+    `   relationship: ${relationship || "none"}`,
+    `   provenance: ${provenance.extractor_id ?? "unknown"}@${provenance.extractor_version ?? "unknown"}`
+      + ` tier=${provenance.evidence_tier ?? "unknown"}`
+      + ` resolution=${provenance.resolution_status ?? "unknown"}`
+      + ` confidence=${provenance.confidence ?? "unknown"}`,
+    `   score: total=${score.total ?? "unknown"} graph=${score.graph ?? 0}`
+      + ` freshness=${score.freshness ?? 0} semantic=${score.semantic ?? 0}`,
+    "   text:",
+  ];
+  const prefixText = prefix.join("\n");
+  const textBudget = Math.max(0, remaining - prefixText.length - 1);
+  const snippet = truncateText(typeof item.text === "string" ? item.text.trim() : "", textBudget);
+  return {
+    text: `${prefixText}\n${indentSnippet(snippet || "(omitted by character limit)")}`,
+    remaining: Math.max(0, remaining - prefixText.length - snippet.length - 1),
+  };
+}
+
+function formatCodebaseStatus({
+  codebase,
+  repositoriesResult,
+  capabilitiesResult,
+  reviewResult,
+  maxRepositories,
+}) {
+  const selection = asRecord(codebase.repository_selection);
+  const repositoryEnvelope = asRecord(repositoriesResult.value);
+  const repositories = Array.isArray(repositoryEnvelope.repositories)
+    ? repositoryEnvelope.repositories.filter(isRecord)
+    : [];
+  const capabilities = asRecord(capabilitiesResult.value);
+  const review = asRecord(reviewResult.value);
+  const lines = [
+    "CorpusWire Codebase status:",
+    `- codebaseId: ${codebase.codebase_id ?? "unknown"}`,
+    `- tenantId: ${codebase.tenant_id ?? "unknown"}`,
+    `- displayName: ${codebase.display_name ?? "unknown"}`,
+    `- status: ${codebase.status ?? "unknown"}`,
+    `- repositorySelection: ${selection.mode ?? "unknown"}`,
+    `- selectedProviderRepositoryIds: ${stringList(selection.provider_repository_ids) || "none"}`,
+    `- createdAt: ${codebase.created_at ?? "unknown"}`,
+    `- updatedAt: ${codebase.updated_at ?? "unknown"}`,
+    `- repositoriesVisible: ${repositories.length}`,
+  ];
+  if (repositoriesResult.error) {
+    lines.push(`- repositoriesWarning: ${repositoriesResult.error}`);
+  }
+  if (repositories.length > 0) {
+    lines.push("", "Repositories:");
+    for (const repository of repositories.slice(0, maxRepositories)) {
+      lines.push(
+        `- ${repository.repository_id ?? "unknown"}`
+          + ` ${repository.provider ?? "provider-neutral"}`
+          + `:${repository.provider_external_id ?? repository.canonical_path ?? "unknown"}`
+          + ` state=${repository.state ?? "unknown"}`,
+      );
+    }
+    if (repositories.length > maxRepositories) {
+      lines.push(`- ${repositories.length - maxRepositories} additional repository record(s) omitted.`);
+    }
+  }
+  if (capabilitiesResult.error) {
+    lines.push("", `Capabilities warning: ${capabilitiesResult.error}`);
+  } else if (Object.keys(capabilities).length > 0) {
+    lines.push(
+      "",
+      "Review capabilities:",
+      `- enabled: ${capabilities.enabled ?? false}`,
+      `- serviceAvailable: ${capabilities.service_available ?? false}`,
+      `- symbolGraph: ${capabilities.symbol_graph ?? false}`,
+      `- reviewOverlays: ${capabilities.review_overlays ?? false}`,
+      `- providers: ${enabledCapabilityNames(capabilities.providers)}`,
+      `- analyzers: ${enabledCapabilityNames(capabilities.analyzers)}`,
+    );
+  }
+  if (reviewResult.error) {
+    lines.push("", `Review status warning: ${reviewResult.error}`);
+  } else if (Object.keys(review).length > 0) {
+    const latestJob = asRecord(review.latest_job);
+    lines.push(
+      "",
+      "Review status:",
+      `- reviewId: ${review.review_id ?? "unknown"}`,
+      `- state: ${review.state ?? "unknown"}`,
+      `- targetRepositoryId: ${review.target_repository_id ?? "unknown"}`,
+      `- headSha: ${review.head_sha ?? "unknown"}`,
+      `- overlay: ${review.overlay_id ?? "none"}@${review.overlay_generation ?? "none"}`,
+      `- freshness: ${review.freshness ?? "unknown"}`,
+      `- latestJob: ${latestJob.job_id ?? "none"} ${latestJob.state ?? ""}`.trimEnd(),
+      `- purgeAfter: ${review.purge_after ?? "none"}`,
+      `- warnings: ${stringList(review.warnings) || "none"}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+function enabledCapabilityNames(value) {
+  const record = asRecord(value);
+  const enabled = Object.entries(record)
+    .filter(([, available]) => available === true)
+    .map(([name]) => name)
+    .sort();
+  return enabled.length > 0 ? enabled.join(", ") : "none";
+}
+
+function stringList(value) {
+  return Array.isArray(value)
+    ? value.filter((item) => typeof item === "string" && item.trim()).join(", ")
+    : "";
+}
+
+function optionalBoundedInteger(value, name, minimum, maximum) {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new JsonRpcError(
+      -32602,
+      `Invalid ${name}: expected an integer from ${minimum} to ${maximum}.`,
+    );
+  }
+  return parsed;
+}
+
+function nullableBoundedInteger(value, name, minimum, maximum) {
+  if (value === undefined || value === null) {
+    return value;
+  }
+  return optionalBoundedInteger(value, name, minimum, maximum);
 }
 
 async function searchContext(args) {
@@ -3667,7 +4164,8 @@ function truncateText(text, maxChars) {
   if (text.length <= maxChars) {
     return text;
   }
-  return `${text.slice(0, Math.max(0, maxChars - 15)).trimEnd()}\n   ... truncated`;
+  const suffix = "\n... truncated";
+  return `${text.slice(0, Math.max(0, maxChars - suffix.length)).trimEnd()}${suffix}`;
 }
 
 function indentSnippet(text) {
@@ -3773,8 +4271,11 @@ async function recordQualityResult(args) {
     throw new JsonRpcError(-32602, "Quality ratings require workspaceId or CORPUSWIRE_WORKSPACE_ID.");
   }
   const workType = requiredString(args, "workType").toLowerCase();
-  if (!["semantic_retrieval", "prompt_enhancement"].includes(workType)) {
-    throw new JsonRpcError(-32602, "workType must be semantic_retrieval or prompt_enhancement.");
+  if (!QUALITY_WORK_TYPE_SET.has(workType)) {
+    throw new JsonRpcError(
+      -32602,
+      `workType must be one of: ${QUALITY_WORK_TYPES.join(", ")}.`,
+    );
   }
   const engine = requiredString(args, "engine").toLowerCase();
   const client = buildClient();
@@ -3821,8 +4322,11 @@ async function reviewQualityResults(args) {
   const client = buildClient();
   const workspaceId = optionalString(args.workspaceId);
   const workType = optionalString(args.workType);
-  if (workType && !["semantic_retrieval", "prompt_enhancement"].includes(workType)) {
-    throw new JsonRpcError(-32602, "workType must be semantic_retrieval or prompt_enhancement.");
+  if (workType && !QUALITY_WORK_TYPE_SET.has(workType)) {
+    throw new JsonRpcError(
+      -32602,
+      `workType must be one of: ${QUALITY_WORK_TYPES.join(", ")}.`,
+    );
   }
   const review = await client.reviewQuality({
     workspaceId,
@@ -4162,15 +4666,27 @@ function isSyncIndexableRelativePath(relativePath, context) {
 
 function classifySyncRelativePath(relativePath, context) {
   const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\/+/, "");
+  if (isSensitiveTerraformRelativePath(normalized)) {
+    return { accepted: false, reason: "sensitive_terraform_artifact" };
+  }
+  if (isDiscoveryOnlyRelativePath(normalized)) {
+    return { accepted: false, reason: "discovery_only_metadata" };
+  }
   const segments = normalized.split("/").filter(Boolean);
   if (
-    segments.some((segment) => EXCLUDED_PATH_SEGMENTS.has(segment))
+    segments.some((segment) => EXCLUDED_PATH_SEGMENTS.has(segment) || segment.startsWith("."))
     && !SAFE_INDEXABLE_PATHS.has(normalized)
   ) {
     return { accepted: false, reason: "excluded_segment" };
   }
   const effectivePath = effectiveIndexableRelativePath(normalized);
-  if (!INDEXABLE_EXTENSIONS.has(path.posix.extname(effectivePath).toLowerCase())) {
+  const effectiveName = path.posix.basename(effectivePath).toLowerCase();
+  const extensions = context.indexableExtensions ?? INDEXABLE_EXTENSIONS;
+  const filenames = context.indexableFilenames ?? INDEXABLE_FILENAMES;
+  if (
+    !extensions.has(path.posix.extname(effectivePath).toLowerCase())
+    && !filenames.has(effectiveName)
+  ) {
     return { accepted: false, reason: "unsupported_extension" };
   }
   const includeGlobs = context.includeGlobs ?? [];
@@ -4192,6 +4708,32 @@ function effectiveIndexableRelativePath(relativePath) {
     }
   }
   return relativePath;
+}
+
+function isSensitiveTerraformRelativePath(relativePath) {
+  const name = path.posix.basename(relativePath).toLowerCase();
+  return name.endsWith(".tfvars")
+    || name.endsWith(".tfvars.json")
+    || name.includes(".tfstate")
+    || name === "crash.log"
+    || name === "tfplan"
+    || name.endsWith(".tfplan")
+    || name.endsWith(".plan")
+    || name.endsWith(".plan.json");
+}
+
+function isDiscoveryOnlyRelativePath(relativePath) {
+  const name = path.posix.basename(relativePath).toLowerCase();
+  return DISCOVERY_ONLY_FILENAMES.has(name)
+    || (name.startsWith("tsconfig") && name.endsWith(".json"))
+    || (name.endsWith(".txt") && (
+      name === "requirements.txt"
+      || name === "constraints.txt"
+      || name.startsWith("requirements-")
+      || name.startsWith("requirements_")
+      || name.startsWith("constraints-")
+      || name.startsWith("constraints_")
+    ));
 }
 
 function isSafeIndexableDirectoryAncestor(relativePath) {
@@ -4269,16 +4811,22 @@ function escapeRegExp(value) {
 
 function isIndexableRelativePath(relativePath) {
   const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\/+/, "");
+  if (isSensitiveTerraformRelativePath(normalized)) {
+    return false;
+  }
+  if (isDiscoveryOnlyRelativePath(normalized)) {
+    return false;
+  }
   const segments = normalized.split("/").filter(Boolean);
   if (
-    segments.some((segment) => EXCLUDED_PATH_SEGMENTS.has(segment))
+    segments.some((segment) => EXCLUDED_PATH_SEGMENTS.has(segment) || segment.startsWith("."))
     && !SAFE_INDEXABLE_PATHS.has(normalized)
   ) {
     return false;
   }
-  return INDEXABLE_EXTENSIONS.has(
-    path.posix.extname(effectiveIndexableRelativePath(normalized)).toLowerCase(),
-  );
+  const effectivePath = effectiveIndexableRelativePath(normalized);
+  return INDEXABLE_EXTENSIONS.has(path.posix.extname(effectivePath).toLowerCase())
+    || INDEXABLE_FILENAMES.has(path.posix.basename(effectivePath).toLowerCase());
 }
 
 function isMissingFileError(error) {
@@ -4777,9 +5325,37 @@ function formatToolError(error, operation = "request") {
     return `Could not connect to corpuswire at ${baseUrl} while handling the ${operation}. Start the FastAPI server and try again. ${message}`;
   }
   if (sdk.CorpusWireHttpError && error instanceof sdk.CorpusWireHttpError) {
-    return `corpuswire rejected the ${operation}: ${error.errorMessage ?? message}`;
+    const guidance = boundedRecoveryGuidance(error.recoveryGuidance);
+    const suffix = guidance.length > 0
+      ? ` Recovery guidance: ${guidance.join(" ")}`
+      : "";
+    return `corpuswire rejected the ${operation}: ${error.errorMessage ?? message}${suffix}`;
   }
   return `corpuswire ${operation} failed: ${message}`;
+}
+
+function boundedRecoveryGuidance(value) {
+  return Array.isArray(value)
+    ? value.filter((item) => (
+      typeof item === "string"
+      && item.length > 0
+      && item.length <= 256
+      && !item.includes("\\n")
+      && !item.includes("\\r")
+    )).slice(0, 4)
+    : [];
+}
+
+function boundedSupportedFileValues(value, pattern) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return [...new Set(value
+    .filter((item) => typeof item === "string")
+    .map((item) => item.trim().toLowerCase())
+    .filter((item) => item.length > 0 && item.length <= 64 && pattern.test(item)))]
+    .sort()
+    .slice(0, 256);
 }
 
 function isConnectionError(message) {

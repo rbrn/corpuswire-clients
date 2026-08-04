@@ -4,6 +4,27 @@ const DEFAULT_BASE_URL = RUNTIME_ENV.CORPUSWIRE_BASE_URL ?? "http://127.0.0.1:80
 const DEFAULT_BASIC_AUTH = RUNTIME_ENV.CORPUSWIRE_BASIC_AUTH ?? "";
 const DEFAULT_BEARER_TOKEN = RUNTIME_ENV.CORPUSWIRE_BEARER_TOKEN ?? "";
 const DEFAULT_OUTPUT_MODE = "generic";
+const DEFAULT_REVIEW_POLL_TIMEOUT_MS = 60_000;
+const DEFAULT_REVIEW_POLL_INTERVAL_MS = 1_000;
+const PENDING_REVIEW_JOB_STATES = new Set(["queued", "running"]);
+export class ReviewContextPollingTimeoutError extends Error {
+    jobId;
+    timeoutMs;
+    constructor(jobId, timeoutMs) {
+        super(`Timed out after ${timeoutMs}ms waiting for review-context job ${jobId}.`);
+        this.name = "ReviewContextPollingTimeoutError";
+        this.jobId = jobId;
+        this.timeoutMs = timeoutMs;
+    }
+}
+export class ReviewContextPollingCancelledError extends Error {
+    jobId;
+    constructor(jobId) {
+        super(`Polling was cancelled for review-context job ${jobId}.`);
+        this.name = "ReviewContextPollingCancelledError";
+        this.jobId = jobId;
+    }
+}
 export class CorpusWireClient {
     baseUrl;
     basicAuth;
@@ -188,6 +209,227 @@ export class CorpusWireClient {
             init: { method: "GET" },
         });
         return response.rollup;
+    }
+    async createCodebase(request) {
+        return requestJson({
+            baseUrl: this.baseUrl,
+            paths: ["/v1/codebases"],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ display_name: request.displayName }),
+            },
+        });
+    }
+    async listCodebases() {
+        const response = await requestJson({
+            baseUrl: this.baseUrl,
+            paths: ["/v1/codebases"],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: { method: "GET" },
+        });
+        return response.codebases;
+    }
+    async getCodebase(codebaseId) {
+        return requestJson({
+            baseUrl: this.baseUrl,
+            paths: [`/v1/codebases/${encodeURIComponent(requireIdentifier(codebaseId, "codebaseId"))}`],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: { method: "GET" },
+        });
+    }
+    async updateCodebase(codebaseId, request) {
+        return requestJson({
+            baseUrl: this.baseUrl,
+            paths: [`/v1/codebases/${encodeURIComponent(requireIdentifier(codebaseId, "codebaseId"))}`],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(removeUndefinedValues({
+                    display_name: request.displayName,
+                    status: request.status,
+                })),
+            },
+        });
+    }
+    async deleteCodebase(codebaseId) {
+        return requestJson({
+            baseUrl: this.baseUrl,
+            paths: [`/v1/codebases/${encodeURIComponent(requireIdentifier(codebaseId, "codebaseId"))}`],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: { method: "DELETE" },
+        });
+    }
+    async listCodebaseRepositories(codebaseId) {
+        return requestJson({
+            baseUrl: this.baseUrl,
+            paths: [
+                `/v1/codebases/${encodeURIComponent(requireIdentifier(codebaseId, "codebaseId"))}/repositories`,
+            ],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: { method: "GET" },
+        });
+    }
+    /** Create or update a GitHub binding while preserving allowlist tri-state values. */
+    async bindGitHubProvider(codebaseId, request) {
+        return requestJson({
+            baseUrl: this.baseUrl,
+            paths: [
+                `/v1/codebases/${encodeURIComponent(requireIdentifier(codebaseId, "codebaseId"))}`
+                    + "/provider-bindings/github",
+            ],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(toGitHubProviderBindingPayload(request)),
+            },
+        });
+    }
+    async revokeGitHubProvider(codebaseId, installationId, providerHost = "github.com") {
+        const query = toQueryString({
+            installation_id: requireIdentifier(installationId, "installationId"),
+            provider_host: requireIdentifier(providerHost, "providerHost"),
+        });
+        return requestJson({
+            baseUrl: this.baseUrl,
+            paths: [
+                `/v1/codebases/${encodeURIComponent(requireIdentifier(codebaseId, "codebaseId"))}`
+                    + `/provider-bindings/github${query}`,
+            ],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: { method: "DELETE" },
+        });
+    }
+    async getReviewContextCapabilities() {
+        return requestJson({
+            baseUrl: this.baseUrl,
+            paths: ["/v1/review-context/capabilities"],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: { method: "GET" },
+        });
+    }
+    async getReviewTelemetrySummary() {
+        return requestJson({
+            baseUrl: this.baseUrl,
+            paths: ["/v1/review-context/telemetry/summary"],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: { method: "GET" },
+        });
+    }
+    async requestReviewContext(request) {
+        const codebaseId = requireIdentifier(request.codebaseId, "codebaseId");
+        return requestJson({
+            baseUrl: this.baseUrl,
+            paths: [`/v1/codebases/${encodeURIComponent(codebaseId)}/reviews/context`],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(toReviewContextPayload(request)),
+            },
+        });
+    }
+    async getReviewContextJob(jobId) {
+        return requestJson({
+            baseUrl: this.baseUrl,
+            paths: [`/v1/review-context/jobs/${encodeURIComponent(requireIdentifier(jobId, "jobId"))}`],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: { method: "GET" },
+        });
+    }
+    async cancelReviewContextJob(jobId) {
+        return requestJson({
+            baseUrl: this.baseUrl,
+            paths: [`/v1/review-context/jobs/${encodeURIComponent(requireIdentifier(jobId, "jobId"))}`],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: { method: "DELETE" },
+        });
+    }
+    async pollReviewContextJob(jobOrId, options = {}) {
+        const timeoutMs = validateNonNegativeNumber(options.timeoutMs ?? DEFAULT_REVIEW_POLL_TIMEOUT_MS, "timeoutMs");
+        const pollIntervalMs = validateNonNegativeNumber(options.pollIntervalMs ?? DEFAULT_REVIEW_POLL_INTERVAL_MS, "pollIntervalMs");
+        const jobId = requireIdentifier(typeof jobOrId === "string" ? jobOrId : jobOrId.job_id, "jobId");
+        const deadline = Date.now() + timeoutMs;
+        let result = typeof jobOrId === "string"
+            ? await this.getReviewContextJob(jobId)
+            : jobOrId;
+        for (;;) {
+            throwIfReviewPollingCancelled(options.signal, jobId);
+            if (!isReviewContextJob(result) || !PENDING_REVIEW_JOB_STATES.has(result.state)) {
+                return result;
+            }
+            options.onJob?.(result);
+            const remainingMs = deadline - Date.now();
+            if (remainingMs <= 0) {
+                throw new ReviewContextPollingTimeoutError(jobId, timeoutMs);
+            }
+            const serverDelayMs = result.retry_after_seconds === null
+                ? pollIntervalMs
+                : result.retry_after_seconds * 1_000;
+            await waitForReviewPoll(Math.min(remainingMs, Math.max(10, serverDelayMs)), options.signal, jobId);
+            result = await this.getReviewContextJob(jobId);
+        }
+    }
+    async requestReviewContextAndWait(request, options = {}) {
+        const result = await this.requestReviewContext(request);
+        return isReviewContextJob(result) && PENDING_REVIEW_JOB_STATES.has(result.state)
+            ? this.pollReviewContextJob(result, options)
+            : result;
+    }
+    async getReviewStatus(codebaseId, reviewId) {
+        return requestJson({
+            baseUrl: this.baseUrl,
+            paths: [
+                `/v1/codebases/${encodeURIComponent(requireIdentifier(codebaseId, "codebaseId"))}`
+                    + `/reviews/${encodeURIComponent(requireIdentifier(reviewId, "reviewId"))}/status`,
+            ],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: { method: "GET" },
+        });
+    }
+    async purgeReviewOverlay(codebaseId, reviewId) {
+        return requestJson({
+            baseUrl: this.baseUrl,
+            paths: [
+                `/v1/codebases/${encodeURIComponent(requireIdentifier(codebaseId, "codebaseId"))}`
+                    + `/reviews/${encodeURIComponent(requireIdentifier(reviewId, "reviewId"))}/overlay`,
+            ],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: { method: "DELETE" },
+        });
     }
     async getLlmModel() {
         return requestJson({
@@ -458,6 +700,39 @@ export function toQueryPayload(request) {
         source_filter: normalizedRequest.sourceFilter,
     });
 }
+export function toGitHubProviderBindingPayload(request) {
+    return removeUndefinedValues({
+        installation_id: request.installationId,
+        provider_host: request.providerHost,
+        display_name: request.displayName,
+        repository_allowlist: request.repositoryAllowlist,
+    });
+}
+export function toReviewContextPayload(request) {
+    const budgets = request.budgets === undefined
+        ? undefined
+        : removeUndefinedValues({
+            graph_hops: request.budgets.graphHops,
+            candidate_repositories: request.budgets.candidateRepositories,
+            pre_rank_candidates: request.budgets.preRankCandidates,
+            evidence_items: request.budgets.evidenceItems,
+            serialized_tokens: request.budgets.serializedTokens,
+            wait_ms: request.budgets.waitMs,
+        });
+    return removeUndefinedValues({
+        codebase_id: request.codebaseId,
+        target_repository_id: request.targetRepositoryId,
+        provider_review_id: request.providerReviewId,
+        expected_head_sha: request.expectedHeadSha,
+        objective: request.objective,
+        strict_freshness: request.strictFreshness,
+        budgets,
+        output_character_limit: request.outputCharacterLimit,
+    });
+}
+export function isReviewContextJob(result) {
+    return "state" in result && "job_id" in result;
+}
 export function toStartIndexSessionPayload(request) {
     return removeUndefinedValues({
         workspace: removeUndefinedValues({
@@ -471,6 +746,23 @@ export function toStartIndexSessionPayload(request) {
         exclude_globs: request.excludeGlobs,
         max_file_size_bytes: request.maxFileSizeBytes,
         recreate_collection: request.recreateCollection ?? false,
+        snapshot_scope: toRemoteIndexScopePayload(request.snapshotScope),
+    });
+}
+function toRemoteIndexScopePayload(scope) {
+    if (scope === null || scope === undefined) {
+        return scope;
+    }
+    return removeUndefinedValues({
+        tenant_id: scope.tenantId,
+        codebase_id: scope.codebaseId,
+        repository_id: scope.repositoryId,
+        repository_set_id: scope.repositorySetId,
+        snapshot_id: scope.snapshotId,
+        layer: scope.layer,
+        revision: scope.revision,
+        generation: scope.generation,
+        overlay_id: scope.overlayId,
     });
 }
 export function manifestEntriesToJsonl(entries) {
@@ -604,6 +896,39 @@ function concatUint8Arrays(chunks) {
 }
 function removeUndefinedValues(record) {
     return Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined));
+}
+function requireIdentifier(value, fieldName) {
+    const normalized = value.trim();
+    if (!normalized) {
+        throw new Error(`${fieldName} must not be empty.`);
+    }
+    return normalized;
+}
+function validateNonNegativeNumber(value, fieldName) {
+    if (!Number.isFinite(value) || value < 0) {
+        throw new Error(`${fieldName} must be a finite non-negative number.`);
+    }
+    return value;
+}
+function throwIfReviewPollingCancelled(signal, jobId) {
+    if (signal?.aborted) {
+        throw new ReviewContextPollingCancelledError(jobId);
+    }
+}
+async function waitForReviewPoll(delayMs, signal, jobId) {
+    throwIfReviewPollingCancelled(signal, jobId);
+    await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            signal?.removeEventListener("abort", onAbort);
+            resolve();
+        }, delayMs);
+        const onAbort = () => {
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", onAbort);
+            reject(new ReviewContextPollingCancelledError(jobId));
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+    });
 }
 function toIndexEventQueryParams(request) {
     return {

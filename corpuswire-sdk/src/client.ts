@@ -3,6 +3,12 @@ import type {
   EnhancePromptPayload,
   EnhancePromptRequest,
   EnhanceResponseEnvelope,
+  CodebaseListV1,
+  CodebaseRepositoriesV1,
+  CodebaseV1,
+  CreateCodebaseRequest,
+  GitHubProviderBindingPayload,
+  GitHubProviderBindingRequest,
   HealthResponse,
   IndexActivityQuery,
   IndexActivityResponse,
@@ -30,6 +36,8 @@ import type {
   QualityReviewQuery,
   QualityReviewResponse,
   QueryValueEvent,
+  ProviderBindingResponseV1,
+  ProviderBindingRevocationV1,
   ValueFeedbackRequest,
   ValueRollup,
   ValueRollupQuery,
@@ -39,16 +47,28 @@ import type {
   RemoteIndexCapabilities,
   RemoteIndexCommitResponse,
   RemoteIndexSession,
+  RemoteIndexScopeV2,
   RemoteIndexSessionsResponse,
   RemoteIndexStatus,
   RemoteManifestBatchResult,
   RemoteManifestEntry,
   RemoteWorkspaceFile,
+  ReviewContextCapabilitiesV1,
+  ReviewContextJobV1,
+  ReviewContextPollOptions,
+  ReviewContextRequest,
+  ReviewContextRequestV1,
+  ReviewContextResponseV1,
+  ReviewContextResult,
+  ReviewTelemetrySummaryV1,
+  ReviewPurgeV1,
+  ReviewStatusV1,
   SearchHit,
   StartRemoteIndexSessionRequest,
   WorkspaceDiagnosis,
   WorkspaceDiagnosisEnvelope,
   WorkspaceDiagnosisRequest,
+  UpdateCodebaseRequest,
 } from "./types.js";
 
 const RUNTIME_ENV = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {};
@@ -56,6 +76,31 @@ const DEFAULT_BASE_URL = RUNTIME_ENV.CORPUSWIRE_BASE_URL ?? "http://127.0.0.1:80
 const DEFAULT_BASIC_AUTH = RUNTIME_ENV.CORPUSWIRE_BASIC_AUTH ?? "";
 const DEFAULT_BEARER_TOKEN = RUNTIME_ENV.CORPUSWIRE_BEARER_TOKEN ?? "";
 const DEFAULT_OUTPUT_MODE: PromptOutputMode = "generic";
+const DEFAULT_REVIEW_POLL_TIMEOUT_MS = 60_000;
+const DEFAULT_REVIEW_POLL_INTERVAL_MS = 1_000;
+const PENDING_REVIEW_JOB_STATES = new Set(["queued", "running"]);
+
+export class ReviewContextPollingTimeoutError extends Error {
+  readonly jobId: string;
+  readonly timeoutMs: number;
+
+  constructor(jobId: string, timeoutMs: number) {
+    super(`Timed out after ${timeoutMs}ms waiting for review-context job ${jobId}.`);
+    this.name = "ReviewContextPollingTimeoutError";
+    this.jobId = jobId;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+export class ReviewContextPollingCancelledError extends Error {
+  readonly jobId: string;
+
+  constructor(jobId: string) {
+    super(`Polling was cancelled for review-context job ${jobId}.`);
+    this.name = "ReviewContextPollingCancelledError";
+    this.jobId = jobId;
+  }
+}
 
 export class CorpusWireClient {
   readonly baseUrl: string;
@@ -256,6 +301,271 @@ export class CorpusWireClient {
       init: { method: "GET" },
     });
     return response.rollup;
+  }
+
+  async createCodebase(request: CreateCodebaseRequest): Promise<CodebaseV1> {
+    return requestJson<CodebaseV1>({
+      baseUrl: this.baseUrl,
+      paths: ["/v1/codebases"],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ display_name: request.displayName }),
+      },
+    });
+  }
+
+  async listCodebases(): Promise<CodebaseV1[]> {
+    const response = await requestJson<CodebaseListV1>({
+      baseUrl: this.baseUrl,
+      paths: ["/v1/codebases"],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "GET" },
+    });
+    return response.codebases;
+  }
+
+  async getCodebase(codebaseId: string): Promise<CodebaseV1> {
+    return requestJson<CodebaseV1>({
+      baseUrl: this.baseUrl,
+      paths: [`/v1/codebases/${encodeURIComponent(requireIdentifier(codebaseId, "codebaseId"))}`],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "GET" },
+    });
+  }
+
+  async updateCodebase(codebaseId: string, request: UpdateCodebaseRequest): Promise<CodebaseV1> {
+    return requestJson<CodebaseV1>({
+      baseUrl: this.baseUrl,
+      paths: [`/v1/codebases/${encodeURIComponent(requireIdentifier(codebaseId, "codebaseId"))}`],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(removeUndefinedValues({
+          display_name: request.displayName,
+          status: request.status,
+        })),
+      },
+    });
+  }
+
+  async deleteCodebase(codebaseId: string): Promise<CodebaseV1> {
+    return requestJson<CodebaseV1>({
+      baseUrl: this.baseUrl,
+      paths: [`/v1/codebases/${encodeURIComponent(requireIdentifier(codebaseId, "codebaseId"))}`],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "DELETE" },
+    });
+  }
+
+  async listCodebaseRepositories(codebaseId: string): Promise<CodebaseRepositoriesV1> {
+    return requestJson<CodebaseRepositoriesV1>({
+      baseUrl: this.baseUrl,
+      paths: [
+        `/v1/codebases/${encodeURIComponent(requireIdentifier(codebaseId, "codebaseId"))}/repositories`,
+      ],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "GET" },
+    });
+  }
+
+  /** Create or update a GitHub binding while preserving allowlist tri-state values. */
+  async bindGitHubProvider(
+    codebaseId: string,
+    request: GitHubProviderBindingRequest,
+  ): Promise<ProviderBindingResponseV1> {
+    return requestJson<ProviderBindingResponseV1>({
+      baseUrl: this.baseUrl,
+      paths: [
+        `/v1/codebases/${encodeURIComponent(requireIdentifier(codebaseId, "codebaseId"))}`
+          + "/provider-bindings/github",
+      ],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(toGitHubProviderBindingPayload(request)),
+      },
+    });
+  }
+
+  async revokeGitHubProvider(
+    codebaseId: string,
+    installationId: string,
+    providerHost = "github.com",
+  ): Promise<ProviderBindingRevocationV1> {
+    const query = toQueryString({
+      installation_id: requireIdentifier(installationId, "installationId"),
+      provider_host: requireIdentifier(providerHost, "providerHost"),
+    });
+    return requestJson<ProviderBindingRevocationV1>({
+      baseUrl: this.baseUrl,
+      paths: [
+        `/v1/codebases/${encodeURIComponent(requireIdentifier(codebaseId, "codebaseId"))}`
+          + `/provider-bindings/github${query}`,
+      ],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "DELETE" },
+    });
+  }
+
+  async getReviewContextCapabilities(): Promise<ReviewContextCapabilitiesV1> {
+    return requestJson<ReviewContextCapabilitiesV1>({
+      baseUrl: this.baseUrl,
+      paths: ["/v1/review-context/capabilities"],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "GET" },
+    });
+  }
+
+  async getReviewTelemetrySummary(): Promise<ReviewTelemetrySummaryV1> {
+    return requestJson<ReviewTelemetrySummaryV1>({
+      baseUrl: this.baseUrl,
+      paths: ["/v1/review-context/telemetry/summary"],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "GET" },
+    });
+  }
+
+  async requestReviewContext(request: ReviewContextRequest): Promise<ReviewContextResult> {
+    const codebaseId = requireIdentifier(request.codebaseId, "codebaseId");
+    return requestJson<ReviewContextResult>({
+      baseUrl: this.baseUrl,
+      paths: [`/v1/codebases/${encodeURIComponent(codebaseId)}/reviews/context`],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(toReviewContextPayload(request)),
+      },
+    });
+  }
+
+  async getReviewContextJob(jobId: string): Promise<ReviewContextResult> {
+    return requestJson<ReviewContextResult>({
+      baseUrl: this.baseUrl,
+      paths: [`/v1/review-context/jobs/${encodeURIComponent(requireIdentifier(jobId, "jobId"))}`],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "GET" },
+    });
+  }
+
+  async cancelReviewContextJob(jobId: string): Promise<ReviewContextJobV1> {
+    return requestJson<ReviewContextJobV1>({
+      baseUrl: this.baseUrl,
+      paths: [`/v1/review-context/jobs/${encodeURIComponent(requireIdentifier(jobId, "jobId"))}`],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "DELETE" },
+    });
+  }
+
+  async pollReviewContextJob(
+    jobOrId: ReviewContextJobV1 | string,
+    options: ReviewContextPollOptions = {},
+  ): Promise<ReviewContextResult> {
+    const timeoutMs = validateNonNegativeNumber(
+      options.timeoutMs ?? DEFAULT_REVIEW_POLL_TIMEOUT_MS,
+      "timeoutMs",
+    );
+    const pollIntervalMs = validateNonNegativeNumber(
+      options.pollIntervalMs ?? DEFAULT_REVIEW_POLL_INTERVAL_MS,
+      "pollIntervalMs",
+    );
+    const jobId = requireIdentifier(
+      typeof jobOrId === "string" ? jobOrId : jobOrId.job_id,
+      "jobId",
+    );
+    const deadline = Date.now() + timeoutMs;
+    let result: ReviewContextResult = typeof jobOrId === "string"
+      ? await this.getReviewContextJob(jobId)
+      : jobOrId;
+
+    for (;;) {
+      throwIfReviewPollingCancelled(options.signal, jobId);
+      if (!isReviewContextJob(result) || !PENDING_REVIEW_JOB_STATES.has(result.state)) {
+        return result;
+      }
+      options.onJob?.(result);
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw new ReviewContextPollingTimeoutError(jobId, timeoutMs);
+      }
+      const serverDelayMs = result.retry_after_seconds === null
+        ? pollIntervalMs
+        : result.retry_after_seconds * 1_000;
+      await waitForReviewPoll(
+        Math.min(remainingMs, Math.max(10, serverDelayMs)),
+        options.signal,
+        jobId,
+      );
+      result = await this.getReviewContextJob(jobId);
+    }
+  }
+
+  async requestReviewContextAndWait(
+    request: ReviewContextRequest,
+    options: ReviewContextPollOptions = {},
+  ): Promise<ReviewContextResult> {
+    const result = await this.requestReviewContext(request);
+    return isReviewContextJob(result) && PENDING_REVIEW_JOB_STATES.has(result.state)
+      ? this.pollReviewContextJob(result, options)
+      : result;
+  }
+
+  async getReviewStatus(codebaseId: string, reviewId: string): Promise<ReviewStatusV1> {
+    return requestJson<ReviewStatusV1>({
+      baseUrl: this.baseUrl,
+      paths: [
+        `/v1/codebases/${encodeURIComponent(requireIdentifier(codebaseId, "codebaseId"))}`
+          + `/reviews/${encodeURIComponent(requireIdentifier(reviewId, "reviewId"))}/status`,
+      ],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "GET" },
+    });
+  }
+
+  async purgeReviewOverlay(codebaseId: string, reviewId: string): Promise<ReviewPurgeV1> {
+    return requestJson<ReviewPurgeV1>({
+      baseUrl: this.baseUrl,
+      paths: [
+        `/v1/codebases/${encodeURIComponent(requireIdentifier(codebaseId, "codebaseId"))}`
+          + `/reviews/${encodeURIComponent(requireIdentifier(reviewId, "reviewId"))}/overlay`,
+      ],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "DELETE" },
+    });
   }
 
   async getLlmModel(): Promise<LlmModelState> {
@@ -573,6 +883,46 @@ export function toQueryPayload(request: string | QueryPromptRequest): QueryPromp
   });
 }
 
+export function toGitHubProviderBindingPayload(
+  request: GitHubProviderBindingRequest,
+): GitHubProviderBindingPayload {
+  return removeUndefinedValues({
+    installation_id: request.installationId,
+    provider_host: request.providerHost,
+    display_name: request.displayName,
+    repository_allowlist: request.repositoryAllowlist,
+  });
+}
+
+export function toReviewContextPayload(request: ReviewContextRequest): ReviewContextRequestV1 {
+  const budgets = request.budgets === undefined
+    ? undefined
+    : removeUndefinedValues({
+        graph_hops: request.budgets.graphHops,
+        candidate_repositories: request.budgets.candidateRepositories,
+        pre_rank_candidates: request.budgets.preRankCandidates,
+        evidence_items: request.budgets.evidenceItems,
+        serialized_tokens: request.budgets.serializedTokens,
+        wait_ms: request.budgets.waitMs,
+      });
+  return removeUndefinedValues({
+    codebase_id: request.codebaseId,
+    target_repository_id: request.targetRepositoryId,
+    provider_review_id: request.providerReviewId,
+    expected_head_sha: request.expectedHeadSha,
+    objective: request.objective,
+    strict_freshness: request.strictFreshness,
+    budgets,
+    output_character_limit: request.outputCharacterLimit,
+  });
+}
+
+export function isReviewContextJob(
+  result: ReviewContextResult,
+): result is ReviewContextJobV1 {
+  return "state" in result && "job_id" in result;
+}
+
 export function toStartIndexSessionPayload(request: StartRemoteIndexSessionRequest): Record<string, unknown> {
   return removeUndefinedValues({
     workspace: removeUndefinedValues({
@@ -586,6 +936,26 @@ export function toStartIndexSessionPayload(request: StartRemoteIndexSessionReque
     exclude_globs: request.excludeGlobs,
     max_file_size_bytes: request.maxFileSizeBytes,
     recreate_collection: request.recreateCollection ?? false,
+    snapshot_scope: toRemoteIndexScopePayload(request.snapshotScope),
+  });
+}
+
+function toRemoteIndexScopePayload(
+  scope: RemoteIndexScopeV2 | null | undefined,
+): Record<string, unknown> | null | undefined {
+  if (scope === null || scope === undefined) {
+    return scope;
+  }
+  return removeUndefinedValues({
+    tenant_id: scope.tenantId,
+    codebase_id: scope.codebaseId,
+    repository_id: scope.repositoryId,
+    repository_set_id: scope.repositorySetId,
+    snapshot_id: scope.snapshotId,
+    layer: scope.layer,
+    revision: scope.revision,
+    generation: scope.generation,
+    overlay_id: scope.overlayId,
   });
 }
 
@@ -757,6 +1127,47 @@ function concatUint8Arrays(chunks: Uint8Array[]): Uint8Array {
 
 function removeUndefinedValues<T extends Record<string, unknown>>(record: T): T {
   return Object.fromEntries(Object.entries(record).filter(([, value]) => value !== undefined)) as T;
+}
+
+function requireIdentifier(value: string, fieldName: string): string {
+  const normalized = value.trim();
+  if (!normalized) {
+    throw new Error(`${fieldName} must not be empty.`);
+  }
+  return normalized;
+}
+
+function validateNonNegativeNumber(value: number, fieldName: string): number {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${fieldName} must be a finite non-negative number.`);
+  }
+  return value;
+}
+
+function throwIfReviewPollingCancelled(signal: AbortSignal | undefined, jobId: string): void {
+  if (signal?.aborted) {
+    throw new ReviewContextPollingCancelledError(jobId);
+  }
+}
+
+async function waitForReviewPoll(
+  delayMs: number,
+  signal: AbortSignal | undefined,
+  jobId: string,
+): Promise<void> {
+  throwIfReviewPollingCancelled(signal, jobId);
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(new ReviewContextPollingCancelledError(jobId));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function toIndexEventQueryParams(request: IndexEventQuery): Record<string, string | undefined> {
