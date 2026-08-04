@@ -4,22 +4,27 @@ import assert from "node:assert/strict";
 import {
   CorpusWireClient,
   CorpusWireHttpError,
+  ReviewContextPollingCancelledError,
+  ReviewContextPollingTimeoutError,
   createBasicAuthHeader,
   createBearerAuthHeader,
   manifestEntriesToJsonl,
   requestJson,
   requireEnhancedPrompt,
   toEnhancePayload,
+  toGitHubProviderBindingPayload,
   toQueryPayload,
   toQualityEventPayload,
+  toReviewContextPayload,
   toStartIndexSessionPayload,
 } from "../dist/index.js";
 
-function jsonResponse(status, body) {
+function jsonResponse(status, body, headers = {}) {
   return {
     status,
     ok: status >= 200 && status < 300,
     statusText: status === 200 ? "OK" : "ERROR",
+    headers: new Headers(headers),
     json: async () => body,
     text: async () => JSON.stringify(body),
   };
@@ -48,6 +53,55 @@ test("toEnhancePayload maps camelCase request fields to backend payload fields",
   );
 });
 
+test("review sidecar payloads preserve omitted, null, empty, and selected values", () => {
+  const omitted = toGitHubProviderBindingPayload({
+    installationId: "installation-42",
+    displayName: "Acme GitHub",
+  });
+  const explicitNull = toGitHubProviderBindingPayload({
+    installationId: "installation-42",
+    displayName: "Acme GitHub",
+    repositoryAllowlist: null,
+  });
+  const empty = toGitHubProviderBindingPayload({
+    installationId: "installation-42",
+    displayName: "Acme GitHub",
+    repositoryAllowlist: [],
+  });
+  const selected = toGitHubProviderBindingPayload({
+    installationId: "installation-42",
+    displayName: "Acme GitHub",
+    repositoryAllowlist: ["repo-2", "repo-1"],
+  });
+
+  assert.equal(Object.hasOwn(omitted, "repository_allowlist"), false);
+  assert.equal(explicitNull.repository_allowlist, null);
+  assert.deepEqual(empty.repository_allowlist, []);
+  assert.deepEqual(selected.repository_allowlist, ["repo-2", "repo-1"]);
+  assert.deepEqual(
+    toReviewContextPayload({
+      codebaseId: "codebase-1",
+      targetRepositoryId: "repo-1",
+      providerReviewId: "42",
+      expectedHeadSha: null,
+      objective: "Find affected consumers",
+      strictFreshness: false,
+      budgets: { graphHops: 0, evidenceItems: 20, waitMs: 0 },
+      outputCharacterLimit: null,
+    }),
+    {
+      codebase_id: "codebase-1",
+      target_repository_id: "repo-1",
+      provider_review_id: "42",
+      expected_head_sha: null,
+      objective: "Find affected consumers",
+      strict_freshness: false,
+      budgets: { graph_hops: 0, evidence_items: 20, wait_ms: 0 },
+      output_character_limit: null,
+    },
+  );
+});
+
 test("toQueryPayload maps workspace-aware semantic search requests", () => {
   assert.deepEqual(
     toQueryPayload({
@@ -71,7 +125,7 @@ test("toQualityEventPayload maps central scorecards to API fields", () => {
   assert.deepEqual(
     toQualityEventPayload({
       workspaceId: "local-docker://demo#main",
-      workType: "semantic_retrieval",
+      workType: "review_context",
       engine: "augment",
       query: "find the exact implementation",
       roundId: "round-1",
@@ -87,7 +141,7 @@ test("toQualityEventPayload maps central scorecards to API fields", () => {
     }),
     {
       workspace_id: "local-docker://demo#main",
-      work_type: "semantic_retrieval",
+      work_type: "review_context",
       engine: "augment",
       query: "find the exact implementation",
       round_id: "round-1",
@@ -138,13 +192,14 @@ test("quality ledger helpers call central event and review endpoints", async () 
   });
   const review = await client.reviewQuality({
     workspaceId: "local-docker://demo#main",
+    workType: "review_context",
     days: 14,
   });
 
   assert.equal(event.event_id, "quality-1");
   assert.equal(review.event_count, 1);
   assert.equal(calls[0].input, "http://example.test/v1/quality/events");
-  assert.equal(calls[1].input, "http://example.test/v1/quality/review?workspace_id=local-docker%3A%2F%2Fdemo%23main&days=14");
+  assert.equal(calls[1].input, "http://example.test/v1/quality/review?workspace_id=local-docker%3A%2F%2Fdemo%23main&work_type=review_context&days=14");
 });
 
 test("toStartIndexSessionPayload maps remote indexing session fields", () => {
@@ -175,6 +230,42 @@ test("toStartIndexSessionPayload maps remote indexing session fields", () => {
       recreate_collection: true,
     },
   );
+});
+
+test("toStartIndexSessionPayload preserves v2 scope omission and null semantics", () => {
+  const omitted = toStartIndexSessionPayload({
+    workspace: { workspaceId: "workspace-1" },
+  });
+  const explicitNull = toStartIndexSessionPayload({
+    workspace: { workspaceId: "workspace-1" },
+    snapshotScope: null,
+  });
+  const scoped = toStartIndexSessionPayload({
+    workspace: { workspaceId: "workspace-1" },
+    snapshotScope: {
+      tenantId: null,
+      codebaseId: "codebase-1",
+      repositoryId: "repository-1",
+      repositorySetId: "repository-set-1",
+      snapshotId: "snapshot-1",
+      layer: "snapshot",
+      revision: "a".repeat(40),
+      generation: 7,
+    },
+  });
+
+  assert.equal(Object.hasOwn(omitted, "snapshot_scope"), false);
+  assert.equal(explicitNull.snapshot_scope, null);
+  assert.deepEqual(scoped.snapshot_scope, {
+    tenant_id: null,
+    codebase_id: "codebase-1",
+    repository_id: "repository-1",
+    repository_set_id: "repository-set-1",
+    snapshot_id: "snapshot-1",
+    layer: "snapshot",
+    revision: "a".repeat(40),
+    generation: 7,
+  });
 });
 
 test("manifestEntriesToJsonl serializes camelCase manifest entries as backend JSONL", () => {
@@ -970,5 +1061,195 @@ test("CorpusWireClient sends bearer authorization and rejects ambiguous auth", a
   assert.throws(
     () => new CorpusWireClient({ basicAuth: "user:pass", bearerToken: "service-token" }),
     /exactly one CorpusWire authorization method/,
+  );
+});
+
+test("Codebase and provider management methods use dedicated operational endpoints", async () => {
+  const calls = [];
+  const client = new CorpusWireClient({
+    baseUrl: "http://example.test",
+    fetchFn: async (input, init) => {
+      calls.push({ input, method: init?.method, body: init?.body ? JSON.parse(init.body) : null });
+      if (input.endsWith("/repositories")) {
+        return jsonResponse(200, { repositories: [] });
+      }
+      if (input.includes("provider-bindings/github")) {
+        return jsonResponse(200, init?.method === "DELETE"
+          ? { binding: { status: "revoked" } }
+          : { container: {}, binding: {} });
+      }
+      return jsonResponse(init?.method === "POST" ? 201 : 200, {
+        codebase_id: "codebase-1",
+        display_name: "Payments",
+      });
+    },
+  });
+
+  await client.createCodebase({ displayName: "Payments" });
+  await client.updateCodebase("codebase-1", { displayName: "Payment Platform" });
+  await client.listCodebaseRepositories("codebase-1");
+  await client.bindGitHubProvider("codebase-1", {
+    installationId: "installation-42",
+    displayName: "Acme GitHub",
+    repositoryAllowlist: [],
+  });
+  await client.revokeGitHubProvider("codebase-1", "installation-42");
+
+  assert.deepEqual(calls, [
+    {
+      input: "http://example.test/v1/codebases",
+      method: "POST",
+      body: { display_name: "Payments" },
+    },
+    {
+      input: "http://example.test/v1/codebases/codebase-1",
+      method: "PATCH",
+      body: { display_name: "Payment Platform" },
+    },
+    {
+      input: "http://example.test/v1/codebases/codebase-1/repositories",
+      method: "GET",
+      body: null,
+    },
+    {
+      input: "http://example.test/v1/codebases/codebase-1/provider-bindings/github",
+      method: "POST",
+      body: {
+        installation_id: "installation-42",
+        display_name: "Acme GitHub",
+        repository_allowlist: [],
+      },
+    },
+    {
+      input: "http://example.test/v1/codebases/codebase-1/provider-bindings/github"
+        + "?installation_id=installation-42&provider_host=github.com",
+      method: "DELETE",
+      body: null,
+    },
+  ]);
+});
+
+test("review context request polling, timeout, and cancellation are typed", async () => {
+  let polls = 0;
+  const job = {
+    schema_version: "review-context/v1",
+    job_id: "job-1",
+    request_id: "request-1",
+    tenant_id: "tenant-a",
+    codebase_id: "codebase-1",
+    state: "running",
+    attempts: 1,
+    status_url: "/v1/review-context/jobs/job-1",
+    retry_after_seconds: 0,
+    created_at: "2026-08-02T15:00:00Z",
+    updated_at: "2026-08-02T15:00:00Z",
+    partial_reasons: [],
+  };
+  const complete = {
+    schema_version: "review-context/v1",
+    request_id: "request-1",
+    telemetry_id: "telemetry-1",
+    review_id: "42",
+    target_repository_id: "repo-1",
+    freshness: "exact",
+    evidence: [],
+  };
+  const client = new CorpusWireClient({
+    baseUrl: "http://example.test",
+    fetchFn: async (input, init) => {
+      if (init?.method === "POST") {
+        return jsonResponse(202, job, { "Retry-After": "0" });
+      }
+      polls += 1;
+      return jsonResponse(200, complete);
+    },
+  });
+
+  const result = await client.requestReviewContextAndWait(
+    {
+      codebaseId: "codebase-1",
+      targetRepositoryId: "repo-1",
+      providerReviewId: "42",
+      objective: "Find affected consumers",
+    },
+    { timeoutMs: 1_000, pollIntervalMs: 0 },
+  );
+  assert.equal(result.freshness, "exact");
+  assert.equal(polls, 1);
+
+  await assert.rejects(
+    client.pollReviewContextJob(job, { timeoutMs: 0 }),
+    ReviewContextPollingTimeoutError,
+  );
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    client.pollReviewContextJob(job, { signal: controller.signal }),
+    ReviewContextPollingCancelledError,
+  );
+});
+
+test("review telemetry summary uses the operator endpoint and returns typed aggregates", async () => {
+  const calls = [];
+  const summary = {
+    schema_version: "review-context/v1",
+    event_count: 1_001,
+    by_operation: { retrieval: 1_001 },
+    by_status: { failed: 1_001 },
+    by_failure_category: { backend_unavailable: 1_001 },
+    metric_totals: { evidence_items: 3_003 },
+    p95_duration_ms: 25,
+  };
+  const client = new CorpusWireClient({
+    baseUrl: "http://example.test",
+    fetchFn: async (input, init) => {
+      calls.push({ input, method: init?.method });
+      return jsonResponse(200, summary);
+    },
+  });
+
+  const result = await client.getReviewTelemetrySummary();
+
+  assert.deepEqual(result, summary);
+  assert.deepEqual(calls, [{
+    input: "http://example.test/v1/review-context/telemetry/summary",
+    method: "GET",
+  }]);
+});
+
+test("requestJson exposes stable review errors and Retry-After metadata", async () => {
+  await assert.rejects(
+    requestJson({
+      baseUrl: "http://example.test",
+      paths: ["/v1/review-context/jobs/job-1"],
+      retryAttempts: 0,
+      fetchFn: async () => jsonResponse(
+        410,
+        {
+          schema_version: "review-context/v1",
+          error_code: "review_overlay_expired",
+          message: "The closed ReviewOverlay has expired",
+          request_id: "request-410",
+          retryable: false,
+          retry_after_seconds: 9,
+          recovery_guidance: ["Request context again to rebuild the overlay."],
+          details: {},
+        },
+        { "Retry-After": "9" },
+      ),
+    }),
+    (error) => {
+      assert.ok(error instanceof CorpusWireHttpError);
+      assert.equal(error.status, 410);
+      assert.equal(error.requestId, "request-410");
+      assert.equal(error.errorCode, "review_overlay_expired");
+      assert.equal(error.retryable, false);
+      assert.equal(error.retryAfterSeconds, 9);
+      assert.deepEqual(error.recoveryGuidance, [
+        "Request context again to rebuild the overlay.",
+      ]);
+      assert.deepEqual(error.errorDetail, {});
+      return true;
+    },
   );
 });

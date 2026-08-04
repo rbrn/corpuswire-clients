@@ -7,6 +7,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SERVER_BIN = fileURLToPath(new URL("../bin/corpuswire-mcp.js", import.meta.url));
+const REVIEW_SCHEMA_PATH = fileURLToPath(
+  new URL("../../../schemas/review-context/v1/review-context.schema.json", import.meta.url),
+);
 
 test("corpuswire-mcp exposes tools and maps search requests to the SDK", async () => {
   const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
@@ -30,6 +33,14 @@ test("corpuswire-mcp exposes tools and maps search requests to the SDK", async (
       assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_diagnose_workspace"), true);
       assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_rate_result"), true);
       assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_quality_review"), true);
+      for (const name of ["corpuswire_rate_result", "corpuswire_quality_review"]) {
+        const tool = tools.result.tools.find((candidate) => candidate.name === name);
+        assert.deepEqual(tool.inputSchema.properties.workType.enum, [
+          "semantic_retrieval",
+          "prompt_enhancement",
+          "review_context",
+        ]);
+      }
       assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_value_rollup"), true);
       for (const name of ["corpuswire_search", "corpuswire_enhance_prompt"]) {
         const tool = tools.result.tools.find((candidate) => candidate.name === name);
@@ -102,6 +113,187 @@ test("corpuswire-mcp exposes tools and maps search requests to the SDK", async (
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test("corpuswire-mcp exposes review context and Codebase status with complete provenance", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-review-"));
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const tools = await rpc({ jsonrpc: "2.0", id: 20, method: "tools/list", params: {} });
+      for (const name of ["corpuswire_review_context", "corpuswire_codebase_status"]) {
+        const tool = tools.result.tools.find((candidate) => candidate.name === name);
+        assert.ok(tool);
+        assert.equal(tool.inputSchema.additionalProperties, false);
+      }
+      const reviewTool = tools.result.tools.find(
+        (tool) => tool.name === "corpuswire_review_context",
+      );
+      const checkedSchema = JSON.parse(await readFile(REVIEW_SCHEMA_PATH, "utf8"));
+      assertReviewToolSchemaParity(reviewTool.inputSchema, checkedSchema.$defs);
+
+      const review = await rpc({
+        jsonrpc: "2.0",
+        id: 21,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_review_context",
+          arguments: {
+            codebaseId: "codebase-1",
+            targetRepositoryId: "repo-kotlin",
+            providerReviewId: "42",
+            expectedHeadSha: null,
+            objective: "Find affected implementations",
+            strictFreshness: true,
+            budgets: { graphHops: 2, evidenceItems: 20, waitMs: 0 },
+            outputCharacterLimit: 4000,
+            timeoutMs: 5000,
+            pollIntervalMs: 0,
+          },
+        },
+      });
+      assert.equal(review.result.isError, false);
+      assert.match(review.result.content[0].text, /repository: repo-kotlin/);
+      assert.match(review.result.content[0].text, /revision: 2222222222222222222222222222222222222222/);
+      assert.match(review.result.content[0].text, /relationship: IMPLEMENTS:/);
+      assert.match(review.result.content[0].text, /provenance: scip-java@1.0 tier=scip/);
+      assert.match(review.result.content[0].text, /freshness: exact/);
+      assert.match(review.result.content[0].text, /selectionReason: direct-implementation/);
+      assert.ok(review.result.content[0].text.length <= 4000);
+
+      const status = await rpc({
+        jsonrpc: "2.0",
+        id: 22,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_codebase_status",
+          arguments: { codebaseId: "codebase-1", reviewId: "42" },
+        },
+      });
+      assert.equal(status.result.isError, false);
+      assert.match(status.result.content[0].text, /repositorySelection: all/);
+      assert.match(status.result.content[0].text, /repo-kotlin github:repository-42 state=active/);
+      assert.match(status.result.content[0].text, /analyzers: java, kotlin/);
+      assert.match(status.result.content[0].text, /Review status:/);
+      assert.match(status.result.content[0].text, /overlay-1@4/);
+    } finally {
+      child.kill();
+    }
+
+    const requests = (await readFile(requestsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const reviewRequest = requests.find((request) => request.kind === "requestReviewContextAndWait");
+    assert.deepEqual(reviewRequest, {
+      kind: "requestReviewContextAndWait",
+      request: {
+        codebaseId: "codebase-1",
+        targetRepositoryId: "repo-kotlin",
+        providerReviewId: "42",
+        expectedHeadSha: null,
+        objective: "Find affected implementations",
+        strictFreshness: true,
+        budgets: { graphHops: 2, evidenceItems: 20, waitMs: 0 },
+        outputCharacterLimit: 4000,
+      },
+      options: { timeoutMs: 5000, pollIntervalMs: 0 },
+    });
+    assert.deepEqual(
+      requests.filter((request) => request.kind !== "requestReviewContextAndWait")
+        .map((request) => request.kind)
+        .sort(),
+      [
+        "getCodebase",
+        "getReviewContextCapabilities",
+        "getReviewStatus",
+        "listCodebaseRepositories",
+      ],
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+function assertReviewToolSchemaParity(toolSchema, definitions) {
+  const requestSchema = definitions.ReviewContextRequestV1;
+  const requestFields = {
+    codebase_id: "codebaseId",
+    target_repository_id: "targetRepositoryId",
+    provider_review_id: "providerReviewId",
+    expected_head_sha: "expectedHeadSha",
+    objective: "objective",
+    strict_freshness: "strictFreshness",
+    budgets: "budgets",
+    output_character_limit: "outputCharacterLimit",
+  };
+  const controlFields = new Set(["waitForCompletion", "timeoutMs", "pollIntervalMs"]);
+  const domainFields = Object.keys(toolSchema.properties)
+    .filter((name) => !controlFields.has(name))
+    .sort();
+  assert.deepEqual(domainFields, Object.values(requestFields).sort());
+  assert.deepEqual(
+    [...toolSchema.required].sort(),
+    requestSchema.required.map((name) => requestFields[name]).sort(),
+  );
+
+  for (const [wireName, toolName] of Object.entries(requestFields)) {
+    if (wireName === "budgets") continue;
+    assertSchemaBoundsEqual(
+      toolSchema.properties[toolName],
+      requestSchema.properties[wireName],
+    );
+  }
+
+  const budgetFields = {
+    graph_hops: "graphHops",
+    candidate_repositories: "candidateRepositories",
+    pre_rank_candidates: "preRankCandidates",
+    evidence_items: "evidenceItems",
+    serialized_tokens: "serializedTokens",
+    wait_ms: "waitMs",
+  };
+  const budgetSchema = definitions.ReviewBudgetsV1;
+  const toolBudgets = toolSchema.properties.budgets;
+  assert.equal(toolBudgets.additionalProperties, false);
+  assert.deepEqual(Object.keys(toolBudgets.properties).sort(), Object.values(budgetFields).sort());
+  for (const [wireName, toolName] of Object.entries(budgetFields)) {
+    assertSchemaBoundsEqual(toolBudgets.properties[toolName], budgetSchema.properties[wireName]);
+  }
+}
+
+function assertSchemaBoundsEqual(actual, authoritative) {
+  for (const keyword of [
+    "type",
+    "pattern",
+    "minLength",
+    "maxLength",
+    "minimum",
+    "maximum",
+    "default",
+  ]) {
+    if (!(keyword in authoritative) || authoritative[keyword] === null) continue;
+    assert.deepEqual(actual[keyword], authoritative[keyword]);
+  }
+  if (Array.isArray(authoritative.anyOf)) {
+    const nonNull = authoritative.anyOf.find((candidate) => candidate.type !== "null");
+    const acceptsNull = authoritative.anyOf.some((candidate) => candidate.type === "null");
+    assert.ok(nonNull);
+    assert.equal(acceptsNull, true);
+    assert.deepEqual(actual.type, [nonNull.type, "null"]);
+    assertSchemaBoundsEqual({ ...actual, type: nonNull.type }, nonNull);
+  }
+}
 
 test("corpuswire-mcp passes bearer authentication to the SDK", async () => {
   const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
@@ -396,7 +588,7 @@ test("corpuswire-mcp records and reviews central quality ratings", async () => {
         params: {
           name: "corpuswire_rate_result",
           arguments: {
-            workType: "semantic_retrieval",
+            workType: "review_context",
             engine: "augment",
             relevance: 5,
             fileSpecificity: 5,
@@ -419,7 +611,7 @@ test("corpuswire-mcp records and reviews central quality ratings", async () => {
         method: "tools/call",
         params: {
           name: "corpuswire_quality_review",
-          arguments: { days: 14 },
+          arguments: { workType: "review_context", days: 14 },
         },
       });
       assert.equal(review.result.isError, false);
@@ -436,7 +628,12 @@ test("corpuswire-mcp records and reviews central quality ratings", async () => {
       .map((line) => JSON.parse(line));
     assert.equal(requests[0].kind, "recordQualityEvent");
     assert.equal(requests[0].workspaceId, "workspace-from-env");
-    assert.deepEqual(requests[1], { kind: "reviewQuality", days: 14 });
+    assert.equal(requests[0].workType, "review_context");
+    assert.deepEqual(requests[1], {
+      kind: "reviewQuality",
+      workType: "review_context",
+      days: 14,
+    });
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -554,6 +751,10 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
     await writeFile(path.join(tempDir, "Bridge.kt"), "class Bridge { fun readSteps() = 0 }\n", "utf8");
     await writeFile(path.join(tempDir, "health-check.kts"), "fun verifyReadOnly() = true\n", "utf8");
     await writeFile(path.join(tempDir, "Reader.scala"), "object Reader { def readSteps(): Int = 0 }\n", "utf8");
+    await writeFile(path.join(tempDir, "main.tf"), "resource \"null_resource\" \"main\" {}\n", "utf8");
+    await writeFile(path.join(tempDir, "mvnw"), "#!/bin/sh\n", "utf8");
+    await mkdir(path.join(tempDir, ".tmp-context-engine"));
+    await writeFile(path.join(tempDir, ".tmp-context-engine", "hidden.tf"), "hidden = true\n", "utf8");
     await mkdir(path.join(tempDir, ".vscode"));
     await writeFile(
       path.join(tempDir, ".vscode", "mcp.json.example"),
@@ -588,8 +789,8 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
         params: {
           name: "corpuswire_sync_reconcile",
           arguments: {
-            includeGlobs: ["README.md", "*.kt", "*.kts", "*.scala", "**/*.json"],
-            maxFiles: 5,
+            includeGlobs: ["README.md", "*.kt", "*.kts", "*.scala", "*.tf", "mvnw", "**/*.json"],
+            maxFiles: 10,
             maxWaitMs: 10000,
             recreateCollection: true,
           },
@@ -619,6 +820,8 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
           ".vscode/mcp.json.example",
           "Bridge.kt",
           "health-check.kts",
+          "main.tf",
+          "mvnw",
           "Reader.scala",
           "README.md",
         ],
@@ -966,6 +1169,148 @@ export class CorpusWireClient {
         collection: "corpuswire-test",
         index: { manifest_revision: 7 }
       }
+    };
+  }
+
+  async requestReviewContextAndWait(request, options = {}) {
+    appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
+      kind: "requestReviewContextAndWait",
+      request,
+      options,
+    }) + "\\n", "utf8");
+    return {
+      request_id: "request-review-1",
+      telemetry_id: "telemetry-review-1",
+      job_id: "job-review-1",
+      review_id: request.providerReviewId,
+      target_repository_id: request.targetRepositoryId,
+      base_sha: "1".repeat(40),
+      head_sha: "2".repeat(40),
+      snapshot_id: "snapshot-1",
+      snapshot_generation: 3,
+      overlay_id: "overlay-1",
+      overlay_generation: 4,
+      freshness: "exact",
+      changed_symbols: ["java:OrdersApi#getOrder"],
+      related_symbols: ["kotlin:OrdersService#getOrder"],
+      repository_count: 2,
+      candidate_count: 1,
+      serialized_token_count: 42,
+      truncated: false,
+      omissions: [],
+      warnings: [],
+      evidence: [{
+        evidence_id: "evidence-1",
+        repository_id: "repo-kotlin",
+        revision: "2".repeat(40),
+        layer: "snapshot",
+        path: "src/OrdersService.kt",
+        source_range: { start_line: 12, end_line: 18 },
+        content_hash: "a".repeat(64),
+        text: "override fun getOrder(id: String) = api.getOrder(id)",
+        symbol_id: "kotlin:OrdersService#getOrder",
+        relationship_path: [{
+          relationship_kind: "IMPLEMENTS",
+          source_symbol_id: "kotlin:OrdersService#getOrder",
+          target_symbol_id: "java:OrdersApi#getOrder",
+          graph_distance: 1,
+        }],
+        graph_distance: 1,
+        provenance: {
+          extractor_id: "scip-java",
+          extractor_version: "1.0",
+          evidence_tier: "scip",
+          resolution_status: "exact",
+          confidence: 0.99,
+        },
+        freshness: "exact",
+        confidence: 0.99,
+        score: { total: 10, graph: 4, freshness: 2, semantic: 1 },
+        selection_reason: "direct-implementation",
+      }],
+    };
+  }
+
+  async requestReviewContext(request) {
+    appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
+      kind: "requestReviewContext",
+      request,
+    }) + "\\n", "utf8");
+    return {
+      job_id: "job-review-1",
+      request_id: "request-review-1",
+      codebase_id: request.codebaseId,
+      state: "running",
+      attempts: 1,
+      status_url: "/v1/review-context/jobs/job-review-1",
+      retry_after_seconds: 2,
+      partial_reasons: [],
+    };
+  }
+
+  async getCodebase(codebaseId) {
+    appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
+      kind: "getCodebase",
+      codebaseId,
+    }) + "\\n", "utf8");
+    return {
+      tenant_id: "tenant-a",
+      codebase_id: codebaseId,
+      display_name: "Payments",
+      status: "active",
+      repository_selection: { mode: "all", provider_repository_ids: [] },
+      created_at: "2026-08-02T15:00:00Z",
+      updated_at: "2026-08-02T15:00:00Z",
+    };
+  }
+
+  async listCodebaseRepositories(codebaseId) {
+    appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
+      kind: "listCodebaseRepositories",
+      codebaseId,
+    }) + "\\n", "utf8");
+    return {
+      repositories: [{
+        repository_id: "repo-kotlin",
+        provider: "github",
+        provider_external_id: "repository-42",
+        canonical_path: "services/orders",
+        state: "active",
+      }],
+    };
+  }
+
+  async getReviewContextCapabilities() {
+    appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
+      kind: "getReviewContextCapabilities",
+    }) + "\\n", "utf8");
+    return {
+      enabled: true,
+      service_available: true,
+      symbol_graph: true,
+      review_overlays: true,
+      providers: { github: true },
+      analyzers: { java: true, kotlin: true, python: false },
+    };
+  }
+
+  async getReviewStatus(codebaseId, reviewId) {
+    appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
+      kind: "getReviewStatus",
+      codebaseId,
+      reviewId,
+    }) + "\\n", "utf8");
+    return {
+      review_id: reviewId,
+      state: "ready",
+      target_repository_id: "repo-kotlin",
+      head_sha: "2".repeat(40),
+      overlay_id: "overlay-1",
+      overlay_generation: 4,
+      freshness: "exact",
+      latest_job: { job_id: "job-review-1", state: "succeeded" },
+      purge_after: null,
+      warnings: [],
     };
   }
 
