@@ -1,4 +1,4 @@
-const TRANSIENT_HTTP_STATUSES = new Set([502, 503, 504]);
+const TRANSIENT_HTTP_STATUSES = new Set([429, 502, 503, 504]);
 const DEFAULT_RETRY_ATTEMPTS = 2;
 const DEFAULT_RETRY_DELAY_MS = 250;
 export class CorpusWireHttpError extends Error {
@@ -11,6 +11,9 @@ export class CorpusWireHttpError extends Error {
     errorMessage;
     errorDetail;
     errorEnvelope;
+    retryable;
+    retryAfterSeconds;
+    recoveryGuidance;
     constructor(status, statusText, responseBody, options = {}) {
         super(`${status} ${statusText}: ${options.errorMessage ?? responseBody}`);
         this.name = "CorpusWireHttpError";
@@ -23,6 +26,9 @@ export class CorpusWireHttpError extends Error {
         this.errorMessage = options.errorMessage ?? null;
         this.errorDetail = options.errorDetail;
         this.errorEnvelope = options.errorEnvelope ?? null;
+        this.retryable = options.retryable ?? false;
+        this.retryAfterSeconds = options.retryAfterSeconds ?? null;
+        this.recoveryGuidance = normalizeRecoveryGuidance(options.recoveryGuidance);
     }
 }
 export function normalizeBaseUrl(baseUrl) {
@@ -81,19 +87,25 @@ export async function requestJson(options) {
             }
             if (!response.ok) {
                 if (attempt < retryAttempts && TRANSIENT_HTTP_STATUSES.has(response.status)) {
+                    const retryAfterSeconds = responseRetryAfterSeconds(response);
                     await discardResponseBody(response);
-                    await waitForRetry(retryDelayMs, attempt);
+                    await waitForRetry(retryDelayMs, attempt, retryAfterSeconds);
                     continue;
                 }
                 const responseBody = await response.text();
-                const parsedEnvelope = parseEnhanceErrorEnvelope(responseBody);
+                const parsed = parseApiError(responseBody);
+                const headerRequestId = response.headers?.get?.("x-request-id") ?? null;
+                const headerRetryAfter = responseRetryAfterSeconds(response);
                 throw new CorpusWireHttpError(response.status, response.statusText, responseBody, {
-                    requestId: parsedEnvelope?.request_id ?? null,
-                    durationMs: parsedEnvelope?.duration_ms ?? null,
-                    errorCode: parsedEnvelope?.error.code ?? null,
-                    errorMessage: parsedEnvelope?.error.message ?? null,
-                    errorDetail: parsedEnvelope?.error.detail,
-                    errorEnvelope: parsedEnvelope,
+                    requestId: parsed?.requestId ?? headerRequestId,
+                    durationMs: parsed?.durationMs ?? null,
+                    errorCode: parsed?.errorCode ?? null,
+                    errorMessage: parsed?.errorMessage ?? null,
+                    errorDetail: parsed?.errorDetail,
+                    errorEnvelope: parsed?.errorEnvelope ?? null,
+                    retryable: parsed?.retryable ?? TRANSIENT_HTTP_STATUSES.has(response.status),
+                    retryAfterSeconds: parsed?.retryAfterSeconds ?? headerRetryAfter,
+                    recoveryGuidance: parsed?.recoveryGuidance ?? [],
                 });
             }
             return (await response.json());
@@ -124,25 +136,41 @@ function isRetryableFetchError(error) {
         || message.includes("EPIPE")
         || message.includes("UND_ERR_SOCKET");
 }
-async function waitForRetry(baseDelayMs, attempt) {
-    if (baseDelayMs <= 0) {
+async function waitForRetry(baseDelayMs, attempt, retryAfterSeconds = null) {
+    const delayMs = retryAfterSeconds === null
+        ? baseDelayMs * (attempt + 1)
+        : retryAfterSeconds * 1_000;
+    if (delayMs <= 0) {
         return;
     }
     await new Promise((resolve) => {
-        setTimeout(resolve, baseDelayMs * (attempt + 1));
+        setTimeout(resolve, delayMs);
     });
 }
-function parseEnhanceErrorEnvelope(responseBody) {
+function parseApiError(responseBody) {
     try {
         const payload = JSON.parse(responseBody);
         if (!payload || typeof payload !== "object") {
             return null;
         }
-        if (!("ok" in payload)
-            || !("request_id" in payload)
-            || !("duration_ms" in payload)
-            || !("error" in payload)) {
-            return null;
+        if ("error_code" in payload
+            && "message" in payload
+            && "request_id" in payload
+            && typeof payload.error_code === "string"
+            && typeof payload.message === "string"
+            && typeof payload.request_id === "string") {
+            const candidate = payload;
+            return {
+                requestId: candidate.request_id,
+                durationMs: null,
+                errorCode: candidate.error_code,
+                errorMessage: candidate.message,
+                errorDetail: candidate.details,
+                errorEnvelope: candidate,
+                retryable: candidate.retryable === true,
+                retryAfterSeconds: nonNegativeIntegerOrNull(candidate.retry_after_seconds),
+                recoveryGuidance: normalizeRecoveryGuidance(candidate.recovery_guidance),
+            };
         }
         const candidate = payload;
         if (candidate.ok !== false
@@ -153,11 +181,47 @@ function parseEnhanceErrorEnvelope(responseBody) {
             || typeof candidate.error.message !== "string") {
             return null;
         }
-        return candidate;
+        const envelope = candidate;
+        return {
+            requestId: envelope.request_id,
+            durationMs: envelope.duration_ms,
+            errorCode: envelope.error.code,
+            errorMessage: envelope.error.message,
+            errorDetail: envelope.error.detail,
+            errorEnvelope: envelope,
+            retryable: false,
+            retryAfterSeconds: null,
+            recoveryGuidance: [],
+        };
     }
     catch {
         return null;
     }
+}
+function responseRetryAfterSeconds(response) {
+    const value = response.headers?.get?.("retry-after");
+    if (!value) {
+        return null;
+    }
+    const seconds = Number(value);
+    return nonNegativeIntegerOrNull(seconds);
+}
+function nonNegativeIntegerOrNull(value) {
+    return typeof value === "number" && Number.isInteger(value) && value >= 0
+        ? value
+        : null;
+}
+function normalizeRecoveryGuidance(value) {
+    if (!Array.isArray(value)) {
+        return [];
+    }
+    return Object.freeze(value
+        .filter((item) => (typeof item === "string"
+        && item.length > 0
+        && item.length <= 256
+        && !item.includes("\n")
+        && !item.includes("\r")))
+        .slice(0, 4));
 }
 function base64Encode(value) {
     const bytes = new TextEncoder().encode(value);

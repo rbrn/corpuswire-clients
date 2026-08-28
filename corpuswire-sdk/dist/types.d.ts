@@ -414,7 +414,7 @@ export interface QueryPromptPayload {
     include_answer: boolean;
     source_filter?: string[];
 }
-export type QualityWorkType = "semantic_retrieval" | "prompt_enhancement";
+export type QualityWorkType = "semantic_retrieval" | "prompt_enhancement" | "review_context";
 export interface QualityScorecard {
     relevance: number;
     fileSpecificity: number;
@@ -558,9 +558,344 @@ export interface ValueRollup {
     hourly_rate?: number | null;
     buckets: Array<Record<string, unknown>>;
 }
+export type ReviewContextSchemaVersion = "review-context/v1";
+export type RepositorySelectionMode = "all" | "none" | "selected";
+export type ReviewJobState = "queued" | "running" | "succeeded" | "partial" | "failed" | "cancelled" | "superseded";
+export type ReviewFreshness = "exact" | "fresh" | "partial" | "stale";
+export type ReviewTelemetryOperation = "webhook" | "reconciliation" | "baseline_index" | "overlay_build" | "analyzer" | "graph_expansion" | "retrieval" | "evidence_packing" | "authorization" | "provider" | "durable_job" | "retention_purge" | "shadow_comparison";
+export type ReviewTelemetryStatus = "succeeded" | "partial" | "failed" | "retrying" | "duplicate" | "timed_out" | "cancelled";
+export type ReviewFailureCategory = "invalid_authentication" | "unauthorized_scope" | "empty_repository_set" | "missing_exact_base_snapshot" | "superseded_review_generation" | "provider_rate_limited" | "provider_unavailable" | "graph_unavailable" | "analyzer_timeout" | "analyzer_failed" | "binary_content" | "lfs_content" | "submodule_content" | "truncated_content" | "missing_content" | "input_limit" | "backend_unavailable" | "expired_overlay";
+export type ReviewMetricName = "webhook_validation_failures" | "webhook_duplicates" | "webhook_gaps" | "reconciliation_pages" | "reconciliation_bindings" | "effective_repositories" | "reviews_discovered" | "changed_files" | "provider_warnings" | "authorization_exclusions" | "baseline_freshness_age_seconds" | "overlay_freshness_age_seconds" | "analyzer_successes" | "analyzer_fallbacks" | "analyzer_timeouts" | "analyzer_files" | "analyzer_failures" | "analyzer_truncations" | "analyzer_completeness" | "definitions" | "references" | "relationships" | "unresolved_relationships" | "graph_depth" | "graph_fan_out" | "candidate_repositories" | "graph_truncations" | "exact_candidates" | "lexical_candidates" | "semantic_candidates" | "reranked_candidates" | "evidence_items" | "evidence_tokens" | "cache_hits" | "omissions" | "provider_rate_limit_remaining" | "job_retries" | "lease_recoveries" | "purge_backlog" | "purged_overlays" | "unauthorized_leakage" | "expected_evidence" | "semantic_evidence" | "review_evidence" | "semantic_recall_at_20" | "review_recall_at_20" | "semantic_relevant_items_per_1000_tokens" | "review_relevant_items_per_1000_tokens" | "precision_improvement_ratio";
+export interface RepositorySelectionV1 {
+    schema_version: ReviewContextSchemaVersion;
+    mode: RepositorySelectionMode;
+    provider_repository_ids: string[];
+}
+export interface CodebaseV1 {
+    schema_version: ReviewContextSchemaVersion;
+    tenant_id: string;
+    codebase_id: string;
+    display_name: string;
+    status: "active" | "disabled" | "deleting";
+    repository_selection: RepositorySelectionV1;
+    created_at: string;
+    updated_at: string;
+}
+export interface CodebaseListV1 {
+    schema_version: ReviewContextSchemaVersion;
+    codebases: CodebaseV1[];
+}
+export interface CreateCodebaseRequest {
+    displayName: string;
+}
+export interface UpdateCodebaseRequest {
+    displayName?: string;
+    status?: "active" | "disabled";
+}
+export interface RepositorySummaryV1 {
+    schema_version: ReviewContextSchemaVersion;
+    tenant_id: string;
+    codebase_id: string;
+    repository_id: string;
+    provider: string | null;
+    provider_host: string | null;
+    provider_external_id: string | null;
+    display_name: string;
+    canonical_path: string;
+    default_branch: string | null;
+    state: "active" | "archived" | "deleted" | "inaccessible";
+    discovered_at: string;
+    updated_at: string;
+}
+export interface CodebaseRepositoriesV1 {
+    schema_version: ReviewContextSchemaVersion;
+    codebase_id: string;
+    repository_selection: RepositorySelectionV1;
+    repositories: RepositorySummaryV1[];
+}
+export interface ProviderContainerV1 {
+    schema_version: ReviewContextSchemaVersion;
+    tenant_id: string;
+    container_id: string;
+    provider: string;
+    provider_host: string;
+    provider_external_id: string;
+    kind: string;
+    display_name: string;
+    status: "active" | "suspended" | "deleted";
+}
+export interface ProviderBindingV1 {
+    schema_version: ReviewContextSchemaVersion;
+    tenant_id: string;
+    binding_id: string;
+    codebase_id: string;
+    container_id: string;
+    repository_selection: RepositorySelectionV1;
+    status: "active" | "disabled" | "revoked";
+    reconciled_at: string | null;
+}
+export interface GitHubProviderBindingRequest {
+    installationId: string;
+    providerHost?: string;
+    displayName: string;
+    /**
+     * Repository selection for the create-or-update operation. Omit to preserve
+     * an existing selection (or select all on first creation), pass null to
+     * select all, pass [] to select none, or pass IDs to select exactly them.
+     */
+    repositoryAllowlist?: string[] | null;
+}
+export interface GitHubProviderBindingPayload {
+    installation_id: string;
+    provider_host?: string;
+    display_name: string;
+    /** Wire equivalent of GitHubProviderBindingRequest.repositoryAllowlist. */
+    repository_allowlist?: string[] | null;
+}
+export interface ProviderBindingResponseV1 {
+    schema_version: ReviewContextSchemaVersion;
+    container: ProviderContainerV1;
+    binding: ProviderBindingV1;
+}
+export interface ProviderBindingRevocationV1 {
+    schema_version: ReviewContextSchemaVersion;
+    binding: ProviderBindingV1;
+}
+export interface ReviewBudgets {
+    graphHops?: number;
+    candidateRepositories?: number;
+    preRankCandidates?: number;
+    evidenceItems?: number;
+    serializedTokens?: number;
+    waitMs?: number;
+}
+export interface ReviewBudgetsV1 {
+    schema_version?: ReviewContextSchemaVersion;
+    graph_hops?: number;
+    candidate_repositories?: number;
+    pre_rank_candidates?: number;
+    evidence_items?: number;
+    serialized_tokens?: number;
+    wait_ms?: number;
+}
+export interface ReviewContextRequest {
+    codebaseId: string;
+    targetRepositoryId: string;
+    providerReviewId: string;
+    expectedHeadSha?: string | null;
+    objective: string;
+    strictFreshness?: boolean;
+    budgets?: ReviewBudgets;
+    outputCharacterLimit?: number | null;
+}
+export interface ReviewContextRequestV1 {
+    schema_version?: ReviewContextSchemaVersion;
+    codebase_id: string;
+    target_repository_id: string;
+    provider_review_id: string;
+    expected_head_sha?: string | null;
+    objective: string;
+    strict_freshness?: boolean;
+    budgets?: ReviewBudgetsV1;
+    output_character_limit?: number | null;
+}
+export interface ReviewContextJobV1 {
+    schema_version: ReviewContextSchemaVersion;
+    job_id: string;
+    request_id: string;
+    tenant_id: string;
+    codebase_id: string;
+    state: ReviewJobState;
+    attempts: number;
+    status_url: string;
+    retry_after_seconds: number | null;
+    created_at: string;
+    updated_at: string;
+    partial_reasons: string[];
+}
+export interface SourceRangeV1 {
+    schema_version: ReviewContextSchemaVersion;
+    start_line: number;
+    end_line: number;
+    start_column: number | null;
+    end_column: number | null;
+}
+export interface ExtractorProvenanceV1 {
+    schema_version: ReviewContextSchemaVersion;
+    extractor_id: string;
+    extractor_version: string;
+    evidence_tier: "scip" | "compiler" | "native" | "syntax" | "text" | "retrieval";
+    resolution_status: "exact" | "declared" | "inferred" | "unresolved";
+    confidence: number;
+    reason_codes: string[];
+    artifact_digest: string | null;
+}
+export interface RelationshipStepV1 {
+    schema_version: ReviewContextSchemaVersion;
+    edge_id: string;
+    relationship_kind: string;
+    source_symbol_id: string;
+    target_symbol_id: string;
+    graph_distance: number;
+}
+export interface ScoreBreakdownV1 {
+    schema_version: ReviewContextSchemaVersion;
+    total: number;
+    exact_overlap: number;
+    graph: number;
+    risk: number;
+    freshness: number;
+    lexical: number;
+    semantic: number;
+    reranker: number | null;
+}
+export interface EvidenceItemV1 {
+    schema_version: ReviewContextSchemaVersion;
+    evidence_id: string;
+    repository_id: string;
+    revision: string;
+    layer: "snapshot" | "overlay";
+    path: string;
+    source_range: SourceRangeV1;
+    content_hash: string;
+    text: string;
+    symbol_id: string | null;
+    relationship_path: RelationshipStepV1[];
+    graph_distance: number | null;
+    provenance: ExtractorProvenanceV1;
+    freshness: "exact" | "fresh" | "stale" | "unknown";
+    confidence: number;
+    score: ScoreBreakdownV1;
+    selection_reason: string;
+    token_count: number;
+}
+export interface ReviewContextResponseV1 {
+    schema_version: ReviewContextSchemaVersion;
+    request_id: string;
+    telemetry_id: string;
+    job_id: string | null;
+    review_id: string;
+    target_repository_id: string;
+    base_sha: string;
+    head_sha: string;
+    snapshot_id: string;
+    snapshot_generation: number;
+    overlay_id: string;
+    overlay_generation: number;
+    freshness: ReviewFreshness;
+    changed_symbols: string[];
+    related_symbols: string[];
+    evidence: EvidenceItemV1[];
+    repository_count: number;
+    candidate_count: number;
+    serialized_token_count: number;
+    truncated: boolean;
+    omissions: string[];
+    warnings: string[];
+    retry_guidance: string | null;
+}
+export type ReviewContextResult = ReviewContextResponseV1 | ReviewContextJobV1;
+export interface ReviewContextLimitsV1 {
+    schema_version: ReviewContextSchemaVersion;
+    repository_limit: number;
+    changed_file_limit: number;
+    max_file_bytes: number;
+    max_diff_bytes: number;
+    graph_hops: number;
+    candidate_repositories: number;
+    pre_rank_candidates: number;
+    evidence_items: number;
+    serialized_tokens: number;
+    wait_ms: number;
+    job_timeout_seconds: number;
+    overlay_retention_hours: number;
+}
+export interface ReviewContextCapabilitiesV1 {
+    schema_version: ReviewContextSchemaVersion;
+    enabled: boolean;
+    service_available: boolean;
+    providers: Record<string, boolean>;
+    analyzers: Record<string, boolean>;
+    symbol_graph: boolean;
+    review_overlays: boolean;
+    supports_polling: boolean;
+    supports_cancellation: boolean;
+    supports_immediate_purge: boolean;
+    limits: ReviewContextLimitsV1;
+}
+export interface ReviewTelemetrySummaryV1 {
+    schema_version: ReviewContextSchemaVersion;
+    event_count: number;
+    by_operation: Partial<Record<ReviewTelemetryOperation, number>>;
+    by_status: Partial<Record<ReviewTelemetryStatus, number>>;
+    by_failure_category: Partial<Record<ReviewFailureCategory, number>>;
+    metric_totals: Partial<Record<ReviewMetricName, number>>;
+    p95_duration_ms: number | null;
+}
+export interface ReviewStatusV1 {
+    schema_version: ReviewContextSchemaVersion;
+    codebase_id: string;
+    review_id: string;
+    state: "pending" | "ready" | "partial" | "closed" | "expired" | "purged" | "failed" | "cancelled" | "superseded";
+    target_repository_id: string | null;
+    head_sha: string | null;
+    overlay_id: string | null;
+    overlay_generation: number | null;
+    freshness: ReviewFreshness | null;
+    latest_job: ReviewContextJobV1 | null;
+    purge_after: string | null;
+    warnings: string[];
+}
+export interface ReviewPurgeV1 {
+    schema_version: ReviewContextSchemaVersion;
+    codebase_id: string;
+    review_id: string;
+    state: "purge_queued" | "purged";
+    job: ReviewContextJobV1 | null;
+    purged_at: string | null;
+}
+export interface ReviewContextErrorV1 {
+    schema_version: ReviewContextSchemaVersion;
+    error_code: string;
+    message: string;
+    request_id: string;
+    retryable: boolean;
+    retry_after_seconds: number | null;
+    recovery_guidance: string[];
+    details: Record<string, unknown>;
+}
+export interface ReviewContextPollOptions {
+    timeoutMs?: number;
+    pollIntervalMs?: number;
+    signal?: AbortSignal;
+    onJob?: (job: ReviewContextJobV1) => void;
+}
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 export type RemoteIndexMode = "full" | "incremental";
 export type RemoteManifestOp = "upsert" | "delete";
+export type RemoteIndexLayer = "snapshot" | "overlay";
+export interface RemoteIndexScopeV2 {
+    tenantId?: string | null;
+    codebaseId: string;
+    repositoryId: string;
+    repositorySetId: string;
+    snapshotId: string;
+    layer: RemoteIndexLayer;
+    revision: string;
+    generation: number;
+    overlayId?: string | null;
+}
+export interface RemoteIndexScopeV2Payload {
+    tenant_id?: string | null;
+    codebase_id: string;
+    repository_id: string;
+    repository_set_id: string;
+    snapshot_id: string;
+    layer: RemoteIndexLayer;
+    revision: string;
+    generation: number;
+    overlay_id?: string | null;
+}
 export interface RemoteWorkspaceIdentity {
     workspaceId: string;
     displayRoot?: string;
@@ -574,6 +909,7 @@ export interface StartRemoteIndexSessionRequest {
     excludeGlobs?: string[];
     maxFileSizeBytes?: number;
     recreateCollection?: boolean;
+    snapshotScope?: RemoteIndexScopeV2 | null;
 }
 export interface RemoteIndexSession {
     session_id: string;
@@ -585,6 +921,8 @@ export interface RemoteIndexSession {
     max_batch_files?: number;
     max_file_size_bytes: number;
     max_concurrent_uploads: number;
+    tenant_id?: string;
+    snapshot_scope?: RemoteIndexScopeV2Payload | null;
 }
 export interface RemoteManifestEntry {
     relativePath: string;
@@ -652,6 +990,7 @@ export interface RemoteIndexStatus {
     idle_seconds?: number | null;
     idle_timeout_seconds?: number | null;
     errors: string[];
+    snapshot_scope?: RemoteIndexScopeV2Payload | null;
 }
 export interface RemoteIndexSessionsResponse {
     ok: true;
@@ -665,12 +1004,16 @@ export interface RemoteIndexCapabilities {
     max_file_size_bytes: number;
     max_concurrent_uploads: number;
     supported_extensions: string[];
+    supported_filenames?: string[];
+    supported_file_registry_version?: string;
     manifest_compression: string[];
     file_batch_content_types: string[];
     payload_compression: string[];
     background_file_batches?: boolean;
     worker_count?: number;
     max_queued_batches?: number;
+    protocol_versions?: string[];
+    snapshot_scoping?: boolean;
 }
 export interface RemoteIndexCommitResponse {
     ok: true;

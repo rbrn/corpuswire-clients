@@ -1,6 +1,10 @@
-import type { EnhanceErrorEnvelope, FetchLike } from "./types.js";
+import type {
+  EnhanceErrorEnvelope,
+  FetchLike,
+  ReviewContextErrorV1,
+} from "./types.js";
 
-const TRANSIENT_HTTP_STATUSES = new Set([502, 503, 504]);
+const TRANSIENT_HTTP_STATUSES = new Set([429, 502, 503, 504]);
 const DEFAULT_RETRY_ATTEMPTS = 2;
 const DEFAULT_RETRY_DELAY_MS = 250;
 
@@ -13,7 +17,10 @@ export class CorpusWireHttpError extends Error {
   readonly errorCode: string | null;
   readonly errorMessage: string | null;
   readonly errorDetail: unknown;
-  readonly errorEnvelope: EnhanceErrorEnvelope | null;
+  readonly errorEnvelope: EnhanceErrorEnvelope | ReviewContextErrorV1 | null;
+  readonly retryable: boolean;
+  readonly retryAfterSeconds: number | null;
+  readonly recoveryGuidance: readonly string[];
 
   constructor(
     status: number,
@@ -25,7 +32,10 @@ export class CorpusWireHttpError extends Error {
       errorCode?: string | null;
       errorMessage?: string | null;
       errorDetail?: unknown;
-      errorEnvelope?: EnhanceErrorEnvelope | null;
+      errorEnvelope?: EnhanceErrorEnvelope | ReviewContextErrorV1 | null;
+      retryable?: boolean;
+      retryAfterSeconds?: number | null;
+      recoveryGuidance?: readonly string[];
     } = {},
   ) {
     super(`${status} ${statusText}: ${options.errorMessage ?? responseBody}`);
@@ -39,6 +49,9 @@ export class CorpusWireHttpError extends Error {
     this.errorMessage = options.errorMessage ?? null;
     this.errorDetail = options.errorDetail;
     this.errorEnvelope = options.errorEnvelope ?? null;
+    this.retryable = options.retryable ?? false;
+    this.retryAfterSeconds = options.retryAfterSeconds ?? null;
+    this.recoveryGuidance = normalizeRecoveryGuidance(options.recoveryGuidance);
   }
 }
 
@@ -120,21 +133,27 @@ export async function requestJson<T>(options: RequestJsonOptions): Promise<T> {
 
       if (!response.ok) {
         if (attempt < retryAttempts && TRANSIENT_HTTP_STATUSES.has(response.status)) {
+          const retryAfterSeconds = responseRetryAfterSeconds(response);
           await discardResponseBody(response);
-          await waitForRetry(retryDelayMs, attempt);
+          await waitForRetry(retryDelayMs, attempt, retryAfterSeconds);
           continue;
         }
 
         const responseBody = await response.text();
-        const parsedEnvelope = parseEnhanceErrorEnvelope(responseBody);
+        const parsed = parseApiError(responseBody);
+        const headerRequestId = response.headers?.get?.("x-request-id") ?? null;
+        const headerRetryAfter = responseRetryAfterSeconds(response);
 
         throw new CorpusWireHttpError(response.status, response.statusText, responseBody, {
-          requestId: parsedEnvelope?.request_id ?? null,
-          durationMs: parsedEnvelope?.duration_ms ?? null,
-          errorCode: parsedEnvelope?.error.code ?? null,
-          errorMessage: parsedEnvelope?.error.message ?? null,
-          errorDetail: parsedEnvelope?.error.detail,
-          errorEnvelope: parsedEnvelope,
+          requestId: parsed?.requestId ?? headerRequestId,
+          durationMs: parsed?.durationMs ?? null,
+          errorCode: parsed?.errorCode ?? null,
+          errorMessage: parsed?.errorMessage ?? null,
+          errorDetail: parsed?.errorDetail,
+          errorEnvelope: parsed?.errorEnvelope ?? null,
+          retryable: parsed?.retryable ?? TRANSIENT_HTTP_STATUSES.has(response.status),
+          retryAfterSeconds: parsed?.retryAfterSeconds ?? headerRetryAfter,
+          recoveryGuidance: parsed?.recoveryGuidance ?? [],
         });
       }
 
@@ -171,16 +190,35 @@ function isRetryableFetchError(error: unknown): boolean {
     || message.includes("UND_ERR_SOCKET");
 }
 
-async function waitForRetry(baseDelayMs: number, attempt: number): Promise<void> {
-  if (baseDelayMs <= 0) {
+async function waitForRetry(
+  baseDelayMs: number,
+  attempt: number,
+  retryAfterSeconds: number | null = null,
+): Promise<void> {
+  const delayMs = retryAfterSeconds === null
+    ? baseDelayMs * (attempt + 1)
+    : retryAfterSeconds * 1_000;
+  if (delayMs <= 0) {
     return;
   }
   await new Promise((resolve) => {
-    setTimeout(resolve, baseDelayMs * (attempt + 1));
+    setTimeout(resolve, delayMs);
   });
 }
 
-function parseEnhanceErrorEnvelope(responseBody: string): EnhanceErrorEnvelope | null {
+interface ParsedApiError {
+  requestId: string;
+  durationMs: number | null;
+  errorCode: string;
+  errorMessage: string;
+  errorDetail: unknown;
+  errorEnvelope: EnhanceErrorEnvelope | ReviewContextErrorV1;
+  retryable: boolean;
+  retryAfterSeconds: number | null;
+  recoveryGuidance: readonly string[];
+}
+
+function parseApiError(responseBody: string): ParsedApiError | null {
   try {
     const payload = JSON.parse(responseBody) as unknown;
     if (!payload || typeof payload !== "object") {
@@ -188,12 +226,25 @@ function parseEnhanceErrorEnvelope(responseBody: string): EnhanceErrorEnvelope |
     }
 
     if (
-      !("ok" in payload)
-      || !("request_id" in payload)
-      || !("duration_ms" in payload)
-      || !("error" in payload)
+      "error_code" in payload
+      && "message" in payload
+      && "request_id" in payload
+      && typeof payload.error_code === "string"
+      && typeof payload.message === "string"
+      && typeof payload.request_id === "string"
     ) {
-      return null;
+      const candidate = payload as unknown as ReviewContextErrorV1;
+      return {
+        requestId: candidate.request_id,
+        durationMs: null,
+        errorCode: candidate.error_code,
+        errorMessage: candidate.message,
+        errorDetail: candidate.details,
+        errorEnvelope: candidate,
+        retryable: candidate.retryable === true,
+        retryAfterSeconds: nonNegativeIntegerOrNull(candidate.retry_after_seconds),
+        recoveryGuidance: normalizeRecoveryGuidance(candidate.recovery_guidance),
+      };
     }
 
     const candidate = payload as Partial<EnhanceErrorEnvelope>;
@@ -208,10 +259,53 @@ function parseEnhanceErrorEnvelope(responseBody: string): EnhanceErrorEnvelope |
       return null;
     }
 
-    return candidate as EnhanceErrorEnvelope;
+    const envelope = candidate as EnhanceErrorEnvelope;
+    return {
+      requestId: envelope.request_id,
+      durationMs: envelope.duration_ms,
+      errorCode: envelope.error.code,
+      errorMessage: envelope.error.message,
+      errorDetail: envelope.error.detail,
+      errorEnvelope: envelope,
+      retryable: false,
+      retryAfterSeconds: null,
+      recoveryGuidance: [],
+    };
   } catch {
     return null;
   }
+}
+
+function responseRetryAfterSeconds(response: Response): number | null {
+  const value = response.headers?.get?.("retry-after");
+  if (!value) {
+    return null;
+  }
+  const seconds = Number(value);
+  return nonNegativeIntegerOrNull(seconds);
+}
+
+function nonNegativeIntegerOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+function normalizeRecoveryGuidance(value: unknown): readonly string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return Object.freeze(
+    value
+      .filter((item): item is string => (
+        typeof item === "string"
+        && item.length > 0
+        && item.length <= 256
+        && !item.includes("\n")
+        && !item.includes("\r")
+      ))
+      .slice(0, 4),
+  );
 }
 
 function base64Encode(value: string): string {

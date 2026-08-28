@@ -1,4 +1,4 @@
-import type { EnhanceErrorEnvelope, FetchLike } from "./types.js";
+import type { EnhanceErrorEnvelope, FetchLike, ReviewContextErrorV1 } from "./types.js";
 export declare class CorpusWireHttpError extends Error {
     readonly status: number;
     readonly statusText: string;
@@ -8,14 +8,20 @@ export declare class CorpusWireHttpError extends Error {
     readonly errorCode: string | null;
     readonly errorMessage: string | null;
     readonly errorDetail: unknown;
-    readonly errorEnvelope: EnhanceErrorEnvelope | null;
+    readonly errorEnvelope: EnhanceErrorEnvelope | ReviewContextErrorV1 | null;
+    readonly retryable: boolean;
+    readonly retryAfterSeconds: number | null;
+    readonly recoveryGuidance: readonly string[];
     constructor(status: number, statusText: string, responseBody: string, options?: {
         requestId?: string | null;
         durationMs?: number | null;
         errorCode?: string | null;
         errorMessage?: string | null;
         errorDetail?: unknown;
-        errorEnvelope?: EnhanceErrorEnvelope | null;
+        errorEnvelope?: EnhanceErrorEnvelope | ReviewContextErrorV1 | null;
+        retryable?: boolean;
+        retryAfterSeconds?: number | null;
+        recoveryGuidance?: readonly string[];
     });
 }
 export interface RequestJsonOptions {
