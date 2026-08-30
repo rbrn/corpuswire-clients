@@ -212,7 +212,7 @@ interface ParsedApiError {
   errorCode: string;
   errorMessage: string;
   errorDetail: unknown;
-  errorEnvelope: EnhanceErrorEnvelope | ReviewContextErrorV1;
+  errorEnvelope: EnhanceErrorEnvelope | ReviewContextErrorV1 | null;
   retryable: boolean;
   retryAfterSeconds: number | null;
   recoveryGuidance: readonly string[];
@@ -248,6 +248,28 @@ function parseApiError(responseBody: string): ParsedApiError | null {
     }
 
     const candidate = payload as Partial<EnhanceErrorEnvelope>;
+    if ("detail" in payload) {
+      const detail = (payload as { detail?: unknown }).detail;
+      const detailRecord = detail && typeof detail === "object" && !Array.isArray(detail)
+        ? detail as Record<string, unknown>
+        : null;
+      const message = typeof detail === "string"
+        ? detail
+        : typeof detailRecord?.message === "string"
+        ? detailRecord.message
+        : "CorpusWire request failed";
+      return {
+        requestId: "",
+        durationMs: null,
+        errorCode: "http_error",
+        errorMessage: message,
+        errorDetail: detail,
+        errorEnvelope: null,
+        retryable: false,
+        retryAfterSeconds: null,
+        recoveryGuidance: [],
+      };
+    }
     if (
       candidate.ok !== false
       || typeof candidate.request_id !== "string"

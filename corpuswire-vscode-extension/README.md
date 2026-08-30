@@ -225,6 +225,12 @@ The command:
 7. Skips files larger than `remoteIndexing.maxFileSizeBytes`.
 8. Calls `client.indexWorkspace({ mode: "full", recreateCollection: false, files, ... })`.
 
+The cancellable notification renders the shared `index-progress/v1` contract:
+phase, processed/total work, elapsed time, numeric progress when a denominator
+exists, and active heartbeat during long CPU work. Cancelling sends a backend
+abort and waits for its terminal acknowledgement; it no longer only dismisses
+an indeterminate client notification.
+
 In full mode, the SDK sends a complete manifest. The backend compares the new
 manifest generation with stored records, skips unchanged files, asks the client
 to upload only changed or new files, and deletes stale records during commit.

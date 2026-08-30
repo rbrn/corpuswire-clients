@@ -40,6 +40,13 @@ const QUALITY_WORK_TYPES = Object.freeze([
   "review_context",
 ]);
 const QUALITY_WORK_TYPE_SET = new Set(QUALITY_WORK_TYPES);
+const INDEX_OBSERVABILITY_SCHEMA_VERSION = "index-observability/v1";
+const INDEX_OBSERVABILITY_HEADER = "X-CorpusWire-Index-Observability";
+const INDEX_OBSERVABILITY_STAGES = new Set([
+  "mcp_receipt", "server_receipt", "queue_wait", "file_discovery", "file_read",
+  "filtering_hashing", "parsing_chunking", "model_wait", "embedding_batch",
+  "vector_writes", "cleanup",
+]);
 const INDEXABLE_EXTENSIONS = new Set([
   ".md",
   ".txt",
@@ -540,7 +547,7 @@ class SyncManager {
       const flush = await this.flushAll({
         maxWaitMs: optionalPositiveInteger(args.maxWaitMs, DEFAULT_SYNC_FLUSH_TIMEOUT_MS),
         processingTimeoutMs: optionalPositiveInteger(
-          args.processingTimeoutMs ?? args.processing_timeout_ms ?? args.maxWaitMs,
+          args.processingTimeoutMs ?? args.processing_timeout_ms,
           undefined,
         ),
       });
@@ -563,7 +570,7 @@ class SyncManager {
       const flush = await this.flushAll({
         maxWaitMs: optionalPositiveInteger(args.maxWaitMs, DEFAULT_SYNC_FLUSH_TIMEOUT_MS),
         processingTimeoutMs: optionalPositiveInteger(
-          args.processingTimeoutMs ?? args.processing_timeout_ms ?? args.maxWaitMs,
+          args.processingTimeoutMs ?? args.processing_timeout_ms,
           undefined,
         ),
       });
@@ -593,7 +600,7 @@ class SyncManager {
     };
   }
 
-  async flushExplicit(args = {}) {
+  async flushExplicit(args = {}, onProgress = undefined) {
     if (!this.isEnabled()) {
       return {
         enabled: false,
@@ -604,9 +611,10 @@ class SyncManager {
     return this.flushAll({
       maxWaitMs: optionalPositiveInteger(args.maxWaitMs, DEFAULT_SYNC_FLUSH_TIMEOUT_MS),
       processingTimeoutMs: optionalPositiveInteger(
-        args.processingTimeoutMs ?? args.processing_timeout_ms ?? args.maxWaitMs,
+        args.processingTimeoutMs ?? args.processing_timeout_ms,
         undefined,
       ),
+      onProgress,
     });
   }
 
@@ -707,7 +715,7 @@ class SyncManager {
     };
   }
 
-  async reconcileExplicit(args = {}) {
+  async reconcileExplicit(args = {}, onProgress = undefined) {
     if (!this.isEnabled()) {
       return {
         enabled: false,
@@ -717,13 +725,26 @@ class SyncManager {
     }
 
     const maxWaitMs = optionalPositiveInteger(args.maxWaitMs, DEFAULT_SYNC_FLUSH_TIMEOUT_MS);
-    const reconciliation = this.reconcileAll(args);
+    let latestProgress;
+    const reportProgress = (event) => {
+      latestProgress = event;
+      onProgress?.(event);
+    };
+    const reconciliation = this.reconcileAll(args, reportProgress);
     const waited = await awaitWithTimeout(reconciliation, maxWaitMs);
     if (waited.timedOut) {
+      const sessionId = latestProgress?.session_id === "pending"
+        ? undefined
+        : latestProgress?.session_id;
       return {
         enabled: true,
         reconciled: false,
         timedOut: true,
+        backendContinues: true,
+        sessionId,
+        reattach: sessionId
+          ? `corpuswire index --attach ${sessionId}`
+          : "Inspect corpuswire_sync_sessions and attach to the active workspace session.",
         status: this.snapshot(),
       };
     }
@@ -909,14 +930,14 @@ class SyncManager {
     return bootstrapStatus;
   }
 
-  async reconcileAll(args = {}) {
+  async reconcileAll(args = {}, onProgress = undefined) {
     if (this.activeReconcile) {
       return this.activeReconcile;
     }
 
     await this.refreshSupportedFileCapabilities();
     const context = this.resolveContext(args);
-    this.activeReconcile = this.runReconcile(context, args)
+    this.activeReconcile = this.runReconcile(context, args, onProgress)
       .catch((error) => {
         this.recordError(error, "reconcile");
         this.lastReconcileFinishedAt = new Date().toISOString();
@@ -939,9 +960,31 @@ class SyncManager {
     return this.activeReconcile;
   }
 
-  async flushAll({ maxWaitMs, allowDuringReconcile = false, processingTimeoutMs = undefined }) {
+  async flushAll({ maxWaitMs, allowDuringReconcile = false, processingTimeoutMs = undefined, onProgress = undefined }) {
     const summaries = [];
     const deadline = Date.now() + maxWaitMs;
+    let latestProgress;
+    const reportProgress = (event) => {
+      latestProgress = event;
+      onProgress?.(event);
+    };
+    const timeoutResult = () => {
+      const sessionId = latestProgress?.session_id === "pending"
+        ? undefined
+        : latestProgress?.session_id;
+      return {
+        enabled: true,
+        flushed: summaries.length > 0,
+        timedOut: true,
+        backendContinues: Boolean(this.activeFlush || this.activeReconcile),
+        sessionId,
+        reattach: sessionId
+          ? `corpuswire index --attach ${sessionId}`
+          : "Inspect corpuswire_sync_sessions and attach to the active workspace session.",
+        summaries,
+        status: this.snapshot(),
+      };
+    };
 
     if (this.timer) {
       clearTimeout(this.timer);
@@ -952,13 +995,7 @@ class SyncManager {
       if (this.activeReconcile && !allowDuringReconcile) {
         const waited = await awaitWithTimeout(this.activeReconcile, Math.max(0, deadline - Date.now()));
         if (waited.timedOut) {
-          return {
-            enabled: true,
-            flushed: false,
-            timedOut: true,
-            summaries,
-            status: this.snapshot(),
-          };
+          return timeoutResult();
         }
         continue;
       }
@@ -966,13 +1003,7 @@ class SyncManager {
       if (this.activeFlush) {
         const waited = await awaitWithTimeout(this.activeFlush, Math.max(0, deadline - Date.now()));
         if (waited.timedOut) {
-          return {
-            enabled: true,
-            flushed: false,
-            timedOut: true,
-            summaries,
-            status: this.snapshot(),
-          };
+          return timeoutResult();
         }
         summaries.push(waited.value);
         continue;
@@ -989,18 +1020,26 @@ class SyncManager {
       }
 
       if (Date.now() >= deadline) {
-        return {
-          enabled: true,
-          flushed: summaries.length > 0,
-          timedOut: true,
-          summaries,
-          status: this.snapshot(),
-        };
+        return timeoutResult();
       }
 
       const batch = this.takePendingBatch();
-      const flush = this.runBatch(batch, { processingTimeoutMs })
+      const flush = this.runBatch(batch, { processingTimeoutMs, onProgress: reportProgress })
         .catch((error) => {
+          if (error?.name === "RemoteIndexDetachedError") {
+            this.recordError(error);
+            return {
+              ok: false,
+              detached: true,
+              backendContinues: true,
+              sessionId: error.sessionId,
+              error: error.message,
+              filesQueued: batch.changedPaths.length,
+              filesUploaded: batch.changedPaths.length,
+              filesDeleted: batch.deletedPaths.length,
+              filesSkipped: 0,
+            };
+          }
           this.requeueBatch(batch);
           this.scheduleFlush(DEFAULT_SYNC_DEBOUNCE_MS);
           this.recordError(error);
@@ -1020,13 +1059,7 @@ class SyncManager {
       this.activeFlush = flush;
       const waited = await awaitWithTimeout(flush, Math.max(0, deadline - Date.now()));
       if (waited.timedOut) {
-        return {
-          enabled: true,
-          flushed: summaries.length > 0,
-          timedOut: true,
-          summaries,
-          status: this.snapshot(),
-        };
+        return timeoutResult();
       }
       summaries.push(waited.value);
       if (waited.value?.requeued) {
@@ -1057,7 +1090,7 @@ class SyncManager {
     }
   }
 
-  async runBatch(batch, { processingTimeoutMs = undefined } = {}) {
+  async runBatch(batch, { processingTimeoutMs = undefined, onProgress = undefined } = {}) {
     const startedAt = Date.now();
     this.lastFlushStartedAt = new Date(startedAt).toISOString();
     const files = [];
@@ -1065,6 +1098,7 @@ class SyncManager {
     const deletedPaths = new Set(batch.deletedPaths);
     const skippedPaths = [];
 
+    const fileReadStartedAt = Date.now();
     for (const entry of batch.changedPaths) {
       try {
         const remoteFile = await this.readRemoteFile(entry, batch, { useCache: true });
@@ -1100,8 +1134,14 @@ class SyncManager {
         }
       }
     }
+    const fileReadDurationMs = Date.now() - fileReadStartedAt;
 
     if (files.length === 0 && deletedPaths.size === 0) {
+      const durationMs = Date.now() - startedAt;
+      const observability = buildMcpIndexTrace({
+        totalDurationMs: durationMs,
+        fileReadDurationMs,
+      });
       const result = {
         ok: true,
         noOp: true,
@@ -1110,7 +1150,8 @@ class SyncManager {
         filesDeleted: 0,
         filesSkipped: skippedPaths.length,
         skippedPaths,
-        durationMs: Date.now() - startedAt,
+        durationMs,
+        ...(observability ? { observability } : {}),
       };
       this.recordResult(result, "flush");
       return result;
@@ -1152,10 +1193,18 @@ class SyncManager {
       ),
       files,
       deletedPaths: [...deletedPaths].sort(),
+      onProgress,
     }, { operation: "flush" });
 
     await this.applySyncCacheUploadResult(batch, cacheEntries, deletedPaths, response);
 
+    const durationMs = Date.now() - startedAt;
+    const observability = buildMcpIndexTrace({
+      client,
+      response,
+      totalDurationMs: durationMs,
+      fileReadDurationMs,
+    });
     const result = {
       ok: true,
       noOp: false,
@@ -1165,13 +1214,14 @@ class SyncManager {
       filesSkipped: skippedPaths.length,
       skippedPaths,
       response,
-      durationMs: Date.now() - startedAt,
+      durationMs,
+      ...(observability ? { observability } : {}),
     };
     this.recordResult(result, "flush");
     return result;
   }
 
-  async runReconcile(context, args) {
+  async runReconcile(context, args, onProgress = undefined) {
     const startedAt = Date.now();
     this.lastReconcileStartedAt = new Date(startedAt).toISOString();
     const recreateCollection = optionalBoolean(
@@ -1187,9 +1237,12 @@ class SyncManager {
       args.maxFiles ?? this.env.CORPUSWIRE_SYNC_RECONCILE_MAX_FILES,
       DEFAULT_SYNC_RECONCILE_MAX_FILES,
     );
+    const discoveryStartedAt = Date.now();
     const changedPaths = await this.collectWorkspaceFileEntries(context, maxFiles);
+    const fileDiscoveryDurationMs = Date.now() - discoveryStartedAt;
     const files = [];
     const skippedPaths = [];
+    const fileReadStartedAt = Date.now();
     for (const entry of changedPaths) {
       try {
         const remoteFile = await this.readRemoteFile(entry, context, { useCache: false });
@@ -1211,6 +1264,7 @@ class SyncManager {
         }
       }
     }
+    const fileReadDurationMs = Date.now() - fileReadStartedAt;
 
     const client = buildClient();
     if (typeof client.indexWorkspace !== "function") {
@@ -1238,7 +1292,7 @@ class SyncManager {
         undefined,
       ),
       processingTimeoutMs: optionalPositiveInteger(
-        args.processingTimeoutMs ?? args.processing_timeout_ms ?? args.maxWaitMs,
+        args.processingTimeoutMs ?? args.processing_timeout_ms,
         undefined,
       ),
       batchBytes: optionalPositiveInteger(this.env.CORPUSWIRE_SYNC_BATCH_BYTES, undefined),
@@ -1249,8 +1303,17 @@ class SyncManager {
       recreateCollection,
       files,
       deletedPaths: [],
+      onProgress,
     }, { operation: "reconcile" });
 
+    const durationMs = Date.now() - startedAt;
+    const observability = buildMcpIndexTrace({
+      client,
+      response,
+      totalDurationMs: durationMs,
+      fileDiscoveryDurationMs,
+      fileReadDurationMs,
+    });
     const result = {
       ok: true,
       noOp: false,
@@ -1262,7 +1325,8 @@ class SyncManager {
       skippedPaths,
       recreateCollection,
       response,
-      durationMs: Date.now() - startedAt,
+      durationMs,
+      ...(observability ? { observability } : {}),
     };
     this.recordResult(result, "reconcile");
     return result;
@@ -1965,8 +2029,50 @@ async function handleLine(line) {
   }
 
   if (response) {
-    process.stdout.write(`${JSON.stringify(response)}\n`);
+    writeProtocolMessage(response);
   }
+}
+
+function writeProtocolMessage(message) {
+  process.stdout.write(`${JSON.stringify(message)}\n`);
+}
+
+function createMcpProgressReporter(params) {
+  const metadata = asRecord(params._meta);
+  const progressToken = metadata.progressToken;
+  if (typeof progressToken !== "string" && typeof progressToken !== "number") {
+    return undefined;
+  }
+  return (event) => {
+    if (!isRecord(event) || event.schema_version !== "index-progress/v1") {
+      return;
+    }
+    const percent = typeof event.overall_percent === "number"
+      ? event.overall_percent
+      : Number(event.sequence ?? 0);
+    const total = typeof event.overall_percent === "number" ? 100 : undefined;
+    writeProtocolMessage({
+      jsonrpc: JSONRPC_VERSION,
+      method: "notifications/progress",
+      params: removeUndefinedValues({
+        progressToken,
+        progress: percent,
+        total,
+        message: formatMcpIndexProgress(event),
+        corpuswire_event: event,
+      }),
+    });
+  };
+}
+
+function formatMcpIndexProgress(event) {
+  const total = Number.isFinite(event.phase_total) ? event.phase_total : null;
+  const completed = Number.isFinite(event.phase_completed) ? event.phase_completed : 0;
+  const work = total === null ? `${completed}` : `${completed}/${total}`;
+  const elapsedSeconds = Number.isFinite(event.elapsed_ms)
+    ? (event.elapsed_ms / 1000).toFixed(1)
+    : "unknown";
+  return `${event.phase ?? "indexing"} ${work} ${event.unit ?? "items"} elapsed=${elapsedSeconds}s`;
 }
 
 async function handleMessage(message) {
@@ -2038,6 +2144,7 @@ async function callTool(params) {
   }
 
   const args = asRecord(params.arguments);
+  const onProgress = createMcpProgressReporter(params);
   if (name === "corpuswire_search") {
     try {
       return textToolResult(await searchContext(args));
@@ -2124,7 +2231,7 @@ async function callTool(params) {
   }
   if (name === "corpuswire_sync_flush") {
     try {
-      return textToolResult(formatSyncPayload(await syncManager.flushExplicit(args)));
+      return textToolResult(formatSyncPayload(await syncManager.flushExplicit(args, onProgress)));
     } catch (error) {
       return textToolResult(formatToolError(error, "sync flush request"), true);
     }
@@ -2138,7 +2245,7 @@ async function callTool(params) {
   }
   if (name === "corpuswire_sync_reconcile") {
     try {
-      return textToolResult(formatSyncPayload(await syncManager.reconcileExplicit(args)));
+      return textToolResult(formatSyncPayload(await syncManager.reconcileExplicit(args, onProgress)));
     } catch (error) {
       return textToolResult(formatToolError(error, "sync reconcile request"), true);
     }
@@ -2852,12 +2959,12 @@ function toolDefinitions() {
             type: "integer",
             minimum: 1,
             default: DEFAULT_SYNC_FLUSH_TIMEOUT_MS,
-            description: "Maximum time to wait for reconciliation and background indexing to finish.",
+            description: "Maximum caller wait for reconciliation. Expiry detaches and leaves backend work running.",
           },
           processingTimeoutMs: {
             type: "integer",
             minimum: 1,
-            description: "Optional SDK background-index processing budget; defaults to maxWaitMs.",
+            description: "Optional SDK wait budget. Omit to follow backend indexing until terminal state.",
           },
           maxFiles: {
             type: "integer",
@@ -4496,13 +4603,129 @@ function retrievalRecoveryAdvice({ result, context, retrievalWarning }) {
 function buildClient() {
   const policy = resolveBackendPolicy();
   const { basicAuth, bearerToken } = resolveAuthConfiguration();
-  return new sdk.CorpusWireClient({
+  const observabilityEnabled = optionalBoolean(
+    process.env.CORPUSWIRE_INDEX_OBSERVABILITY_ENABLED,
+    false,
+  );
+  const traceCollector = createMcpServerTraceCollector();
+  const client = new sdk.CorpusWireClient({
     baseUrl: policy.baseUrl,
     basicAuth,
     bearerToken,
     endpointMode: "v1-only",
-    fetchFn: (input, init = {}) => fetch(input, { ...init, redirect: "error" }),
+    defaultHeaders: observabilityEnabled
+      ? { [INDEX_OBSERVABILITY_HEADER]: "1" }
+      : undefined,
+    fetchFn: async (input, init = {}) => {
+      try {
+        const response = await fetch(input, { ...init, redirect: "error" });
+        if (observabilityEnabled) {
+          traceCollector.observe(response);
+        }
+        return response;
+      } catch (error) {
+        if (observabilityEnabled) {
+          traceCollector.recordClientError("client_transport_error");
+        }
+        throw error;
+      }
+    },
   });
+  Object.defineProperty(client, "indexObservability", {
+    value: observabilityEnabled ? traceCollector : null,
+    enumerable: false,
+  });
+  return client;
+}
+
+function createMcpServerTraceCollector() {
+  const stageTimingsMs = {};
+  let modelState = "unknown";
+  let errorState = "none";
+  return {
+    observe(response) {
+      if (response?.headers?.get?.("x-corpuswire-index-trace") !== INDEX_OBSERVABILITY_SCHEMA_VERSION) {
+        return;
+      }
+      for (const item of (response.headers.get("server-timing") ?? "").split(",")) {
+        const match = item.match(/^\s*cw_([a-z_]+)\s*;\s*dur=([0-9]+(?:\.[0-9]+)?)/i);
+        if (!match || !INDEX_OBSERVABILITY_STAGES.has(match[1])) {
+          continue;
+        }
+        const duration = Number(match[2]);
+        if (Number.isFinite(duration) && duration >= 0) {
+          stageTimingsMs[match[1]] = (stageTimingsMs[match[1]] ?? 0) + Math.round(duration);
+        }
+      }
+      const observedModelState = response.headers.get("x-corpuswire-index-model-state");
+      if (modelState === "unknown" && ["warm", "cold", "disabled"].includes(observedModelState)) {
+        modelState = observedModelState;
+      }
+      const observedErrorState = response.headers.get("x-corpuswire-index-error-state");
+      if (observedErrorState && observedErrorState !== "none") {
+        errorState = /^http_[45][0-9]{2}$/.test(observedErrorState)
+          ? observedErrorState
+          : "server_error";
+      }
+    },
+    recordClientError(state = "client_error") {
+      if (errorState === "none") {
+        errorState = state;
+      }
+    },
+    snapshot() {
+      return { stageTimingsMs: { ...stageTimingsMs }, modelState, errorState };
+    },
+  };
+}
+
+function buildMcpIndexTrace({
+  client = null,
+  response = null,
+  totalDurationMs,
+  fileDiscoveryDurationMs = null,
+  fileReadDurationMs = null,
+}) {
+  const collector = client?.indexObservability;
+  if (!collector && !optionalBoolean(process.env.CORPUSWIRE_INDEX_OBSERVABILITY_ENABLED, false)) {
+    return undefined;
+  }
+  const stagesMs = Object.fromEntries(
+    [...INDEX_OBSERVABILITY_STAGES].map((stage) => [stage, null]),
+  );
+  const addTimings = (timings) => {
+    if (!timings || typeof timings !== "object") {
+      return;
+    }
+    for (const [stage, duration] of Object.entries(timings)) {
+      if (!(stage in stagesMs) || typeof duration !== "number" || !Number.isFinite(duration)) {
+        continue;
+      }
+      stagesMs[stage] = (stagesMs[stage] ?? 0) + Math.max(0, Math.round(duration));
+    }
+  };
+  const collected = collector?.snapshot() ?? {
+    stageTimingsMs: {},
+    modelState: "unknown",
+    errorState: "none",
+  };
+  addTimings(collected.stageTimingsMs);
+  addTimings(response?.status?.progress?.phase_timings_ms);
+  if (typeof fileDiscoveryDurationMs === "number") {
+    stagesMs.file_discovery = Math.max(0, Math.round(fileDiscoveryDurationMs));
+  }
+  if (typeof fileReadDurationMs === "number") {
+    stagesMs.file_read = Math.max(0, Math.round(fileReadDurationMs));
+  }
+  stagesMs.mcp_receipt = Math.max(0, Math.round(totalDurationMs));
+  return {
+    schema_version: INDEX_OBSERVABILITY_SCHEMA_VERSION,
+    stages_ms: stagesMs,
+    total_duration_ms: Math.max(0, Math.round(totalDurationMs)),
+    error_state: collected.errorState,
+    model_state: collected.modelState,
+    sensitive_payloads_captured: false,
+  };
 }
 
 function resolveEnhancedPrompt(result) {
@@ -5208,6 +5431,15 @@ function formatSyncPayload(payload) {
     lines.push(`- reconcileTimedOut: ${payload.timedOut ?? false}`);
     lines.push(`- reconcileRan: ${payload.reconciled ?? false}`);
   }
+  if (payload.backendContinues !== undefined) {
+    lines.push(`- backendContinues: ${payload.backendContinues}`);
+  }
+  if (payload.sessionId) {
+    lines.push(`- sessionId: ${payload.sessionId}`);
+  }
+  if (payload.reattach) {
+    lines.push(`- reattach: ${payload.reattach}`);
+  }
   if (payload.reconcile) {
     lines.push("", "Reconciliation summary:", formatSyncSummary(payload.reconcile, 1));
   }
@@ -5268,6 +5500,11 @@ function formatSyncEvent(event) {
 
 function formatSyncSummary(summary, ordinal) {
   const compact = summarizeSyncResult(summary);
+  const observability = asRecord(compact?.observability);
+  const observabilityStages = asRecord(observability.stages_ms);
+  const measuredStages = Object.entries(observabilityStages)
+    .filter(([, duration]) => typeof duration === "number" && Number.isFinite(duration))
+    .map(([stage, duration]) => `${stage}=${Math.max(0, Math.round(duration))}ms`);
   return [
     `${ordinal}. filesQueued: ${compact?.filesQueued ?? 0}`,
     `   filesUploaded: ${compact?.filesUploaded ?? 0}`,
@@ -5276,8 +5513,17 @@ function formatSyncSummary(summary, ordinal) {
     `   reconcile: ${compact?.reconcile ?? false}`,
     `   noOp: ${compact?.noOp ?? false}`,
     ...(compact?.error ? [`   error: ${compact.error}`] : []),
+    ...(compact?.detached ? ["   detached: true"] : []),
+    ...(compact?.backendContinues ? ["   backendContinues: true"] : []),
+    ...(compact?.sessionId ? [`   sessionId: ${compact.sessionId}`] : []),
     ...(compact?.collection ? [`   collection: ${compact.collection}`] : []),
     ...(compact?.manifestRevision ? [`   manifestRevision: ${compact.manifestRevision}`] : []),
+    ...(observability.schema_version === INDEX_OBSERVABILITY_SCHEMA_VERSION
+      ? [
+        `   observability: ${observability.schema_version} model=${observability.model_state ?? "unknown"} error=${observability.error_state ?? "unknown"} total=${observability.total_duration_ms ?? 0}ms`,
+        `   stages: ${measuredStages.length > 0 ? measuredStages.join(", ") : "none"}`,
+      ]
+      : []),
   ].join("\n");
 }
 
@@ -5296,12 +5542,16 @@ function summarizeSyncResult(result) {
     filesSkipped: result.filesSkipped ?? 0,
     durationMs: result.durationMs,
     reconcile: Boolean(result.reconcile),
+    detached: Boolean(result.detached),
+    backendContinues: Boolean(result.backendContinues),
+    sessionId: result.sessionId,
     error: result.error,
     collection: responseResult.collection,
     documentsIndexed: responseResult.documents_indexed,
     filesAdded: responseResult.files_added,
     filesUpdated: responseResult.files_updated,
     manifestRevision: responseStatus.manifest_revision,
+    observability: result.observability,
   };
 }
 

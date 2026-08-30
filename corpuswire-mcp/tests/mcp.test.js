@@ -775,6 +775,7 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
         CORPUSWIRE_WORKSPACE_ID: "workspace-from-env",
         CORPUSWIRE_REPO_PATH: tempDir,
         CORPUSWIRE_SYNC_ENABLED: "true",
+        CORPUSWIRE_INDEX_OBSERVABILITY_ENABLED: "true",
         MOCK_REQUESTS_PATH: requestsPath,
       },
     });
@@ -787,6 +788,7 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
         method: "tools/call",
         params: {
           name: "corpuswire_sync_reconcile",
+          _meta: { progressToken: "reconcile-progress-1" },
           arguments: {
             includeGlobs: ["README.md", "*.kt", "*.kts", "*.scala", "*.tf", "mvnw", "**/*.json"],
             maxFiles: 10,
@@ -799,6 +801,19 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
       assert.equal(reconcile.result.isError, false);
       assert.match(reconcile.result.content[0].text, /reconcileRan: true/);
       assert.match(reconcile.result.content[0].text, /Reconciliation summary:/);
+      assert.match(reconcile.result.content[0].text, /observability: index-observability\/v1/);
+      assert.match(reconcile.result.content[0].text, /mcp_receipt=\d+ms/);
+      assert.match(reconcile.result.content[0].text, /file_discovery=\d+ms/);
+      assert.doesNotMatch(
+        reconcile.result.content[0].text,
+        /CorpusWire rebuild test|class Bridge/,
+        "trace should not contain indexed file contents",
+      );
+      assert.ok(rpc.notifications.some((notification) => (
+        notification.method === "notifications/progress"
+        && notification.params.progressToken === "reconcile-progress-1"
+        && notification.params.corpuswire_event?.schema_version === "index-progress/v1"
+      )));
     } finally {
       child.kill();
     }
@@ -814,7 +829,6 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
         workspaceId: "workspace-from-env",
         mode: "full",
         recreateCollection: true,
-        processingTimeoutMs: 10000,
         files: [
           ".vscode/mcp.json.example",
           "Bridge.kt",
@@ -827,6 +841,48 @@ test("corpuswire-mcp reconcile can request a clean collection rebuild", async ()
         deletedPaths: [],
       },
     ]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("corpuswire-mcp caller timeout reports continued backend work and reattachment", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-timeout-"));
+  try {
+    await writeFile(path.join(tempDir, "README.md"), "# Synthetic timeout fixture\n", "utf8");
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        CORPUSWIRE_WORKSPACE_ID: "workspace-timeout",
+        CORPUSWIRE_REPO_PATH: tempDir,
+        CORPUSWIRE_SYNC_ENABLED: "true",
+        MOCK_INDEX_DELAY_MS: "100",
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+    try {
+      const response = await rpc({
+        jsonrpc: "2.0",
+        id: 7,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_sync_reconcile",
+          arguments: { includeGlobs: ["README.md"], maxFiles: 10, maxWaitMs: 30 },
+        },
+      });
+      assert.equal(response.result.isError, false);
+      assert.match(response.result.content[0].text, /reconcileTimedOut: true/);
+      assert.match(response.result.content[0].text, /backendContinues: true/);
+      assert.match(response.result.content[0].text, /sessionId: session-mcp/);
+      assert.match(response.result.content[0].text, /corpuswire index --attach session-mcp/);
+    } finally {
+      child.kill();
+    }
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -1521,6 +1577,42 @@ export class CorpusWireClient {
       files: request.files.map((file) => file.relativePath),
       deletedPaths: request.deletedPaths ?? [],
     }) + "\\n", "utf8");
+    request.onProgress?.({
+      schema_version: "index-progress/v1",
+      sequence: 1,
+      session_id: "session-mcp",
+      workspace_id: request.workspace.workspaceId,
+      occurred_at: new Date().toISOString(),
+      phase: "embedding",
+      state: "running",
+      message: "Embedding synthetic chunks",
+      overall_completed: 1,
+      overall_total: 2,
+      overall_percent: 50,
+      overall_indeterminate: false,
+      phase_completed: 1,
+      phase_total: 2,
+      unit: "chunks",
+      elapsed_ms: 100,
+      phase_elapsed_ms: 50,
+      throughput_per_second: 20,
+      queue_depth: 0,
+      retries: 0,
+      warnings: [],
+      eta_seconds: 0.05,
+      eta_confidence: "medium",
+      heartbeat: false,
+      last_progress_at: new Date().toISOString(),
+      last_heartbeat_at: null,
+      active_heartbeat: false,
+      counts: {},
+      phase_timings_ms: {},
+      verification_status: "pending",
+    });
+    const delayMs = Number(process.env.MOCK_INDEX_DELAY_MS ?? 0);
+    if (delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
     return {
       result: {
         collection: "corpuswire-test",
@@ -1549,6 +1641,7 @@ export class CorpusWireHttpError extends Error {
 function createRpc(process) {
   let buffer = "";
   const responses = [];
+  const notifications = [];
   const waiters = [];
 
   process.stdout.setEncoding("utf8");
@@ -1559,7 +1652,12 @@ function createRpc(process) {
       const line = buffer.slice(0, newlineIndex).trim();
       buffer = buffer.slice(newlineIndex + 1);
       if (line) {
-        responses.push(JSON.parse(line));
+        const message = JSON.parse(line);
+        if (message.id === undefined && typeof message.method === "string") {
+          notifications.push(message);
+        } else {
+          responses.push(message);
+        }
       }
       newlineIndex = buffer.indexOf("\n");
     }
@@ -1572,7 +1670,7 @@ function createRpc(process) {
     }
   }
 
-  return (message) => new Promise((resolve, reject) => {
+  const rpc = (message) => new Promise((resolve, reject) => {
     waiters.push(resolve);
     process.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
       if (error) {
@@ -1581,4 +1679,6 @@ function createRpc(process) {
     });
     flushWaiters();
   });
+  rpc.notifications = notifications;
+  return rpc;
 }

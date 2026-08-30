@@ -232,12 +232,26 @@ Recommended prompt settings:
 - `CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_ATTEMPTS`: active-session 409 retry attempts before requeueing, default `5`
 - `CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_DELAY_MS`: base active-session retry delay, default `750`
 - `CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_MAX_DELAY_MS`: active-session retry delay ceiling, default `5000`
+- `CORPUSWIRE_INDEX_OBSERVABILITY_ENABLED`: request and render content-free `index-observability/v1` timings for sync/reconcile, default `false`; the API must also set `INDEX_OBSERVABILITY_ENABLED=true`
 
 `corpuswire_sync_bootstrap` is diagnostic by default. It calls workspace diagnosis, reports `bootstrapState` and `needsReconcile` in sync status, and returns recovery actions when the local API workspace index is stale, degraded, missing, or blocked. It uploads files only when called with `"reconcile": true`.
 
 `corpuswire_sync_reconcile` normally runs a full manifest reconciliation without deleting and recreating the Qdrant collection. Pass `"recreateCollection": true` only for an intentional clean rebuild, such as when the existing workspace collection was created with an embedding dimension that no longer matches the active provider. The first uploaded batch recreates the physical collection, so that workspace can be temporarily unavailable until the full manifest commits.
 
-For a large workspace, set `maxWaitMs` to the full expected indexing budget. The MCP server passes that value through as the SDK background-processing timeout; `processingTimeoutMs` may be set separately when the operator wait and server processing budgets must differ.
+For a large workspace, omit `processingTimeoutMs` to remain attached until the
+backend reaches a terminal state. An explicit timeout detaches without aborting
+the backend session, reports `backendContinues` and the session id when
+available, and can be followed through `corpuswire_sync_sessions` or the SDK.
+
+MCP hosts that supply `_meta.progressToken` receive standard
+`notifications/progress` during flush and reconcile. `progress`/`total` carry a
+numeric percentage when known, `message` is a compact human summary, and the
+additive `corpuswire_event` field contains the full `index-progress/v1` event.
+Polling session status remains the reliable fallback and reattachment contract.
+When both observability gates are enabled, reconciliation summaries also show
+MCP receipt, discovery/read, server/model wait, queue, chunking, embedding,
+vector-write, cleanup, total, model state, and bounded error state. The trace
+contains no file content, prompt text, credentials, or request headers.
 
 When `CORPUSWIRE_SYNC_MTIME_CACHE_ENABLED=true`, incremental sync writes a JSON metadata cache containing relative paths, size, mtime, SHA-256, and last decision. It never stores file contents. The cache suppresses duplicate changed-file uploads across MCP restarts when size and mtime match, re-hashes same-size files when mtime changes, and is ignored while bootstrap says the local API workspace index needs reconciliation. Full reconciliation does not use the cache because it must send a complete inventory.
 

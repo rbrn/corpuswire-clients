@@ -1,7 +1,7 @@
 # `corpuswire`
 
-Thin Node.js CLI for CorpusWire health checks, semantic search, prompt
-enhancement, and index observability. It delegates all typed HTTP behavior to
+Node.js CLI for CorpusWire health checks, semantic search, prompt enhancement,
+and observable workspace indexing. It delegates typed HTTP behavior to
 `@corpuswire/sdk` and keeps this package focused on argument parsing and
 terminal output.
 
@@ -14,10 +14,15 @@ The CLI supports:
 - `enhance` or a bare prompt for `POST /v1/enhance`.
 - `index-events` for `GET /v1/index/events`.
 - `index-activity` for `GET /v1/index/activity`.
+- `index` for previewed, confirmed remote workspace indexing with live
+  `index-progress/v1` output.
 
-The CLI does not perform ingestion. Use the full VS Code extension or SDK for
-remote `/v1/index/*` indexing, and use the Python backend CLI
-for service-local `/ingest`.
+`corpuswire index` defaults the source root to the current folder. It resolves
+the destination from explicit flags, workspace settings, user profile settings,
+or a stable `local-docker://<folder-slug>#main` folder identity. It scans and
+hashes locally, asks the backend for a read-only manifest preview, and prints the
+resolved workspace, source, service/profile, candidate/excluded counts, bytes,
+expected full/incremental/no-change mode, and destructive risk before mutation.
 
 ## Architecture
 
@@ -37,7 +42,7 @@ result for humans unless `--json` is provided.
 Node.js 18 or newer is required.
 
 ```bash
-cd /Users/constantinaldea/workspace/my-context-engine/clients/corpuswire-cli
+cd /path/to/corpuswire-clients/corpuswire-cli
 npm install
 ```
 
@@ -47,19 +52,23 @@ Run the local executable:
 node ./bin/corpuswire.js health
 ```
 
-Link it into your shell while developing:
+Build and install a local package snapshot without a source-tree entrypoint:
 
 ```bash
-cd /Users/constantinaldea/workspace/my-context-engine/clients/corpuswire-cli
-npm link
-corpuswire health
+cd /path/to/corpuswire-clients
+npm pack ./corpuswire-sdk --pack-destination /tmp/corpuswire-snapshot
+npm pack ./corpuswire-cli --pack-destination /tmp/corpuswire-snapshot
+npm install --prefix /tmp/corpuswire-install \
+  /tmp/corpuswire-snapshot/corpuswire-sdk-0.1.3.tgz \
+  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.3.tgz
+/tmp/corpuswire-install/node_modules/.bin/corpuswire --version
 ```
 
 Run tests:
 
 ```bash
-cd /Users/constantinaldea/workspace/my-context-engine
-node --test clients/corpuswire-cli/tests/cli.test.js
+cd /path/to/corpuswire-clients
+node --test corpuswire-cli/tests/cli.test.js
 ```
 
 ## Configuration
@@ -77,6 +86,18 @@ Command-line flags override environment defaults.
 | `--output-mode` | Prompt style | `generic`, `copilot`, `claude-code`, or `sequential` |
 | `--local-only` | Deterministic rewrite | Disables backend LLM generation for enhancement |
 | `--json` | Raw response output | Useful for automation and debugging |
+
+Index-specific controls include `--source-root`, `--profile local|hosted`,
+repeatable `--include` and `--exclude`, `--mode full|incremental`, `--yes`,
+`--non-interactive`, `--timeout-ms`, `--attach`, `--ndjson`, and `--trace`. The local
+profile accepts only a loopback service; the hosted profile requires HTTPS.
+Credentials are never printed.
+
+`--trace` adds a content-free `index-observability/v1` record with client file
+discovery/read/hash time, server receipt and model-wait time when the backend
+enables `INDEX_OBSERVABILITY_ENABLED=true`, durable queue/chunk/embed/write/
+cleanup timings, warm/cold model state, total time, and a bounded error state.
+It never records file contents, prompts, credentials, or request headers.
 
 Example environment:
 
@@ -135,24 +156,47 @@ node ./bin/corpuswire.js index-activity \
   --workspace-id github://rbrn/corpuswire#main
 ```
 
+Preview and index the current folder against a local service:
+
+```bash
+cd /path/to/reviewed-workspace
+corpuswire index \
+  --profile local \
+  --api-base-url http://127.0.0.1:18080 \
+  --workspace-id local-docker://reviewed-workspace#main \
+  --exclude '.env*' \
+  --exclude 'private/**'
+```
+
+The mutation prompt is exactly:
+
+```text
+Start indexing this workspace? [y/N]
+```
+
+EOF, an empty answer, or `n` exits without starting a session. Automation must
+use both `--non-interactive` and `--yes`. A destructive `--rebuild` adds a
+second confirmation; non-interactive rebuilds must also pass
+`--confirm-rebuild <exact-workspace-id>`.
+
+Stream machine-readable progress or follow an existing session:
+
+```bash
+corpuswire index --yes --non-interactive --ndjson --trace
+corpuswire index --attach 8a4f... --api-base-url http://127.0.0.1:18080
+```
+
 ## Ingestion And Update Behavior
 
-This CLI is intentionally read-only with respect to ingestion. It can observe
-index state, but it does not send manifests, upload file bytes, call `/ingest`,
-or mutate a collection.
+The index command sends a complete manifest in full mode, uploads only files the
+backend requests, and commits stale-file reconciliation after verification.
+Incremental mode updates only files included in that invocation; it does not
+remove unmentioned paths. A second identical full run is reported as
+`no_change` in the preview and avoids re-embedding unchanged files.
 
-For complete ingestion:
-
-- Use `clients/corpuswire-vscode-extension` and run
-  `CorpusWire: Index Workspace` for a full remote upload from VS Code.
-- Use `@corpuswire/sdk` and call `indexWorkspace({ mode: "full", ... })` from a
-  custom Node client.
-
-For updates to already ingested content:
-
-- Use the VS Code extension's remote watcher when
-  `corpuswire.remoteIndexing.autoWatch` is enabled.
-- Use the SDK with `mode: "incremental"`, changed `files`, and `deletedPaths`.
+Ctrl+C sends a real backend abort and waits for acknowledgement. A second Ctrl+C
+detaches and reports the session id and reattachment command. An explicit
+`--timeout-ms` also detaches rather than falsely marking the backend run failed.
 
 The CLI helps verify those flows after they run:
 
@@ -173,5 +217,9 @@ Default output is compact and human-readable:
 - `index-events` prints one line per event with timestamp, status, operation,
   source, and counts.
 - `index-activity` prints freshness fields.
+- `index` shows a live TTY bar with phase, defensible percentage, elapsed and
+  phase time, work units, throughput, queue depth, retries, ETA confidence, and
+  heartbeat. Redirected output uses line-oriented updates; `--ndjson` emits the
+  same semantic events as JSON records.
 
 Use `--json` when another process needs the full backend envelope.

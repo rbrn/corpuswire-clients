@@ -6,6 +6,28 @@ const DEFAULT_BEARER_TOKEN = RUNTIME_ENV.CORPUSWIRE_BEARER_TOKEN ?? "";
 const DEFAULT_OUTPUT_MODE = "generic";
 const DEFAULT_REVIEW_POLL_TIMEOUT_MS = 60_000;
 const DEFAULT_REVIEW_POLL_INTERVAL_MS = 1_000;
+export class RemoteIndexDetachedError extends Error {
+    sessionId;
+    status;
+    backendContinues = true;
+    constructor(sessionId, status, reason) {
+        super(`${reason}; backend indexing continues for session ${sessionId}. `
+            + `Reattach with getIndexSessionStatus(${JSON.stringify(sessionId)}).`);
+        this.name = "RemoteIndexDetachedError";
+        this.sessionId = sessionId;
+        this.status = status;
+    }
+}
+export class RemoteIndexCancelledError extends Error {
+    sessionId;
+    status;
+    constructor(sessionId, status) {
+        super(`Remote index session ${sessionId} was cancelled.`);
+        this.name = "RemoteIndexCancelledError";
+        this.sessionId = sessionId;
+        this.status = status;
+    }
+}
 const PENDING_REVIEW_JOB_STATES = new Set(["queued", "running"]);
 export class ReviewContextPollingTimeoutError extends Error {
     jobId;
@@ -513,6 +535,26 @@ export class CorpusWireClient {
         });
         return response.result;
     }
+    async previewIndexWorkspace(request) {
+        const remoteFiles = await Promise.all(request.files.map(prepareRemoteWorkspaceFile));
+        const manifest = buildWorkspaceManifest(remoteFiles, request.deletedPaths ?? []);
+        const response = await requestJson({
+            baseUrl: this.baseUrl,
+            paths: ["/v1/index/preview"],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    ...toStartIndexSessionPayload(request),
+                    manifest: manifest.map(toRemoteManifestEntryPayload),
+                }),
+            },
+        });
+        return response.result;
+    }
     async sendManifestBatch(sessionId, entries) {
         const response = await requestJson({
             baseUrl: this.baseUrl,
@@ -571,6 +613,34 @@ export class CorpusWireClient {
         });
         return response.result;
     }
+    async followIndexSession(sessionId, options = {}) {
+        const deadline = options.timeoutMs === undefined
+            ? null
+            : Date.now() + Math.max(1, options.timeoutMs);
+        let abortSent = false;
+        let lastSequence = -1;
+        for (;;) {
+            const status = await this.getIndexSessionStatus(sessionId);
+            if (status.progress && status.progress.sequence !== lastSequence) {
+                options.onProgress?.(status.progress);
+                lastSequence = status.progress.sequence;
+            }
+            if (["completed", "aborted", "failed", "expired"].includes(status.phase)) {
+                return status;
+            }
+            if (options.signal?.aborted && !abortSent) {
+                await this.abortIndexSession(sessionId);
+                abortSent = true;
+            }
+            if (options.detachSignal?.aborted) {
+                throw new RemoteIndexDetachedError(sessionId, status, "Detached by caller");
+            }
+            if (deadline !== null && Date.now() >= deadline) {
+                throw new RemoteIndexDetachedError(sessionId, status, "Caller wait timeout elapsed");
+            }
+            await new Promise((resolve) => setTimeout(resolve, Math.max(10, options.pollMs ?? 250)));
+        }
+    }
     async abortIndexSession(sessionId) {
         return requestJson({
             baseUrl: this.baseUrl,
@@ -589,11 +659,19 @@ export class CorpusWireClient {
             // Best effort: preserve the original indexing failure for callers.
         }
     }
-    async waitForIndexSessionProcessing(sessionId, timeoutMs, pollMs) {
-        const deadline = Date.now() + Math.max(1, timeoutMs);
+    async waitForIndexSessionProcessing(sessionId, timeoutMs, pollMs, request) {
+        const deadline = timeoutMs === undefined ? null : Date.now() + Math.max(1, timeoutMs);
+        let lastSequence = -1;
         for (;;) {
             const status = await this.getIndexSessionStatus(sessionId);
+            if (status.progress && status.progress.sequence !== lastSequence) {
+                request.onProgress?.(status.progress);
+                lastSequence = status.progress.sequence;
+            }
             if (["failed", "incomplete", "aborted", "expired"].includes(status.phase)) {
+                if (status.phase === "aborted") {
+                    return status;
+                }
                 throw new Error(`Remote index session ${sessionId} entered ${status.phase}: ${status.errors.join("; ") || "unknown error"}`);
             }
             const pendingBatches = status.pending_batches ?? 0;
@@ -601,50 +679,113 @@ export class CorpusWireClient {
             if (pendingBatches === 0 && activeBatches === 0 && status.queue_depth === 0) {
                 return status;
             }
-            if (Date.now() >= deadline) {
-                throw new Error(`Timed out waiting for remote index session ${sessionId}: ` +
-                    `phase=${status.phase}; queue_depth=${status.queue_depth}; ` +
-                    `pending_batches=${pendingBatches}; active_batches=${activeBatches}`);
+            if (request.signal?.aborted) {
+                return status;
+            }
+            if (request.detachSignal?.aborted) {
+                throw new RemoteIndexDetachedError(sessionId, status, "Detached by caller");
+            }
+            if (deadline !== null && Date.now() >= deadline) {
+                throw new RemoteIndexDetachedError(sessionId, status, "Caller wait timeout elapsed");
             }
             await new Promise((resolve) => setTimeout(resolve, Math.max(10, pollMs)));
         }
     }
     async indexWorkspace(request) {
+        const clientStartedAt = Date.now();
+        let clientSequence = 0;
+        let lastOverallPercent = null;
+        const emitProgress = (event) => {
+            const normalized = { ...event };
+            if (normalized.overall_percent !== null) {
+                normalized.overall_percent = lastOverallPercent === null
+                    ? normalized.overall_percent
+                    : Math.max(lastOverallPercent, normalized.overall_percent);
+                lastOverallPercent = normalized.overall_percent;
+            }
+            request.onProgress?.(normalized);
+        };
+        const emitClientProgress = (phase, completed, total, unit, message, sessionId = "pending", overallCompleted = 0, overallTotal = null) => {
+            emitProgress(clientIndexProgressEvent({
+                sequence: clientSequence,
+                sessionId,
+                workspaceId: request.workspace.workspaceId,
+                phase,
+                completed,
+                total,
+                unit,
+                message,
+                startedAt: clientStartedAt,
+                overallCompleted,
+                overallTotal,
+            }));
+            clientSequence += 1;
+        };
+        emitClientProgress("resolving_configuration", 0, null, "items", "Resolving remote indexing configuration");
         const remoteFiles = await Promise.all(request.files.map(prepareRemoteWorkspaceFile));
+        emitClientProgress("filtering_hashing", remoteFiles.length, remoteFiles.length, "files", "Workspace file hashes prepared");
         const session = await this.startIndexSession(request);
         try {
-            const manifestEntries = [
-                ...remoteFiles.map(({ file, content, sha256, mtimeNs }) => ({
-                    relativePath: file.relativePath,
-                    op: "upsert",
-                    size: content.byteLength,
-                    mtimeNs,
-                    sha256,
-                })),
-                ...(request.deletedPaths ?? []).map((relativePath) => ({
-                    relativePath,
-                    op: "delete",
-                })),
-            ];
+            const manifestEntries = buildWorkspaceManifest(remoteFiles, request.deletedPaths ?? []);
+            emitClientProgress("manifest_comparison", 0, manifestEntries.length, "files", "Sending manifest for comparison", session.session_id);
             const manifestResult = await this.sendManifestBatch(session.session_id, manifestEntries);
+            const initiallyComplete = manifestResult.unchanged + manifestResult.deletes + manifestResult.skipped;
+            emitClientProgress("manifest_comparison", manifestEntries.length, manifestEntries.length, "files", "Manifest comparison complete", session.session_id, initiallyComplete, manifestEntries.length);
             const uploadRequired = new Set(manifestResult.upload_required);
             const filesToUpload = remoteFiles.filter(({ file }) => uploadRequired.has(file.relativePath));
             let queuedBackgroundWork = false;
+            let uploadedFiles = 0;
             if (filesToUpload.length > 0) {
                 const uploadBatches = buildUploadBatches(filesToUpload, request.batchBytes ?? session.max_batch_bytes, session.max_batch_files);
                 await runWithConcurrency(uploadBatches, request.maxConcurrentUploads ?? session.max_concurrent_uploads, async (batchFiles) => {
                     const result = await this.uploadFileBatch(session.session_id, { files: batchFiles.map((file) => file.descriptor) }, batchFiles);
                     queuedBackgroundWork ||= result.queued === true;
+                    uploadedFiles += batchFiles.length;
+                    emitClientProgress("uploading", uploadedFiles, filesToUpload.length, "files", "Uploading changed files", session.session_id, initiallyComplete, manifestEntries.length);
                 });
             }
             if (queuedBackgroundWork) {
-                await this.waitForIndexSessionProcessing(session.session_id, request.processingTimeoutMs ?? 15 * 60 * 1000, request.processingPollMs ?? 250);
+                const processingStatus = await this.waitForIndexSessionProcessing(session.session_id, request.processingTimeoutMs, request.processingPollMs ?? 250, { ...request, onProgress: emitProgress });
+                if (request.signal?.aborted || processingStatus.phase === "aborted") {
+                    if (processingStatus.phase !== "aborted") {
+                        await this.abortIndexSession(session.session_id);
+                    }
+                    const terminal = await this.waitForIndexSessionTerminal(session.session_id, request.processingPollMs ?? 250, emitProgress, request.detachSignal);
+                    throw new RemoteIndexCancelledError(session.session_id, terminal);
+                }
             }
-            return await this.commitIndexSession(session.session_id);
+            if (request.signal?.aborted) {
+                await this.abortIndexSession(session.session_id);
+                const terminal = await this.waitForIndexSessionTerminal(session.session_id, request.processingPollMs ?? 250, emitProgress, request.detachSignal);
+                throw new RemoteIndexCancelledError(session.session_id, terminal);
+            }
+            const committed = await this.commitIndexSession(session.session_id);
+            if (committed.status.progress) {
+                emitProgress(committed.status.progress);
+            }
+            return committed;
         }
         catch (error) {
+            if (error instanceof RemoteIndexDetachedError || error instanceof RemoteIndexCancelledError) {
+                throw error;
+            }
             await this.abortIndexSessionQuietly(session.session_id);
             throw error;
+        }
+    }
+    async waitForIndexSessionTerminal(sessionId, pollMs, onProgress, detachSignal) {
+        for (;;) {
+            const status = await this.getIndexSessionStatus(sessionId);
+            if (status.progress) {
+                onProgress?.(status.progress);
+            }
+            if (["aborted", "failed", "expired", "completed"].includes(status.phase)) {
+                return status;
+            }
+            if (detachSignal?.aborted) {
+                throw new RemoteIndexDetachedError(sessionId, status, "Detached while cancellation was pending");
+            }
+            await new Promise((resolve) => setTimeout(resolve, Math.max(10, pollMs)));
         }
     }
 }
@@ -815,6 +956,62 @@ async function prepareRemoteWorkspaceFile(file) {
         content,
         sha256: file.sha256 ?? await sha256Hex(content),
         mtimeNs: file.mtimeNs ?? Date.now() * 1_000_000,
+    };
+}
+function buildWorkspaceManifest(remoteFiles, deletedPaths) {
+    return [
+        ...remoteFiles.map(({ file, content, sha256, mtimeNs }) => ({
+            relativePath: file.relativePath,
+            op: "upsert",
+            size: content.byteLength,
+            mtimeNs,
+            sha256,
+        })),
+        ...deletedPaths.map((relativePath) => ({
+            relativePath,
+            op: "delete",
+        })),
+    ];
+}
+function clientIndexProgressEvent(options) {
+    const elapsedMs = Math.max(0, Date.now() - options.startedAt);
+    const throughput = elapsedMs > 0 && options.completed > 0
+        ? options.completed / (elapsedMs / 1_000)
+        : null;
+    const overallPercent = options.overallTotal && options.overallTotal > 0
+        ? Math.min(99, (options.overallCompleted / options.overallTotal) * 99)
+        : null;
+    return {
+        schema_version: "index-progress/v1",
+        sequence: options.sequence,
+        session_id: options.sessionId,
+        workspace_id: options.workspaceId,
+        occurred_at: new Date().toISOString(),
+        phase: options.phase,
+        state: "running",
+        message: options.message,
+        overall_completed: options.overallCompleted,
+        overall_total: options.overallTotal,
+        overall_percent: overallPercent,
+        overall_indeterminate: overallPercent === null,
+        phase_completed: options.completed,
+        phase_total: options.total,
+        unit: options.unit,
+        elapsed_ms: elapsedMs,
+        phase_elapsed_ms: elapsedMs,
+        throughput_per_second: throughput,
+        queue_depth: 0,
+        retries: 0,
+        warnings: [],
+        eta_seconds: null,
+        eta_confidence: "unknown",
+        heartbeat: false,
+        last_progress_at: new Date().toISOString(),
+        last_heartbeat_at: null,
+        active_heartbeat: false,
+        counts: {},
+        phase_timings_ms: {},
+        verification_status: "pending",
     };
 }
 function buildUploadBatches(files, batchBytes, batchFiles) {

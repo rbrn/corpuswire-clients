@@ -874,6 +874,42 @@ export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 export type RemoteIndexMode = "full" | "incremental";
 export type RemoteManifestOp = "upsert" | "delete";
 export type RemoteIndexLayer = "snapshot" | "overlay";
+export type RemoteIndexProgressState = "running" | "cancelling" | "completed" | "failed" | "cancelled";
+export type RemoteIndexProgressPhase = "resolving_configuration" | "scanning" | "filtering_hashing" | "manifest_comparison" | "uploading" | "queued" | "parsing_chunking" | "embedding" | "vector_writes" | "committing" | "verifying" | "completed" | "failed" | "cancelling" | "cancelled";
+export type RemoteIndexEtaConfidence = "unknown" | "low" | "medium" | "high";
+export type RemoteIndexVerificationStatus = "pending" | "verified" | "failed" | "not_applicable";
+export interface RemoteIndexProgressEvent {
+    schema_version: "index-progress/v1";
+    sequence: number;
+    session_id: string;
+    workspace_id: string;
+    occurred_at: string;
+    phase: RemoteIndexProgressPhase;
+    state: RemoteIndexProgressState;
+    message: string;
+    overall_completed: number;
+    overall_total: number | null;
+    overall_percent: number | null;
+    overall_indeterminate: boolean;
+    phase_completed: number;
+    phase_total: number | null;
+    unit: string;
+    elapsed_ms: number;
+    phase_elapsed_ms: number;
+    throughput_per_second: number | null;
+    queue_depth: number;
+    retries: number;
+    warnings: string[];
+    eta_seconds: number | null;
+    eta_confidence: RemoteIndexEtaConfidence;
+    heartbeat: boolean;
+    last_progress_at: string;
+    last_heartbeat_at: string | null;
+    active_heartbeat: boolean;
+    counts: Record<string, number>;
+    phase_timings_ms: Record<string, number>;
+    verification_status: RemoteIndexVerificationStatus;
+}
 export interface RemoteIndexScopeV2 {
     tenantId?: string | null;
     codebaseId: string;
@@ -988,9 +1024,26 @@ export interface RemoteIndexStatus {
     failed_batches?: number;
     age_seconds?: number | null;
     idle_seconds?: number | null;
+    last_progress_seconds?: number | null;
+    active_heartbeat?: boolean;
     idle_timeout_seconds?: number | null;
     errors: string[];
+    progress?: RemoteIndexProgressEvent | null;
     snapshot_scope?: RemoteIndexScopeV2Payload | null;
+}
+export interface RemoteIndexPreview {
+    workspace_id: string;
+    collection_name: string;
+    requested_mode: RemoteIndexMode;
+    expected_mode: "full" | "incremental" | "no_change";
+    candidates: number;
+    included: number;
+    excluded: number;
+    changed: number;
+    unchanged: number;
+    deleted: number;
+    candidate_bytes: number;
+    destructive_risk: boolean;
 }
 export interface RemoteIndexSessionsResponse {
     ok: true;
@@ -1034,4 +1087,7 @@ export interface IndexWorkspaceRequest extends Omit<StartRemoteIndexSessionReque
     maxConcurrentUploads?: number;
     processingTimeoutMs?: number;
     processingPollMs?: number;
+    signal?: AbortSignal;
+    detachSignal?: AbortSignal;
+    onProgress?: (event: RemoteIndexProgressEvent) => void;
 }

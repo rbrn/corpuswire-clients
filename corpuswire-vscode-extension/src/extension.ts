@@ -684,32 +684,51 @@ async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}): Promi
           : "Indexing workspace with CorpusWire",
         cancellable: true,
       },
-      async (_progress, token) => {
+      async (progress, token) => {
+        const controller = new AbortController();
+        const cancellation = token.onCancellationRequested(() => controller.abort());
+        let reportedPercent = 0;
         const collected = await collectWorkspaceFiles(workspaceFolder, settings.remoteIndexing.maxFileSizeBytes);
         skippedLargeFiles = collected.skippedLargeFiles;
         if (token.isCancellationRequested) {
           throw new Error("Indexing cancelled before upload started.");
         }
-        await client.indexWorkspace({
-          workspace: {
-            workspaceId,
-            displayRoot: workspaceFolder.uri.toString(),
-            name: workspaceFolder.name,
-          },
-          mode: "full",
-          client: {
-            name: "corpuswire-vscode-extension",
-            transport: "vscode.workspace.fs",
+        try {
+          await client.indexWorkspace({
+            workspace: {
+              workspaceId,
+              displayRoot: workspaceFolder.uri.toString(),
+              name: workspaceFolder.name,
+            },
+            mode: "full",
+            client: {
+              name: "corpuswire-vscode-extension",
+              transport: "vscode.workspace.fs",
+              maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
+              batchBytes: settings.remoteIndexing.batchBytes,
+              maxFileSizeBytes: settings.remoteIndexing.maxFileSizeBytes,
+            },
             maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
             batchBytes: settings.remoteIndexing.batchBytes,
             maxFileSizeBytes: settings.remoteIndexing.maxFileSizeBytes,
-          },
-          maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
-          batchBytes: settings.remoteIndexing.batchBytes,
-          maxFileSizeBytes: settings.remoteIndexing.maxFileSizeBytes,
-          recreateCollection: options.recreateCollection === true,
-          files: collected.files,
-        } satisfies IndexWorkspaceRequest);
+            recreateCollection: options.recreateCollection === true,
+            files: collected.files,
+            signal: controller.signal,
+            onProgress: (event) => {
+              const percent = event.overall_percent;
+              const increment = percent === null ? undefined : Math.max(0, percent - reportedPercent);
+              if (percent !== null) {
+                reportedPercent = Math.max(reportedPercent, percent);
+              }
+              progress.report({
+                increment,
+                message: formatIndexProgressMessage(event),
+              });
+            },
+          } satisfies IndexWorkspaceRequest);
+        } finally {
+          cancellation.dispose();
+        }
       },
     );
     const skippedSuffix = skippedLargeFiles > 0
@@ -723,6 +742,22 @@ async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}): Promi
   } catch (error) {
     void vscode.window.showWarningMessage(formatIndexingError(error, indexerService.url));
   }
+}
+
+function formatIndexProgressMessage(event: {
+  phase: string;
+  elapsed_ms: number;
+  phase_completed: number;
+  phase_total: number | null;
+  unit: string;
+  active_heartbeat: boolean;
+}): string {
+  const elapsedSeconds = (event.elapsed_ms / 1_000).toFixed(1);
+  const work = event.phase_total === null
+    ? `${event.phase_completed} ${event.unit}`
+    : `${event.phase_completed}/${event.phase_total} ${event.unit}`;
+  const heartbeat = event.active_heartbeat ? " · active" : "";
+  return `${event.phase} · ${work} · ${elapsedSeconds}s${heartbeat}`;
 }
 
 function registerRemoteIndexWatchers(context: vscode.ExtensionContext): void {

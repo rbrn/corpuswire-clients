@@ -282,6 +282,32 @@ const commit = await client.indexWorkspace({
 console.log(commit.status.files_indexed, commit.status.files_deleted);
 ```
 
+Preview the same hashed manifest without acquiring a workspace lock or starting
+a session, then subscribe to semantic progress:
+
+```ts
+const preview = await client.previewIndexWorkspace(request);
+console.log(preview.expected_mode, preview.changed, preview.unchanged);
+
+const commit = await client.indexWorkspace({
+  ...request,
+  onProgress: (event) => {
+    console.log(event.phase, event.overall_percent, event.elapsed_ms);
+  },
+});
+```
+
+The stable `index-progress/v1` event preserves unknown denominators as `null`,
+caps unverified overall progress below 100, and reports 100 only after verified
+commit. It includes heartbeat/liveness, phase timing, throughput, queue, retry,
+warning, ETA-confidence, and cumulative count fields.
+
+`processingTimeoutMs` is an explicit caller wait budget, not a backend job
+timeout. Expiry raises `RemoteIndexDetachedError`; backend work continues and
+the error contains the session id. Use `followIndexSession(sessionId, ...)` to
+reattach. An `AbortSignal` sends `DELETE /v1/index/sessions/{id}` and waits for
+the terminal `aborted` status before raising `RemoteIndexCancelledError`.
+
 Use `mode: "full"` when the file list represents the complete workspace
 snapshot. The backend stores a new manifest generation and, during commit,
 deletes stale records from older generations that were not present in the new

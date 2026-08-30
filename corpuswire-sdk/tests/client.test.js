@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import {
   CorpusWireClient,
   CorpusWireHttpError,
+  RemoteIndexCancelledError,
+  RemoteIndexDetachedError,
   ReviewContextPollingCancelledError,
   ReviewContextPollingTimeoutError,
   createBasicAuthHeader,
@@ -941,6 +943,257 @@ test("remote indexWorkspace aborts a started session when indexing fails", async
   ]);
   assert.equal(calls[2].init.method, "DELETE");
 });
+
+test("previewIndexWorkspace compares a hashed manifest without starting a session", async () => {
+  const calls = [];
+  const client = new CorpusWireClient({
+    baseUrl: "http://example.test",
+    fetchFn: async (input, init) => {
+      calls.push({ input, init });
+      return jsonResponse(200, {
+        ok: true,
+        result: {
+          workspace_id: "workspace-1",
+          collection_name: "collection-1",
+          requested_mode: "full",
+          expected_mode: "no_change",
+          candidates: 1,
+          included: 1,
+          excluded: 0,
+          changed: 0,
+          unchanged: 1,
+          deleted: 0,
+          candidate_bytes: 7,
+          destructive_risk: false,
+        },
+      });
+    },
+  });
+
+  const result = await client.previewIndexWorkspace({
+    workspace: { workspaceId: "workspace-1" },
+    mode: "full",
+    files: [{ relativePath: "README.md", content: "# Demo\n" }],
+  });
+
+  assert.equal(result.expected_mode, "no_change");
+  assert.deepEqual(calls.map((call) => call.input), ["http://example.test/v1/index/preview"]);
+  const payload = JSON.parse(calls[0].init.body);
+  assert.match(payload.manifest[0].sha256, /^[0-9a-f]{64}$/);
+});
+
+test("remote indexWorkspace emits monotonic semantic progress and 100 once", async () => {
+  const progress = [];
+  let statusCalls = 0;
+  const client = new CorpusWireClient({
+    baseUrl: "http://example.test",
+    fetchFn: async (input) => {
+      if (input.endsWith("/v1/index/sessions")) {
+        return jsonResponse(200, { ok: true, result: {
+          session_id: "sess-progress", workspace_id: "workspace-1", collection_name: "collection-1",
+          mode: "full", manifest_revision: 1, max_batch_bytes: 1024, max_batch_files: 1,
+          max_file_size_bytes: 1024, max_concurrent_uploads: 1,
+        } });
+      }
+      if (input.endsWith("/manifest/batch")) {
+        return jsonResponse(200, { ok: true, result: {
+          accepted: 1, upload_required: ["README.md"], unchanged: 0, deletes: 0, skipped: 0, errors: [],
+        } });
+      }
+      if (input.endsWith("/files/batch")) {
+        return jsonResponse(202, { ok: true, result: {
+          files_received: 1, files_indexed: 0, bytes_uploaded: 0, bytes_skipped: 0,
+          errors: [], queued: true, job_id: "job-1", phase: "queued",
+        } });
+      }
+      if (input.endsWith("/status")) {
+        statusCalls += 1;
+        const completed = statusCalls > 1;
+        return jsonResponse(200, { ok: true, result: {
+          session_id: "sess-progress", workspace_id: "workspace-1", collection_name: "collection-1",
+          mode: "full", phase: completed ? "ready_to_commit" : "indexing",
+          files_manifested: 1, files_indexed: completed ? 1 : 0, files_deleted: 0,
+          files_unchanged: 0, files_skipped: 0, bytes_uploaded: completed ? 7 : 0,
+          bytes_skipped: 0, queue_depth: completed ? 0 : 1, pending_batches: 0,
+          active_batches: completed ? 0 : 1, errors: [],
+          progress: progressEvent(statusCalls, completed ? 99 : 25, completed ? "vector_writes" : "embedding"),
+        } });
+      }
+      if (input.endsWith("/commit")) {
+        return jsonResponse(200, { ok: true, result: { documents_indexed: 1 }, status: {
+          session_id: "sess-progress", workspace_id: "workspace-1", collection_name: "collection-1",
+          mode: "full", phase: "completed", files_manifested: 1, files_indexed: 1,
+          files_deleted: 0, files_unchanged: 0, files_skipped: 0, bytes_uploaded: 7,
+          bytes_skipped: 0, queue_depth: 0, errors: [],
+          progress: { ...progressEvent(3, 100, "completed"), state: "completed", verification_status: "verified" },
+        } });
+      }
+      throw new Error(`Unexpected request: ${input}`);
+    },
+  });
+
+  await client.indexWorkspace({
+    workspace: { workspaceId: "workspace-1" },
+    files: [{ relativePath: "README.md", content: "# Demo\n" }],
+    processingPollMs: 1,
+    onProgress: (event) => progress.push(event),
+  });
+
+  const percentages = progress.map((event) => event.overall_percent).filter((value) => value !== null);
+  assert.deepEqual(percentages, [...percentages].sort((left, right) => left - right));
+  assert.equal(percentages.filter((value) => value === 100).length, 1);
+  assert.ok(progress.some((event) => event.phase === "uploading"));
+  assert.ok(progress.some((event) => event.phase === "embedding"));
+});
+
+test("explicit processing timeout detaches without aborting backend work", async () => {
+  const calls = [];
+  const client = new CorpusWireClient({
+    baseUrl: "http://example.test",
+    fetchFn: async (input) => {
+      calls.push(input);
+      if (input.endsWith("/v1/index/sessions")) {
+        return jsonResponse(200, { ok: true, result: {
+          session_id: "sess-timeout", workspace_id: "workspace-1", collection_name: "collection-1",
+          mode: "full", manifest_revision: 1, max_batch_bytes: 1024, max_batch_files: 1,
+          max_file_size_bytes: 1024, max_concurrent_uploads: 1,
+        } });
+      }
+      if (input.endsWith("/manifest/batch")) {
+        return jsonResponse(200, { ok: true, result: {
+          accepted: 1, upload_required: ["README.md"], unchanged: 0, deletes: 0, skipped: 0, errors: [],
+        } });
+      }
+      if (input.endsWith("/files/batch")) {
+        return jsonResponse(202, { ok: true, result: {
+          files_received: 1, files_indexed: 0, bytes_uploaded: 0, bytes_skipped: 0, errors: [], queued: true,
+        } });
+      }
+      if (input.endsWith("/status")) {
+        return jsonResponse(200, { ok: true, result: {
+          session_id: "sess-timeout", workspace_id: "workspace-1", collection_name: "collection-1",
+          mode: "full", phase: "indexing", files_manifested: 1, files_indexed: 0,
+          files_deleted: 0, files_unchanged: 0, files_skipped: 0, bytes_uploaded: 0,
+          bytes_skipped: 0, queue_depth: 1, pending_batches: 0, active_batches: 1, errors: [],
+        } });
+      }
+      throw new Error(`Unexpected request: ${input}`);
+    },
+  });
+
+  await assert.rejects(client.indexWorkspace({
+    workspace: { workspaceId: "workspace-1" },
+    files: [{ relativePath: "README.md", content: "# Demo\n" }],
+    processingTimeoutMs: 1,
+    processingPollMs: 1,
+  }), RemoteIndexDetachedError);
+  assert.equal(calls.some((input) => input.endsWith("/sess-timeout")), false);
+});
+
+test("AbortSignal sends a backend abort and waits for terminal acknowledgement", async () => {
+  const calls = [];
+  let aborted = false;
+  const client = new CorpusWireClient({
+    baseUrl: "http://example.test",
+    fetchFn: async (input, init = {}) => {
+      calls.push({ input, method: init.method ?? "GET" });
+      if (input.endsWith("/v1/index/sessions")) {
+        return jsonResponse(200, { ok: true, result: {
+          session_id: "sess-cancel", workspace_id: "workspace-1", collection_name: "collection-1",
+          mode: "full", manifest_revision: 1, max_batch_bytes: 1024, max_batch_files: 1,
+          max_file_size_bytes: 1024, max_concurrent_uploads: 1,
+        } });
+      }
+      if (input.endsWith("/manifest/batch")) {
+        return jsonResponse(200, { ok: true, result: {
+          accepted: 1, upload_required: ["README.md"], unchanged: 0, deletes: 0, skipped: 0, errors: [],
+        } });
+      }
+      if (input.endsWith("/files/batch")) {
+        return jsonResponse(202, { ok: true, result: {
+          files_received: 1, files_indexed: 0, bytes_uploaded: 0, bytes_skipped: 0, errors: [], queued: true,
+        } });
+      }
+      if (input.endsWith("/status")) {
+        return jsonResponse(200, { ok: true, result: {
+          session_id: "sess-cancel", workspace_id: "workspace-1", collection_name: "collection-1",
+          mode: "full", phase: aborted ? "aborted" : "indexing", files_manifested: 1,
+          files_indexed: 0, files_deleted: 0, files_unchanged: 0, files_skipped: 0,
+          bytes_uploaded: 0, bytes_skipped: 0, queue_depth: aborted ? 0 : 1,
+          pending_batches: 0, active_batches: aborted ? 0 : 1, errors: [],
+        } });
+      }
+      if (input.endsWith("/sess-cancel") && init.method === "DELETE") {
+        aborted = true;
+        return jsonResponse(200, { ok: true, session_id: "sess-cancel", phase: "cancelling" });
+      }
+      throw new Error(`Unexpected request: ${input}`);
+    },
+  });
+  const controller = new AbortController();
+  controller.abort();
+
+  await assert.rejects(client.indexWorkspace({
+    workspace: { workspaceId: "workspace-1" },
+    files: [{ relativePath: "README.md", content: "# Demo\n" }],
+    processingPollMs: 1,
+    signal: controller.signal,
+  }), RemoteIndexCancelledError);
+  assert.equal(calls.filter((call) => call.method === "DELETE").length, 1);
+  assert.equal(calls.some((call) => call.input.endsWith("/commit")), false);
+});
+
+test("a second-interrupt detach cannot overtake the first backend abort", async () => {
+  const calls = [];
+  const client = new CorpusWireClient({
+    baseUrl: "http://example.test",
+    fetchFn: async (input, init = {}) => {
+      calls.push({ input, method: init.method ?? "GET" });
+      if (input.endsWith("/status")) {
+        return jsonResponse(200, { ok: true, result: {
+          session_id: "sess-double-interrupt", workspace_id: "workspace-1",
+          collection_name: "collection-1", mode: "full", phase: "indexing",
+          files_manifested: 1, files_indexed: 0, files_deleted: 0,
+          files_unchanged: 0, files_skipped: 0, bytes_uploaded: 0,
+          bytes_skipped: 0, queue_depth: 1, pending_batches: 0,
+          active_batches: 1, errors: [],
+        } });
+      }
+      if (input.endsWith("/sess-double-interrupt") && init.method === "DELETE") {
+        return jsonResponse(200, {
+          ok: true,
+          session_id: "sess-double-interrupt",
+          phase: "cancelling",
+        });
+      }
+      throw new Error(`Unexpected request: ${input}`);
+    },
+  });
+  const cancelController = new AbortController();
+  const detachController = new AbortController();
+  cancelController.abort();
+  detachController.abort();
+
+  await assert.rejects(client.followIndexSession("sess-double-interrupt", {
+    signal: cancelController.signal,
+    detachSignal: detachController.signal,
+    pollMs: 1,
+  }), RemoteIndexDetachedError);
+  assert.equal(calls.filter((call) => call.method === "DELETE").length, 1);
+});
+
+function progressEvent(sequence, percent, phase) {
+  return {
+    schema_version: "index-progress/v1", sequence, session_id: "sess-progress", workspace_id: "workspace-1",
+    occurred_at: new Date().toISOString(), phase, state: "running", message: phase,
+    overall_completed: percent, overall_total: 100, overall_percent: percent, overall_indeterminate: false,
+    phase_completed: percent, phase_total: 100, unit: "items", elapsed_ms: sequence * 10,
+    phase_elapsed_ms: sequence * 10, throughput_per_second: 1, queue_depth: 0, retries: 0,
+    warnings: [], eta_seconds: null, eta_confidence: "unknown", heartbeat: false,
+    last_progress_at: new Date().toISOString(), last_heartbeat_at: null, active_heartbeat: false,
+    counts: {}, phase_timings_ms: {}, verification_status: "pending",
+  };
+}
 
 test("index event helpers query activity endpoints", async () => {
   const calls = [];

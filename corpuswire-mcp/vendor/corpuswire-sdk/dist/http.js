@@ -173,6 +173,28 @@ function parseApiError(responseBody) {
             };
         }
         const candidate = payload;
+        if ("detail" in payload) {
+            const detail = payload.detail;
+            const detailRecord = detail && typeof detail === "object" && !Array.isArray(detail)
+                ? detail
+                : null;
+            const message = typeof detail === "string"
+                ? detail
+                : typeof detailRecord?.message === "string"
+                    ? detailRecord.message
+                    : "CorpusWire request failed";
+            return {
+                requestId: "",
+                durationMs: null,
+                errorCode: "http_error",
+                errorMessage: message,
+                errorDetail: detail,
+                errorEnvelope: null,
+                retryable: false,
+                retryAfterSeconds: null,
+                recoveryGuidance: [],
+            };
+        }
         if (candidate.ok !== false
             || typeof candidate.request_id !== "string"
             || typeof candidate.duration_ms !== "number"

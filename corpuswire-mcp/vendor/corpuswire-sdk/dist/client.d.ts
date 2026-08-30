@@ -1,4 +1,15 @@
-import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceResponseEnvelope, CodebaseRepositoriesV1, CodebaseV1, CreateCodebaseRequest, GitHubProviderBindingPayload, GitHubProviderBindingRequest, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexSessionQuery, IndexWorkspaceRequest, CorpusWireClientOptions, LlmModelState, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, QualityEvent, QualityEventPayload, QualityEventRequest, QualityEventsQuery, QualityReview, QualityReviewQuery, QueryValueEvent, ProviderBindingResponseV1, ProviderBindingRevocationV1, ValueFeedbackRequest, ValueRollup, ValueRollupQuery, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexSession, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, ReviewContextCapabilitiesV1, ReviewContextJobV1, ReviewContextPollOptions, ReviewContextRequest, ReviewContextRequestV1, ReviewContextResult, ReviewTelemetrySummaryV1, ReviewPurgeV1, ReviewStatusV1, SearchHit, StartRemoteIndexSessionRequest, WorkspaceDiagnosis, WorkspaceDiagnosisRequest, UpdateCodebaseRequest } from "./types.js";
+import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceResponseEnvelope, CodebaseRepositoriesV1, CodebaseV1, CreateCodebaseRequest, GitHubProviderBindingPayload, GitHubProviderBindingRequest, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexSessionQuery, IndexWorkspaceRequest, CorpusWireClientOptions, LlmModelState, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, QualityEvent, QualityEventPayload, QualityEventRequest, QualityEventsQuery, QualityReview, QualityReviewQuery, QueryValueEvent, ProviderBindingResponseV1, ProviderBindingRevocationV1, ValueFeedbackRequest, ValueRollup, ValueRollupQuery, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexProgressEvent, RemoteIndexPreview, RemoteIndexSession, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, ReviewContextCapabilitiesV1, ReviewContextJobV1, ReviewContextPollOptions, ReviewContextRequest, ReviewContextRequestV1, ReviewContextResult, ReviewTelemetrySummaryV1, ReviewPurgeV1, ReviewStatusV1, SearchHit, StartRemoteIndexSessionRequest, WorkspaceDiagnosis, WorkspaceDiagnosisRequest, UpdateCodebaseRequest } from "./types.js";
+export declare class RemoteIndexDetachedError extends Error {
+    readonly sessionId: string;
+    readonly status: RemoteIndexStatus;
+    readonly backendContinues = true;
+    constructor(sessionId: string, status: RemoteIndexStatus, reason: string);
+}
+export declare class RemoteIndexCancelledError extends Error {
+    readonly sessionId: string;
+    readonly status: RemoteIndexStatus;
+    constructor(sessionId: string, status: RemoteIndexStatus);
+}
 export declare class ReviewContextPollingTimeoutError extends Error {
     readonly jobId: string;
     readonly timeoutMs: number;
@@ -56,10 +67,18 @@ export declare class CorpusWireClient {
     getIndexActivity(request?: IndexActivityQuery): Promise<IndexActivitySummary>;
     listIndexSessions(request?: IndexSessionQuery): Promise<RemoteIndexStatus[]>;
     startIndexSession(request: StartRemoteIndexSessionRequest): Promise<RemoteIndexSession>;
+    previewIndexWorkspace(request: IndexWorkspaceRequest): Promise<RemoteIndexPreview>;
     sendManifestBatch(sessionId: string, entries: RemoteManifestEntry[]): Promise<RemoteManifestBatchResult>;
     uploadFileBatch(sessionId: string, metadata: RemoteFileBatchMetadata, files: RemoteFileContent[]): Promise<RemoteFileBatchResult>;
     commitIndexSession(sessionId: string): Promise<RemoteIndexCommitResponse>;
     getIndexSessionStatus(sessionId: string): Promise<RemoteIndexStatus>;
+    followIndexSession(sessionId: string, options?: {
+        timeoutMs?: number;
+        pollMs?: number;
+        signal?: AbortSignal;
+        detachSignal?: AbortSignal;
+        onProgress?: (event: RemoteIndexProgressEvent) => void;
+    }): Promise<RemoteIndexStatus>;
     abortIndexSession(sessionId: string): Promise<{
         ok: true;
         session_id: string;
@@ -68,6 +87,7 @@ export declare class CorpusWireClient {
     private abortIndexSessionQuietly;
     private waitForIndexSessionProcessing;
     indexWorkspace(request: IndexWorkspaceRequest): Promise<RemoteIndexCommitResponse>;
+    private waitForIndexSessionTerminal;
 }
 export declare function toQualityEventPayload(request: QualityEventRequest): QualityEventPayload;
 export declare function toEnhancePayload(request: string | EnhancePromptRequest): EnhancePromptPayload;
