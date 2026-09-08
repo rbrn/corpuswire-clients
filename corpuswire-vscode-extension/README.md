@@ -374,3 +374,7 @@ valid for hosted services that cannot mount the local path.
   settings include `semanticSearch` for shared configuration consistency.
 - Backend `index-events` and `index-activity` are the preferred way to diagnose
   stale or failed update flows.
+
+## Full-scan readiness
+
+Full indexing now fails if an eligible file cannot be read or changes during its read. It supplies a declared inventory for the selected include/exclude policy and skips symlinks. Watcher batches retain incremental semantics and cannot establish a full baseline by themselves. Completion notifications display inventory coverage and acknowledged transferred files separately; unsupported older services display unknown coverage.

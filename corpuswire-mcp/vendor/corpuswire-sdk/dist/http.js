@@ -2,6 +2,7 @@ const TRANSIENT_HTTP_STATUSES = new Set([429, 502, 503, 504]);
 const DEFAULT_RETRY_ATTEMPTS = 2;
 const DEFAULT_RETRY_DELAY_MS = 250;
 export class CorpusWireHttpError extends Error {
+    transfer;
     status;
     statusText;
     responseBody;

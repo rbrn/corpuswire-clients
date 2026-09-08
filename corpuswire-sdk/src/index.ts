@@ -153,3 +153,6 @@ export type {
   WorkspaceDiagnosisResolutionMode,
   WorkspaceDiagnosisStatus,
 } from "./types.js";
+
+export { INVENTORY_VERSION, WorkspaceScanIncompleteError, canonicalInventoryPath, inventoryDigest, inventorySha256, selectionPolicyDigest, buildWorkspaceInventory, isRetrievalExcludedPath } from "./inventory.js";
+export type { InventoryScan, InventorySelectionPolicy, WorkspaceInventory, WorkspaceCoverage, IndexTransferSummary } from "./types.js";

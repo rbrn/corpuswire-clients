@@ -4,7 +4,7 @@ import { execFile } from "node:child_process";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { existsSync, watch as watchFileSystem } from "node:fs";
-import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, stat, lstat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -31,7 +31,7 @@ const DEFAULT_SYNC_SESSION_CONFLICT_RETRY_DELAY_MS = 750;
 const DEFAULT_SYNC_SESSION_CONFLICT_RETRY_MAX_DELAY_MS = 5000;
 const DEFAULT_SYNC_RECENT_EVENTS_LIMIT = 25;
 const DEFAULT_SYNC_LATENCY_SAMPLE_LIMIT = 20;
-const DEFAULT_SYNC_CACHE_SCHEMA_VERSION = 1;
+const DEFAULT_SYNC_CACHE_SCHEMA_VERSION = 2;
 const DIRECTORY_GLOB_PROBE = "__corpuswire_directory_probe__";
 const OUTPUT_MODES = new Set(["generic", "copilot", "claude-code", "sequential"]);
 const QUALITY_WORK_TYPES = Object.freeze([
@@ -360,6 +360,9 @@ class SyncManager {
         if (Array.isArray(capabilities.supported_filenames)) {
           this.indexableFilenames = new Set(filenames);
         }
+        if (Number.isSafeInteger(capabilities.max_file_size_bytes) && capabilities.max_file_size_bytes > 0) {
+          this.serverMaxFileSizeBytes = capabilities.max_file_size_bytes;
+        }
         if (typeof capabilities.supported_file_registry_version === "string") {
           this.supportedFileRegistryVersion = capabilities.supported_file_registry_version.slice(0, 128);
         }
@@ -371,15 +374,10 @@ class SyncManager {
   }
 
   isCacheUsable() {
-    if (!this.isCacheEnabled()) {
-      return false;
-    }
-    if (optionalBoolean(this.env.CORPUSWIRE_SYNC_BOOTSTRAP_CHECK, false)) {
-      if (this.activeBootstrapCheck || !this.bootstrapStatus.checkedAt) {
-        return false;
-      }
-    }
-    return this.bootstrapStatus.state !== "error" && this.bootstrapStatus.needsReconcile !== true;
+    return this.isCacheEnabled() && this.observationGap === false
+      && !this.activeBootstrapCheck && this.bootstrapStatus.coverage?.state === "verified"
+      && Boolean(this.bootstrapStatus.coverage.coverage_token)
+      && this.bootstrapStatus.needsReconcile !== true;
   }
 
   async probePaths(args = {}) {
@@ -705,7 +703,9 @@ class SyncManager {
       && (staleAfterMs === 0 || (freshnessAgeMs !== null && freshnessAgeMs >= staleAfterMs));
     return {
       state: this.bootstrapStatus.state,
-      needsReconcile: this.bootstrapStatus.needsReconcile,
+      needsReconcile: this.observationGap !== false || this.bootstrapStatus.needsReconcile,
+      observationGap: this.observationGap !== false,
+      coverage: this.bootstrapStatus.coverage ?? null,
       checkedAt,
       ageMs: freshnessAgeMs,
       reason: this.bootstrapStatus.reason,
@@ -926,6 +926,10 @@ class SyncManager {
       ? await client.diagnoseWorkspace({ repoPath, workspaceId })
       : diagnosisFromHealth(await client.health({ repoPath, workspaceId }), { repoPath, workspaceId });
     const bootstrapStatus = bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId });
+    if (this.observationGap === false && this.bootstrapStatus.coverage?.coverage_token
+      && this.bootstrapStatus.coverage.coverage_token !== bootstrapStatus.coverage?.coverage_token) {
+      this.observationGap = true;
+    }
     this.recordBootstrapStatus(bootstrapStatus);
     return bootstrapStatus;
   }
@@ -939,6 +943,7 @@ class SyncManager {
     const context = this.resolveContext(args);
     this.activeReconcile = this.runReconcile(context, args, onProgress)
       .catch((error) => {
+        this.observationGap = true;
         this.recordError(error, "reconcile");
         this.lastReconcileFinishedAt = new Date().toISOString();
         return {
@@ -946,7 +951,9 @@ class SyncManager {
           reconcile: true,
           error: error instanceof Error ? error.message : String(error),
           filesQueued: 0,
-          filesUploaded: 0,
+          filesUploaded: error.transfer?.files_transferred ?? null,
+          transfer: error.transfer ?? null,
+          code: error.code ?? null,
           filesDeleted: 0,
           filesSkipped: 0,
         };
@@ -1035,7 +1042,8 @@ class SyncManager {
               sessionId: error.sessionId,
               error: error.message,
               filesQueued: batch.changedPaths.length,
-              filesUploaded: batch.changedPaths.length,
+              filesUploaded: error.transfer?.files_transferred ?? null,
+              transfer: error.transfer ?? null,
               filesDeleted: batch.deletedPaths.length,
               filesSkipped: 0,
             };
@@ -1048,7 +1056,8 @@ class SyncManager {
             requeued: true,
             error: error instanceof Error ? error.message : String(error),
             filesQueued: batch.changedPaths.length,
-            filesUploaded: 0,
+            filesUploaded: error.transfer?.files_transferred ?? null,
+            transfer: error.transfer ?? null,
             filesDeleted: batch.deletedPaths.length,
             filesSkipped: 0,
           };
@@ -1093,6 +1102,10 @@ class SyncManager {
   async runBatch(batch, { processingTimeoutMs = undefined, onProgress = undefined } = {}) {
     const startedAt = Date.now();
     this.lastFlushStartedAt = new Date(startedAt).toISOString();
+    if (this.observationGap === false) {
+      try { await this.refreshBootstrapStatus(batch); }
+      catch { this.observationGap = true; }
+    }
     const files = [];
     const cacheEntries = [];
     const deletedPaths = new Set(batch.deletedPaths);
@@ -1170,6 +1183,11 @@ class SyncManager {
         name: path.basename(batch.sourceRoot),
       },
       mode: "incremental",
+      ...(this.observationGap === false && this.bootstrapStatus.coverage?.state === "verified"
+        && this.coverageContextKey === syncContextKey(batch) ? {
+        baseCoverageToken: this.bootstrapStatus.coverage.coverage_token,
+        selectionPolicyDigest: this.bootstrapStatus.coverage.selection_policy_digest,
+      } : {}),
       client: removeUndefinedValues({
         name: SERVER_NAME,
         transport: "codex-mcp",
@@ -1209,7 +1227,9 @@ class SyncManager {
       ok: true,
       noOp: false,
       filesQueued: batch.changedPaths.length,
-      filesUploaded: files.length,
+      filesUploaded: response.transfer?.files_transferred ?? null,
+      filesSubmitted: response.transfer?.files_submitted ?? files.length,
+      filesReused: response.transfer?.files_reused ?? null,
       filesDeleted: deletedPaths.size,
       filesSkipped: skippedPaths.length,
       skippedPaths,
@@ -1249,6 +1269,7 @@ class SyncManager {
         if (remoteFile.file) {
           files.push(remoteFile.file);
         } else {
+          if (remoteFile.reason !== "too_large") throw scanIncompleteError();
           skippedPaths.push(entry.relativePath);
           this.recordSyncEvent({
             source: "reconcile",
@@ -1259,9 +1280,7 @@ class SyncManager {
           });
         }
       } catch (error) {
-        if (!isMissingFileError(error)) {
-          throw error;
-        }
+        throw scanIncompleteError(error);
       }
     }
     const fileReadDurationMs = Date.now() - fileReadStartedAt;
@@ -1279,6 +1298,18 @@ class SyncManager {
         name: path.basename(context.sourceRoot),
       },
       mode: "full",
+      includeGlobs: context.includeGlobs ?? [],
+      excludeGlobs: context.excludeGlobs ?? [],
+      inventoryScan: {
+        complete: true, startedAt: new Date(discoveryStartedAt).toISOString(),
+        completedAt: new Date().toISOString(),
+        excludedFileCount: (changedPaths.excludedFileCount ?? 0) + skippedPaths.length,
+        producer: "corpuswire-mcp-scan/v1",
+        ignoreDigest: createHash("sha256").update(JSON.stringify({
+          excludedSegments: [...EXCLUDED_PATH_SEGMENTS].sort(), hiddenDirectories: "except-safe-ancestors",
+          sensitiveTerraform: "skip/v1", discoveryOnly: "skip/v1",
+        })).digest("hex"),
+      },
       client: removeUndefinedValues({
         name: SERVER_NAME,
         transport: "codex-mcp-reconcile",
@@ -1296,16 +1327,17 @@ class SyncManager {
         undefined,
       ),
       batchBytes: optionalPositiveInteger(this.env.CORPUSWIRE_SYNC_BATCH_BYTES, undefined),
-      maxFileSizeBytes: optionalPositiveInteger(
-        this.env.CORPUSWIRE_SYNC_MAX_FILE_SIZE_BYTES,
-        DEFAULT_SYNC_MAX_FILE_SIZE_BYTES,
-      ),
+      maxFileSizeBytes: context.effectiveMaxFileSizeBytes,
       recreateCollection,
       files,
       deletedPaths: [],
       onProgress,
     }, { operation: "reconcile" });
 
+    this.observationGap = response.status?.coverage?.state !== "verified";
+    await this.applySyncCacheUploadResult(context, files.map((file) => ({
+      relativePath: file.relativePath, size: file.content.length, mtimeNs: file.mtimeNs, sha256: file.sha256,
+    })), new Set(), response, true);
     const durationMs = Date.now() - startedAt;
     const observability = buildMcpIndexTrace({
       client,
@@ -1319,7 +1351,9 @@ class SyncManager {
       noOp: false,
       reconcile: true,
       filesQueued: changedPaths.length,
-      filesUploaded: files.length,
+      filesUploaded: response.transfer?.files_transferred ?? null,
+      filesSubmitted: response.transfer?.files_submitted ?? files.length,
+      filesReused: response.transfer?.files_reused ?? null,
       filesDeleted: 0,
       filesSkipped: skippedPaths.length,
       skippedPaths,
@@ -1333,15 +1367,12 @@ class SyncManager {
   }
 
   async readRemoteFile(entry, context, { useCache = false } = {}) {
-    const fileStat = await stat(entry.absolutePath);
+    const fileStat = await lstat(entry.absolutePath);
     if (!fileStat.isFile()) {
       return { skipped: true, reason: "not_file" };
     }
 
-    const maxFileSizeBytes = optionalPositiveInteger(
-      this.env.CORPUSWIRE_SYNC_MAX_FILE_SIZE_BYTES,
-      DEFAULT_SYNC_MAX_FILE_SIZE_BYTES,
-    );
+    const maxFileSizeBytes = context.effectiveMaxFileSizeBytes ?? DEFAULT_SYNC_MAX_FILE_SIZE_BYTES;
     if (fileStat.size > maxFileSizeBytes) {
       return { skipped: true, reason: "too_large" };
     }
@@ -1353,6 +1384,9 @@ class SyncManager {
     }
 
     const content = await readFile(entry.absolutePath);
+    const after = await lstat(entry.absolutePath);
+    if (!after.isFile() || after.isSymbolicLink() || after.size !== fileStat.size
+      || after.mtimeMs !== fileStat.mtimeMs || content.length !== fileStat.size) throw scanIncompleteError();
     const sha256 = createHash("sha256").update(content).digest("hex");
     if (cached?.cacheState && cached?.entry && cached.entry.sha256 === sha256) {
       await this.updateSyncCacheEntry(cached.cacheState, {
@@ -1438,47 +1472,65 @@ class SyncManager {
   }
 
   async findUsableCacheEntry(context, entry, fileStat, mtimeNs) {
-    if (!this.isCacheUsable()) {
+    if (!this.isCacheUsable() || this.coverageContextKey !== syncContextKey(context)) {
       this.recordCacheDecision(this.isCacheEnabled() ? "unusable" : "disabled");
       return null;
     }
     const cacheState = await this.loadSyncCache(context);
+    if (cacheState.data.coverage?.coverage_token !== this.bootstrapStatus.coverage?.coverage_token
+      || cacheState.data.collection !== this.bootstrapStatus.collection
+      || cacheState.data.coverage?.selection_policy_digest !== this.bootstrapStatus.coverage?.selection_policy_digest) {
+      return null;
+    }
     const cachedEntry = asRecord(cacheState.data.entries?.[entry.relativePath]);
     if (!cachedEntry.sha256) {
       this.recordCacheDecision("miss");
       return { cacheState, entry: null };
     }
-    if (cachedEntry.size === fileStat.size && cachedEntry.mtimeNs === mtimeNs) {
-      this.recordCacheDecision("unchanged_mtime_size");
-      this.recordSyncEvent({
-        source: "cache",
-        eventType: "changed",
-        relativePath: entry.relativePath,
-        decision: "skipped",
-        reason: "unchanged_mtime_size",
-      });
-      return { cacheState, entry: cachedEntry, skipReason: "unchanged_mtime_size" };
-    }
     return { cacheState, entry: cachedEntry };
   }
 
-  async applySyncCacheUploadResult(context, cacheEntries, deletedPaths, response) {
+  async applySyncCacheUploadResult(context, cacheEntries, deletedPaths, response, fullBaseline = false) {
+    const evidence = response.status?.coverage;
+    if (evidence?.state === "verified" && response.transfer?.complete) {
+      this.coverageContextKey = syncContextKey(context);
+      this.bootstrapStatus = { ...this.bootstrapStatus, coverage: evidence,
+        checkedAt: new Date().toISOString(), collection: response.status.collection_name,
+        state: "ready", needsReconcile: false };
+    } else {
+      this.observationGap = true;
+    }
     if (!this.isCacheEnabled()) {
       return;
     }
     let cacheState;
     try {
       cacheState = await this.loadSyncCache(context);
+      if (fullBaseline) cacheState.data.entries = {};
+      const coverage = response.status?.coverage;
+      cacheState.data.coverage = coverage ?? null;
+      cacheState.data.collection = response.status?.collection_name ?? null;
+      if (coverage?.state !== "verified" || !response.transfer?.complete) {
+        this.observationGap = true;
+        await this.saveSyncCache(cacheState);
+        return;
+      }
+      this.coverageContextKey = syncContextKey(context);
+      this.bootstrapStatus = { ...this.bootstrapStatus, coverage, checkedAt: new Date().toISOString(),
+        collection: response.status.collection_name, state: "ready", needsReconcile: false };
       const manifestRevision = asRecord(asRecord(response).status).manifest_revision;
       const uploadedAt = new Date().toISOString();
       for (const entry of cacheEntries) {
+        const acknowledgement = response.transfer.acknowledged_files?.find((ack) =>
+          ack.relative_path === entry.relativePath && ack.sha256 === entry.sha256);
+        if (!acknowledgement) continue;
         cacheState.data.entries[entry.relativePath] = removeUndefinedValues({
           size: entry.size,
           mtimeNs: entry.mtimeNs,
           sha256: entry.sha256,
           lastUploadedAt: uploadedAt,
           manifestRevision,
-          lastDecision: "uploaded",
+          lastDecision: acknowledgement.disposition,
           lastError: null,
         });
         this.recordCacheDecision("updated");
@@ -1610,6 +1662,7 @@ class SyncManager {
 
   async collectWorkspaceFileEntries(context, maxFiles) {
     const result = [];
+    result.excludedFileCount = 0;
     const { sourceRoot } = context;
     const stack = [sourceRoot];
     while (stack.length > 0) {
@@ -1618,10 +1671,7 @@ class SyncManager {
       try {
         entries = await readdir(directory, { withFileTypes: true });
       } catch (error) {
-        if (isMissingFileError(error) && directory !== sourceRoot) {
-          continue;
-        }
-        throw error;
+        throw scanIncompleteError(error);
       }
       entries.sort((left, right) => left.name.localeCompare(right.name));
       for (const entry of entries) {
@@ -1644,10 +1694,11 @@ class SyncManager {
           continue;
         }
         if (!isSyncIndexableRelativePath(relativePath, context)) {
+          result.excludedFileCount += 1;
           continue;
         }
         if (result.length >= maxFiles) {
-          throw new Error(`Reconciliation exceeded max file count ${maxFiles}. Increase CORPUSWIRE_SYNC_RECONCILE_MAX_FILES.`);
+          throw Object.assign(new Error(`Reconciliation exceeded max file count ${maxFiles}. Increase CORPUSWIRE_SYNC_RECONCILE_MAX_FILES.`), { code: "scan_incomplete" });
         }
         result.push({ absolutePath, relativePath });
       }
@@ -1673,6 +1724,14 @@ class SyncManager {
       throw new JsonRpcError(-32602, "Sync requires workspaceId or CORPUSWIRE_WORKSPACE_ID.");
     }
     return {
+      effectiveMaxFileSizeBytes: Math.min(
+        optionalPositiveInteger(this.env.CORPUSWIRE_SYNC_MAX_FILE_SIZE_BYTES, DEFAULT_SYNC_MAX_FILE_SIZE_BYTES),
+        this.serverMaxFileSizeBytes ?? DEFAULT_SYNC_MAX_FILE_SIZE_BYTES),
+      serviceBaseUrl: firstNonEmptyString(this.env.CORPUSWIRE_BASE_URL, DEFAULT_BASE_URL).replace(/\/+$/, ""),
+      selectionIdentity: JSON.stringify({
+        maxFileSizeBytes: this.env.CORPUSWIRE_SYNC_MAX_FILE_SIZE_BYTES ?? DEFAULT_SYNC_MAX_FILE_SIZE_BYTES,
+        supportedFileRegistryVersion: this.supportedFileRegistryVersion ?? null, producer: "corpuswire-mcp-scan/v1",
+      }),
       sourceRoot: path.resolve(sourceRootRaw),
       workspaceId,
       includeGlobs: resolveSyncGlobList(args, this.env.CORPUSWIRE_SYNC_INCLUDE_GLOBS, "includeGlobs", "include_globs"),
@@ -1737,6 +1796,7 @@ class SyncManager {
     // priority, so we only insert back paths that have no current entry.
     if (!this.pendingContext) {
       this.pendingContext = {
+        ...batch,
         sourceRoot: batch.sourceRoot,
         workspaceId: batch.workspaceId,
         includeGlobs: batch.includeGlobs ?? [],
@@ -1791,6 +1851,7 @@ class SyncManager {
     }
 
     return {
+      ...context,
       sourceRoot: context.sourceRoot,
       workspaceId: context.workspaceId,
       includeGlobs: context.includeGlobs,
@@ -1820,6 +1881,7 @@ class SyncManager {
   }
 
   recordError(error, operation = "flush") {
+    this.observationGap = true;
     this.lastError = error instanceof Error ? error.message : String(error);
     const finishedAt = new Date().toISOString();
     if (operation === "reconcile") {
@@ -2245,7 +2307,8 @@ async function callTool(params) {
   }
   if (name === "corpuswire_sync_reconcile") {
     try {
-      return textToolResult(formatSyncPayload(await syncManager.reconcileExplicit(args, onProgress)));
+      const result = await syncManager.reconcileExplicit(args, onProgress);
+      return textToolResult(formatSyncPayload(result), result.reconcile?.ok === false);
     } catch (error) {
       return textToolResult(formatToolError(error, "sync reconcile request"), true);
     }
@@ -3788,7 +3851,9 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
   const canRetrieve = typeof diagnosis.can_retrieve === "boolean" ? diagnosis.can_retrieve : null;
   const pointCount = Number.isInteger(diagnosis.point_count) ? diagnosis.point_count : null;
   const statusLooksBlocked = ["blocked", "error", "missing"].includes((diagnosisStatus ?? "").toLowerCase());
-  const needsReconcile = hasFreshnessProblem
+  const coverage = asRecord(index.coverage);
+  const coverageUnknown = !["verified", "not_applicable"].includes(coverage.state);
+  const needsReconcile = coverageUnknown || hasFreshnessProblem
     || collectionExists === false
     || indexHealthStatus === "degraded"
     || indexHealthStatus === "stale"
@@ -3803,6 +3868,7 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
         : "unknown";
 
   return {
+    coverage,
     state,
     needsReconcile,
     checkedAt: new Date().toISOString(),
@@ -4870,6 +4936,9 @@ function normalizeStringArray(value, label, { allowString = false } = {}) {
 
 function syncContextKey(context) {
   return [
+    context.serviceBaseUrl ?? DEFAULT_BASE_URL,
+    context.selectionIdentity ?? "unknown",
+    String(context.effectiveMaxFileSizeBytes ?? DEFAULT_SYNC_MAX_FILE_SIZE_BYTES),
     context.sourceRoot,
     context.workspaceId,
     JSON.stringify(context.includeGlobs ?? []),
@@ -5507,7 +5576,10 @@ function formatSyncSummary(summary, ordinal) {
     .map(([stage, duration]) => `${stage}=${Math.max(0, Math.round(duration))}ms`);
   return [
     `${ordinal}. filesQueued: ${compact?.filesQueued ?? 0}`,
-    `   filesUploaded: ${compact?.filesUploaded ?? 0}`,
+    `   filesUploaded: ${compact?.filesUploaded ?? "unknown"}`,
+    `   filesSubmitted: ${compact?.filesSubmitted ?? "unknown"}`,
+    `   filesReused: ${compact?.filesReused ?? "unknown"}`,
+    `   coverage: ${compact?.coverageState ?? "unknown"}`,
     `   filesDeleted: ${compact?.filesDeleted ?? 0}`,
     `   filesSkipped: ${compact?.filesSkipped ?? 0}`,
     `   reconcile: ${compact?.reconcile ?? false}`,
@@ -5537,7 +5609,10 @@ function summarizeSyncResult(result) {
   return {
     noOp: Boolean(result.noOp),
     filesQueued: result.filesQueued ?? 0,
-    filesUploaded: result.filesUploaded ?? 0,
+    filesUploaded: result.filesUploaded ?? null,
+    filesSubmitted: result.filesSubmitted ?? null,
+    filesReused: result.filesReused ?? null,
+    coverageState: responseStatus.coverage?.state ?? "unknown",
     filesDeleted: result.filesDeleted ?? 0,
     filesSkipped: result.filesSkipped ?? 0,
     durationMs: result.durationMs,
@@ -5638,4 +5713,8 @@ function asRecord(value) {
 
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function scanIncompleteError(cause = undefined) {
+  return Object.assign(new Error("Workspace scan incomplete; no full inventory can be published.", { cause }), { code: "scan_incomplete" });
 }

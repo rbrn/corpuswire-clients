@@ -1682,3 +1682,92 @@ function createRpc(process) {
   rpc.notifications = notifications;
   return rpc;
 }
+
+test("reconcile reports acknowledged transfers, rejects caps, and leaves legacy coverage unknown", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cw-inventory-"));
+  const sdkPath = path.join(root, "mock-sdk.mjs"), requestsPath = path.join(root, "calls.jsonl");
+  const sourceRoot = path.join(root, "repo");
+  await mkdir(sourceRoot);
+  await writeFile(path.join(sourceRoot, "a.py"), "a=1");
+  await writeFile(path.join(sourceRoot, "empty.py"), "");
+  await writeFile(sdkPath, `import { appendFileSync } from 'node:fs';
+    export class CorpusWireClient {
+      async indexWorkspace(request) {
+        appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({ scan: request.inventoryScan, count: request.files.length }) + '\\n');
+        return {ok: true, result: {}, status: {phase: 'completed'}, transfer: {
+          complete: true, files_submitted: request.files.length, files_reused: request.files.length,
+          files_transferred: 0, acknowledged_files: [],
+        }};
+      }
+    }`);
+  const child = spawn("node", [SERVER_BIN], { stdio: ["pipe", "pipe", "pipe"], env: {
+    ...process.env, CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000", CORPUSWIRE_SDK_PATH: sdkPath,
+    CORPUSWIRE_SYNC_ENABLED: "true", CORPUSWIRE_SYNC_ROOT: sourceRoot, CORPUSWIRE_WORKSPACE_ID: "fixture",
+    CORPUSWIRE_SYNC_STATE_DIR: path.join(root, "cache"), MOCK_REQUESTS_PATH: requestsPath,
+  }});
+  const rpc = createRpc(child);
+  try {
+    const invoke = (id, maxFiles) => rpc({ jsonrpc: "2.0", id, method: "tools/call", params: {
+      name: "corpuswire_sync_reconcile", arguments: { maxFiles },
+    }});
+    const full = await invoke(1, 10);
+    assert.equal(full.result.isError, false);
+    assert.match(full.result.content[0].text, /filesUploaded: 0/);
+    assert.match(full.result.content[0].text, /filesSubmitted: 2/);
+    assert.match(full.result.content[0].text, /coverage: unknown/);
+    const capped = await invoke(2, 1);
+    assert.equal(capped.result.isError, true);
+    assert.match(capped.result.content[0].text, /exceeded max file count/);
+    const calls = (await readFile(requestsPath, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].scan.complete, true);
+    assert.equal(calls[0].count, 2);
+  } finally { child.kill(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("verified cache rehashes content and refuses lineage adopted from another client", async () => {
+  const { utimes } = await import("node:fs/promises");
+  const root = await mkdtemp(path.join(tmpdir(), "cw-coverage-cache-"));
+  const sdkPath = path.join(root, "sdk.mjs"), requestsPath = path.join(root, "calls.jsonl");
+  const sourceRoot = path.join(root, "repo"), foreign = path.join(root, "foreign");
+  await mkdir(sourceRoot);
+  await writeFile(path.join(sourceRoot, "a.py"), "old");
+  const stamp = new Date("2026-09-08T00:00:00Z");
+  await utimes(path.join(sourceRoot, "a.py"), stamp, stamp);
+  await writeFile(sdkPath, `import {appendFileSync,existsSync} from 'node:fs';
+    let token='baseline';
+    export class CorpusWireClient {
+      async diagnoseWorkspace() { return {status:'ready',can_retrieve:true,collection:'fixture',collection_exists:true,point_count:1,
+        index:{health_status:'ok',coverage:{state:'verified',coverage_token:existsSync(process.env.FOREIGN_MARKER)?'foreign':token,selection_policy_digest:'policy'}},checks:[],recovery_actions:[]}; }
+      async indexWorkspace(request) {
+        appendFileSync(process.env.MOCK_REQUESTS_PATH,JSON.stringify({mode:request.mode,token:request.baseCoverageToken,files:request.files.map(f=>f.relativePath)})+'\\n');
+        token+='x';
+        return {ok:true,result:{collection:'fixture'},status:{collection_name:'fixture',coverage:{state:'verified',coverage_token:token,selection_policy_digest:'policy'}},
+          transfer:{complete:true,files_submitted:request.files.length,files_transferred:request.files.length,files_reused:0,
+            acknowledged_files:request.files.map(f=>({relative_path:f.relativePath,sha256:f.sha256,disposition:'uploaded'}))}};
+      }
+    }`);
+  const child = spawn('node', [SERVER_BIN], {stdio:['pipe','pipe','pipe'],env:{...process.env,
+    CORPUSWIRE_BASE_URL:'http://127.0.0.1:8000',CORPUSWIRE_SDK_PATH:sdkPath,CORPUSWIRE_SYNC_ENABLED:'true',
+    CORPUSWIRE_SYNC_MTIME_CACHE_ENABLED:'true',CORPUSWIRE_SYNC_ROOT:sourceRoot,CORPUSWIRE_WORKSPACE_ID:'fixture',
+    CORPUSWIRE_SYNC_STATE_DIR:path.join(root,'cache'),MOCK_REQUESTS_PATH:requestsPath,FOREIGN_MARKER:foreign}});
+  const rpc = createRpc(child);
+  const invoke = (id, name, args={}) => rpc({jsonrpc:'2.0',id,method:'tools/call',params:{name,arguments:args}});
+  try {
+    const full = await invoke(1,'corpuswire_sync_reconcile');
+    assert.equal(full.result.isError,false);
+    const unchanged = await invoke(2,'corpuswire_sync_delta',{changedPaths:['a.py'],flush:true});
+    assert.match(unchanged.result.content[0].text,/unchanged_hash/);
+    assert.match(unchanged.result.content[0].text,/filesUploaded: 0/);
+    await writeFile(path.join(sourceRoot,'a.py'),'new');
+    await utimes(path.join(sourceRoot,'a.py'),stamp,stamp);
+    const changed = await invoke(3,'corpuswire_sync_delta',{changedPaths:['a.py'],flush:true});
+    assert.match(changed.result.content[0].text,/filesUploaded: 1/);
+    await writeFile(foreign,'1');
+    await invoke(4,'corpuswire_sync_delta',{changedPaths:['a.py'],flush:true});
+    const calls = (await readFile(requestsPath,'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(calls.length,3);
+    assert.equal(calls[1].token,'baselinex');
+    assert.equal(calls[2].token,undefined);
+  } finally {child.kill();await rm(root,{recursive:true,force:true});}
+});
