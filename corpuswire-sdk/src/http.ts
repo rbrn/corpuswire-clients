@@ -1,5 +1,6 @@
 import type {
   EnhanceErrorEnvelope,
+  IndexTransferSummary,
   FetchLike,
   ReviewContextErrorV1,
 } from "./types.js";
@@ -9,6 +10,7 @@ const DEFAULT_RETRY_ATTEMPTS = 2;
 const DEFAULT_RETRY_DELAY_MS = 250;
 
 export class CorpusWireHttpError extends Error {
+  readonly transfer?: IndexTransferSummary;
   readonly status: number;
   readonly statusText: string;
   readonly responseBody: string;

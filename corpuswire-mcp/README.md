@@ -272,3 +272,9 @@ Use `corpuswire_sync_probe_paths` before queuing uncertain edits. It applies the
 Use `corpuswire_doctor` as the quick replacement-readiness check before trusting CorpusWire in a long Codex session. It returns `ready`, `attention`, or `blocked` from backend health, workspace diagnosis, process-local sync state, active sessions, and persisted activity.
 
 For the local Docker app on an existing dense-only Qdrant collection, keep `APP_QDRANT_HYBRID_ENABLED=false` unless you intentionally recreate the collection for hybrid named vectors. A dense/hybrid mismatch raises a backend writer error; current backend builds close the failed index session so retry attempts are not blocked by a stale active-session lock.
+
+## Inventory readiness compatibility note
+
+`filesUploaded` now counts acknowledged unique source-file transfers, so a warm full reconcile can report zero even when every eligible file was submitted. Use `filesSubmitted` and `filesReused` for the other boundaries. Missing SDK measurements display `unknown`; errors and detachments do not manufacture successful counts.
+
+Full reconcile fails with `scan_incomplete` on unresolved enumeration/read races or the file cap. Intentional selection exclusions are encoded in the producer policy. A queryable legacy or one-file index remains usable for retrieval but has unknown full coverage. `corpuswire_doctor` and sync status expose the need for reconciliation separately from session completion. The backend feature is enabled by default after the approved live gates. Set `REMOTE_INDEX_INVENTORY_COVERAGE_ENABLED=false` for rollback; existing indexes still require a complete scan to establish verified coverage.

@@ -1,3 +1,4 @@
+import { INVENTORY_VERSION, WorkspaceScanIncompleteError, buildWorkspaceInventory, canonicalInventoryPath, inventoryDigest } from "./inventory.js";
 import { createBearerAuthHeader, requestJson } from "./http.js";
 import type {
   EnhancePromptPayload,
@@ -18,6 +19,7 @@ import type {
   IndexEventsResponse,
   IndexSessionQuery,
   IndexWorkspaceRequest,
+  IndexTransferSummary,
   CorpusWireClientOptions,
   LlmModelState,
   PromptOutputMode,
@@ -83,6 +85,7 @@ const DEFAULT_REVIEW_POLL_TIMEOUT_MS = 60_000;
 const DEFAULT_REVIEW_POLL_INTERVAL_MS = 1_000;
 
 export class RemoteIndexDetachedError extends Error {
+  readonly transfer?: IndexTransferSummary;
   readonly sessionId: string;
   readonly status: RemoteIndexStatus;
   readonly backendContinues = true;
@@ -99,6 +102,7 @@ export class RemoteIndexDetachedError extends Error {
 }
 
 export class RemoteIndexCancelledError extends Error {
+  readonly transfer?: IndexTransferSummary;
   readonly sessionId: string;
   readonly status: RemoteIndexStatus;
 
@@ -673,6 +677,12 @@ export class CorpusWireClient {
   }
 
   async startIndexSession(request: StartRemoteIndexSessionRequest): Promise<RemoteIndexSession> {
+    if (request.inventory || request.baseCoverageToken || request.selectionPolicyDigest) {
+      const capabilities = await this.getIndexCapabilities();
+      if (!capabilities.inventory_coverage_versions?.includes(INVENTORY_VERSION)) {
+        request = { ...request, inventory: undefined, baseCoverageToken: undefined, selectionPolicyDigest: undefined };
+      }
+    }
     const response = await requestJson<{ ok: true; result: RemoteIndexSession }>({
       baseUrl: this.baseUrl,
       paths: ["/v1/index/sessions"],
@@ -732,12 +742,13 @@ export class CorpusWireClient {
     sessionId: string,
     metadata: RemoteFileBatchMetadata,
     files: RemoteFileContent[],
+    onAttempt?: () => void,
   ): Promise<RemoteFileBatchResult> {
     const multipart = buildMultipartMixed(metadata, files);
     const response = await requestJson<{ ok: true; result: RemoteFileBatchResult }>({
       baseUrl: this.baseUrl,
       paths: [`/v1/index/sessions/${encodeURIComponent(sessionId)}/files/batch`],
-      fetchFn: this.fetchFn,
+      fetchFn: (input, init) => { onAttempt?.(); return (this.fetchFn ?? globalThis.fetch)(input, init); },
       defaultHeaders: this.defaultHeaders,
       basicAuth: this.basicAuth,
       init: {
@@ -926,6 +937,29 @@ export class CorpusWireClient {
       "files",
       "Workspace file hashes prepared",
     );
+    if (request.inventoryScan && request.signal?.aborted) throw new WorkspaceScanIncompleteError("Scan cancelled before session creation");
+    const triples = remoteFiles.map(({ file, sha256, content }) => [file.relativePath, sha256, content.length] as const);
+    await inventoryDigest(triples);
+    if (request.inventoryScan) {
+      if (request.mode !== "full" || request.snapshotScope) throw new WorkspaceScanIncompleteError("Inventory requires a v1 full scan");
+      const capabilities = await this.getIndexCapabilities();
+      if (request.inventoryScan.complete !== true) throw new WorkspaceScanIncompleteError();
+      if (capabilities.inventory_coverage_versions?.includes(INVENTORY_VERSION)) {
+        if (!capabilities.supported_file_registry_version) throw new WorkspaceScanIncompleteError("Missing supported file registry version");
+        request = { ...request, inventory: await buildWorkspaceInventory(triples, {
+          version: "workspace-selection/v1", include_globs: request.includeGlobs ?? [], exclude_globs: request.excludeGlobs ?? [],
+          ignore_digest: request.inventoryScan.ignoreDigest, producer: request.inventoryScan.producer,
+          supported_file_registry_version: capabilities.supported_file_registry_version,
+          max_file_size_bytes: Math.min(request.maxFileSizeBytes ?? capabilities.max_file_size_bytes, capabilities.max_file_size_bytes),
+          symlink_policy: "skip",
+        }, request.inventoryScan) };
+      }
+    }
+    const transfer: IndexTransferSummary = {
+      files_submitted: remoteFiles.length, files_upload_required: null, files_reused: null,
+      files_transferred: 0, source_bytes_transferred: 0, upload_attempts: 0,
+      source_bytes_attempted: 0, complete: false, acknowledged_files: [],
+    };
     const session = await this.startIndexSession(request);
     try {
       const manifestEntries = buildWorkspaceManifest(remoteFiles, request.deletedPaths ?? []);
@@ -950,6 +984,17 @@ export class CorpusWireClient {
         manifestEntries.length,
       );
       const uploadRequired = new Set(manifestResult.upload_required);
+      transfer.files_upload_required = uploadRequired.size;
+      transfer.files_reused = manifestResult.unchanged;
+      if (manifestResult.errors.length || manifestResult.skipped) {
+        throw new WorkspaceScanIncompleteError("Server rejected manifest entries");
+      }
+      for (const { file, sha256 } of remoteFiles) {
+        if (!uploadRequired.has(file.relativePath)) {
+          transfer.acknowledged_files.push({ relative_path: file.relativePath, sha256, disposition: "confirmed_reused" });
+        }
+      }
+
       const filesToUpload = remoteFiles.filter(({ file }) => uploadRequired.has(file.relativePath));
       let queuedBackgroundWork = false;
       let uploadedFiles = 0;
@@ -967,7 +1012,17 @@ export class CorpusWireClient {
               session.session_id,
               { files: batchFiles.map((file) => file.descriptor) },
               batchFiles,
+              () => {
+                transfer.upload_attempts += 1;
+                transfer.source_bytes_attempted += batchFiles.reduce((sum, file) => sum + file.descriptor.size, 0);
+              },
             );
+            if (result.errors.length) throw new Error("Source upload was not fully acknowledged");
+            transfer.files_transferred += batchFiles.length;
+            transfer.source_bytes_transferred += batchFiles.reduce((sum, file) => sum + file.descriptor.size, 0);
+            transfer.acknowledged_files.push(...batchFiles.map((file) => ({
+              relative_path: file.descriptor.relativePath, sha256: file.descriptor.sha256, disposition: "uploaded" as const,
+            })));
             queuedBackgroundWork ||= result.queued === true;
             uploadedFiles += batchFiles.length;
             emitClientProgress(
@@ -1017,8 +1072,10 @@ export class CorpusWireClient {
       if (committed.status.progress) {
         emitProgress(committed.status.progress);
       }
-      return committed;
+      transfer.complete = true;
+      return { ...committed, transfer };
     } catch (error) {
+      if (error instanceof Error) Object.assign(error, { transfer });
       if (error instanceof RemoteIndexDetachedError || error instanceof RemoteIndexCancelledError) {
         throw error;
       }
@@ -1160,6 +1217,9 @@ export function toStartIndexSessionPayload(request: StartRemoteIndexSessionReque
     max_file_size_bytes: request.maxFileSizeBytes,
     recreate_collection: request.recreateCollection ?? false,
     snapshot_scope: toRemoteIndexScopePayload(request.snapshotScope),
+    inventory: request.inventory,
+    base_coverage_token: request.baseCoverageToken,
+    selection_policy_digest: request.selectionPolicyDigest,
   });
 }
 
@@ -1240,11 +1300,13 @@ function buildMultipartMixed(
 async function prepareRemoteWorkspaceFile(
   file: RemoteWorkspaceFile,
 ): Promise<{ file: RemoteWorkspaceFile; content: Uint8Array; sha256: string; mtimeNs: number }> {
-  const content = toUint8Array(file.content);
+  const content = new Uint8Array(toUint8Array(file.content));
+  const sha256 = await sha256Hex(content);
+  if (file.sha256 !== undefined && file.sha256 !== sha256) throw new WorkspaceScanIncompleteError("Source hash changed after scan");
   return {
-    file,
+    file: { ...file, relativePath: canonicalInventoryPath(file.relativePath) },
     content,
-    sha256: file.sha256 ?? await sha256Hex(content),
+    sha256,
     mtimeNs: file.mtimeNs ?? Date.now() * 1_000_000,
   };
 }
@@ -1385,21 +1447,26 @@ async function runWithConcurrency<T>(
 ): Promise<void> {
   const maxConcurrency = Math.max(1, Math.floor(concurrency));
   let nextIndex = 0;
+  let failed = false;
+  let firstError: unknown;
   async function runNext(): Promise<void> {
-    const currentIndex = nextIndex;
-    nextIndex += 1;
-    if (currentIndex >= items.length) {
-      return;
+    while (!failed && nextIndex < items.length) {
+      const currentIndex = nextIndex++;
+      try {
+        await worker(items[currentIndex]);
+      } catch (error) {
+        if (!failed) firstError = error;
+        failed = true;
+      }
     }
-    await worker(items[currentIndex]);
-    await runNext();
   }
   await Promise.all(items.slice(0, maxConcurrency).map(() => runNext()));
+  if (failed) throw firstError;
 }
 
 async function sha256Hex(content: Uint8Array): Promise<string> {
   if (!globalThis.crypto?.subtle) {
-    throw new Error("Remote indexWorkspace requires sha256 values when Web Crypto is unavailable.");
+    throw new Error("Remote indexWorkspace requires Web Crypto to verify source hashes.");
   }
   const digest = await globalThis.crypto.subtle.digest("SHA-256", toArrayBuffer(content));
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");

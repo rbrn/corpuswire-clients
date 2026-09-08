@@ -421,3 +421,9 @@ try {
 The SDK retries transient gateway and socket failures. It does not retry stable
 request errors such as invalid prompt payloads, unsupported output modes, or
 incomplete index sessions.
+
+## Inventory coverage and transfer measurements
+
+Full filesystem producers pass `inventoryScan` to `indexWorkspace()`. The SDK freezes and hashes uploaded buffers, computes `workspace-inventory/v1`, and negotiates `inventory_coverage_versions` before sending new fields. Supplying a `files` array alone does not certify a complete scan. Legacy servers receive the compatible request without coverage fields. Capability failures propagate before session creation.
+
+`status.coverage` describes a verified full baseline and compatible observed deltas. Session completion and 100% progress retain their existing meaning. The optional `transfer` result separates submitted, upload-required, reused and acknowledged unique transferred files; source bytes exclude multipart/TLS overhead. `upload_attempts` and `source_bytes_attempted` include HTTP retries. Error/detach objects retain partial counters with `complete: false`; do not interpret absent counters as zero. `acknowledged_files` is for authorized local cache updates and must not be copied into broad telemetry.

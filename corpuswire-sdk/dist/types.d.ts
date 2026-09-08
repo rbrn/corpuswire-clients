@@ -166,6 +166,7 @@ export interface QdrantHealth {
     error?: string | null;
 }
 export interface IndexHealth {
+    coverage?: WorkspaceCoverage;
     workspace_id?: string | null;
     path: string;
     collection: string;
@@ -938,6 +939,9 @@ export interface RemoteWorkspaceIdentity {
     name?: string;
 }
 export interface StartRemoteIndexSessionRequest {
+    inventory?: WorkspaceInventory;
+    baseCoverageToken?: string;
+    selectionPolicyDigest?: string;
     workspace: RemoteWorkspaceIdentity;
     mode?: RemoteIndexMode;
     client?: Record<string, unknown>;
@@ -1004,6 +1008,7 @@ export interface RemoteFileBatchResult {
     phase?: string | null;
 }
 export interface RemoteIndexStatus {
+    coverage?: WorkspaceCoverage | null;
     session_id: string;
     workspace_id: string;
     collection_name: string;
@@ -1050,6 +1055,7 @@ export interface RemoteIndexSessionsResponse {
     sessions: RemoteIndexStatus[];
 }
 export interface RemoteIndexCapabilities {
+    inventory_coverage_versions?: string[];
     ok: true;
     protocol_version: string;
     max_batch_bytes: number;
@@ -1069,6 +1075,7 @@ export interface RemoteIndexCapabilities {
     snapshot_scoping?: boolean;
 }
 export interface RemoteIndexCommitResponse {
+    transfer?: IndexTransferSummary;
     ok: true;
     result: Record<string, unknown>;
     status: RemoteIndexStatus;
@@ -1080,6 +1087,7 @@ export interface RemoteWorkspaceFile {
     sha256?: string;
 }
 export interface IndexWorkspaceRequest extends Omit<StartRemoteIndexSessionRequest, "workspace"> {
+    inventoryScan?: InventoryScan;
     workspace: RemoteWorkspaceIdentity;
     files: RemoteWorkspaceFile[];
     deletedPaths?: string[];
@@ -1090,4 +1098,69 @@ export interface IndexWorkspaceRequest extends Omit<StartRemoteIndexSessionReque
     signal?: AbortSignal;
     detachSignal?: AbortSignal;
     onProgress?: (event: RemoteIndexProgressEvent) => void;
+}
+/** Evidence emitted only by a complete filesystem scan; a files array alone is insufficient. */
+export interface InventoryScan {
+    complete: true;
+    startedAt: string;
+    completedAt: string;
+    excludedFileCount: number;
+    ignoreDigest: string;
+    producer: string;
+}
+export interface InventorySelectionPolicy {
+    version: "workspace-selection/v1";
+    include_globs: string[];
+    exclude_globs: string[];
+    ignore_digest: string;
+    supported_file_registry_version: string;
+    max_file_size_bytes: number;
+    symlink_policy: "skip";
+    producer: string;
+}
+export interface WorkspaceInventory {
+    schema_version: "workspace-inventory/v1";
+    scan_complete: true;
+    selection_policy: InventorySelectionPolicy;
+    selection_policy_digest: string;
+    manifest_digest: string;
+    eligible_file_count: number;
+    eligible_source_bytes: number;
+    excluded_file_count: number;
+    scan_started_at: string;
+    scan_completed_at: string;
+}
+export interface WorkspaceCoverage {
+    schema_version: "workspace-coverage/v1";
+    state: "unknown" | "pending" | "verified" | "invalidated" | "unavailable" | "not_applicable";
+    reason_codes: string[];
+    coverage_token?: string | null;
+    session_id?: string | null;
+    published_revision?: number | null;
+    baseline_revision?: number | null;
+    last_delta_revision?: number | null;
+    baseline_manifest_digest?: string | null;
+    eligible_file_count?: number | null;
+    eligible_source_bytes?: number | null;
+    selection_policy_digest?: string | null;
+    scan_started_at?: string | null;
+    scan_completed_at?: string | null;
+    published_at?: string | null;
+    collection_fingerprint?: string | null;
+}
+export interface IndexTransferSummary {
+    files_submitted: number;
+    files_upload_required: number | null;
+    files_reused: number | null;
+    files_transferred: number;
+    source_bytes_transferred: number;
+    upload_attempts: number;
+    source_bytes_attempted: number;
+    complete: boolean;
+    /** Per-operation acknowledgements for authorized local cache updates; never activity telemetry. */
+    acknowledged_files: Array<{
+        relative_path: string;
+        sha256: string;
+        disposition: "uploaded" | "confirmed_reused";
+    }>;
 }

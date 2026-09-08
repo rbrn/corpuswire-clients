@@ -1,5 +1,6 @@
-import type { EnhanceErrorEnvelope, FetchLike, ReviewContextErrorV1 } from "./types.js";
+import type { EnhanceErrorEnvelope, IndexTransferSummary, FetchLike, ReviewContextErrorV1 } from "./types.js";
 export declare class CorpusWireHttpError extends Error {
+    readonly transfer?: IndexTransferSummary;
     readonly status: number;
     readonly statusText: string;
     readonly responseBody: string;

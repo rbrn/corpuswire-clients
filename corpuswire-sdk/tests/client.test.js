@@ -1506,3 +1506,119 @@ test("requestJson exposes stable review errors and Retry-After metadata", async 
     },
   );
 });
+
+test("inventory canonicalization matches Python UTF-8 vectors and rejects ambiguous paths", async () => {
+  const { inventoryDigest } = await import("../dist/inventory.js");
+  assert.equal(await inventoryDigest([]), "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945");
+  const entries = [["z.py", "0".repeat(64), 0], ["é.py", "0".repeat(64), 1], ["😀.py", "0".repeat(64), 2], ["a\\b.py", "0".repeat(64), 3]];
+  const { createHash } = await import("node:crypto");
+  const canonical = JSON.stringify([["a/b.py", "0".repeat(64), 3], ...entries.slice(0, 3)]);
+  assert.equal(await inventoryDigest(entries), createHash("sha256").update(canonical).digest("hex"));
+  for (const path of ["/abs.py", "../a.py", "a//b.py", "C:\\a.py", "\ud800.py"]) {
+    await assert.rejects(inventoryDigest([[path, "0".repeat(64), 0]]), { code: "scan_incomplete" });
+  }
+  await assert.rejects(inventoryDigest([["a.py", "0".repeat(64), true]]));
+});
+
+for (const supportsInventory of [true, false]) {
+  test(`full scan capability negotiation and independently observed cold/warm transfer (${supportsInventory})`, async () => {
+    let warm = false, attempts = 0;
+    const starts = [], bodies = [];
+    const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url, init) => {
+      if (url.endsWith("/capabilities")) return jsonResponse(200, { ok: true,
+        inventory_coverage_versions: supportsInventory ? ["workspace-inventory/v1"] : [],
+        supported_file_registry_version: "fixture/v1", max_file_size_bytes: 1024,
+      });
+      if (url.endsWith("/sessions")) {
+        starts.push(JSON.parse(init.body));
+        return jsonResponse(200, { ok: true, result: { session_id: "fixture", max_batch_bytes: 1024, max_concurrent_uploads: 1 } });
+      }
+      if (url.endsWith("/manifest/batch")) return jsonResponse(200, { ok: true, result: {
+        accepted: 1, upload_required: warm ? [] : ["a.py"], unchanged: warm ? 1 : 0, deletes: 0, skipped: 0, errors: [],
+      }});
+      if (url.endsWith("/files/batch")) {
+        attempts += 1;
+        bodies.push(await init.body.text());
+        if (attempts === 1) return jsonResponse(503, { detail: "synthetic retry" });
+        return jsonResponse(200, { ok: true, result: { files_received: 1, errors: [] }});
+      }
+      if (url.endsWith("/commit")) return jsonResponse(200, { ok: true, result: {}, status: { phase: "completed" }});
+      throw new Error(`Unexpected fixture request ${url}`);
+    }});
+    const request = { workspace: { workspaceId: "fixture" }, mode: "full", files: [{ relativePath: "a.py", content: "x=1" }],
+      inventoryScan: { complete: true, startedAt: "2026-09-08T00:00:00Z", completedAt: "2026-09-08T00:00:01Z",
+        excludedFileCount: 0, ignoreDigest: "0".repeat(64), producer: "fixture/v1" },
+    };
+    const cold = await client.indexWorkspace(request);
+    assert.equal(Boolean(starts[0].inventory), supportsInventory);
+    assert.equal(cold.transfer.files_submitted, 1);
+    assert.equal(cold.transfer.files_transferred, 1);
+    assert.equal(cold.transfer.source_bytes_transferred, 3);
+    assert.equal(cold.transfer.upload_attempts, 2);
+    assert.equal(cold.transfer.source_bytes_attempted, 6);
+    assert.equal(bodies.length, 2);
+    assert.ok(bodies.every((body) => body.includes("x=1")));
+    warm = true;
+    const reused = await client.indexWorkspace(request);
+    assert.equal(reused.transfer.files_transferred, 0);
+    assert.equal(reused.transfer.files_reused, 1);
+    assert.equal(reused.transfer.source_bytes_attempted, 0);
+    assert.equal(bodies.length, 2);
+    assert.equal(reused.transfer.acknowledged_files[0].disposition, "confirmed_reused");
+  });
+}
+
+test("incomplete scan, supplied hash mismatch and duplicate files cannot allocate a session", async () => {
+  let mutations = 0;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (_, init) => {
+    if (init.method === "POST") mutations += 1;
+    return jsonResponse(200, { ok: true, inventory_coverage_versions: [] });
+  }});
+  await assert.rejects(client.indexWorkspace({ workspace: { workspaceId: "f" }, mode: "full",
+    files: [{ relativePath: "a.py", content: "x", sha256: "0".repeat(64) }],
+  }), { code: "scan_incomplete" });
+  await assert.rejects(client.indexWorkspace({ workspace: { workspaceId: "f" }, mode: "full",
+    files: [{ relativePath: "a.py", content: "x" }, { relativePath: "a.py", content: "x" }],
+  }), { code: "scan_incomplete" });
+  await assert.rejects(client.indexWorkspace({ workspace: { workspaceId: "f" }, mode: "full", files: [],
+    inventoryScan: { complete: false },
+  }), { code: "scan_incomplete" });
+  assert.equal(mutations, 0);
+});
+
+test("partial upload error waits for in-flight acknowledgements and retains truthful counts", async () => {
+  let attempts = 0;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url, init) => {
+    if (url.endsWith("/sessions")) return jsonResponse(200, {ok:true,result:{session_id:"partial",max_batch_bytes:1000,max_batch_files:1,max_concurrent_uploads:2}});
+    if (url.endsWith("/manifest/batch")) return jsonResponse(200, {ok:true,result:{accepted:2,upload_required:["a.py","b.py"],unchanged:0,deletes:0,skipped:0,errors:[]}});
+    if (url.endsWith("/files/batch")) {
+      attempts += 1;
+      const body = await init.body.text();
+      if (body.includes("synth_fail")) return jsonResponse(400, {detail:"synthetic rejection"});
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return jsonResponse(200, {ok:true,result:{files_received:1,errors:[]}});
+    }
+    if (url.endsWith("/abort")) return jsonResponse(200, {ok:true});
+    throw new Error(`Unexpected request ${url}`);
+  }});
+  await assert.rejects(client.indexWorkspace({workspace:{workspaceId:"partial"},files:[
+    {relativePath:"a.py",content:"synth_fail"},{relativePath:"b.py",content:"ok"},
+  ]}), (error) => {
+    assert.equal(error.transfer.complete, false);
+    assert.equal(error.transfer.upload_attempts, 2);
+    assert.equal(error.transfer.files_transferred, 1);
+    assert.equal(error.transfer.source_bytes_transferred, 2);
+    return true;
+  });
+  assert.equal(attempts, 2);
+});
+
+test("retrieval exclusions preserve source while rejecting discovery and Terraform inputs", async () => {
+  const { isRetrievalExcludedPath } = await import("../dist/index.js");
+  for (const path of ["package.json", "src/tsconfig.build.json", "requirements.txt", "requirements-dev.txt", "constraints_prod.txt", "SETUP.PY", "nx.json", "project.json", "state.tfstate.json", "values.tfvars.json", "out.plan.json", "pom.xml"]) {
+    assert.equal(isRetrievalExcludedPath(path), true, path);
+  }
+  for (const path of ["src/main.py", "README.md", "settings.json", "requirements-guide.md", "main.tf", "model.tf.json"]) {
+    assert.equal(isRetrievalExcludedPath(path), false, path);
+  }
+});

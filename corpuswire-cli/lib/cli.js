@@ -1,5 +1,6 @@
+import { isRetrievalExcludedPath } from "@corpuswire/sdk";
 import { createHash } from "node:crypto";
-import { readFile, readdir, stat } from "node:fs/promises";
+import { readFile, readdir, stat, lstat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -483,8 +484,9 @@ export async function runIndexCommand(options, dependencies) {
     capabilities,
     includeGlobs: options.includeGlobs ?? [],
     excludeGlobs: options.excludeGlobs ?? [],
-    maxFileSizeBytes: options.maxFileSizeBytes ?? capabilities.max_file_size_bytes,
+    maxFileSizeBytes: Math.min(options.maxFileSizeBytes ?? capabilities.max_file_size_bytes, capabilities.max_file_size_bytes),
     onProgress: renderer.render,
+    signal: dependencies.signal,
     workspaceId: configuration.workspaceId,
     startedAt,
   });
@@ -501,9 +503,10 @@ export async function runIndexCommand(options, dependencies) {
     },
     includeGlobs: options.includeGlobs ?? [],
     excludeGlobs: options.excludeGlobs ?? [],
-    maxFileSizeBytes: options.maxFileSizeBytes ?? capabilities.max_file_size_bytes,
+    maxFileSizeBytes: Math.min(options.maxFileSizeBytes ?? capabilities.max_file_size_bytes, capabilities.max_file_size_bytes),
     recreateCollection: options.rebuild === true,
     files: scan.files,
+    inventoryScan: (options.mode ?? "full") === "full" ? scan.inventoryScan : undefined,
     deletedPaths: [],
   };
   const preview = await dependencies.client.previewIndexWorkspace(request);
@@ -678,15 +681,22 @@ function deriveWorkspaceId(sourceRoot) {
 }
 
 async function scanWorkspace(sourceRoot, options) {
+  try { return await scanWorkspaceComplete(sourceRoot, options); }
+  catch (error) { throw Object.assign(error, { code: "scan_incomplete" }); }
+}
+
+async function scanWorkspaceComplete(sourceRoot, options) {
+  const scanStartedAt = new Date().toISOString();
   const scannedPaths = [];
   let scanned = 0;
   const discoveryStartedAt = performance.now();
   async function walk(directory) {
+    if (options.signal?.aborted) throw Object.assign(new Error("Workspace scan cancelled"), { code: "scan_incomplete" });
     const entries = await readdir(directory, { withFileTypes: true });
     for (const entry of entries) {
       const absolutePath = path.join(directory, entry.name);
       const relativePath = path.relative(sourceRoot, absolutePath).split(path.sep).join("/");
-      if (entry.isSymbolicLink()) {
+      if (entry.isSymbolicLink() || entry.name.startsWith(".")) {
         continue;
       }
       if (entry.isDirectory()) {
@@ -726,8 +736,9 @@ async function scanWorkspace(sourceRoot, options) {
     const includedByType = supportedExtensions.has(extension) || supportedNames.has(basename);
     const includedByGlob = options.includeGlobs.length === 0 || matchesAnyGlob(candidate.relativePath, options.includeGlobs);
     const excludedByGlob = matchesAnyGlob(candidate.relativePath, options.excludeGlobs);
-    const fileStats = await stat(candidate.absolutePath);
-    if (!includedByType || !includedByGlob || excludedByGlob || fileStats.size > options.maxFileSizeBytes) {
+    const fileStats = await lstat(candidate.absolutePath);
+    if (!fileStats.isFile() || fileStats.isSymbolicLink()) throw Object.assign(new Error("Workspace changed during scan"), { code: "scan_incomplete" });
+    if (isRetrievalExcludedPath(candidate.relativePath) || !includedByType || !includedByGlob || excludedByGlob || fileStats.size > options.maxFileSizeBytes) {
       excluded += 1;
       continue;
     }
@@ -751,6 +762,12 @@ async function scanWorkspace(sourceRoot, options) {
     const readStartedAt = performance.now();
     const content = await readFile(candidate.absolutePath);
     fileReadMs += performance.now() - readStartedAt;
+    const after = await lstat(candidate.absolutePath);
+    if (options.signal?.aborted || !after.isFile() || after.isSymbolicLink()
+      || after.size !== candidate.fileStats.size || after.mtimeMs !== candidate.fileStats.mtimeMs
+      || content.length !== candidate.fileStats.size) {
+      throw Object.assign(new Error("Workspace changed during scan"), { code: "scan_incomplete" });
+    }
     const hashingStartedAt = performance.now();
     const sha256 = createHash("sha256").update(content).digest("hex");
     filteringHashingMs += performance.now() - hashingStartedAt;
@@ -771,6 +788,11 @@ async function scanWorkspace(sourceRoot, options) {
     }));
   }
   return {
+    inventoryScan: {
+      complete: true, startedAt: scanStartedAt, completedAt: new Date().toISOString(),
+      excludedFileCount: excluded, producer: "corpuswire-cli-scan/v1",
+      ignoreDigest: createHash("sha256").update(JSON.stringify({ directories: [...DEFAULT_EXCLUDED_DIRECTORIES].sort(), hiddenPaths: "exclude", retrievalExclusions: "discovery-and-terraform/v1" })).digest("hex"),
+    },
     files,
     scanned,
     included: selected.length,
@@ -1075,6 +1097,11 @@ function printIndexTerminalSummary(write, {
   const counts = progress.counts ?? {};
   const resultCounts = result?.result ?? {};
   const summary = {
+    coverage_state: status?.coverage?.state ?? "unknown",
+    files_submitted: result?.transfer?.files_submitted ?? null,
+    files_transferred: result?.transfer?.files_transferred ?? null,
+    source_bytes_transferred: result?.transfer?.source_bytes_transferred ?? null,
+    upload_attempts: result?.transfer?.upload_attempts ?? null,
     session_id: status?.session_id ?? progress.session_id ?? null,
     state: progress.state ?? status?.phase ?? "unknown",
     wall_time_ms: wallTimeMs,
@@ -1107,7 +1134,8 @@ function printIndexTerminalSummary(write, {
     `  Files: scanned=${summary.files_scanned ?? "unknown"} included=${summary.files_included ?? "unknown"} excluded=${summary.files_excluded ?? "unknown"} changed=${summary.files_changed ?? "unknown"} indexed=${summary.files_indexed} unchanged=${summary.files_unchanged} skipped=${summary.files_skipped} deleted=${summary.files_deleted}`,
     `  Data: ${formatBytes(summary.bytes)}; chunks=${summary.chunks}; embedding batches=${summary.embedding_batches}; vector writes=${summary.vector_writes}`,
     `  Retries/warnings: ${summary.retries}/${summary.warnings.length}`,
-    `  Verification: ${summary.verification}`,
+    `  Verification: ${summary.verification}; inventory coverage: ${summary.coverage_state}`,
+    `  Transfer: ${summary.files_transferred ?? "unknown"} acknowledged files; ${summary.source_bytes_transferred ?? "unknown"} source bytes; ${summary.upload_attempts ?? "unknown"} attempts`,
     `  Phase timings: ${formatPhaseTimings(summary.phase_timings_ms)}`,
   ].join("\n"));
 }
