@@ -6,6 +6,11 @@ This package is the preferred distributable MCP entrypoint for the VS Code/Copil
 
 ## Tools
 
+- `corpuswire_review_context`: the byte-compatible v1 provenance-rich review
+  evidence tool.
+- `corpuswire_review_context_v2`: deterministic, versioned symbol-change
+  evidence with atomic BASE/HEAD bundles, normalized hunks, relationship
+  deltas, and explicit whole-bundle omissions.
 - `corpuswire_search`: calls `POST /query` for semantic retrieval.
 - `corpuswire_enhance_prompt`: calls `POST /v1/enhance` for context-grounded prompt rewriting. It defaults to deterministic local rewriting and retries once with `localOnly=true` if backend generation setup is unavailable.
 - `corpuswire_rate_result`: records a 1-5 semantic-retrieval or prompt-enhancement scorecard for any engine in the central cross-workspace quality ledger.
@@ -35,9 +40,23 @@ packet block for evidence and citations.
 ```bash
 cd clients/corpuswire-mcp
 npm install
+npm run check:vendor
 npm test
 npm run smoke
 ```
+
+After rebuilding `clients/corpuswire-sdk/dist`, refresh and verify the committed
+SDK copy deterministically:
+
+```bash
+npm run vendor:write
+npm run check:vendor
+```
+
+The v2 MCP formatter admits each complete change bundle or omits the whole
+bundle when the MCP output limit cannot hold it. It never truncates one required
+BASE/HEAD side while returning the other. This makes evidence construction
+deterministic; it does not make language-model conclusions deterministic.
 
 The package can also run directly from this repository without `npm install` because the server first checks its vendored SDK runtime and then falls back to `clients/corpuswire-sdk/dist` for development.
 
@@ -253,7 +272,7 @@ MCP receipt, discovery/read, server/model wait, queue, chunking, embedding,
 vector-write, cleanup, total, model state, and bounded error state. The trace
 contains no file content, prompt text, credentials, or request headers.
 
-When `CORPUSWIRE_SYNC_MTIME_CACHE_ENABLED=true`, incremental sync writes a JSON metadata cache containing relative paths, size, mtime, SHA-256, and last decision. It never stores file contents. The cache suppresses duplicate changed-file uploads across MCP restarts when size and mtime match, re-hashes same-size files when mtime changes, and is ignored while bootstrap says the local API workspace index needs reconciliation. Full reconciliation does not use the cache because it must send a complete inventory.
+When `CORPUSWIRE_SYNC_MTIME_CACHE_ENABLED=true`, the versioned cache stores acknowledged path/hash metadata without source contents. Cache skips require the same service, workspace, collection, selection policy and coverage token, plus uninterrupted local observation since a verified full reconcile. Every candidate is hashed; matching size and mtime alone cannot suppress an upload. A restart, watcher error, foreign token or missing diagnosis requires reconciliation before cache reuse. Full reconciliation always reads and hashes every eligible file.
 
 `corpuswire_sync_git_delta` runs `git status --porcelain=v1 -z --untracked-files=all --ignored=no`, so gitignored files are not uploaded. Renames are sent as delete-old plus upload-new. The same CorpusWire include/exclude filters and extension allowlist still apply before anything is queued.
 
@@ -272,3 +291,9 @@ Use `corpuswire_sync_probe_paths` before queuing uncertain edits. It applies the
 Use `corpuswire_doctor` as the quick replacement-readiness check before trusting CorpusWire in a long Codex session. It returns `ready`, `attention`, or `blocked` from backend health, workspace diagnosis, process-local sync state, active sessions, and persisted activity.
 
 For the local Docker app on an existing dense-only Qdrant collection, keep `APP_QDRANT_HYBRID_ENABLED=false` unless you intentionally recreate the collection for hybrid named vectors. A dense/hybrid mismatch raises a backend writer error; current backend builds close the failed index session so retry attempts are not blocked by a stale active-session lock.
+
+## Inventory readiness compatibility note
+
+`filesUploaded` now counts acknowledged unique source-file transfers, so a warm full reconcile can report zero even when every eligible file was submitted. Use `filesSubmitted` and `filesReused` for the other boundaries. Missing SDK measurements display `unknown`; errors and detachments do not manufacture successful counts.
+
+Full reconcile fails with `scan_incomplete` on unresolved enumeration/read races or the file cap. Intentional selection exclusions are encoded in the producer policy. A queryable legacy or one-file index remains usable for retrieval but has unknown full coverage. `corpuswire_doctor` and sync status expose the need for reconciliation separately from session completion. The backend feature is enabled by default after the approved live gates. Set `REMOTE_INDEX_INVENTORY_COVERAGE_ENABLED=false` for rollback; existing indexes still require a complete scan to establish verified coverage.

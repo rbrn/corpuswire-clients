@@ -2,6 +2,7 @@ const TRANSIENT_HTTP_STATUSES = new Set([429, 502, 503, 504]);
 const DEFAULT_RETRY_ATTEMPTS = 2;
 const DEFAULT_RETRY_DELAY_MS = 250;
 export class CorpusWireHttpError extends Error {
+    transfer;
     status;
     statusText;
     responseBody;
@@ -159,6 +160,24 @@ function parseApiError(responseBody) {
             && typeof payload.error_code === "string"
             && typeof payload.message === "string"
             && typeof payload.request_id === "string") {
+            const schemaVersion = "schema_version" in payload && typeof payload.schema_version === "string"
+                ? payload.schema_version
+                : null;
+            if (schemaVersion?.startsWith("review-context/")
+                && schemaVersion !== "review-context/v1"
+                && schemaVersion !== "review-context/v2") {
+                return {
+                    requestId: payload.request_id,
+                    durationMs: null,
+                    errorCode: "unsupported_review_context_contract",
+                    errorMessage: `CorpusWire returned unsupported review error schema: ${schemaVersion}.`,
+                    errorDetail: undefined,
+                    errorEnvelope: null,
+                    retryable: false,
+                    retryAfterSeconds: null,
+                    recoveryGuidance: [],
+                };
+            }
             const candidate = payload;
             return {
                 requestId: candidate.request_id,

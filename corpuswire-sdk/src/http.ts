@@ -1,14 +1,19 @@
 import type {
   EnhanceErrorEnvelope,
+  IndexTransferSummary,
   FetchLike,
   ReviewContextErrorV1,
+  ReviewContextErrorV2,
 } from "./types.js";
+
+type ReviewContextErrorEnvelope = ReviewContextErrorV1 | ReviewContextErrorV2;
 
 const TRANSIENT_HTTP_STATUSES = new Set([429, 502, 503, 504]);
 const DEFAULT_RETRY_ATTEMPTS = 2;
 const DEFAULT_RETRY_DELAY_MS = 250;
 
 export class CorpusWireHttpError extends Error {
+  readonly transfer?: IndexTransferSummary;
   readonly status: number;
   readonly statusText: string;
   readonly responseBody: string;
@@ -17,7 +22,7 @@ export class CorpusWireHttpError extends Error {
   readonly errorCode: string | null;
   readonly errorMessage: string | null;
   readonly errorDetail: unknown;
-  readonly errorEnvelope: EnhanceErrorEnvelope | ReviewContextErrorV1 | null;
+  readonly errorEnvelope: EnhanceErrorEnvelope | ReviewContextErrorEnvelope | null;
   readonly retryable: boolean;
   readonly retryAfterSeconds: number | null;
   readonly recoveryGuidance: readonly string[];
@@ -32,7 +37,7 @@ export class CorpusWireHttpError extends Error {
       errorCode?: string | null;
       errorMessage?: string | null;
       errorDetail?: unknown;
-      errorEnvelope?: EnhanceErrorEnvelope | ReviewContextErrorV1 | null;
+      errorEnvelope?: EnhanceErrorEnvelope | ReviewContextErrorEnvelope | null;
       retryable?: boolean;
       retryAfterSeconds?: number | null;
       recoveryGuidance?: readonly string[];
@@ -207,12 +212,12 @@ async function waitForRetry(
 }
 
 interface ParsedApiError {
-  requestId: string;
+  requestId: string | null;
   durationMs: number | null;
   errorCode: string;
   errorMessage: string;
   errorDetail: unknown;
-  errorEnvelope: EnhanceErrorEnvelope | ReviewContextErrorV1 | null;
+  errorEnvelope: EnhanceErrorEnvelope | ReviewContextErrorEnvelope | null;
   retryable: boolean;
   retryAfterSeconds: number | null;
   recoveryGuidance: readonly string[];
@@ -233,7 +238,25 @@ function parseApiError(responseBody: string): ParsedApiError | null {
       && typeof payload.message === "string"
       && typeof payload.request_id === "string"
     ) {
-      const candidate = payload as unknown as ReviewContextErrorV1;
+      const schemaVersion = "schema_version" in payload && typeof payload.schema_version === "string"
+        ? payload.schema_version
+        : null;
+      if (schemaVersion?.startsWith("review-context/")
+        && schemaVersion !== "review-context/v1"
+        && schemaVersion !== "review-context/v2") {
+        return {
+          requestId: payload.request_id,
+          durationMs: null,
+          errorCode: "unsupported_review_context_contract",
+          errorMessage: `CorpusWire returned unsupported review error schema: ${schemaVersion}.`,
+          errorDetail: undefined,
+          errorEnvelope: null,
+          retryable: false,
+          retryAfterSeconds: null,
+          recoveryGuidance: [],
+        };
+      }
+      const candidate = payload as unknown as ReviewContextErrorEnvelope;
       return {
         requestId: candidate.request_id,
         durationMs: null,

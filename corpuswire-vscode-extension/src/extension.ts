@@ -1,7 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import * as vscode from "vscode";
 import {
   CorpusWireClient,
+  isRetrievalExcludedPath,
   CorpusWireHttpError,
 } from "@corpuswire/sdk";
 import type {
@@ -9,6 +10,8 @@ import type {
   IndexWorkspaceRequest,
   PromptRewriteResult,
   RemoteWorkspaceFile,
+  InventoryScan,
+  RemoteIndexCommitResponse,
 } from "@corpuswire/sdk";
 import {
   buildRemoteServiceHeaders,
@@ -353,6 +356,8 @@ interface ReposResponseRepo {
 interface CollectedWorkspaceFiles {
   files: RemoteWorkspaceFile[];
   skippedLargeFiles: number;
+  skippedPolicyFiles: number;
+  inventoryScan?: InventoryScan;
 }
 
 async function runIndexStatusCheck(post: (message: PanelOutboundMessage) => void): Promise<void> {
@@ -675,6 +680,10 @@ async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}): Promi
   });
 
   try {
+    const capabilities = await client.getIndexCapabilities();
+    const maxFileSizeBytes = Math.min(settings.remoteIndexing.maxFileSizeBytes, capabilities.max_file_size_bytes);
+
+    let committed: RemoteIndexCommitResponse | undefined;
     let skippedLargeFiles = 0;
     await vscode.window.withProgress(
       {
@@ -688,13 +697,13 @@ async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}): Promi
         const controller = new AbortController();
         const cancellation = token.onCancellationRequested(() => controller.abort());
         let reportedPercent = 0;
-        const collected = await collectWorkspaceFiles(workspaceFolder, settings.remoteIndexing.maxFileSizeBytes);
+        const collected = await collectWorkspaceFiles(workspaceFolder, maxFileSizeBytes);
         skippedLargeFiles = collected.skippedLargeFiles;
         if (token.isCancellationRequested) {
           throw new Error("Indexing cancelled before upload started.");
         }
         try {
-          await client.indexWorkspace({
+          committed = await client.indexWorkspace({
             workspace: {
               workspaceId,
               displayRoot: workspaceFolder.uri.toString(),
@@ -706,13 +715,14 @@ async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}): Promi
               transport: "vscode.workspace.fs",
               maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
               batchBytes: settings.remoteIndexing.batchBytes,
-              maxFileSizeBytes: settings.remoteIndexing.maxFileSizeBytes,
+              maxFileSizeBytes,
             },
             maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
             batchBytes: settings.remoteIndexing.batchBytes,
-            maxFileSizeBytes: settings.remoteIndexing.maxFileSizeBytes,
+            maxFileSizeBytes,
             recreateCollection: options.recreateCollection === true,
             files: collected.files,
+            inventoryScan: collected.inventoryScan,
             signal: controller.signal,
             onProgress: (event) => {
               const percent = event.overall_percent;
@@ -734,10 +744,11 @@ async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}): Promi
     const skippedSuffix = skippedLargeFiles > 0
       ? ` Skipped ${skippedLargeFiles} file(s) above the configured size limit.`
       : "";
+    const evidenceSuffix = ` Inventory coverage: ${committed?.status.coverage?.state ?? "unknown"}; transferred files: ${committed?.transfer?.files_transferred ?? "unknown"}.`;
     void vscode.window.showInformationMessage(
       options.recreateCollection
-        ? `Workspace index rebuilt with CorpusWire.${skippedSuffix}`
-        : `Workspace indexed with CorpusWire.${skippedSuffix}`,
+        ? `Workspace index rebuilt with CorpusWire.${skippedSuffix}${evidenceSuffix}`
+        : `Workspace indexed with CorpusWire.${skippedSuffix}${evidenceSuffix}`,
     );
   } catch (error) {
     void vscode.window.showWarningMessage(formatIndexingError(error, indexerService.url));
@@ -878,24 +889,36 @@ async function collectWorkspaceFiles(
   workspaceFolder: vscode.WorkspaceFolder,
   maxFileSizeBytes: number,
 ): Promise<CollectedWorkspaceFiles> {
+  const startedAt = new Date().toISOString();
   const uris = await vscode.workspace.findFiles(
     new vscode.RelativePattern(workspaceFolder, INDEX_INCLUDE_GLOB),
     new vscode.RelativePattern(workspaceFolder, INDEX_EXCLUDE_GLOB),
   );
-  return collectUriFiles(uris, maxFileSizeBytes);
+  const collected = await collectUriFiles(uris, maxFileSizeBytes, true);
+  return { ...collected, inventoryScan: {
+    complete: true, startedAt, completedAt: new Date().toISOString(),
+    excludedFileCount: collected.skippedLargeFiles + collected.skippedPolicyFiles, producer: "corpuswire-vscode-scan/v1",
+    ignoreDigest: createHash("sha256").update(JSON.stringify({ include: INDEX_INCLUDE_GLOB, exclude: INDEX_EXCLUDE_GLOB, hiddenPaths: "exclude", retrievalExclusions: "discovery-and-terraform/v1" })).digest("hex"),
+  } };
 }
 
-async function collectUriFiles(uris: vscode.Uri[], maxFileSizeBytes: number): Promise<CollectedWorkspaceFiles> {
+async function collectUriFiles(uris: vscode.Uri[], maxFileSizeBytes: number, strict = false): Promise<CollectedWorkspaceFiles> {
   const files: RemoteWorkspaceFile[] = [];
   let skippedLargeFiles = 0;
+  let skippedPolicyFiles = 0;
   for (const uri of uris) {
     const relativePath = relativePathForUri(uri);
     if (!relativePath) {
+      if (strict) throw Object.assign(new Error("Workspace scan incomplete"), { code: "scan_incomplete" });
+      continue;
+    }
+    if (relativePath.split("/").some((part) => part.startsWith(".")) || isRetrievalExcludedPath(relativePath)) {
+      skippedPolicyFiles += 1;
       continue;
     }
     try {
       const stat = await vscode.workspace.fs.stat(uri);
-      if ((stat.type & vscode.FileType.Directory) !== 0) {
+      if ((stat.type & (vscode.FileType.Directory | vscode.FileType.SymbolicLink)) !== 0) {
         continue;
       }
       if (stat.size > maxFileSizeBytes) {
@@ -903,16 +926,20 @@ async function collectUriFiles(uris: vscode.Uri[], maxFileSizeBytes: number): Pr
         continue;
       }
       const content = await vscode.workspace.fs.readFile(uri);
+      const after = await vscode.workspace.fs.stat(uri);
+      if (after.size !== stat.size || after.mtime !== stat.mtime || content.length !== stat.size
+        || (after.type & vscode.FileType.SymbolicLink) !== 0) throw new Error("File changed during scan");
       files.push({
         relativePath,
         content,
         mtimeNs: Math.trunc(stat.mtime * 1_000_000),
       });
-    } catch {
+    } catch (cause) {
+      if (strict) throw Object.assign(new Error("Workspace scan incomplete", { cause }), { code: "scan_incomplete" });
       // Files can disappear between watcher events and upload; the next event heals state.
     }
   }
-  return { files, skippedLargeFiles };
+  return { files, skippedLargeFiles, skippedPolicyFiles };
 }
 
 function relativePathForUri(uri: vscode.Uri): string | null {

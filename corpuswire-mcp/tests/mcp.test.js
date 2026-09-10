@@ -10,6 +10,13 @@ const SERVER_BIN = fileURLToPath(new URL("../bin/corpuswire-mcp.js", import.meta
 const REVIEW_SCHEMA_PATH = fileURLToPath(
   new URL("../../../schemas/review-context/v1/review-context.schema.json", import.meta.url),
 );
+const REVIEW_V2_SCHEMA_PATH = fileURLToPath(
+  new URL("../../../schemas/review-context/v2/review-context.schema.json", import.meta.url),
+);
+const VENDORED_SDK_INDEX = new URL(
+  "../vendor/corpuswire-sdk/dist/index.js",
+  import.meta.url,
+);
 
 test("corpuswire-mcp exposes tools and maps search requests to the SDK", async () => {
   const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
@@ -225,6 +232,397 @@ test("corpuswire-mcp exposes review context and Codebase status with complete pr
   }
 });
 
+test("corpuswire-mcp exposes isolated v2 review context and never splits atomic BASE/HEAD evidence", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-review-v2-"));
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+    try {
+      const tools = await rpc({ jsonrpc: "2.0", id: 30, method: "tools/list", params: {} });
+      const v1Tool = tools.result.tools.find((tool) => tool.name === "corpuswire_review_context");
+      const v2Tool = tools.result.tools.find((tool) => tool.name === "corpuswire_review_context_v2");
+      assert.ok(v1Tool);
+      assert.ok(v2Tool);
+      const v1Schema = JSON.parse(await readFile(REVIEW_SCHEMA_PATH, "utf8"));
+      const v2Schema = JSON.parse(await readFile(REVIEW_V2_SCHEMA_PATH, "utf8"));
+      assertReviewToolSchemaParity(v1Tool.inputSchema, v1Schema.$defs);
+      assertReviewToolSchemaParityV2(v2Tool.inputSchema, v2Schema.$defs);
+
+      const sufficient = await rpc({
+        jsonrpc: "2.0",
+        id: 31,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_review_context_v2",
+          arguments: {
+            codebaseId: "codebase-1",
+            targetRepositoryId: "repo-kotlin",
+            providerReviewId: "42",
+            expectedHeadSha: null,
+            objective: "Compare exact BASE and HEAD symbols",
+            budgets: {
+              graphHops: 1,
+              evidenceItems: 20,
+              serializedCharacters: 100000,
+              serializedUtf8Bytes: 100000,
+              waitMs: 0,
+            },
+            outputCharacterLimit: 100000,
+            timeoutMs: 5000,
+            pollIntervalMs: 0,
+          },
+        },
+      });
+      assert.equal(sufficient.result.isError, false);
+      const sufficientText = sufficient.result.content[0].text;
+      assert.match(sufficientText, /CorpusWire deterministic symbol-change evidence v2/);
+      assert.match(sufficientText, /BASE_EXACT_SYMBOL_BODY/);
+      assert.match(sufficientText, /HEAD_EXACT_SYMBOL_BODY/);
+      assert.match(sufficientText, /each serialized bundle is atomic/);
+      assert.match(sufficientText, /language-model conclusions remain probabilistic/);
+      assert.match(sufficientText, /repositorySelectionDigest: 9{64}/);
+      assert.match(sufficientText, /baseBuild: snapshot-artifacts\/v2/);
+      assert.match(sufficientText, /overlayBuild: review-artifacts\/v2/);
+      assert.match(sufficientText, /normalizedDiffHash: 6{64}/);
+      assert.match(sufficientText, /serializedCounts: tokens=18 characters=100 utf8Bytes=100/);
+
+      const exactBoundary = await rpc({
+        jsonrpc: "2.0",
+        id: 32,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_review_context_v2",
+          arguments: {
+            codebaseId: "codebase-1",
+            targetRepositoryId: "repo-kotlin",
+            providerReviewId: "42",
+            objective: "Compare exact BASE and HEAD symbols",
+            outputCharacterLimit: sufficientText.length,
+          },
+        },
+      });
+      assert.equal(exactBoundary.result.isError, false);
+      assert.match(exactBoundary.result.content[0].text, /BASE_EXACT_SYMBOL_BODY/);
+      assert.match(exactBoundary.result.content[0].text, /HEAD_EXACT_SYMBOL_BODY/);
+      assert.equal(exactBoundary.result.content[0].text.length, sufficientText.length);
+
+      const constrained = await rpc({
+        jsonrpc: "2.0",
+        id: 33,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_review_context_v2",
+          arguments: {
+            codebaseId: "codebase-1",
+            targetRepositoryId: "repo-kotlin",
+            providerReviewId: "42",
+            objective: "Compare exact BASE and HEAD symbols",
+            outputCharacterLimit: sufficientText.length - 1,
+          },
+        },
+      });
+      assert.equal(constrained.result.isError, false);
+      const constrainedText = constrained.result.content[0].text;
+      assert.doesNotMatch(constrainedText, /BASE_EXACT_SYMBOL_BODY/);
+      assert.doesNotMatch(constrainedText, /HEAD_EXACT_SYMBOL_BODY/);
+      assert.match(constrainedText, /mcpOmittedBundles: 1|omission summary item/);
+      assert.ok(constrainedText.length <= sufficientText.length - 1);
+
+      const multipleFull = await rpc({
+        jsonrpc: "2.0",
+        id: 34,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_review_context_v2",
+          arguments: {
+            codebaseId: "codebase-1",
+            targetRepositoryId: "repo-kotlin",
+            providerReviewId: "42",
+            objective: "Compare multiple symbols with simultaneous omissions",
+            outputCharacterLimit: 100000,
+          },
+        },
+      });
+      const multipleFullText = multipleFull.result.content[0].text;
+      assert.match(multipleFullText, /BASE_EXACT_SYMBOL_BODY/);
+      assert.match(multipleFullText, /HEAD_EXACT_SYMBOL_BODY/);
+      assert.match(multipleFullText, /BASE_UNICODE_Δ😀/u);
+      assert.match(multipleFullText, /HEAD_UNICODE_Δ😀/u);
+      assert.match(multipleFullText, /"change_id":"server-omitted-change"/);
+      assert.match(multipleFullText, /"minimum_required_budget":\{"schema_version":"review-context\/v2","evidence_items":2,"tokens":123,"characters":456,"utf8_bytes":789\}/);
+      assert.match(multipleFullText, /"model_evidence_available":false/);
+
+      const multipleConstrained = await rpc({
+        jsonrpc: "2.0",
+        id: 35,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_review_context_v2",
+          arguments: {
+            codebaseId: "codebase-1",
+            targetRepositoryId: "repo-kotlin",
+            providerReviewId: "42",
+            objective: "Compare multiple symbols with simultaneous omissions",
+            outputCharacterLimit: multipleFullText.length - 1,
+          },
+        },
+      });
+      const multipleConstrainedText = multipleConstrained.result.content[0].text;
+      assert.match(multipleConstrainedText, /BASE_EXACT_SYMBOL_BODY/);
+      assert.match(multipleConstrainedText, /HEAD_EXACT_SYMBOL_BODY/);
+      assert.doesNotMatch(multipleConstrainedText, /BASE_UNICODE_Δ😀/u);
+      assert.doesNotMatch(multipleConstrainedText, /HEAD_UNICODE_Δ😀/u);
+      assert.match(multipleConstrainedText, /"change_id":"server-omitted-change"/);
+      assert.match(multipleConstrainedText, /"reason":"mcp_output_character_limit"/);
+
+      for (const [id, objective, expected] of [
+        [36, "missing collections", /malformed v2 atomic bundle evidence/],
+        [37, "malformed bundle", /malformed v2 atomic bundle evidence/],
+        [38, "malformed omission", /malformed v2 omission metadata/],
+        [40, "half pair", /malformed v2 atomic bundle evidence/],
+        [41, "mismatched instance", /malformed v2 atomic bundle evidence/],
+        [42, "unknown change kind", /malformed v2 atomic bundle evidence/],
+        [43, "unknown pairing status", /malformed v2 atomic bundle evidence/],
+        [45, "unknown continuity status", /malformed v2 atomic bundle evidence/],
+        [44, "unknown delta status", /malformed v2 atomic bundle evidence/],
+      ]) {
+        const malformed = await rpc({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: {
+            name: "corpuswire_review_context_v2",
+            arguments: {
+              codebaseId: "codebase-1",
+              targetRepositoryId: "repo-kotlin",
+              providerReviewId: "42",
+              objective,
+            },
+          },
+        });
+        assert.equal(malformed.result.isError, true);
+        assert.match(malformed.result.content[0].text, expected);
+        assert.doesNotMatch(malformed.result.content[0].text, /EXACT_SYMBOL_BODY/);
+      }
+
+      const futureJob = await rpc({
+        jsonrpc: "2.0",
+        id: 39,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_review_context_v2",
+          arguments: {
+            codebaseId: "codebase-1",
+            targetRepositoryId: "repo-kotlin",
+            providerReviewId: "42",
+            objective: "future contract",
+            waitForCompletion: false,
+          },
+        },
+      });
+      assert.equal(futureJob.result.isError, true);
+      assert.match(futureJob.result.content[0].text, /unsupported v2 job contract/);
+
+      for (const [id, state] of [
+        [45, "succeeded"],
+        [46, "partial"],
+        [47, "failed"],
+        [48, "cancelled"],
+        [49, "superseded"],
+      ]) {
+        const terminal = await rpc({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: {
+            name: "corpuswire_review_context_v2",
+            arguments: {
+              codebaseId: "codebase-1",
+              targetRepositoryId: "repo-kotlin",
+              providerReviewId: "42",
+              objective: `job ${state}`,
+              waitForCompletion: false,
+              outputCharacterLimit: 1000,
+            },
+          },
+        });
+        assert.equal(terminal.result.isError, false);
+        assert.match(terminal.result.content[0].text, new RegExp(`state: ${state}`));
+        assert.match(
+          terminal.result.content[0].text,
+          state === "succeeded" ? /partialReasons: none/ : new RegExp(`job_${state}_reason`),
+        );
+      }
+
+      const maximumIdentifiers = await rpc({
+        jsonrpc: "2.0",
+        id: 50,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_review_context_v2",
+          arguments: {
+            codebaseId: "codebase-1",
+            targetRepositoryId: "repo-kotlin",
+            providerReviewId: "42",
+            objective: "job failed max ids",
+            waitForCompletion: false,
+            outputCharacterLimit: 256,
+          },
+        },
+      });
+      assert.equal(maximumIdentifiers.result.isError, false);
+      assert.match(maximumIdentifiers.result.content[0].text, /state: failed/);
+      assert.match(maximumIdentifiers.result.content[0].text, /job_failed_reason/);
+
+      const minimumLimit = await rpc({
+        jsonrpc: "2.0",
+        id: 51,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_review_context_v2",
+          arguments: {
+            codebaseId: "codebase-1",
+            targetRepositoryId: "repo-kotlin",
+            providerReviewId: "42",
+            objective: "Compare exact BASE and HEAD symbols",
+            outputCharacterLimit: 256,
+          },
+        },
+      });
+      assert.equal(minimumLimit.result.isError, true);
+      assert.match(minimumLimit.result.content[0].text, /too small for mandatory v2 omission metadata; required=/);
+      assert.doesNotMatch(minimumLimit.result.content[0].text, /EXACT_SYMBOL_BODY/);
+      const requiredLimit = Number(
+        minimumLimit.result.content[0].text.match(/required=(\d+)/)?.[1],
+      );
+      assert.ok(Number.isInteger(requiredLimit) && requiredLimit > 256);
+      const exactMinimum = await rpc({
+        jsonrpc: "2.0", id: 54, method: "tools/call",
+        params: { name: "corpuswire_review_context_v2", arguments: {
+          codebaseId: "codebase-1", targetRepositoryId: "repo-kotlin",
+          providerReviewId: "42", objective: "Compare exact BASE and HEAD symbols",
+          outputCharacterLimit: requiredLimit,
+        } },
+      });
+      assert.equal(exactMinimum.result.isError, false);
+      assert.equal(exactMinimum.result.content[0].text.length, requiredLimit);
+      assert.match(exactMinimum.result.content[0].text, /"schema_version":"review-context\/v2"/);
+      assert.match(exactMinimum.result.content[0].text, /"change_kind":"modified"/);
+      assert.match(exactMinimum.result.content[0].text, /"pairing_status":"exact_symbol_id"/);
+      assert.match(exactMinimum.result.content[0].text, /"omitted_sides":\["base","head"\]/);
+      assert.match(exactMinimum.result.content[0].text, /"minimum_required_budget":null/);
+      assert.match(exactMinimum.result.content[0].text, /"model_evidence_available":false/);
+      const belowMinimum = await rpc({
+        jsonrpc: "2.0", id: 55, method: "tools/call",
+        params: { name: "corpuswire_review_context_v2", arguments: {
+          codebaseId: "codebase-1", targetRepositoryId: "repo-kotlin",
+          providerReviewId: "42", objective: "Compare exact BASE and HEAD symbols",
+          outputCharacterLimit: requiredLimit - 1,
+        } },
+      });
+      assert.equal(belowMinimum.result.isError, true);
+      assert.match(belowMinimum.result.content[0].text, new RegExp(`required=${requiredLimit}`));
+
+      const httpFailure = await rpc({
+        jsonrpc: "2.0",
+        id: 53,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_review_context_v2",
+          arguments: {
+            codebaseId: "codebase-1",
+            targetRepositoryId: "repo-kotlin",
+            providerReviewId: "42",
+            objective: "http error",
+          },
+        },
+      });
+      assert.equal(httpFailure.result.isError, true);
+      assert.match(httpFailure.result.content[0].text, /errorCode=review_reads_disabled/);
+      assert.match(httpFailure.result.content[0].text, /requestId=request-http-v2/);
+      assert.match(httpFailure.result.content[0].text, /retryable=true/);
+      assert.match(httpFailure.result.content[0].text, /retryAfterSeconds=7/);
+      assert.match(httpFailure.result.content[0].text, /Recovery guidance: Retry after rollout enablement\./);
+
+      const scaleStarted = performance.now();
+      const scale = await rpc({
+        jsonrpc: "2.0",
+        id: 52,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_review_context_v2",
+          arguments: {
+            codebaseId: "codebase-1",
+            targetRepositoryId: "repo-kotlin",
+            providerReviewId: "42",
+            objective: "scale 200",
+            outputCharacterLimit: 2_000_000,
+          },
+        },
+      });
+      const scaleDurationMs = performance.now() - scaleStarted;
+      assert.equal(scale.result.isError, false);
+      assert.match(scale.result.content[0].text, /scale-change-199/);
+      assert.ok(scaleDurationMs < 2_000, `200-bundle formatting took ${scaleDurationMs}ms`);
+    } finally {
+      child.kill();
+    }
+
+    const requests = (await readFile(requestsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const v2Requests = requests.filter((request) => request.kind === "requestReviewContextV2AndWait");
+    assert.equal(v2Requests.length, 19);
+    assert.deepEqual(v2Requests[0].request.budgets, {
+      graphHops: 1,
+      evidenceItems: 20,
+      serializedCharacters: 100000,
+      serializedUtf8Bytes: 100000,
+      waitMs: 0,
+    });
+    assert.equal(Object.hasOwn(v2Requests[0].request, "outputCharacterLimit"), false);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("v2 MCP admission uses one append-only pass with no middle-array removals", async () => {
+  const source = await readFile(SERVER_BIN, "utf8");
+  const admission = source.slice(
+    source.indexOf("function formatReviewContextResultV2"),
+    source.indexOf("function formatReviewContextV2BundleBlock"),
+  );
+  assert.match(admission, /const admittedMask = new Uint8Array\(bundles\.length\)/);
+  assert.doesNotMatch(admission, /\.indexOf\(|\.splice\(/);
+  assert.equal((admission.match(/for \(let index = 0; index < bundles\.length/g) ?? []).length, 1);
+});
+
+test("vendored SDK rejects skeletal current-v2 evidence before MCP rendering", async () => {
+  const sdk = await import(VENDORED_SDK_INDEX.href);
+  assert.throws(
+    () => sdk.assertReviewContextV2Result({
+      schema_version: "review-context/v2",
+      request_id: "request-v2",
+      bundles: [{
+        schema_version: "review-context/v2",
+        change_record: { schema_version: "review-context/v2" },
+      }],
+      omitted_bundles: [],
+    }),
+    /Malformed review response v2 response contract/,
+  );
+});
+
 function assertReviewToolSchemaParity(toolSchema, definitions) {
   const requestSchema = definitions.ReviewContextRequestV1;
   const requestFields = {
@@ -265,6 +663,54 @@ function assertReviewToolSchemaParity(toolSchema, definitions) {
   };
   const budgetSchema = definitions.ReviewBudgetsV1;
   const toolBudgets = toolSchema.properties.budgets;
+  assert.equal(toolBudgets.additionalProperties, false);
+  assert.deepEqual(Object.keys(toolBudgets.properties).sort(), Object.values(budgetFields).sort());
+  for (const [wireName, toolName] of Object.entries(budgetFields)) {
+    assertSchemaBoundsEqual(toolBudgets.properties[toolName], budgetSchema.properties[wireName]);
+  }
+}
+
+function assertReviewToolSchemaParityV2(toolSchema, definitions) {
+  const requestSchema = definitions.ReviewContextRequestV2;
+  const requestFields = {
+    codebase_id: "codebaseId",
+    target_repository_id: "targetRepositoryId",
+    provider_review_id: "providerReviewId",
+    expected_head_sha: "expectedHeadSha",
+    objective: "objective",
+    strict_freshness: "strictFreshness",
+    budgets: "budgets",
+  };
+  const controlFields = new Set([
+    "outputCharacterLimit",
+    "waitForCompletion",
+    "timeoutMs",
+    "pollIntervalMs",
+  ]);
+  assert.deepEqual(
+    Object.keys(toolSchema.properties).filter((name) => !controlFields.has(name)).sort(),
+    Object.values(requestFields).sort(),
+  );
+  assert.deepEqual(
+    [...toolSchema.required].sort(),
+    requestSchema.required.map((name) => requestFields[name]).sort(),
+  );
+  for (const [wireName, toolName] of Object.entries(requestFields)) {
+    if (wireName === "budgets") continue;
+    assertSchemaBoundsEqual(toolSchema.properties[toolName], requestSchema.properties[wireName]);
+  }
+  const budgetFields = {
+    graph_hops: "graphHops",
+    candidate_repositories: "candidateRepositories",
+    pre_rank_candidates: "preRankCandidates",
+    evidence_items: "evidenceItems",
+    serialized_tokens: "serializedTokens",
+    serialized_characters: "serializedCharacters",
+    serialized_utf8_bytes: "serializedUtf8Bytes",
+    wait_ms: "waitMs",
+  };
+  const toolBudgets = toolSchema.properties.budgets;
+  const budgetSchema = definitions.ReviewBudgetsV2;
   assert.equal(toolBudgets.additionalProperties, false);
   assert.deepEqual(Object.keys(toolBudgets.properties).sort(), Object.values(budgetFields).sort());
   for (const [wireName, toolName] of Object.entries(budgetFields)) {
@@ -1148,6 +1594,12 @@ async function writeMockSdk(tempDir) {
     `
 import { appendFileSync } from "node:fs";
 
+export function assertReviewContextV2Result(value) {
+  if (!value || value.schema_version !== "review-context/v2") {
+    throw new Error("invalid mock v2 result");
+  }
+}
+
 export class CorpusWireClient {
   constructor(options = {}) {
     this.baseUrl = options.baseUrl ?? "http://mock-corpuswire";
@@ -1299,6 +1751,250 @@ export class CorpusWireClient {
       status_url: "/v1/review-context/jobs/job-review-1",
       retry_after_seconds: 2,
       partial_reasons: [],
+    };
+  }
+
+  async requestReviewContextV2AndWait(request, options = {}) {
+    appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
+      kind: "requestReviewContextV2AndWait",
+      request,
+      options,
+    }) + "\\n", "utf8");
+    if (request.objective.includes("http error")) {
+      throw new CorpusWireHttpError();
+    }
+    const baseRange = {
+      schema_version: "review-context/v2",
+      start_line: 10,
+      end_line: 12,
+      start_column: 1,
+      end_column: 2,
+    };
+    const headRange = { ...baseRange, start_line: 14, end_line: 16 };
+    const response = {
+      schema_version: "review-context/v2",
+      request_id: "request-review-v2",
+      telemetry_id: "telemetry-review-v2",
+      job_id: "job-review-v2",
+      review_id: request.providerReviewId,
+      target_repository_id: request.targetRepositoryId,
+      review_scope: {
+        schema_version: "review-context/v2",
+        repository_set_id: "set-v2",
+        repository_selection_digest: "9".repeat(64),
+      },
+      base_sha: "1".repeat(40),
+      head_sha: "2".repeat(40),
+      base_snapshot_id: "snapshot-v2",
+      base_snapshot_generation: 3,
+      base_snapshot_refresh_sequence: 0,
+      base_artifact_contract_version: "snapshot-artifacts/v2",
+      base_snapshot_builder_version: "snapshot-builder-v2",
+      base_build_policy_digest: "7".repeat(64),
+      overlay_id: "overlay-v2",
+      overlay_generation: 4,
+      overlay_refresh_sequence: 0,
+      artifact_contract_version: "review-artifacts/v2",
+      evidence_builder_version: "evidence-builder-v2",
+      overlay_build_policy_digest: "8".repeat(64),
+      normalized_diff_hash: "6".repeat(64),
+      freshness: "exact",
+      partial: false,
+      partial_reasons: [],
+      bundles: [{
+        schema_version: "review-context/v2",
+        ordinal: 0,
+        change_record: {
+          schema_version: "review-context/v2",
+          change_id: "change-v2",
+          logical_identity: "logical-v2",
+          change_kind: "modified",
+          pairing_status: "exact_symbol_id",
+          continuity_status: "proven",
+          base: {
+            schema_version: "review-context/v2",
+            symbol_instance_id: "base-instance",
+            path: "src/service.py",
+            source_range: baseRange,
+          },
+          head: {
+            schema_version: "review-context/v2",
+            symbol_instance_id: "head-instance",
+            path: "src/service.py",
+            source_range: headRange,
+          },
+          normalized_hunks: [],
+          relationship_deltas: [],
+        },
+        base_evidence: {
+          schema_version: "review-context/v2",
+          side: "base",
+          evidence_id: "extent-base",
+          symbol_instance_id: "base-instance",
+          repository_id: request.targetRepositoryId,
+          revision: "1".repeat(40),
+          layer: "snapshot",
+          path: "src/service.py",
+          symbol_source_range: baseRange,
+          extent_start_line: 10,
+          extent_end_line: 12,
+          source_content_sha256: "a".repeat(64),
+          symbol_extent_sha256: "b".repeat(64),
+          text: "BASE_EXACT_SYMBOL_BODY\\nline two\\nline three\\n",
+          token_count: 9,
+        },
+        head_evidence: {
+          schema_version: "review-context/v2",
+          side: "head",
+          evidence_id: "extent-head",
+          symbol_instance_id: "head-instance",
+          repository_id: request.targetRepositoryId,
+          revision: "2".repeat(40),
+          layer: "overlay",
+          path: "src/service.py",
+          symbol_source_range: headRange,
+          extent_start_line: 14,
+          extent_end_line: 16,
+          source_content_sha256: "c".repeat(64),
+          symbol_extent_sha256: "d".repeat(64),
+          text: "HEAD_EXACT_SYMBOL_BODY\\nline two\\nline three\\n",
+          token_count: 9,
+        },
+        related_evidence: [],
+        completeness: {
+          schema_version: "review-context/v2",
+          required_sides_complete: true,
+          related_evidence_complete: true,
+          reason_codes: [],
+        },
+        evidence_item_count: 2,
+        serialized_tokens: 18,
+        serialized_characters: 100,
+        serialized_utf8_bytes: 100,
+      }],
+      omitted_bundles: [],
+      serialized_token_count: 18,
+      serialized_character_count: 100,
+      serialized_utf8_byte_count: 100,
+      retry_guidance: null,
+    };
+    if (request.objective.includes("multiple")) {
+      const second = structuredClone(response.bundles[0]);
+      second.ordinal = 1;
+      second.change_record.change_id = "change-v2-unicode";
+      second.change_record.logical_identity = "logical-v2-unicode";
+      second.change_record.base.symbol_instance_id = "base-instance-unicode";
+      second.change_record.head.symbol_instance_id = "head-instance-unicode";
+      second.base_evidence.evidence_id = "extent-base-unicode";
+      second.base_evidence.symbol_instance_id = "base-instance-unicode";
+      second.base_evidence.text = "BASE_UNICODE_Δ😀\\nline two\\nline three\\n";
+      second.head_evidence.evidence_id = "extent-head-unicode";
+      second.head_evidence.symbol_instance_id = "head-instance-unicode";
+      second.head_evidence.text = "HEAD_UNICODE_Δ😀\\nline two\\nline three\\n";
+      response.bundles.push(second);
+      response.omitted_bundles.push({
+        schema_version: "review-context/v2",
+        change_id: "server-omitted-change",
+        ordinal: 2,
+        change_kind: "modified",
+        pairing_status: "exact_symbol_id",
+        reason: "required_pair_budget_exceeded",
+        omitted_sides: ["base", "head"],
+        minimum_required_budget: {
+          schema_version: "review-context/v2",
+          evidence_items: 2,
+          tokens: 123,
+          characters: 456,
+          utf8_bytes: 789,
+        },
+        model_evidence_available: false,
+      });
+    }
+    if (request.objective.includes("scale 200")) {
+      const template = response.bundles[0];
+      response.bundles = [];
+      for (let index = 0; index < 200; index += 1) {
+        const item = structuredClone(template);
+        item.ordinal = index;
+        item.change_record.change_id = "scale-change-" + index;
+        item.change_record.logical_identity = "scale-logical-" + index;
+        item.change_record.base.symbol_instance_id = "scale-base-" + index;
+        item.change_record.head.symbol_instance_id = "scale-head-" + index;
+        item.base_evidence.evidence_id = "scale-base-evidence-" + index;
+        item.base_evidence.symbol_instance_id = "scale-base-" + index;
+        item.base_evidence.text = "BASE_SCALE_" + index + "\\nline two\\nline three\\n";
+        item.head_evidence.evidence_id = "scale-head-evidence-" + index;
+        item.head_evidence.symbol_instance_id = "scale-head-" + index;
+        item.head_evidence.text = "HEAD_SCALE_" + index + "\\nline two\\nline three\\n";
+        response.bundles.push(item);
+      }
+    }
+    if (request.objective.includes("missing collections")) {
+      delete response.bundles;
+    }
+    if (request.objective.includes("malformed bundle")) {
+      response.bundles = [null];
+    }
+    if (request.objective.includes("malformed omission")) {
+      response.omitted_bundles = [{}];
+    }
+    if (request.objective.includes("half pair")) {
+      response.bundles[0].head_evidence = null;
+    }
+    if (request.objective.includes("mismatched instance")) {
+      response.bundles[0].head_evidence.symbol_instance_id = "wrong-head-instance";
+    }
+    if (request.objective.includes("unknown change kind")) {
+      response.bundles[0].change_record.change_kind = "future_change_kind";
+    }
+    if (request.objective.includes("unknown pairing status")) {
+      response.bundles[0].change_record.pairing_status = "future_pairing_status";
+    }
+    if (request.objective.includes("unknown continuity status")) {
+      response.bundles[0].change_record.continuity_status = "future_continuity_status";
+    }
+    if (request.objective.includes("unknown delta status")) {
+      response.bundles[0].change_record.relationship_deltas = [{
+        schema_version: "review-context/v2",
+        status: "future_delta_status",
+        direction: "outgoing",
+        base_fact: null,
+        head_fact: null,
+      }];
+    }
+    return response;
+  }
+
+  async requestReviewContextV2(request) {
+    appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
+      kind: "requestReviewContextV2",
+      request,
+    }) + "\\n", "utf8");
+    const state = ["succeeded", "partial", "failed", "cancelled", "superseded"]
+      .find((candidate) => request.objective.includes("job " + candidate)) ?? "running";
+    return {
+      schema_version: "review-context/v2",
+      contract_version: request.objective.includes("future contract")
+        ? "review-context/v3"
+        : "review-context/v2",
+      job_id: request.objective.includes("max ids") ? "j".repeat(256) : "job-review-v2",
+      request_id: "request-review-v2",
+      tenant_id: "tenant-a",
+      codebase_id: request.codebaseId,
+      repository_set_id: "set-v2",
+      repository_selection_digest: "e".repeat(64),
+      state,
+      attempts: 1,
+      status_url: "/v2/review-context/jobs/job-review-v2",
+      retry_after_seconds: ["queued", "running"].includes(state) ? 1 : null,
+      created_at: "2026-08-19T12:00:00Z",
+      updated_at: "2026-08-19T12:00:01Z",
+      partial_reasons: state === "succeeded" ? [] : [{
+        schema_version: "review-context/v2",
+        code: "job_" + state + "_reason",
+        retryable: false,
+        affected_side: "response",
+      }],
     };
   }
 
@@ -1630,7 +2326,12 @@ export class CorpusWireClient {
 }
 
 export class CorpusWireHttpError extends Error {
-  errorMessage = null;
+  errorMessage = "Review-context reads are disabled";
+  errorCode = "review_reads_disabled";
+  requestId = "request-http-v2";
+  retryable = true;
+  retryAfterSeconds = 7;
+  recoveryGuidance = ["Retry after rollout enablement."];
 }
 `.trimStart(),
     "utf8",
@@ -1682,3 +2383,92 @@ function createRpc(process) {
   rpc.notifications = notifications;
   return rpc;
 }
+
+test("reconcile reports acknowledged transfers, rejects caps, and leaves legacy coverage unknown", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cw-inventory-"));
+  const sdkPath = path.join(root, "mock-sdk.mjs"), requestsPath = path.join(root, "calls.jsonl");
+  const sourceRoot = path.join(root, "repo");
+  await mkdir(sourceRoot);
+  await writeFile(path.join(sourceRoot, "a.py"), "a=1");
+  await writeFile(path.join(sourceRoot, "empty.py"), "");
+  await writeFile(sdkPath, `import { appendFileSync } from 'node:fs';
+    export class CorpusWireClient {
+      async indexWorkspace(request) {
+        appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({ scan: request.inventoryScan, count: request.files.length }) + '\\n');
+        return {ok: true, result: {}, status: {phase: 'completed'}, transfer: {
+          complete: true, files_submitted: request.files.length, files_reused: request.files.length,
+          files_transferred: 0, acknowledged_files: [],
+        }};
+      }
+    }`);
+  const child = spawn("node", [SERVER_BIN], { stdio: ["pipe", "pipe", "pipe"], env: {
+    ...process.env, CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000", CORPUSWIRE_SDK_PATH: sdkPath,
+    CORPUSWIRE_SYNC_ENABLED: "true", CORPUSWIRE_SYNC_ROOT: sourceRoot, CORPUSWIRE_WORKSPACE_ID: "fixture",
+    CORPUSWIRE_SYNC_STATE_DIR: path.join(root, "cache"), MOCK_REQUESTS_PATH: requestsPath,
+  }});
+  const rpc = createRpc(child);
+  try {
+    const invoke = (id, maxFiles) => rpc({ jsonrpc: "2.0", id, method: "tools/call", params: {
+      name: "corpuswire_sync_reconcile", arguments: { maxFiles },
+    }});
+    const full = await invoke(1, 10);
+    assert.equal(full.result.isError, false);
+    assert.match(full.result.content[0].text, /filesUploaded: 0/);
+    assert.match(full.result.content[0].text, /filesSubmitted: 2/);
+    assert.match(full.result.content[0].text, /coverage: unknown/);
+    const capped = await invoke(2, 1);
+    assert.equal(capped.result.isError, true);
+    assert.match(capped.result.content[0].text, /exceeded max file count/);
+    const calls = (await readFile(requestsPath, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].scan.complete, true);
+    assert.equal(calls[0].count, 2);
+  } finally { child.kill(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("verified cache rehashes content and refuses lineage adopted from another client", async () => {
+  const { utimes } = await import("node:fs/promises");
+  const root = await mkdtemp(path.join(tmpdir(), "cw-coverage-cache-"));
+  const sdkPath = path.join(root, "sdk.mjs"), requestsPath = path.join(root, "calls.jsonl");
+  const sourceRoot = path.join(root, "repo"), foreign = path.join(root, "foreign");
+  await mkdir(sourceRoot);
+  await writeFile(path.join(sourceRoot, "a.py"), "old");
+  const stamp = new Date("2026-09-08T00:00:00Z");
+  await utimes(path.join(sourceRoot, "a.py"), stamp, stamp);
+  await writeFile(sdkPath, `import {appendFileSync,existsSync} from 'node:fs';
+    let token='baseline';
+    export class CorpusWireClient {
+      async diagnoseWorkspace() { return {status:'ready',can_retrieve:true,collection:'fixture',collection_exists:true,point_count:1,
+        index:{health_status:'ok',coverage:{state:'verified',coverage_token:existsSync(process.env.FOREIGN_MARKER)?'foreign':token,selection_policy_digest:'policy'}},checks:[],recovery_actions:[]}; }
+      async indexWorkspace(request) {
+        appendFileSync(process.env.MOCK_REQUESTS_PATH,JSON.stringify({mode:request.mode,token:request.baseCoverageToken,files:request.files.map(f=>f.relativePath)})+'\\n');
+        token+='x';
+        return {ok:true,result:{collection:'fixture'},status:{collection_name:'fixture',coverage:{state:'verified',coverage_token:token,selection_policy_digest:'policy'}},
+          transfer:{complete:true,files_submitted:request.files.length,files_transferred:request.files.length,files_reused:0,
+            acknowledged_files:request.files.map(f=>({relative_path:f.relativePath,sha256:f.sha256,disposition:'uploaded'}))}};
+      }
+    }`);
+  const child = spawn('node', [SERVER_BIN], {stdio:['pipe','pipe','pipe'],env:{...process.env,
+    CORPUSWIRE_BASE_URL:'http://127.0.0.1:8000',CORPUSWIRE_SDK_PATH:sdkPath,CORPUSWIRE_SYNC_ENABLED:'true',
+    CORPUSWIRE_SYNC_MTIME_CACHE_ENABLED:'true',CORPUSWIRE_SYNC_ROOT:sourceRoot,CORPUSWIRE_WORKSPACE_ID:'fixture',
+    CORPUSWIRE_SYNC_STATE_DIR:path.join(root,'cache'),MOCK_REQUESTS_PATH:requestsPath,FOREIGN_MARKER:foreign}});
+  const rpc = createRpc(child);
+  const invoke = (id, name, args={}) => rpc({jsonrpc:'2.0',id,method:'tools/call',params:{name,arguments:args}});
+  try {
+    const full = await invoke(1,'corpuswire_sync_reconcile');
+    assert.equal(full.result.isError,false);
+    const unchanged = await invoke(2,'corpuswire_sync_delta',{changedPaths:['a.py'],flush:true});
+    assert.match(unchanged.result.content[0].text,/unchanged_hash/);
+    assert.match(unchanged.result.content[0].text,/filesUploaded: 0/);
+    await writeFile(path.join(sourceRoot,'a.py'),'new');
+    await utimes(path.join(sourceRoot,'a.py'),stamp,stamp);
+    const changed = await invoke(3,'corpuswire_sync_delta',{changedPaths:['a.py'],flush:true});
+    assert.match(changed.result.content[0].text,/filesUploaded: 1/);
+    await writeFile(foreign,'1');
+    await invoke(4,'corpuswire_sync_delta',{changedPaths:['a.py'],flush:true});
+    const calls = (await readFile(requestsPath,'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(calls.length,3);
+    assert.equal(calls[1].token,'baselinex');
+    assert.equal(calls[2].token,undefined);
+  } finally {child.kill();await rm(root,{recursive:true,force:true});}
+});

@@ -797,3 +797,30 @@ function progressEvent(sequence, phase, percent, state) {
     verification_status: state === "completed" ? "verified" : "pending",
   };
 }
+
+test("CLI complete scan carries inventory evidence and cancellation cannot reach a session", async () => {
+  const fixture = await syntheticWorkspace();
+  await writeFile(path.join(fixture, "package.json"), "{}");
+  await writeFile(path.join(fixture, "requirements-dev.txt"), "private");
+  await writeFile(path.join(fixture, "values.tfvars.json"), "{}");
+  await mkdir(path.join(fixture, ".github"));
+  await writeFile(path.join(fixture, ".github", "workflow.yml"), "private: true");
+  await writeFile(path.join(fixture, "src", ".hidden.json"), "{}");
+  let requests = 0;
+  const client = fakeIndexClient({ indexWorkspace: async (request) => {
+    requests += 1;
+    assert.equal(request.inventoryScan.complete, true);
+    assert.equal(request.inventoryScan.producer, "corpuswire-cli-scan/v1");
+    assert.ok(Date.parse(request.inventoryScan.completedAt) >= Date.parse(request.inventoryScan.startedAt));
+    assert.deepEqual(request.files.map((f) => f.relativePath).sort(), ["README.md", "src/index.js"]);
+    return { ok: true, result: {}, status: {} };
+  }});
+  try {
+    const dependencies = { client, write: () => {}, writeRaw: () => {}, isTTY: false };
+    await runCliCommand({ ...indexOptions(fixture), yes: true }, dependencies);
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(runCliCommand({ ...indexOptions(fixture), yes: true }, { ...dependencies, signal: controller.signal }), { code: "scan_incomplete" });
+    assert.equal(requests, 1);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});

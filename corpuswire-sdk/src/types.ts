@@ -203,6 +203,7 @@ export interface QdrantHealth {
 }
 
 export interface IndexHealth {
+  coverage?: WorkspaceCoverage;
   workspace_id?: string | null;
   path: string;
   collection: string;
@@ -1077,6 +1078,550 @@ export interface ReviewContextPollOptions {
   onJob?: (job: ReviewContextJobV1) => void;
 }
 
+/** Structurally isolated deterministic symbol-change review contract. */
+export type ReviewContextSchemaVersionV2 = "review-context/v2";
+export type PairingStatusV2 =
+  | "exact_symbol_id"
+  | "exact_analyzer_declaration_id"
+  | "exact_unique_declaration_key"
+  | "one_sided"
+  | "ambiguous"
+  | "unresolved"
+  | "unsupported";
+export type SymbolChangeKindV2 =
+  | "added"
+  | "removed"
+  | "modified"
+  | "signature_changed"
+  | "renamed"
+  | "moved"
+  | "renamed_and_moved"
+  | "unchanged_context"
+  | "ambiguous"
+  | "unresolved"
+  | "unsupported_split_merge";
+export type ContinuityStatusV2 = "proven" | "not_established" | "ambiguous" | "unavailable";
+export type ReviewJobStateV2 =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "partial"
+  | "failed"
+  | "cancelled"
+  | "superseded";
+export type ReviewLayerV2 = "snapshot" | "overlay";
+export type RelationshipDirectionV2 = "incoming" | "outgoing";
+
+export interface SourceRangeV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  start_line: number;
+  end_line: number;
+  start_column: number | null;
+  end_column: number | null;
+}
+
+export interface ExtractorProvenanceV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  extractor_id: string;
+  extractor_version: string;
+  evidence_tier: "scip" | "compiler" | "native" | "syntax" | "text" | "retrieval";
+  resolution_status: "exact" | "declared" | "inferred" | "unresolved";
+  confidence: number;
+  reason_codes: string[];
+  artifact_digest: string | null;
+}
+
+export interface StableDeclarationIdentityV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  extractor_id: string;
+  identity_scheme_version: string;
+  value: string;
+}
+
+export interface SymbolInstanceEvidenceV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  symbol_id: string;
+  symbol_instance_id: string;
+  repository_id: string;
+  revision: string;
+  layer: ReviewLayerV2;
+  path: string;
+  source_range: SourceRangeV2;
+  language: string;
+  project_root: string;
+  qualified_name: string;
+  display_name: string;
+  kind: string;
+  signature: string | null;
+  source_content_sha256: string | null;
+  symbol_extent_sha256: string | null;
+  stable_declaration_identity: StableDeclarationIdentityV2 | null;
+  provenance: ExtractorProvenanceV2;
+}
+
+export interface NormalizedDiffLineV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  kind: "context" | "addition" | "deletion";
+  text: string;
+  old_line: number | null;
+  new_line: number | null;
+  no_newline_at_end: boolean;
+}
+
+export interface NormalizedSymbolHunkV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  path: string;
+  ordinal: number;
+  old_start: number;
+  old_count: number;
+  new_start: number;
+  new_count: number;
+  section: string | null;
+  lines: NormalizedDiffLineV2[];
+  hunk_sha256: string;
+}
+
+export interface NormalizedFileDiffEvidenceV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  normalized_diff_hash: string;
+  path: string;
+  previous_path: string | null;
+  change_kind: "added" | "modified" | "renamed" | "deleted";
+  content_kind: "text" | "binary" | "lfs";
+  patch_status: "complete" | "truncated" | "missing" | "not_applicable";
+  additions: number;
+  deletions: number;
+}
+
+export interface PairingGroupEvidenceV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  group_id: string;
+  tier: "symbol_id" | "stable_declaration_identity" | "unique_declaration_key" | "authoritative_split_merge";
+  base_candidate_instance_ids: string[];
+  head_candidate_instance_ids: string[];
+  base_candidate_count: number;
+  head_candidate_count: number;
+  candidates_truncated: boolean;
+}
+
+export interface ReviewSidePathObservationV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  path: string;
+  path_role:
+    | "added_base_absent"
+    | "added_head"
+    | "deleted_base"
+    | "deleted_head_absent"
+    | "modified_base"
+    | "modified_head"
+    | "renamed_base"
+    | "renamed_head"
+    | "unchanged_reanalyzed";
+  source_state: "present" | "absent_by_diff" | "non_text" | "unavailable";
+  analyzer_state:
+    | "complete"
+    | "degraded"
+    | "skipped"
+    | "truncated"
+    | "failed"
+    | "not_applicable"
+    | "unavailable"
+    | null;
+  analyzed_scope_complete: boolean;
+  source_content_sha256: string | null;
+  reason_codes: string[];
+}
+
+export interface ResolvedRelationshipFactV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  fact_type: "resolved";
+  edge_id: string;
+  direction: RelationshipDirectionV2;
+  relationship_kind: string;
+  changed_logical_identity: string;
+  endpoint_logical_identity: string | null;
+  source_repository_id: string;
+  source_snapshot_id: string;
+  source_generation: number;
+  source_symbol_id: string;
+  source_symbol_instance_id: string;
+  source_language: string;
+  target_repository_id: string;
+  target_snapshot_id: string;
+  target_generation: number;
+  target_symbol_id: string;
+  target_symbol_instance_id: string;
+  target_language: string;
+  path: string;
+  source_range: SourceRangeV2;
+  provenance: ExtractorProvenanceV2;
+  resolution_precedence: "local" | "declared_dependency" | "exact_coordinate" | "extractor";
+  contract_evidence_id: string | null;
+  contract_coordinate: string | null;
+  contract_artifact_digest: string | null;
+  revision: string;
+  layer: ReviewLayerV2;
+}
+
+export interface UnresolvedRelationshipFactV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  fact_type: "unresolved";
+  reference_id: string;
+  direction: RelationshipDirectionV2;
+  relationship_kind: string;
+  changed_logical_identity: string;
+  normalized_target: string;
+  source_symbol_id: string;
+  source_symbol_instance_id: string;
+  path: string;
+  source_range: SourceRangeV2;
+  provenance: ExtractorProvenanceV2;
+  resolution_status: "ambiguous" | "not_found" | "rejected";
+  candidate_count: number;
+  reason: string;
+  revision: string;
+  layer: ReviewLayerV2;
+  generation: number;
+}
+
+export type RelationshipFactV2 = ResolvedRelationshipFactV2 | UnresolvedRelationshipFactV2;
+
+export interface RelationshipDeltaCompletenessV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  base_declaring_unit_observed: boolean;
+  head_declaring_unit_observed: boolean;
+  incoming_dependents_reanalyzed: boolean;
+  reason_codes: string[];
+}
+
+export interface RelationshipDeltaV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  status: "added" | "removed" | "preserved" | "evidence_changed" | "ambiguous" | "unresolved";
+  relationship_kind: string;
+  direction: RelationshipDirectionV2;
+  changed_logical_identity: string;
+  endpoint_logical_identity: string | null;
+  base_fact: RelationshipFactV2 | null;
+  head_fact: RelationshipFactV2 | null;
+  comparison_attributes_changed: string[];
+  completeness: RelationshipDeltaCompletenessV2;
+}
+
+export interface ChangeEvidenceCompletenessV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  symbol_pair_complete: boolean;
+  normalized_hunks_complete: boolean;
+  relationship_deltas_complete: boolean;
+  complete: boolean;
+  reason_codes: string[];
+}
+
+export interface SymbolChangeRecordV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  change_id: string;
+  logical_identity: string;
+  base: SymbolInstanceEvidenceV2 | null;
+  head: SymbolInstanceEvidenceV2 | null;
+  change_kind: SymbolChangeKindV2;
+  pairing_status: PairingStatusV2;
+  continuity_status: ContinuityStatusV2;
+  pairing_confidence: number | null;
+  pairing_group: PairingGroupEvidenceV2 | null;
+  diff_evidence: NormalizedFileDiffEvidenceV2;
+  normalized_hunks: NormalizedSymbolHunkV2[];
+  relationship_deltas: RelationshipDeltaV2[];
+  base_observation: ReviewSidePathObservationV2;
+  head_observation: ReviewSidePathObservationV2;
+  completeness: ChangeEvidenceCompletenessV2;
+}
+
+export interface ReviewBudgetsV2Input {
+  graphHops?: number;
+  candidateRepositories?: number;
+  preRankCandidates?: number;
+  evidenceItems?: number;
+  serializedTokens?: number;
+  serializedCharacters?: number;
+  serializedUtf8Bytes?: number;
+  waitMs?: number;
+}
+
+export interface ReviewBudgetsV2 {
+  schema_version?: ReviewContextSchemaVersionV2;
+  graph_hops?: number;
+  candidate_repositories?: number;
+  pre_rank_candidates?: number;
+  evidence_items?: number;
+  serialized_tokens?: number;
+  serialized_characters?: number;
+  serialized_utf8_bytes?: number;
+  wait_ms?: number;
+}
+
+export interface ReviewContextRequestV2Input {
+  codebaseId: string;
+  targetRepositoryId: string;
+  providerReviewId: string;
+  expectedHeadSha?: string | null;
+  objective: string;
+  strictFreshness?: boolean;
+  budgets?: ReviewBudgetsV2Input;
+}
+
+export interface ReviewContextRequestV2 {
+  schema_version?: ReviewContextSchemaVersionV2;
+  codebase_id: string;
+  target_repository_id: string;
+  provider_review_id: string;
+  expected_head_sha?: string | null;
+  objective: string;
+  strict_freshness?: boolean;
+  budgets?: ReviewBudgetsV2;
+}
+
+export interface ReviewScopeV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  tenant_id: string;
+  actor_id: string;
+  codebase_id: string;
+  target_repository_id: string;
+  authorized_repository_ids: string[];
+  repository_set_id: string;
+  repository_selection_digest: string;
+  base_snapshot_id: string;
+  base_snapshot_generation: number;
+  base_snapshot_refresh_sequence: number;
+  overlay_id: string;
+  overlay_generation: number;
+  overlay_refresh_sequence: number;
+}
+
+export interface ReviewPartialReasonV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  code: string;
+  retryable: boolean;
+  affected_side: "base" | "head" | "both" | "graph" | "response";
+}
+
+export interface ReviewContextLimitsV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  max_records: number;
+  max_symbol_extent_utf8_bytes_per_side: number;
+  max_symbol_extent_utf8_bytes_per_overlay: number;
+  max_serialized_bundle_bytes: number;
+  max_serialized_response_bytes: number;
+  construction_timeout_ms: number;
+  base_rebuild_timeout_ms: number;
+  max_refresh_sequences_per_lineage: number;
+}
+
+export interface ReviewContextCapabilitiesV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  contract_version: ReviewContextSchemaVersionV2;
+  enabled: boolean;
+  service_available: boolean;
+  construction_enabled: boolean;
+  publication_enabled: boolean;
+  read_enabled: boolean;
+  routes_enabled: boolean;
+  supports_polling: boolean;
+  supports_cancellation: boolean;
+  supports_repository_set_scoped_status: boolean;
+  snapshot_artifact_contract_version: "snapshot-artifacts/v2";
+  snapshot_builder_version: string;
+  artifact_contract_version: "review-artifacts/v2";
+  evidence_builder_version: string;
+  build_policy_digest: string;
+  limits: ReviewContextLimitsV2;
+}
+
+export interface ReviewContextJobV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  contract_version: ReviewContextSchemaVersionV2;
+  job_id: string;
+  request_id: string;
+  tenant_id: string;
+  codebase_id: string;
+  repository_set_id: string;
+  repository_selection_digest: string;
+  state: ReviewJobStateV2;
+  attempts: number;
+  status_url: string;
+  retry_after_seconds: number | null;
+  created_at: string;
+  updated_at: string;
+  overlay_id: string | null;
+  overlay_generation: number | null;
+  overlay_refresh_sequence: number | null;
+  partial_reasons: ReviewPartialReasonV2[];
+}
+
+export interface ReviewPublicationStatusV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  repository_set_id: string;
+  repository_selection_digest: string;
+  target_repository_id: string;
+  base_sha: string;
+  head_sha: string;
+  base_snapshot_id: string;
+  base_snapshot_generation: number;
+  base_snapshot_refresh_sequence: number;
+  overlay_id: string;
+  overlay_generation: number;
+  overlay_refresh_sequence: number;
+  state: "ready" | "partial" | "failed" | "stale" | "closed" | "expired" | "purged";
+  freshness: "exact" | "partial" | "stale" | null;
+  evidence_state: "ready" | "partial" | "failed";
+  warning_count: number;
+  published_at: string;
+}
+
+export interface ReviewStatusV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  contract_version: ReviewContextSchemaVersionV2;
+  codebase_id: string;
+  review_id: string;
+  target_repository_id: string;
+  head_sha: string;
+  publications: ReviewPublicationStatusV2[];
+  latest_jobs: ReviewContextJobV2[];
+}
+
+export interface MinimumRequiredBudgetV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  evidence_items: number;
+  tokens: number;
+  characters: number;
+  utf8_bytes: number;
+}
+
+export interface SymbolExtentEvidenceV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  side: "base" | "head";
+  evidence_id: string;
+  symbol_instance_id: string;
+  repository_id: string;
+  revision: string;
+  layer: ReviewLayerV2;
+  path: string;
+  symbol_source_range: SourceRangeV2;
+  extent_start_line: number;
+  extent_end_line: number;
+  source_content_sha256: string;
+  symbol_extent_sha256: string;
+  text: string;
+  token_count: number;
+}
+
+export interface EvidenceItemV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  evidence_id: string;
+  repository_id: string;
+  revision: string;
+  layer: ReviewLayerV2;
+  path: string;
+  source_range: SourceRangeV2;
+  content_hash: string;
+  text: string;
+  symbol_id: string | null;
+  graph_distance: number | null;
+  provenance: ExtractorProvenanceV2;
+  freshness: "exact" | "fresh" | "stale" | "unknown";
+  confidence: number;
+  selection_reason: string;
+  token_count: number;
+}
+
+export interface BundleCompletenessV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  required_sides_complete: boolean;
+  related_evidence_complete: boolean;
+  reason_codes: string[];
+}
+
+export interface AdmittedSymbolChangeEvidenceBundleV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  ordinal: number;
+  change_record: SymbolChangeRecordV2;
+  base_evidence: SymbolExtentEvidenceV2 | null;
+  head_evidence: SymbolExtentEvidenceV2 | null;
+  related_evidence: EvidenceItemV2[];
+  completeness: BundleCompletenessV2;
+  evidence_item_count: number;
+  serialized_tokens: number;
+  serialized_characters: number;
+  serialized_utf8_bytes: number;
+}
+
+export interface OmittedSymbolChangeEvidenceBundleV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  change_id: string;
+  ordinal: number;
+  change_kind: SymbolChangeKindV2;
+  pairing_status: PairingStatusV2;
+  reason:
+    | "required_pair_budget_exceeded"
+    | "required_evidence_unavailable"
+    | "required_evidence_capacity_exceeded";
+  omitted_sides: Array<"base" | "head" | "related">;
+  minimum_required_budget: MinimumRequiredBudgetV2 | null;
+  model_evidence_available: false;
+}
+
+export interface ReviewContextResponseV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  request_id: string;
+  telemetry_id: string;
+  job_id: string | null;
+  review_id: string;
+  target_repository_id: string;
+  review_scope: ReviewScopeV2;
+  base_sha: string;
+  head_sha: string;
+  base_snapshot_id: string;
+  base_snapshot_generation: number;
+  base_snapshot_refresh_sequence: number;
+  base_artifact_contract_version: "snapshot-artifacts/v2";
+  base_snapshot_builder_version: string;
+  base_build_policy_digest: string;
+  overlay_id: string;
+  overlay_generation: number;
+  overlay_refresh_sequence: number;
+  artifact_contract_version: "review-artifacts/v2";
+  evidence_builder_version: string;
+  overlay_build_policy_digest: string;
+  normalized_diff_hash: string;
+  freshness: "exact" | "partial";
+  bundles: AdmittedSymbolChangeEvidenceBundleV2[];
+  omitted_bundles: OmittedSymbolChangeEvidenceBundleV2[];
+  serialized_token_count: number;
+  serialized_character_count: number;
+  serialized_utf8_byte_count: number;
+  partial: boolean;
+  partial_reasons: ReviewPartialReasonV2[];
+  retry_guidance: string | null;
+}
+
+export type ReviewContextResultV2 = ReviewContextResponseV2 | ReviewContextJobV2;
+
+export interface ReviewContextErrorV2 {
+  schema_version: ReviewContextSchemaVersionV2;
+  error_code: string;
+  message: string;
+  request_id: string;
+  retryable: boolean;
+  retry_after_seconds: number | null;
+  recovery_guidance: string[];
+  details: Record<string, unknown>;
+}
+
+export interface ReviewContextPollOptionsV2 {
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+  signal?: AbortSignal;
+  onJob?: (job: ReviewContextJobV2) => void;
+}
+
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 export type RemoteIndexMode = "full" | "incremental";
@@ -1166,6 +1711,9 @@ export interface RemoteWorkspaceIdentity {
 }
 
 export interface StartRemoteIndexSessionRequest {
+  inventory?: WorkspaceInventory;
+  baseCoverageToken?: string;
+  selectionPolicyDigest?: string;
   workspace: RemoteWorkspaceIdentity;
   mode?: RemoteIndexMode;
   client?: Record<string, unknown>;
@@ -1240,6 +1788,7 @@ export interface RemoteFileBatchResult {
 }
 
 export interface RemoteIndexStatus {
+  coverage?: WorkspaceCoverage | null;
   session_id: string;
   workspace_id: string;
   collection_name: string;
@@ -1289,6 +1838,7 @@ export interface RemoteIndexSessionsResponse {
 }
 
 export interface RemoteIndexCapabilities {
+  inventory_coverage_versions?: string[];
   ok: true;
   protocol_version: string;
   max_batch_bytes: number;
@@ -1309,6 +1859,7 @@ export interface RemoteIndexCapabilities {
 }
 
 export interface RemoteIndexCommitResponse {
+  transfer?: IndexTransferSummary;
   ok: true;
   result: Record<string, unknown>;
   status: RemoteIndexStatus;
@@ -1322,6 +1873,7 @@ export interface RemoteWorkspaceFile {
 }
 
 export interface IndexWorkspaceRequest extends Omit<StartRemoteIndexSessionRequest, "workspace"> {
+  inventoryScan?: InventoryScan;
   workspace: RemoteWorkspaceIdentity;
   files: RemoteWorkspaceFile[];
   deletedPaths?: string[];
@@ -1332,4 +1884,66 @@ export interface IndexWorkspaceRequest extends Omit<StartRemoteIndexSessionReque
   signal?: AbortSignal;
   detachSignal?: AbortSignal;
   onProgress?: (event: RemoteIndexProgressEvent) => void;
+}
+
+/** Evidence emitted only by a complete filesystem scan; a files array alone is insufficient. */
+export interface InventoryScan {
+  complete: true;
+  startedAt: string;
+  completedAt: string;
+  excludedFileCount: number;
+  ignoreDigest: string;
+  producer: string;
+}
+export interface InventorySelectionPolicy {
+  version: "workspace-selection/v1";
+  include_globs: string[];
+  exclude_globs: string[];
+  ignore_digest: string;
+  supported_file_registry_version: string;
+  max_file_size_bytes: number;
+  symlink_policy: "skip";
+  producer: string;
+}
+export interface WorkspaceInventory {
+  schema_version: "workspace-inventory/v1";
+  scan_complete: true;
+  selection_policy: InventorySelectionPolicy;
+  selection_policy_digest: string;
+  manifest_digest: string;
+  eligible_file_count: number;
+  eligible_source_bytes: number;
+  excluded_file_count: number;
+  scan_started_at: string;
+  scan_completed_at: string;
+}
+export interface WorkspaceCoverage {
+  schema_version: "workspace-coverage/v1";
+  state: "unknown" | "pending" | "verified" | "invalidated" | "unavailable" | "not_applicable";
+  reason_codes: string[];
+  coverage_token?: string | null;
+  session_id?: string | null;
+  published_revision?: number | null;
+  baseline_revision?: number | null;
+  last_delta_revision?: number | null;
+  baseline_manifest_digest?: string | null;
+  eligible_file_count?: number | null;
+  eligible_source_bytes?: number | null;
+  selection_policy_digest?: string | null;
+  scan_started_at?: string | null;
+  scan_completed_at?: string | null;
+  published_at?: string | null;
+  collection_fingerprint?: string | null;
+}
+export interface IndexTransferSummary {
+  files_submitted: number;
+  files_upload_required: number | null;
+  files_reused: number | null;
+  files_transferred: number;
+  source_bytes_transferred: number;
+  upload_attempts: number;
+  source_bytes_attempted: number;
+  complete: boolean;
+  /** Per-operation acknowledgements for authorized local cache updates; never activity telemetry. */
+  acknowledged_files: Array<{ relative_path: string; sha256: string; disposition: "uploaded" | "confirmed_reused" }>;
 }

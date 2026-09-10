@@ -223,3 +223,9 @@ Default output is compact and human-readable:
   same semantic events as JSON records.
 
 Use `--json` when another process needs the full backend envelope.
+
+## Full inventory evidence
+
+A successful full scan supplies a canonical inventory after the existing preview and confirmation. Read errors, disappearing files, cancellation and detected file changes stop the scan before mutation. The effective file-size ceiling is the minimum of the configured and advertised server limits. Selection policies include default directory exclusions; excluded counts cover inspected files, not descendants of excluded directories.
+
+Terminal and NDJSON results distinguish session verification, inventory coverage, acknowledged file transfers and sender attempts. Legacy services report unknown coverage. An intentionally empty full inventory can be verified while there is no searchable content.

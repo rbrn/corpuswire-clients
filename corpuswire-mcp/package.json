@@ -17,7 +17,9 @@
   ],
   "scripts": {
     "test": "node --test tests/*.test.js",
-    "smoke": "printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\\n' | node ./bin/corpuswire-mcp.js"
+    "smoke": "printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\\n' | node ./bin/corpuswire-mcp.js",
+    "vendor:sdk": "node ./scripts/vendor-sdk.mjs --write",
+    "check:vendor": "node ./scripts/vendor-sdk.mjs --check"
   },
   "repository": {
     "type": "git",
