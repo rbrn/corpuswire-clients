@@ -977,6 +977,11 @@ class SyncManager {
           filesUploaded: error.transfer?.files_transferred ?? null,
           transfer: error.transfer ?? null,
           code: error.code ?? null,
+          sessionId: boundedErrorMetadata(error.sessionId),
+          manifestErrors: boundedManifestErrors(error.manifestErrors),
+          manifestSkipped: Number.isSafeInteger(error.manifestSkipped)
+            ? error.manifestSkipped
+            : null,
           filesDeleted: 0,
           filesSkipped: 0,
         };
@@ -6152,6 +6157,12 @@ function formatSyncSummary(summary, ordinal) {
     ...(compact?.detached ? ["   detached: true"] : []),
     ...(compact?.backendContinues ? ["   backendContinues: true"] : []),
     ...(compact?.sessionId ? [`   sessionId: ${compact.sessionId}`] : []),
+    ...(Number.isSafeInteger(compact?.manifestSkipped)
+      ? [`   manifestSkipped: ${compact.manifestSkipped}`]
+      : []),
+    ...(compact?.manifestErrors?.length > 0
+      ? [`   manifestErrors: ${compact.manifestErrors.join("; ")}`]
+      : []),
     ...(compact?.collection ? [`   collection: ${compact.collection}`] : []),
     ...(compact?.manifestRevision ? [`   manifestRevision: ${compact.manifestRevision}`] : []),
     ...(observability.schema_version === INDEX_OBSERVABILITY_SCHEMA_VERSION
@@ -6184,6 +6195,10 @@ function summarizeSyncResult(result) {
     detached: Boolean(result.detached),
     backendContinues: Boolean(result.backendContinues),
     sessionId: result.sessionId,
+    manifestErrors: boundedManifestErrors(result.manifestErrors),
+    manifestSkipped: Number.isSafeInteger(result.manifestSkipped)
+      ? result.manifestSkipped
+      : null,
     error: result.error,
     collection: responseResult.collection,
     documentsIndexed: responseResult.documents_indexed,
@@ -6234,6 +6249,18 @@ function boundedErrorMetadata(value) {
     && !value.includes("\r")
     ? value
     : null;
+}
+
+function boundedManifestErrors(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .slice(0, 20)
+    .map((entry) => boundedErrorMetadata(
+      typeof entry === "string" ? entry.replace(/[\r\n\t]+/g, " ").trim() : entry,
+    ))
+    .filter(Boolean);
 }
 
 function boundedRecoveryGuidance(value) {

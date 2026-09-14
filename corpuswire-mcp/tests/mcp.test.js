@@ -1334,6 +1334,153 @@ test("corpuswire-mcp caller timeout reports continued backend work and reattachm
   }
 });
 
+test("sync path probe applies leading globstar, basename, and exclusion semantics", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-globs-"));
+  try {
+    await mkdir(path.join(tempDir, "docs"), { recursive: true });
+    await mkdir(path.join(tempDir, "src"), { recursive: true });
+    await writeFile(path.join(tempDir, "README.md"), "# Root\n", "utf8");
+    await writeFile(path.join(tempDir, "docs", "guide.md"), "# Guide\n", "utf8");
+    await writeFile(path.join(tempDir, "docs", "README.md"), "# Nested root\n", "utf8");
+    await writeFile(path.join(tempDir, "main.py"), "value = 1\n", "utf8");
+    await writeFile(path.join(tempDir, "src", "main.py"), "value = 2\n", "utf8");
+    await writeFile(path.join(tempDir, "skip.py"), "skip = True\n", "utf8");
+    await writeFile(path.join(tempDir, "src", "skip.py"), "skip = True\n", "utf8");
+    await mkdir(path.join(tempDir, "data"), { recursive: true });
+    await mkdir(path.join(tempDir, "src", "data"), { recursive: true });
+    await writeFile(path.join(tempDir, "data", "root.py"), "data = True\n", "utf8");
+    await writeFile(path.join(tempDir, "src", "data", "nested.py"), "data = True\n", "utf8");
+    await writeFile(path.join(tempDir, "notes.txt"), "not selected\n", "utf8");
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], { stdio: ["pipe", "pipe", "pipe"], env: {
+      ...globalThis.process.env,
+      CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+      CORPUSWIRE_SDK_PATH: sdkPath,
+      CORPUSWIRE_WORKSPACE_ID: "workspace-globs",
+      CORPUSWIRE_REPO_PATH: tempDir,
+      CORPUSWIRE_SYNC_ENABLED: "true",
+      MOCK_REQUESTS_PATH: requestsPath,
+    } });
+    const rpc = createRpc(child);
+    try {
+      const globstar = await rpc({ jsonrpc: "2.0", id: 31, method: "tools/call", params: {
+        name: "corpuswire_sync_probe_paths",
+        arguments: {
+          paths: ["README.md", "docs/guide.md", "main.py", "src/main.py", "skip.py", "src/skip.py", "notes.txt"],
+          includeGlobs: ["**/*.md", "**/*.py"],
+          excludeGlobs: ["**/skip.py"],
+        },
+      } });
+      const globstarText = globstar.result.content[0].text;
+      assert.equal((globstarText.match(/pathAccepted: true/g) ?? []).length, 4);
+      assert.equal((globstarText.match(/reason: exclude_filter/g) ?? []).length, 2);
+      assert.equal((globstarText.match(/reason: include_filter/g) ?? []).length, 1);
+
+      const basename = await rpc({ jsonrpc: "2.0", id: 32, method: "tools/call", params: {
+        name: "corpuswire_sync_probe_paths",
+        arguments: {
+          paths: ["README.md", "docs/README.md", "docs/guide.md"],
+          includeGlobs: ["README.md"],
+        },
+      } });
+      const basenameText = basename.result.content[0].text;
+      assert.equal((basenameText.match(/pathAccepted: true/g) ?? []).length, 2);
+      assert.equal((basenameText.match(/reason: include_filter/g) ?? []).length, 1);
+
+      const directories = await rpc({ jsonrpc: "2.0", id: 34, method: "tools/call", params: {
+        name: "corpuswire_sync_probe_paths",
+        arguments: {
+          paths: ["main.py", "data/root.py", "src/data/nested.py"],
+          includeGlobs: ["**/*.py"],
+          excludeGlobs: ["**/data/**"],
+        },
+      } });
+      const directoryText = directories.result.content[0].text;
+      assert.equal((directoryText.match(/pathAccepted: true/g) ?? []).length, 1);
+      assert.equal((directoryText.match(/reason: exclude_filter/g) ?? []).length, 2);
+    } finally {
+      child.kill();
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("reconcile includes root and nested files using only leading globstar patterns", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-glob-reconcile-"));
+  try {
+    await mkdir(path.join(tempDir, "docs"), { recursive: true });
+    await mkdir(path.join(tempDir, "src"), { recursive: true });
+    await writeFile(path.join(tempDir, "README.md"), "# Root\n", "utf8");
+    await writeFile(path.join(tempDir, "docs", "guide.md"), "# Guide\n", "utf8");
+    await writeFile(path.join(tempDir, "main.py"), "value = 1\n", "utf8");
+    await writeFile(path.join(tempDir, "src", "main.py"), "value = 2\n", "utf8");
+    await writeFile(path.join(tempDir, "notes.txt"), "not selected\n", "utf8");
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], { stdio: ["pipe", "pipe", "pipe"], env: {
+      ...globalThis.process.env,
+      CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+      CORPUSWIRE_SDK_PATH: sdkPath,
+      CORPUSWIRE_WORKSPACE_ID: "workspace-glob-reconcile",
+      CORPUSWIRE_REPO_PATH: tempDir,
+      CORPUSWIRE_SYNC_ENABLED: "true",
+      MOCK_REQUESTS_PATH: requestsPath,
+    } });
+    const rpc = createRpc(child);
+    try {
+      const response = await rpc({ jsonrpc: "2.0", id: 35, method: "tools/call", params: {
+        name: "corpuswire_sync_reconcile",
+        arguments: { includeGlobs: ["**/*.md", "**/*.py"], maxFiles: 10, maxWaitMs: 5000 },
+      } });
+      assert.equal(response.result.isError, false);
+      assert.match(response.result.content[0].text, /filesSubmitted: 4/);
+    } finally {
+      child.kill();
+    }
+    const calls = (await readFile(requestsPath, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.deepEqual(
+      new Set(calls.at(-1).files),
+      new Set(["README.md", "docs/guide.md", "main.py", "src/main.py"]),
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("reconcile reports manifest rejection details and session identity", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-manifest-error-"));
+  try {
+    await writeFile(path.join(tempDir, "README.md"), "# Root\n", "utf8");
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], { stdio: ["pipe", "pipe", "pipe"], env: {
+      ...globalThis.process.env,
+      CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+      CORPUSWIRE_SDK_PATH: sdkPath,
+      CORPUSWIRE_WORKSPACE_ID: "workspace-manifest-error",
+      CORPUSWIRE_REPO_PATH: tempDir,
+      CORPUSWIRE_SYNC_ENABLED: "true",
+      MOCK_MANIFEST_FAILURE: "true",
+      MOCK_REQUESTS_PATH: requestsPath,
+    } });
+    const rpc = createRpc(child);
+    try {
+      const response = await rpc({ jsonrpc: "2.0", id: 33, method: "tools/call", params: {
+        name: "corpuswire_sync_reconcile",
+        arguments: { includeGlobs: ["**/*.md"], maxFiles: 10, maxWaitMs: 5000 },
+      } });
+      const output = response.result.content[0].text;
+      assert.equal(response.result.isError, true);
+      assert.match(output, /sessionId: session-manifest-error/);
+      assert.match(output, /manifestSkipped: 1/);
+      assert.match(output, /manifestErrors: line 1: invalid_inventory_entry/);
+    } finally {
+      child.kill();
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("corpuswire-mcp sends basic auth to plugin discovery and calls", async () => {
   const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
   const expectedAuth = "Basic dXNlcjpwYXNz";
@@ -2305,6 +2452,14 @@ export class CorpusWireClient {
       phase_timings_ms: {},
       verification_status: "pending",
     });
+    if (process.env.MOCK_MANIFEST_FAILURE === "true") {
+      const error = new Error("Server rejected manifest entries: line 1: invalid_inventory_entry");
+      error.code = "scan_incomplete";
+      error.sessionId = "session-manifest-error";
+      error.manifestSkipped = 1;
+      error.manifestErrors = ["line 1: invalid_inventory_entry"];
+      throw error;
+    }
     const delayMs = Number(process.env.MOCK_INDEX_DELAY_MS ?? 0);
     if (delayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, delayMs));

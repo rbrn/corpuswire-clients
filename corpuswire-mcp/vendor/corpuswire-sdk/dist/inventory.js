@@ -2,9 +2,15 @@ const encoder = new TextEncoder();
 export const INVENTORY_VERSION = "workspace-inventory/v1";
 export class WorkspaceScanIncompleteError extends Error {
     code = "scan_incomplete";
-    constructor(message = "Workspace scan did not complete") {
+    sessionId;
+    manifestErrors;
+    manifestSkipped;
+    constructor(message = "Workspace scan did not complete", details = {}) {
         super(message);
         this.name = "WorkspaceScanIncompleteError";
+        this.sessionId = details.sessionId;
+        this.manifestErrors = Object.freeze([...(details.manifestErrors ?? [])]);
+        this.manifestSkipped = details.manifestSkipped;
     }
 }
 export function canonicalInventoryPath(value) {

@@ -1401,6 +1401,7 @@ export interface RemoteWorkspaceIdentity {
 }
 export interface StartRemoteIndexSessionRequest {
     inventory?: WorkspaceInventory;
+    evaluationInventoryAttestation?: EvaluationInventoryAttestation;
     baseCoverageToken?: string;
     selectionPolicyDigest?: string;
     workspace: RemoteWorkspaceIdentity;
@@ -1591,6 +1592,27 @@ export interface WorkspaceInventory {
     scan_started_at: string;
     scan_completed_at: string;
 }
+export interface EvaluationInventoryEntry {
+    relative_path: string;
+    sha256: string;
+    size: number;
+}
+export interface EvaluationInventoryAttestation {
+    schema_version: "evaluation-inventory-attestation/v1";
+    full_manifest_digest: string;
+    eligible_manifest_digest: string;
+    excluded_manifest_digest: string;
+    allowlist_digest: string;
+    required_evidence_digest: string;
+    selection_policy_digest: string;
+    complete_file_count: number;
+    complete_source_bytes: number;
+    excluded_file_count: number;
+    excluded_source_bytes: number;
+    excluded_entries: EvaluationInventoryEntry[];
+    allowlist_entries: EvaluationInventoryEntry[];
+    required_evidence_entries: EvaluationInventoryEntry[];
+}
 export interface WorkspaceCoverage {
     schema_version: "workspace-coverage/v1";
     state: "unknown" | "pending" | "verified" | "invalidated" | "unavailable" | "not_applicable";
@@ -1607,7 +1629,15 @@ export interface WorkspaceCoverage {
     scan_started_at?: string | null;
     scan_completed_at?: string | null;
     published_at?: string | null;
+    embedding_fingerprint?: string | null;
+    collection_schema_fingerprint?: string | null;
     collection_fingerprint?: string | null;
+    evaluation_full_manifest_digest?: string | null;
+    evaluation_excluded_manifest_digest?: string | null;
+    evaluation_allowlist_digest?: string | null;
+    evaluation_required_evidence_digest?: string | null;
+    evaluation_excluded_file_count?: number | null;
+    evaluation_complete_file_count?: number | null;
 }
 export interface IndexTransferSummary {
     files_submitted: number;

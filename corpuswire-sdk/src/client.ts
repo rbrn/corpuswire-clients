@@ -90,6 +90,8 @@ const DEFAULT_BEARER_TOKEN = RUNTIME_ENV.CORPUSWIRE_BEARER_TOKEN ?? "";
 const DEFAULT_OUTPUT_MODE: PromptOutputMode = "generic";
 const DEFAULT_REVIEW_POLL_TIMEOUT_MS = 60_000;
 const DEFAULT_REVIEW_POLL_INTERVAL_MS = 1_000;
+const MAX_MANIFEST_ERROR_DETAILS = 20;
+const MAX_MANIFEST_ERROR_LENGTH = 256;
 
 export class RemoteIndexDetachedError extends Error {
   readonly transfer?: IndexTransferSummary;
@@ -841,6 +843,11 @@ export class CorpusWireClient {
     if (request.inventory || request.baseCoverageToken || request.selectionPolicyDigest) {
       const capabilities = await this.getIndexCapabilities();
       if (!capabilities.inventory_coverage_versions?.includes(INVENTORY_VERSION)) {
+        if (request.evaluationInventoryAttestation) {
+          throw new WorkspaceScanIncompleteError(
+            "Evaluation inventory attestation requires workspace inventory coverage",
+          );
+        }
         request = { ...request, inventory: undefined, baseCoverageToken: undefined, selectionPolicyDigest: undefined };
       }
     }
@@ -861,6 +868,36 @@ export class CorpusWireClient {
 
   async previewIndexWorkspace(request: IndexWorkspaceRequest): Promise<RemoteIndexPreview> {
     const remoteFiles = await Promise.all(request.files.map(prepareRemoteWorkspaceFile));
+    const triples = remoteFiles.map(({ file, sha256, content }) => [file.relativePath, sha256, content.length] as const);
+    await inventoryDigest(triples);
+    if (request.inventoryScan) {
+      if (request.mode !== "full" || request.snapshotScope) throw new WorkspaceScanIncompleteError("Inventory requires a v1 full scan");
+      const capabilities = await this.getIndexCapabilities();
+      if (request.inventoryScan.complete !== true) throw new WorkspaceScanIncompleteError();
+      if (capabilities.inventory_coverage_versions?.includes(INVENTORY_VERSION)) {
+        if (!capabilities.supported_file_registry_version) throw new WorkspaceScanIncompleteError("Missing supported file registry version");
+        const excludedPaths = new Set(
+          request.evaluationInventoryAttestation?.excluded_entries.map(
+            (entry) => entry.relative_path,
+          ) ?? [],
+        );
+        const eligibleTriples = request.evaluationInventoryAttestation
+          ? triples.filter(([relativePath]) => !excludedPaths.has(relativePath))
+          : triples;
+        request = { ...request, inventory: await buildWorkspaceInventory(eligibleTriples, {
+          version: "workspace-selection/v1", include_globs: request.includeGlobs ?? [], exclude_globs: request.excludeGlobs ?? [],
+          ignore_digest: request.inventoryScan.ignoreDigest, producer: request.inventoryScan.producer,
+          supported_file_registry_version: capabilities.supported_file_registry_version,
+          max_file_size_bytes: Math.min(request.maxFileSizeBytes ?? capabilities.max_file_size_bytes, capabilities.max_file_size_bytes),
+          symlink_policy: "skip",
+        }, request.inventoryScan) };
+      }
+      if (request.evaluationInventoryAttestation && !request.inventory) {
+        throw new WorkspaceScanIncompleteError(
+          "Evaluation inventory attestation requires workspace inventory coverage",
+        );
+      }
+    }
     const manifest = buildWorkspaceManifest(remoteFiles, request.deletedPaths ?? []);
     const response = await requestJson<{ ok: true; result: RemoteIndexPreview }>({
       baseUrl: this.baseUrl,
@@ -1107,13 +1144,26 @@ export class CorpusWireClient {
       if (request.inventoryScan.complete !== true) throw new WorkspaceScanIncompleteError();
       if (capabilities.inventory_coverage_versions?.includes(INVENTORY_VERSION)) {
         if (!capabilities.supported_file_registry_version) throw new WorkspaceScanIncompleteError("Missing supported file registry version");
-        request = { ...request, inventory: await buildWorkspaceInventory(triples, {
+        const excludedPaths = new Set(
+          request.evaluationInventoryAttestation?.excluded_entries.map(
+            (entry) => entry.relative_path,
+          ) ?? [],
+        );
+        const eligibleTriples = request.evaluationInventoryAttestation
+          ? triples.filter(([relativePath]) => !excludedPaths.has(relativePath))
+          : triples;
+        request = { ...request, inventory: await buildWorkspaceInventory(eligibleTriples, {
           version: "workspace-selection/v1", include_globs: request.includeGlobs ?? [], exclude_globs: request.excludeGlobs ?? [],
           ignore_digest: request.inventoryScan.ignoreDigest, producer: request.inventoryScan.producer,
           supported_file_registry_version: capabilities.supported_file_registry_version,
           max_file_size_bytes: Math.min(request.maxFileSizeBytes ?? capabilities.max_file_size_bytes, capabilities.max_file_size_bytes),
           symlink_policy: "skip",
         }, request.inventoryScan) };
+      }
+      if (request.evaluationInventoryAttestation && !request.inventory) {
+        throw new WorkspaceScanIncompleteError(
+          "Evaluation inventory attestation requires workspace inventory coverage",
+        );
       }
     }
     const transfer: IndexTransferSummary = {
@@ -1147,8 +1197,24 @@ export class CorpusWireClient {
       const uploadRequired = new Set(manifestResult.upload_required);
       transfer.files_upload_required = uploadRequired.size;
       transfer.files_reused = manifestResult.unchanged;
-      if (manifestResult.errors.length || manifestResult.skipped) {
-        throw new WorkspaceScanIncompleteError("Server rejected manifest entries");
+      const expectedEvaluationSkips =
+        request.evaluationInventoryAttestation?.excluded_file_count ?? 0;
+      if (
+        manifestResult.errors.length
+        || manifestResult.skipped !== expectedEvaluationSkips
+      ) {
+        const manifestErrors = sanitizeManifestErrors(manifestResult.errors);
+        const detail = manifestErrors.length > 0
+          ? `: ${manifestErrors.join("; ")}`
+          : `: skipped=${manifestResult.skipped}`;
+        throw new WorkspaceScanIncompleteError(
+          `Server rejected manifest entries${detail}`,
+          {
+            sessionId: session.session_id,
+            manifestErrors,
+            manifestSkipped: manifestResult.skipped,
+          },
+        );
       }
       for (const { file, sha256 } of remoteFiles) {
         if (!uploadRequired.has(file.relativePath)) {
@@ -1265,6 +1331,13 @@ export class CorpusWireClient {
       await new Promise((resolve) => setTimeout(resolve, Math.max(10, pollMs)));
     }
   }
+}
+
+function sanitizeManifestErrors(errors: readonly string[]): string[] {
+  return errors
+    .slice(0, MAX_MANIFEST_ERROR_DETAILS)
+    .map((error) => String(error).replace(/[\r\n\t]+/g, " ").trim().slice(0, MAX_MANIFEST_ERROR_LENGTH))
+    .filter(Boolean);
 }
 
 export function toQualityEventPayload(request: QualityEventRequest): QualityEventPayload {
@@ -1414,6 +1487,7 @@ export function toStartIndexSessionPayload(request: StartRemoteIndexSessionReque
     recreate_collection: request.recreateCollection ?? false,
     snapshot_scope: toRemoteIndexScopePayload(request.snapshotScope),
     inventory: request.inventory,
+    evaluation_inventory_attestation: request.evaluationInventoryAttestation,
     base_coverage_token: request.baseCoverageToken,
     selection_policy_digest: request.selectionPolicyDigest,
   });

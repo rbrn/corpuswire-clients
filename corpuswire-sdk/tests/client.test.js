@@ -10,6 +10,7 @@ import {
   RemoteIndexDetachedError,
   ReviewContextPollingCancelledError,
   ReviewContextPollingTimeoutError,
+  WorkspaceScanIncompleteError,
   createBasicAuthHeader,
   createBearerAuthHeader,
   manifestEntriesToJsonl,
@@ -29,6 +30,22 @@ const REVIEW_CONTEXT_V2_SCHEMA = JSON.parse(readFileSync(
   new URL("../../../schemas/review-context/v2/review-context.schema.json", import.meta.url),
   "utf8",
 ));
+
+test("WorkspaceCoverage declares embedding and collection schema fingerprints", () => {
+  const declarations = readFileSync(
+    new URL("../dist/types.d.ts", import.meta.url),
+    "utf8",
+  );
+  const workspaceCoverage = declarations.match(
+    /export interface WorkspaceCoverage \{[\s\S]*?\n\}/,
+  );
+  assert.ok(workspaceCoverage);
+  assert.match(workspaceCoverage[0], /embedding_fingerprint\?: string \| null;/);
+  assert.match(
+    workspaceCoverage[0],
+    /collection_schema_fingerprint\?: string \| null;/,
+  );
+});
 
 function canonicalExtentId(changeId, side, instance) {
   const values = [changeId, side, instance.symbol_instance_id, instance.repository_id,
@@ -337,6 +354,36 @@ test("toStartIndexSessionPayload preserves v2 scope omission and null semantics"
     revision: "a".repeat(40),
     generation: 7,
   });
+});
+
+test("toStartIndexSessionPayload binds evaluation inventory without changing omission", () => {
+  const ordinary = toStartIndexSessionPayload({
+    workspace: { workspaceId: "ordinary-workspace" },
+  });
+  assert.equal(Object.hasOwn(ordinary, "evaluation_inventory_attestation"), false);
+
+  const attestation = {
+    schema_version: "evaluation-inventory-attestation/v1",
+    full_manifest_digest: "1".repeat(64),
+    eligible_manifest_digest: "2".repeat(64),
+    excluded_manifest_digest: "3".repeat(64),
+    allowlist_digest: "4".repeat(64),
+    required_evidence_digest: "5".repeat(64),
+    selection_policy_digest: "6".repeat(64),
+    complete_file_count: 2,
+    complete_source_bytes: 7,
+    excluded_file_count: 1,
+    excluded_source_bytes: 3,
+    excluded_entries: [{ relative_path: "excluded.bin", sha256: "7".repeat(64), size: 3 }],
+    allowlist_entries: [{ relative_path: "package.json", sha256: "8".repeat(64), size: 4 }],
+    required_evidence_entries: [{ relative_path: "package.json", sha256: "8".repeat(64), size: 4 }],
+  };
+  const payload = toStartIndexSessionPayload({
+    workspace: { workspaceId: "local-docker://rqt-fixture#frozen" },
+    mode: "full",
+    evaluationInventoryAttestation: attestation,
+  });
+  assert.deepEqual(payload.evaluation_inventory_attestation, attestation);
 });
 
 test("manifestEntriesToJsonl serializes camelCase manifest entries as backend JSONL", () => {
@@ -1011,6 +1058,52 @@ test("remote indexWorkspace aborts a started session when indexing fails", async
     "http://example.test/v1/index/sessions/sess-failed",
   ]);
   assert.equal(calls[2].init.method, "DELETE");
+});
+
+test("manifest rejection preserves bounded details and session identity", async () => {
+  const calls = [];
+  const client = new CorpusWireClient({
+    baseUrl: "http://example.test",
+    fetchFn: async (input, init) => {
+      calls.push({ input, init });
+      if (input.endsWith("/v1/index/sessions")) {
+        return jsonResponse(200, { ok: true, result: {
+          session_id: "sess-manifest", workspace_id: "workspace-1",
+          collection_name: "collection-1", mode: "full", manifest_revision: 1,
+          max_batch_bytes: 1024, max_batch_files: 1,
+          max_file_size_bytes: 1024, max_concurrent_uploads: 1,
+        } });
+      }
+      if (input.endsWith("/manifest/batch")) {
+        return jsonResponse(200, { ok: true, result: {
+          accepted: 1, upload_required: [], unchanged: 0, deletes: 0, skipped: 1,
+          errors: ["line 1:\tinvalid_inventory_entry\nignored"],
+        } });
+      }
+      if (input.endsWith("/v1/index/sessions/sess-manifest")) {
+        return jsonResponse(200, { ok: true, session_id: "sess-manifest", phase: "aborted" });
+      }
+      throw new Error(`Unexpected request: ${input}`);
+    },
+  });
+
+  await assert.rejects(
+    client.indexWorkspace({
+      workspace: { workspaceId: "workspace-1" },
+      files: [{ relativePath: "README.md", content: "# Demo\n" }],
+    }),
+    (error) => {
+      assert.ok(error instanceof WorkspaceScanIncompleteError);
+      assert.equal(error.sessionId, "sess-manifest");
+      assert.equal(error.manifestSkipped, 1);
+      assert.deepEqual(error.manifestErrors, ["line 1: invalid_inventory_entry ignored"]);
+      assert.match(error.message, /line 1: invalid_inventory_entry ignored/);
+      assert.equal(error.transfer.files_submitted, 1);
+      assert.equal(error.transfer.complete, false);
+      return true;
+    },
+  );
+  assert.equal(calls.at(-1).init.method, "DELETE");
 });
 
 test("previewIndexWorkspace compares a hashed manifest without starting a session", async () => {
@@ -2383,6 +2476,85 @@ for (const supportsInventory of [true, false]) {
     assert.equal(reused.transfer.acknowledged_files[0].disposition, "confirmed_reused");
   });
 }
+
+test("evaluation inventory keeps full manifest while excluding only attested coverage entries", async () => {
+  const starts = [], manifests = [];
+  const attestation = {
+    schema_version: "evaluation-inventory-attestation/v1",
+    full_manifest_digest: "1".repeat(64),
+    eligible_manifest_digest: "2".repeat(64),
+    excluded_manifest_digest: "3".repeat(64),
+    allowlist_digest: "4".repeat(64),
+    required_evidence_digest: "5".repeat(64),
+    selection_policy_digest: "6".repeat(64),
+    complete_file_count: 3,
+    complete_source_bytes: 9,
+    excluded_file_count: 1,
+    excluded_source_bytes: 3,
+    excluded_entries: [{ relative_path: "package-lock.json", sha256: "7".repeat(64), size: 3 }],
+    allowlist_entries: [{ relative_path: "package.json", sha256: "8".repeat(64), size: 3 }],
+    required_evidence_entries: [{ relative_path: "package.json", sha256: "8".repeat(64), size: 3 }],
+  };
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url, init) => {
+    if (url.endsWith("/capabilities")) return jsonResponse(200, { ok: true,
+      inventory_coverage_versions: ["workspace-inventory/v1"],
+      supported_file_registry_version: "fixture/v1", max_file_size_bytes: 1024,
+    });
+    if (url.endsWith("/sessions")) {
+      starts.push(JSON.parse(init.body));
+      return jsonResponse(200, { ok: true, result: { session_id: "evaluation", max_batch_bytes: 4096, max_concurrent_uploads: 1 } });
+    }
+    if (url.endsWith("/manifest/batch")) {
+      manifests.push(init.body);
+      return jsonResponse(200, { ok: true, result: {
+        accepted: 3, upload_required: ["main.py", "package.json"], unchanged: 0,
+        deletes: 0, skipped: 1, errors: [],
+      }});
+    }
+    if (url.endsWith("/files/batch")) return jsonResponse(200, { ok: true, result: { files_received: 2, errors: [] }});
+    if (url.endsWith("/commit")) return jsonResponse(200, { ok: true, result: {}, status: { phase: "completed" }});
+    throw new Error(`Unexpected fixture request ${url}`);
+  }});
+  await client.indexWorkspace({
+    workspace: { workspaceId: "local-docker://rqt-fixture#frozen" },
+    mode: "full",
+    files: [
+      { relativePath: "main.py", content: "a=1" },
+      { relativePath: "package.json", content: "{}\n" },
+      { relativePath: "package-lock.json", content: "{}\n" },
+    ],
+    inventoryScan: { complete: true, startedAt: "2026-09-13T00:00:00Z", completedAt: "2026-09-13T00:00:01Z",
+      excludedFileCount: 1, ignoreDigest: "0".repeat(64), producer: "fixture/v1" },
+    evaluationInventoryAttestation: attestation,
+  });
+  assert.equal(starts[0].inventory.eligible_file_count, 2);
+  assert.deepEqual(starts[0].evaluation_inventory_attestation, attestation);
+  assert.equal(manifests[0].trim().split("\n").length, 3);
+});
+
+test("evaluation inventory refuses a service without inventory coverage", async () => {
+  let sessions = 0;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url) => {
+    if (url.endsWith("/capabilities")) return jsonResponse(200, { ok: true, inventory_coverage_versions: [] });
+    sessions += 1;
+    return jsonResponse(500, {});
+  }});
+  await assert.rejects(client.indexWorkspace({
+    workspace: { workspaceId: "local-docker://rqt-fixture#frozen" }, mode: "full",
+    files: [{ relativePath: "main.py", content: "a=1" }],
+    inventoryScan: { complete: true, startedAt: "2026-09-13T00:00:00Z", completedAt: "2026-09-13T00:00:01Z",
+      excludedFileCount: 0, ignoreDigest: "0".repeat(64), producer: "fixture/v1" },
+    evaluationInventoryAttestation: {
+      schema_version: "evaluation-inventory-attestation/v1",
+      full_manifest_digest: "1".repeat(64), eligible_manifest_digest: "2".repeat(64),
+      excluded_manifest_digest: "3".repeat(64), allowlist_digest: "4".repeat(64),
+      required_evidence_digest: "5".repeat(64), selection_policy_digest: "6".repeat(64),
+      complete_file_count: 1, complete_source_bytes: 3, excluded_file_count: 0,
+      excluded_source_bytes: 0, excluded_entries: [], allowlist_entries: [], required_evidence_entries: [],
+    },
+  }), { code: "scan_incomplete" });
+  assert.equal(sessions, 0);
+});
 
 test("incomplete scan, supplied hash mismatch and duplicate files cannot allocate a session", async () => {
   let mutations = 0;

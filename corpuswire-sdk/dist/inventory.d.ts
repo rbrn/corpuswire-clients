@@ -1,8 +1,16 @@
 import type { InventoryScan, InventorySelectionPolicy, WorkspaceInventory } from "./types.js";
 export declare const INVENTORY_VERSION: "workspace-inventory/v1";
+export interface WorkspaceScanIncompleteDetails {
+    sessionId?: string;
+    manifestErrors?: readonly string[];
+    manifestSkipped?: number;
+}
 export declare class WorkspaceScanIncompleteError extends Error {
     readonly code = "scan_incomplete";
-    constructor(message?: string);
+    readonly sessionId?: string;
+    readonly manifestErrors: readonly string[];
+    readonly manifestSkipped?: number;
+    constructor(message?: string, details?: WorkspaceScanIncompleteDetails);
 }
 export declare function canonicalInventoryPath(value: string): string;
 export declare function inventorySha256(content: Uint8Array | string): Promise<string>;
