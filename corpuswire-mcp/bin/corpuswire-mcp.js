@@ -2,7 +2,7 @@
 
 import { execFile } from "node:child_process";
 import { Buffer } from "node:buffer";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, watch as watchFileSystem } from "node:fs";
 import { mkdir, readdir, readFile, rename, stat, lstat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -40,6 +40,11 @@ const QUALITY_WORK_TYPES = Object.freeze([
   "review_context",
 ]);
 const QUALITY_WORK_TYPE_SET = new Set(QUALITY_WORK_TYPES);
+const QUALITY_COMPARISON_ROUNDS = new Map();
+const RETRIEVAL_FAILURE_SCHEMA = "corpuswire-retrieval-failure/v1";
+const RETRIEVAL_FAILURE_DIRECTORY = path.join("reports", "retrieval-failures");
+const MATERIAL_OVERALL_SCORE_GAP = 1;
+const MATERIAL_DIMENSION_SCORE_GAP = 2;
 const INDEX_OBSERVABILITY_SCHEMA_VERSION = "index-observability/v1";
 const INDEX_OBSERVABILITY_HEADER = "X-CorpusWire-Index-Observability";
 const INDEX_OBSERVABILITY_STAGES = new Set([
@@ -145,6 +150,7 @@ const EXCLUDED_PATH_SEGMENTS = new Set([
   ".ruff_cache",
   ".qdrant",
 ]);
+const PROTECTED_DIAGNOSTIC_DIRECTORY = "reports/retrieval-failures";
 const SAFE_INDEXABLE_PATHS = new Set([".vscode/mcp.json.example"]);
 const CONFIG_EXAMPLE_SUFFIXES = new Set([".json.example"]);
 
@@ -2239,7 +2245,9 @@ async function callTool(params) {
     try {
       return textToolResult(await searchContext(args));
     } catch (error) {
-      return textToolResult(formatToolError(error, "search request"), true);
+      const message = formatToolError(error, "search request");
+      const reportPath = await reportToolFailureSafely(name, args, error);
+      return textToolResult(appendFailureReportPath(message, reportPath), true);
     }
   }
   if (name === "corpuswire_review_context") {
@@ -2267,7 +2275,9 @@ async function callTool(params) {
     try {
       return textToolResult(await enhancePrompt(args));
     } catch (error) {
-      return textToolResult(formatToolError(error, "enhancement request"), true);
+      const message = formatToolError(error, "enhancement request");
+      const reportPath = await reportToolFailureSafely(name, args, error);
+      return textToolResult(appendFailureReportPath(message, reportPath), true);
     }
   }
   if (name === "corpuswire_rate_result") {
@@ -4158,7 +4168,7 @@ async function searchContext(args) {
   const context = response.context ?? {};
   const hits = Array.isArray(result.retrieved_chunks) ? result.retrieved_chunks : [];
 
-  return formatSearchResult({
+  const formatted = formatSearchResult({
     baseUrl: client.baseUrl,
     query,
     repoPath,
@@ -4171,6 +4181,27 @@ async function searchContext(args) {
     hits,
     readPreparation,
   });
+  const failureMode = searchFailureMode({ result, hits, readPreparation });
+  if (!failureMode) {
+    return formatted;
+  }
+  const failureReportPath = await writeRetrievalFailureReportSafely({
+    workspaceId: workspaceId ?? optionalString(context.workspace_id),
+    workType: "semantic_retrieval",
+    toolName: "corpuswire_search",
+    query,
+    roundId: optionalString(args.roundId),
+    failureMode,
+    scores: { corpuswire: { status: "not_rated" }, augment: { status: "not_compared" } },
+    resultPaths: retrievedSourcePaths(hits),
+    details: {
+      hitCount: hits.length,
+      retrievalNotFound: result.retrieval_not_found === true,
+      readNeedsReconcile: readPreparation?.freshness?.needsReconcile === true,
+      retrievalConfidence: finiteScore(result.retrieval_confidence),
+    },
+  });
+  return appendFailureReportPath(formatted, failureReportPath);
 }
 
 async function health() {
@@ -4787,27 +4818,103 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minSc
   }
 
   const packets = Array.isArray(result.agent_context_packets) ? result.agent_context_packets : [];
+  if (optionalString(result.retrieval_evidence_policy) !== "generic-v2") {
+    if (packets.length > 0) {
+      lines.push("", "Agent context packets:");
+      for (const packet of packets) {
+        lines.push(formatAgentContextPacket(packet));
+      }
+    }
+    lines.push("", "Hits:");
+    let remainingChars = maxChars;
+    for (const [index, hit] of hits.entries()) {
+      const formatted = formatLegacySearchHit(hit, index + 1, remainingChars);
+      lines.push(formatted.text);
+      remainingChars = formatted.remainingChars;
+      if (remainingChars <= 0 && index < hits.length - 1) {
+        lines.push(`\nResponse truncated before ${hits.length - index - 1} additional hit(s). Increase maxChars to include more text.`);
+        break;
+      }
+    }
+    if (Array.isArray(result.citations) && result.citations.length > 0) {
+      lines.push("", "Citations:", ...result.citations.map((citation) => `- ${citation}`));
+    }
+    return lines.join("\n");
+  }
+
+  let remainingChars = maxChars;
+  let renderedHitCount = 0;
+  let incompleteHitCount = 0;
+  const renderedHits = [];
+  const deliveredCitations = new Set();
+  const deliveredLineRanges = new Map();
+  const excerptLength = (hit) => searchHitDisplayText(hit).length;
+  const selectedExcerptChars = hits.reduce((sum, hit) => sum + excerptLength(hit), 0);
+  const priorityTailChars = hits.slice(1, 3).reduce((sum, hit) => sum + excerptLength(hit), 0);
+  const anchorSourcePath = asRecord(hits[0]?.metadata).source_path;
+  const priorityTailRepeatsAnchor = hits.slice(1, 3).some(
+    (hit) => asRecord(hit.metadata).source_path === anchorSourcePath,
+  );
+  const minimumAnchorChars = Math.min(excerptLength(hits[0]), Math.floor(maxChars * 0.2));
+  // Keep the anchor present, but avoid letting a long first excerpt crowd out
+  // two higher-coverage excerpts when one of them complements the same source.
+  const anchorBudget = selectedExcerptChars > maxChars && priorityTailRepeatsAnchor
+    ? Math.max(minimumAnchorChars, maxChars - priorityTailChars)
+    : maxChars;
+  for (const [index, hit] of hits.entries()) {
+    const successorReservation = index === 0
+      ? 0
+      : boundedSuccessorReservation(hit, hits[index + 1], remainingChars, maxChars);
+    const hitBudget = index === 0
+      ? Math.min(remainingChars, anchorBudget)
+      : Math.max(0, remainingChars - successorReservation);
+    const formatted = formatSearchHit(hit, renderedHitCount + 1, hitBudget);
+    if (!formatted) {
+      incompleteHitCount += 1;
+      continue;
+    }
+    renderedHits.push(formatted.text);
+    renderedHitCount += 1;
+    remainingChars -= hitBudget - formatted.remainingChars;
+    if (formatted.renderedLineRange) {
+      deliveredCitations.add(`${formatted.sourcePath}:${formatted.renderedLineRange}`);
+    }
+    if (formatted.renderedLineRange) {
+      const ranges = deliveredLineRanges.get(formatted.sourcePath) ?? [];
+      if (!ranges.includes(formatted.renderedLineRange)) {
+        ranges.push(formatted.renderedLineRange);
+      }
+      deliveredLineRanges.set(formatted.sourcePath, ranges);
+    }
+    if (formatted.truncated) {
+      incompleteHitCount += 1;
+      if (remainingChars <= 0) {
+        incompleteHitCount += hits.length - index - 1;
+        break;
+      }
+    }
+  }
+
   if (packets.length > 0) {
     lines.push("", "Agent context packets:");
     for (const packet of packets) {
-      lines.push(formatAgentContextPacket(packet));
+      const sourcePath = optionalString(packet?.source_path);
+      lines.push(formatAgentContextPacket(packet, {
+        lineRanges: sourcePath ? deliveredLineRanges.get(sourcePath) ?? [] : [],
+      }));
     }
   }
+  lines.push("", "Hits:", ...renderedHits);
 
-  lines.push("", "Hits:");
-  let remainingChars = maxChars;
-  for (const [index, hit] of hits.entries()) {
-    const formatted = formatSearchHit(hit, index + 1, remainingChars);
-    lines.push(formatted.text);
-    remainingChars = formatted.remainingChars;
-    if (remainingChars <= 0 && index < hits.length - 1) {
-      lines.push(`\nResponse truncated before ${hits.length - index - 1} additional hit(s). Increase maxChars to include more text.`);
-      break;
-    }
+  if (incompleteHitCount > 0) {
+    lines.push(
+      "",
+      `Response truncated: ${incompleteHitCount} selected hit(s) clipped or omitted because their full excerpts did not fit the ${maxChars}-character excerpt budget.`,
+    );
   }
 
-  if (Array.isArray(result.citations) && result.citations.length > 0) {
-    lines.push("", "Citations:", ...result.citations.map((citation) => `- ${citation}`));
+  if (deliveredCitations.size > 0) {
+    lines.push("", "Citations:", ...[...deliveredCitations].map((citation) => `- ${citation}`));
   }
 
   return lines.join("\n");
@@ -4839,12 +4946,12 @@ function formatReadPreparation(readPreparation) {
   return lines;
 }
 
-function formatAgentContextPacket(packet) {
+function formatAgentContextPacket(packet, { lineRanges = packet.line_ranges } = {}) {
   const symbols = Array.isArray(packet.symbols) && packet.symbols.length > 0
     ? packet.symbols.join(", ")
     : "none";
-  const lines = Array.isArray(packet.line_ranges) && packet.line_ranges.length > 0
-    ? packet.line_ranges.join(", ")
+  const lines = Array.isArray(lineRanges) && lineRanges.length > 0
+    ? lineRanges.join(", ")
     : "unknown";
   const reasons = Array.isArray(packet.reasons) && packet.reasons.length > 0
     ? packet.reasons.join("; ")
@@ -4859,7 +4966,7 @@ function formatAgentContextPacket(packet) {
   ].join("\n");
 }
 
-function formatSearchHit(hit, ordinal, remainingChars) {
+function formatLegacySearchHit(hit, ordinal, remainingChars) {
   const metadata = asRecord(hit.metadata);
   const sourcePath = optionalString(metadata.source_path) ?? "unknown";
   const heading = optionalString(metadata.section_heading);
@@ -4899,6 +5006,229 @@ function formatSearchHit(hit, ordinal, remainingChars) {
   };
 }
 
+function verifiedDisplayLines(hit) {
+  const metadata = asRecord(hit.metadata);
+  const projection = asRecord(asRecord(metadata.extras).corpuswire_display_lines);
+  const sourceHash = metadata.source_hash;
+  const displayText = projection.text;
+  const chunkText = typeof hit.text === "string" ? hit.text.trim() : "";
+  const sourceContextMapping = projection.mapping_kind === "source-context/v1";
+  if (
+    projection.schema_version !== "corpuswire-complete-source-lines/v1"
+    || typeof sourceHash !== "string"
+    || !/^[0-9a-f]{64}$/.test(sourceHash)
+    || projection.source_hash !== sourceHash
+    || typeof displayText !== "string"
+    || !displayText.trim()
+    || (displayText.endsWith("\n") && !sourceContextMapping)
+    || Buffer.byteLength(displayText, "utf8") > 16_000
+    || !Number.isInteger(projection.start_line)
+    || !Number.isInteger(projection.end_line)
+    || projection.start_line < 1
+    || projection.end_line < projection.start_line
+    || !Number.isInteger(metadata.start_line)
+    || !Number.isInteger(metadata.end_line)
+    || displayText.split("\n").length !== projection.end_line - projection.start_line + 1
+    || projection.text_sha256 !== createHash("sha256").update(displayText, "utf8").digest("hex")
+    || typeof hit.text !== "string"
+    || !chunkText
+  ) {
+    return null;
+  }
+  const directMapping = projection.mapping_kind === undefined
+    && projection.start_line >= metadata.start_line
+    && projection.end_line <= metadata.end_line
+    && displayText.includes(chunkText);
+  let verifiedSourceContext = false;
+  if (
+    sourceContextMapping
+    && projection.chunk_text_sha256 === createHash("sha256").update(hit.text, "utf8").digest("hex")
+    && projection.start_line <= metadata.start_line
+    && projection.end_line >= metadata.end_line
+    && metadata.start_line - projection.start_line <= 3
+    && projection.end_line - metadata.end_line <= 3
+    && (projection.start_line < metadata.start_line || projection.end_line > metadata.end_line)
+    && displayText.split("\n").slice(
+      metadata.start_line - projection.start_line,
+      metadata.end_line - projection.start_line + 1,
+    ).join("\n").includes(chunkText)
+  ) {
+    const lines = displayText.split("\n");
+    const before = lines.slice(0, metadata.start_line - projection.start_line);
+    const after = lines.slice(lines.length - (projection.end_line - metadata.end_line));
+    const markdown = optionalString(metadata.source_path)?.toLowerCase().endsWith(".md") ?? false;
+    const permitted = (line) => !line.trim()
+      || (markdown && /^#{1,6}\s+\S/.test(line.replace(/\r$/, "")));
+    verifiedSourceContext = before.every(permitted) && after.every(permitted);
+  }
+  let transformedMapping = false;
+  if (
+    !directMapping
+    && projection.chunk_text_sha256 === createHash("sha256").update(hit.text, "utf8").digest("hex")
+  ) {
+    try {
+      const sourcePath = optionalString(metadata.source_path)?.toLowerCase() ?? "";
+      if (
+        projection.mapping_kind === "json-record/v1"
+        && (sourcePath.endsWith(".jsonl") || sourcePath.endsWith(".ndjson"))
+        && metadata.symbol_kind === "data_record"
+        && metadata.section_heading === `record line ${projection.start_line}`
+        && projection.start_line === projection.end_line
+        && projection.start_line === metadata.start_line
+      ) {
+        transformedMapping = JSON.stringify(JSON.parse(displayText), null, 2).includes(chunkText);
+      } else if (
+        projection.mapping_kind === "json-top-level-value/v1"
+        && (sourcePath.endsWith(".json") || sourcePath.endsWith(".json.example"))
+        && metadata.symbol_kind === "config_section"
+      ) {
+        const parsed = JSON.parse(displayText);
+        transformedMapping = parsed !== null
+          && !Array.isArray(parsed)
+          && typeof parsed === "object"
+          && Object.hasOwn(parsed, metadata.section_heading)
+          && JSON.stringify(parsed[metadata.section_heading], null, 2).includes(chunkText);
+      }
+    } catch {
+      return null;
+    }
+  }
+  if (!directMapping && !verifiedSourceContext && !transformedMapping) {
+    return null;
+  }
+  return projection;
+}
+
+function searchHitDisplayText(hit) {
+  const projection = verifiedDisplayLines(hit);
+  return projection?.text ?? (typeof hit.text === "string" ? hit.text.trim() : "");
+}
+
+function formatSearchHit(hit, ordinal, remainingChars) {
+  const metadata = asRecord(hit.metadata);
+  const sourcePath = optionalString(metadata.source_path) ?? "unknown";
+  const heading = optionalString(metadata.section_heading);
+  const title = optionalString(metadata.title);
+  const docType = optionalString(metadata.doc_type);
+  const chunkIndex = Number.isInteger(metadata.chunk_index) ? metadata.chunk_index : "unknown";
+  const score = typeof hit.score === "number" ? hit.score.toFixed(4) : "unknown";
+  const tags = Array.isArray(metadata.tags) && metadata.tags.length > 0
+    ? metadata.tags.filter((tag) => typeof tag === "string" && tag.trim()).join(", ")
+    : "";
+  const projection = verifiedDisplayLines(hit);
+  const rawText = searchHitDisplayText(hit);
+  if (!rawText || remainingChars <= 0) {
+    return null;
+  }
+  const rawLines = rawText.split("\n");
+  const complete = rawText.length <= remainingChars;
+  let snippet = rawText;
+  let renderedLineRange = projection ? `${projection.start_line}-${projection.end_line}` : "";
+  if (!complete) {
+    const sourceContext = projection?.mapping_kind === "source-context/v1";
+    const originalRangeLines = sourceContext
+      ? rawLines.slice(
+        metadata.start_line - projection.start_line,
+        metadata.end_line - projection.start_line + 1,
+      )
+      : rawLines;
+    const clipped = truncateAtLineBoundary(originalRangeLines, remainingChars);
+    if (clipped) {
+      snippet = clipped.text;
+      renderedLineRange = projection
+        ? `${sourceContext ? metadata.start_line : projection.start_line}-${
+          (sourceContext ? metadata.start_line : projection.start_line) + clipped.lineCount - 1}`
+        : "";
+    } else {
+      return null;
+    }
+    if (!snippet) {
+      return null;
+    }
+  }
+  const consumedChars = snippet.length;
+
+  return {
+    remainingChars: Math.max(0, remainingChars - consumedChars),
+    complete,
+    truncated: !complete,
+    sourcePath,
+    renderedLineRange,
+    text: [
+      `\n${ordinal}. ${sourcePath}`,
+      `   score: ${score}`,
+      `   chunk: ${chunkIndex}`,
+      ...(title ? [`   title: ${title}`] : []),
+      ...(heading ? [`   heading: ${heading}`] : []),
+      ...(docType ? [`   docType: ${docType}`] : []),
+      ...(renderedLineRange ? [`   lines: ${renderedLineRange}`] : []),
+      ...(!renderedLineRange ? ["   sourceRange: unavailable"] : []),
+      ...(!complete ? ["   excerptStatus: shortened"] : []),
+      ...(metadata.package_name ? [`   package: ${metadata.package_name}`] : []),
+      ...(metadata.symbol_kind ? [`   symbolKind: ${metadata.symbol_kind}`] : []),
+      ...(metadata.indexed_commit ? [`   indexedCommit: ${metadata.indexed_commit}`] : []),
+      ...(tags ? [`   tags: ${tags}`] : []),
+      ...(hit.chunk_id ? [`   chunkId: ${hit.chunk_id}`] : []),
+      "   text:",
+      indentSnippet(snippet || "(empty)"),
+    ].join("\n"),
+  };
+}
+
+function boundedSuccessorReservation(hit, successor, remainingChars, maxChars) {
+  if (!successor) {
+    return 0;
+  }
+  const metadata = asRecord(hit.metadata);
+  const rawText = searchHitDisplayText(hit);
+  const successorText = searchHitDisplayText(successor);
+  const projection = verifiedDisplayLines(hit);
+  const lineCount = projection
+    ? projection.end_line - projection.start_line + 1
+    : Number.isInteger(metadata.start_line) && Number.isInteger(metadata.end_line)
+      ? metadata.end_line - metadata.start_line + 1
+      : 0;
+  const rawLines = rawText.split("\n");
+  const successorLength = successorText.length;
+  if (
+    !rawText
+    || !successorText
+    || successorLength > Math.floor(maxChars * 0.2)
+    || successorLength >= remainingChars
+    || rawText.length + successorLength <= remainingChars
+    || lineCount <= 0
+    || rawLines.length !== lineCount
+  ) {
+    return 0;
+  }
+  const clipped = truncateAtLineBoundary(rawLines, remainingChars - successorLength);
+  if (
+    !clipped
+    || rawText.length - clipped.text.length > Math.floor(rawText.length * 0.05)
+  ) {
+    return 0;
+  }
+  return successorLength;
+}
+
+function truncateAtLineBoundary(lines, maxChars) {
+  const retained = [];
+  let length = 0;
+  for (const line of lines) {
+    const nextLength = length + (retained.length > 0 ? 1 : 0) + line.length;
+    if (nextLength > maxChars) {
+      break;
+    }
+    retained.push(line);
+    length = nextLength;
+  }
+  const text = retained.join("\n");
+  if (!text.trim()) {
+    return null;
+  }
+  return { text, lineCount: retained.length };
+}
+
 function truncateText(text, maxChars) {
   if (maxChars <= 0) {
     return "";
@@ -4906,8 +5236,20 @@ function truncateText(text, maxChars) {
   if (text.length <= maxChars) {
     return text;
   }
-  const suffix = "\n... truncated";
-  return `${text.slice(0, Math.max(0, maxChars - suffix.length)).trimEnd()}${suffix}`;
+  const marker = "\n... truncated";
+  const suffix = maxChars >= marker.length ? marker : ".".repeat(maxChars);
+  let endIndex = Math.max(0, maxChars - suffix.length);
+  if (
+    endIndex > 0
+    && endIndex < text.length
+    && text.charCodeAt(endIndex - 1) >= 0xd800
+    && text.charCodeAt(endIndex - 1) <= 0xdbff
+    && text.charCodeAt(endIndex) >= 0xdc00
+    && text.charCodeAt(endIndex) <= 0xdfff
+  ) {
+    endIndex -= 1;
+  }
+  return `${text.slice(0, endIndex).trimEnd()}${suffix}`;
 }
 
 function indentSnippet(text) {
@@ -4960,7 +5302,7 @@ async function enhancePrompt(args) {
     })
     : [];
 
-  return [
+  const formatted = [
     "Prompt augmentation preview",
     "",
     "Original prompt:",
@@ -4998,6 +5340,33 @@ async function enhancePrompt(args) {
       ? ["", "Citations:", ...result.citations.map((citation) => `- ${citation}`)]
       : []),
   ].join("\n");
+  const failureMode = enhancementFailureMode({
+    result,
+    enhancedPrompt,
+    usedLocalFallback,
+    readPreparation,
+  });
+  if (!failureMode) {
+    return formatted;
+  }
+  const failureReportPath = await writeRetrievalFailureReportSafely({
+    workspaceId: workspaceId ?? optionalString(result.workspace_id),
+    workType: "prompt_enhancement",
+    toolName: "corpuswire_enhance_prompt",
+    query: prompt,
+    roundId: optionalString(args.roundId),
+    failureMode,
+    scores: { corpuswire: { status: "not_rated" }, augment: { status: "not_compared" } },
+    resultPaths: retrievedSourcePaths(result.agent_context_packets),
+    details: {
+      hasEnhancedPrompt: Boolean(enhancedPrompt),
+      usedLocalFallback,
+      retrievalNotFound: result.retrieval_not_found === true,
+      readNeedsReconcile: readPreparation?.freshness?.needsReconcile === true,
+      retrievalConfidence: finiteScore(result.retrieval_confidence),
+    },
+  });
+  return appendFailureReportPath(formatted, failureReportPath);
 }
 
 function indentPreviewBlock(text) {
@@ -5020,18 +5389,19 @@ async function recordQualityResult(args) {
     );
   }
   const engine = requiredString(args, "engine").toLowerCase();
+  const scorecard = {
+    relevance: qualityDimension(args.relevance, "relevance"),
+    fileSpecificity: qualityDimension(args.fileSpecificity, "fileSpecificity"),
+    coverage: qualityDimension(args.coverage, "coverage"),
+    freshness: qualityDimension(args.freshness, "freshness"),
+    actionability: qualityDimension(args.actionability, "actionability"),
+  };
   const client = buildClient();
   const event = await client.recordQualityEvent({
     workspaceId,
     workType,
     engine,
-    scorecard: {
-      relevance: qualityDimension(args.relevance, "relevance"),
-      fileSpecificity: qualityDimension(args.fileSpecificity, "fileSpecificity"),
-      coverage: qualityDimension(args.coverage, "coverage"),
-      freshness: qualityDimension(args.freshness, "freshness"),
-      actionability: qualityDimension(args.actionability, "actionability"),
-    },
+    scorecard,
     query: optionalString(args.query) ?? "",
     surface: optionalString(args.surface) ?? "codex",
     roundId: optionalString(args.roundId),
@@ -5041,6 +5411,17 @@ async function recordQualityResult(args) {
     notes: optionalString(args.notes),
     issueUrl: optionalString(args.issueUrl),
     metadata: isRecord(args.metadata) ? args.metadata : {},
+  });
+  const failureReportPath = await compareQualityRoundAndReport({
+    workspaceId,
+    workType,
+    engine,
+    scorecard,
+    roundId: optionalString(args.roundId),
+    query: optionalString(args.query),
+    resultPaths: optionalStringArray(args, "resultPaths"),
+    improvement: optionalString(args.improvement),
+    warning: optionalString(args.warning),
   });
   return [
     "CorpusWire quality rating recorded:",
@@ -5057,7 +5438,274 @@ async function recordQualityResult(args) {
     `- queryStoredAs: ${event.query}`,
     ...(event.improvement ? [`- improvement: ${event.improvement}`] : []),
     ...(event.issue_url ? [`- issueUrl: ${event.issue_url}`] : []),
+    ...(failureReportPath ? [`- failureReport: ${failureReportPath}`] : []),
   ].join("\n");
+}
+
+async function compareQualityRoundAndReport({
+  workspaceId,
+  workType,
+  engine,
+  scorecard,
+  roundId,
+  query,
+  resultPaths,
+  improvement,
+  warning,
+}) {
+  if (!roundId || !["augment", "corpuswire"].includes(engine)) {
+    return null;
+  }
+  const key = `${workspaceId}\u0000${workType}\u0000${roundId}`;
+  const round = QUALITY_COMPARISON_ROUNDS.get(key) ?? {};
+  round[engine] = {
+    dimensions: scorecard,
+    overall: averageScore(scorecard),
+    query,
+    resultPaths,
+    improvement,
+    warning,
+  };
+  QUALITY_COMPARISON_ROUNDS.set(key, round);
+  while (QUALITY_COMPARISON_ROUNDS.size > 256) {
+    const oldestKey = QUALITY_COMPARISON_ROUNDS.keys().next().value;
+    QUALITY_COMPARISON_ROUNDS.delete(oldestKey);
+  }
+
+  if (!round.augment || !round.corpuswire) {
+    return null;
+  }
+  QUALITY_COMPARISON_ROUNDS.delete(key);
+
+  const overallGap = round.augment.overall - round.corpuswire.overall;
+  const dimensionGaps = Object.fromEntries(
+    Object.keys(round.augment.dimensions).map((dimension) => [
+      dimension,
+      round.augment.dimensions[dimension] - round.corpuswire.dimensions[dimension],
+    ]),
+  );
+  const largestDimensionGap = Math.max(...Object.values(dimensionGaps));
+  if (
+    overallGap < MATERIAL_OVERALL_SCORE_GAP
+    && largestDimensionGap < MATERIAL_DIMENSION_SCORE_GAP
+  ) {
+    return null;
+  }
+
+  return writeRetrievalFailureReportSafely({
+    workspaceId,
+    workType,
+    toolName: "corpuswire_rate_result",
+    query: round.corpuswire.query ?? round.augment.query,
+    roundId,
+    failureMode: "corpuswire_materially_weaker_than_augment",
+    scores: {
+      augment: {
+        status: "rated",
+        overall: round.augment.overall,
+        dimensions: round.augment.dimensions,
+      },
+      corpuswire: {
+        status: "rated",
+        overall: round.corpuswire.overall,
+        dimensions: round.corpuswire.dimensions,
+      },
+    },
+    resultPaths: round.corpuswire.resultPaths,
+    details: {
+      overallGap: roundNumber(overallGap),
+      dimensionGaps,
+      overallGapThreshold: MATERIAL_OVERALL_SCORE_GAP,
+      dimensionGapThreshold: MATERIAL_DIMENSION_SCORE_GAP,
+      improvement: round.corpuswire.improvement,
+      warning: round.corpuswire.warning,
+    },
+  });
+}
+
+function averageScore(scorecard) {
+  const values = Object.values(scorecard).filter(Number.isFinite);
+  return values.length > 0
+    ? values.reduce((sum, value) => sum + value, 0) / values.length
+    : null;
+}
+
+function roundNumber(value) {
+  return Number.isFinite(value) ? Number(value.toFixed(2)) : null;
+}
+
+function finiteScore(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function searchFailureMode({ result, hits, readPreparation }) {
+  // A disabled sync manager has no observed inventory state. Its initial
+  // `needsReconcile` value therefore means "unobserved", not that this
+  // successful backend response is known to be stale. Reporting it as a
+  // failure would make offline renderers non-deterministic and create a
+  // diagnostic on every search.
+  if (readPreparation?.enabled === true && readPreparation.freshness?.needsReconcile === true) {
+    return "index_needs_reconcile";
+  }
+  if (result.retrieval_not_found === true || hits.length === 0) {
+    return "no_retrieval_context";
+  }
+  return null;
+}
+
+function enhancementFailureMode({ result, enhancedPrompt, usedLocalFallback, readPreparation }) {
+  if (readPreparation?.enabled === true && readPreparation.freshness?.needsReconcile === true) {
+    return "index_needs_reconcile";
+  }
+  const packetCount = Array.isArray(result.agent_context_packets)
+    ? result.agent_context_packets.length
+    : 0;
+  const chunkCount = Array.isArray(result.retrieved_chunks) ? result.retrieved_chunks.length : 0;
+  if (result.retrieval_not_found === true || (packetCount === 0 && chunkCount === 0)) {
+    return "no_retrieval_context";
+  }
+  if (!enhancedPrompt) {
+    return "no_enhanced_prompt";
+  }
+  if (usedLocalFallback) {
+    return "generation_fallback";
+  }
+  return null;
+}
+
+function retrievedSourcePaths(values) {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  return [...new Set(values.map((value) => {
+    if (typeof value === "string") {
+      return value;
+    }
+    const record = asRecord(value);
+    const metadata = asRecord(record.metadata);
+    return optionalString(record.source_path ?? metadata.source_path);
+  }).filter(isSafeWorkspaceRelativePath))];
+}
+
+function isSafeWorkspaceRelativePath(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && !path.posix.isAbsolute(value)
+    && !value.split(/[\\/]+/).includes("..")
+    && !/^[A-Za-z]:/.test(value);
+}
+
+async function reportToolFailureSafely(toolName, args, error) {
+  const query = optionalString(args.query ?? args.prompt);
+  const workspaceId = optionalString(args.workspaceId ?? process.env.CORPUSWIRE_WORKSPACE_ID);
+  if (!query || !workspaceId) {
+    return null;
+  }
+  const errorMessage = error instanceof Error ? error.message : String(error ?? "");
+  const failureMode = /no enhanced prompt/i.test(errorMessage)
+    ? "no_enhanced_prompt"
+    : "mcp_request_error";
+  return writeRetrievalFailureReportSafely({
+    workspaceId,
+    workType: toolName === "corpuswire_enhance_prompt" ? "prompt_enhancement" : "semantic_retrieval",
+    toolName,
+    query,
+    roundId: optionalString(args.roundId),
+    failureMode,
+    scores: { corpuswire: { status: "failed" }, augment: { status: "not_compared" } },
+    resultPaths: [],
+    details: { errorCode: optionalString(error?.errorCode) ?? null },
+  });
+}
+
+async function writeRetrievalFailureReportSafely(report) {
+  try {
+    const workspaceRoot = optionalString(
+      report.workspaceRoot
+        ?? process.env.CORPUSWIRE_SYNC_ROOT
+        ?? process.env.CORPUSWIRE_REPO_PATH
+        ?? process.cwd(),
+    );
+    const workspaceId = optionalString(report.workspaceId);
+    if (!workspaceRoot || !workspaceId) {
+      return null;
+    }
+    const root = path.resolve(workspaceRoot);
+    const directory = path.join(root, RETRIEVAL_FAILURE_DIRECTORY);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const reportPath = path.join(directory, `${timestamp}-${randomUUID()}.json`);
+    const queryFields = diagnosticQueryFields(report.query);
+    const safeScores = isRecord(report.scores) ? report.scores : {};
+    const safeReport = {
+      schemaVersion: RETRIEVAL_FAILURE_SCHEMA,
+      createdAt: new Date().toISOString(),
+      roundId: optionalString(report.roundId),
+      workspaceId,
+      workType: optionalString(report.workType),
+      toolName: optionalString(report.toolName),
+      query: queryFields.query,
+      queryRedacted: queryFields.redacted,
+      querySha256: queryFields.sha256,
+      failureMode: optionalString(report.failureMode) ?? "unspecified_failure",
+      scores: safeScores,
+      resultPaths: retrievedSourcePaths(report.resultPaths),
+      details: sanitizeDiagnosticDetails(report.details),
+    };
+    await writeFile(reportPath, `${JSON.stringify(safeReport, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    return path.relative(root, reportPath).split(path.sep).join("/");
+  } catch {
+    return null;
+  }
+}
+
+function diagnosticQueryFields(value) {
+  const raw = optionalString(value) ?? "";
+  const sha256 = raw ? createHash("sha256").update(raw, "utf8").digest("hex") : null;
+  const privateContent = /\b(patient|diagnos(?:is|ed)|symptom|medication|prescription|medical history|date of birth|passport|social security|health record|my child|my baby)\b/i.test(raw);
+  let query = raw
+    .replace(/-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
+    .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1[REDACTED]")
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{16,})\b/gi, "[REDACTED TOKEN]")
+    .replace(/\b(password|secret|api[_ -]?key|token|authorization)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]")
+    .replace(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/g, "[REDACTED EMAIL]")
+    .replace(/\+?\d[\d().\s-]{7,}\d/g, "[REDACTED PHONE]")
+    .trim()
+    .slice(0, 2000);
+  if (privateContent) {
+    query = "[redacted: likely personal or health-related content]";
+  }
+  return { query, redacted: privateContent || query !== raw, sha256 };
+}
+
+function sanitizeDiagnosticDetails(value) {
+  if (!isRecord(value)) {
+    return {};
+  }
+  const safe = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (item === null || typeof item === "boolean" || Number.isFinite(item)) {
+      safe[key] = item;
+    } else if (typeof item === "string") {
+      safe[key] = diagnosticQueryFields(item).query;
+    } else if (isRecord(item)) {
+      safe[key] = sanitizeDiagnosticDetails(item);
+    } else if (Array.isArray(item)) {
+      safe[key] = item.map((child) => (
+        typeof child === "string" ? diagnosticQueryFields(child).query : child
+      ));
+    }
+  }
+  return safe;
+}
+
+function appendFailureReportPath(text, reportPath) {
+  return reportPath ? `${text}\n- failureReport: ${reportPath}` : text;
 }
 
 async function reviewQualityResults(args) {
@@ -5521,6 +6169,9 @@ function isSyncIndexableRelativePath(relativePath, context) {
 
 function classifySyncRelativePath(relativePath, context) {
   const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\/+/, "");
+  if (isProtectedDiagnosticPath(normalized)) {
+    return { accepted: false, reason: "protected_diagnostic" };
+  }
   if (isSensitiveTerraformRelativePath(normalized)) {
     return { accepted: false, reason: "sensitive_terraform_artifact" };
   }
@@ -5605,10 +6256,16 @@ function matchesAnySyncGlob(relativePath, patterns) {
 }
 
 function isExcludedDirectory(relativePath, excludeGlobs) {
-  if (!relativePath || !Array.isArray(excludeGlobs) || excludeGlobs.length === 0) {
+  if (!relativePath) {
     return false;
   }
   const normalized = relativePath.replaceAll("\\", "/").replace(/\/+$/, "");
+  if (isProtectedDiagnosticPath(normalized)) {
+    return true;
+  }
+  if (!Array.isArray(excludeGlobs) || excludeGlobs.length === 0) {
+    return false;
+  }
   return matchesAnyGlob(normalized, excludeGlobs)
     || matchesAnyGlob(`${normalized}/`, excludeGlobs)
     || matchesAnyGlob(`${normalized}/${DIRECTORY_GLOB_PROBE}`, excludeGlobs);
@@ -5666,6 +6323,9 @@ function escapeRegExp(value) {
 
 function isIndexableRelativePath(relativePath) {
   const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\/+/, "");
+  if (isProtectedDiagnosticPath(normalized)) {
+    return false;
+  }
   if (isSensitiveTerraformRelativePath(normalized)) {
     return false;
   }
@@ -5682,6 +6342,16 @@ function isIndexableRelativePath(relativePath) {
   const effectivePath = effectiveIndexableRelativePath(normalized);
   return INDEXABLE_EXTENSIONS.has(path.posix.extname(effectivePath).toLowerCase())
     || INDEXABLE_FILENAMES.has(path.posix.basename(effectivePath).toLowerCase());
+}
+
+function isProtectedDiagnosticPath(relativePath) {
+  const normalized = relativePath
+    .replaceAll("\\", "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+  const protectedDirectory = PROTECTED_DIAGNOSTIC_DIRECTORY.toLowerCase();
+  return normalized === protectedDirectory || normalized.startsWith(`${protectedDirectory}/`);
 }
 
 function isMissingFileError(error) {

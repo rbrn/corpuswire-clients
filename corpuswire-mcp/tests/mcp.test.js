@@ -1,12 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SERVER_BIN = fileURLToPath(new URL("../bin/corpuswire-mcp.js", import.meta.url));
+const WRAPPER_BIN = fileURLToPath(new URL("../../../plugins/corpuswire-context-engine/scripts/mcp-server.mjs", import.meta.url));
 const REVIEW_SCHEMA_PATH = fileURLToPath(
   new URL("../../../schemas/review-context/v1/review-context.schema.json", import.meta.url),
 );
@@ -17,6 +19,30 @@ const VENDORED_SDK_INDEX = new URL(
   "../vendor/corpuswire-sdk/dist/index.js",
   import.meta.url,
 );
+
+function withDisplayProjection(hit, { text = hit.text, startLine = hit.metadata.start_line,
+  endLine = hit.metadata.end_line, sourceText = text } = {}) {
+  const digest = (value) => createHash("sha256").update(value, "utf8").digest("hex");
+  const sourceHash = digest(sourceText);
+  return {
+    ...hit,
+    metadata: {
+      ...hit.metadata,
+      source_hash: sourceHash,
+      extras: {
+        ...hit.metadata.extras,
+        corpuswire_display_lines: {
+          schema_version: "corpuswire-complete-source-lines/v1",
+          start_line: startLine,
+          end_line: endLine,
+          text,
+          text_sha256: digest(text),
+          source_hash: sourceHash,
+        },
+      },
+    },
+  };
+}
 
 test("corpuswire-mcp exposes tools and maps search requests to the SDK", async () => {
   const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
@@ -116,6 +142,841 @@ test("corpuswire-mcp exposes tools and maps search requests to the SDK", async (
         hourlyRate: 100,
       },
     ]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("CorpusWire search writes a redacted retrieval-failure report when it has no context", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-failure-report-"));
+  const workspaceRoot = path.join(tempDir, "workspace");
+  await mkdir(workspaceRoot);
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        CORPUSWIRE_SYNC_ENABLED: "false",
+        CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK: "false",
+        CORPUSWIRE_SYNC_ROOT: workspaceRoot,
+        CORPUSWIRE_WORKSPACE_ID: "local-docker://report-test#main",
+        MOCK_QUERY_EMPTY: "true",
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const result = await rpc({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_search",
+          arguments: {
+            query: "find token=synthetic-secret-placeholder in local config",
+          },
+        },
+      });
+      assert.equal(result.result.isError, false, result.result.content[0].text);
+      assert.match(result.result.content[0].text, /failureReport: reports\/retrieval-failures\//);
+    } finally {
+      child.kill();
+    }
+
+    const reportDirectory = path.join(workspaceRoot, "reports", "retrieval-failures");
+    const [reportName] = await readdir(reportDirectory);
+    const report = JSON.parse(await readFile(path.join(reportDirectory, reportName), "utf8"));
+    assert.equal(report.schemaVersion, "corpuswire-retrieval-failure/v1");
+    assert.equal(report.workspaceId, "local-docker://report-test#main");
+    assert.equal(report.workType, "semantic_retrieval");
+    assert.equal(report.failureMode, "no_retrieval_context");
+    assert.equal(report.details.hitCount, 0);
+    assert.match(report.query, /token=\[REDACTED\]/);
+    assert.doesNotMatch(JSON.stringify(report), /synthetic-secret-placeholder/);
+    assert.equal(report.scores.corpuswire.status, "not_rated");
+    assert.equal(report.scores.augment.status, "not_compared");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("CorpusWire search writes failure reports under the resolved working directory", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-failure-report-cwd-"));
+  const workspaceRoot = path.join(tempDir, "workspace");
+  await mkdir(workspaceRoot);
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const env = {
+      ...globalThis.process.env,
+      CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+      CORPUSWIRE_SDK_PATH: sdkPath,
+      CORPUSWIRE_SYNC_ENABLED: "false",
+      CORPUSWIRE_WORKSPACE_ID: "local-docker://report-cwd-test#main",
+      MOCK_QUERY_EMPTY: "true",
+      MOCK_REQUESTS_PATH: requestsPath,
+    };
+    delete env.CORPUSWIRE_SYNC_ROOT;
+    delete env.CORPUSWIRE_REPO_PATH;
+    const child = spawn("node", [SERVER_BIN], {
+      cwd: workspaceRoot,
+      stdio: ["pipe", "pipe", "pipe"],
+      env,
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const result = await rpc({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_search",
+          arguments: { query: "find workspace configuration" },
+        },
+      });
+      assert.equal(result.result.isError, false, result.result.content[0].text);
+      assert.match(result.result.content[0].text, /failureReport: reports\/retrieval-failures\//);
+    } finally {
+      child.kill();
+    }
+
+    const reportDirectory = path.join(workspaceRoot, "reports", "retrieval-failures");
+    const [reportName] = await readdir(reportDirectory);
+    const report = JSON.parse(await readFile(path.join(reportDirectory, reportName), "utf8"));
+    assert.equal(report.workspaceId, "local-docker://report-cwd-test#main");
+    assert.equal(report.failureMode, "no_retrieval_context");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("CorpusWire prompt enhancement failures create a local diagnostic report", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-enhance-failure-report-"));
+  const workspaceRoot = path.join(tempDir, "workspace");
+  await mkdir(workspaceRoot);
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        CORPUSWIRE_SYNC_ENABLED: "false",
+        CORPUSWIRE_SYNC_ROOT: workspaceRoot,
+        CORPUSWIRE_WORKSPACE_ID: "local-docker://report-test#main",
+        MOCK_ENHANCE_EMPTY: "true",
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const result = await rpc({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_enhance_prompt",
+          arguments: { prompt: "ground this task in the workspace" },
+        },
+      });
+      assert.equal(result.result.isError, true);
+      assert.match(result.result.content[0].text, /failureReport: reports\/retrieval-failures\//);
+    } finally {
+      child.kill();
+    }
+
+    const reportDirectory = path.join(workspaceRoot, "reports", "retrieval-failures");
+    const [reportName] = await readdir(reportDirectory);
+    const report = JSON.parse(await readFile(path.join(reportDirectory, reportName), "utf8"));
+    assert.equal(report.workType, "prompt_enhancement");
+    assert.equal(report.failureMode, "no_enhanced_prompt");
+    assert.equal(report.query, "ground this task in the workspace");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("CorpusWire ratings create a report when a shared round is materially weaker than Augment", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-comparison-report-"));
+  const workspaceRoot = path.join(tempDir, "workspace");
+  await mkdir(workspaceRoot);
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        CORPUSWIRE_SYNC_ENABLED: "false",
+        CORPUSWIRE_SYNC_ROOT: workspaceRoot,
+        CORPUSWIRE_WORKSPACE_ID: "local-docker://report-test#main",
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+    const rating = (id, engine, score) => rpc({
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: {
+        name: "corpuswire_rate_result",
+        arguments: {
+          workspaceId: "local-docker://report-test#main",
+          workType: "semantic_retrieval",
+          engine,
+          relevance: score,
+          fileSpecificity: score,
+          coverage: score,
+          freshness: score,
+          actionability: score,
+          query: "find configuration generator",
+          resultPaths: ["src/corpuswire/onboarding.py"],
+          roundId: "comparison-test-r1",
+        },
+      },
+    });
+
+    try {
+      const corpuswire = await rating(1, "corpuswire", 2);
+      assert.equal(corpuswire.result.isError, false);
+      assert.doesNotMatch(corpuswire.result.content[0].text, /failureReport:/);
+      const augment = await rating(2, "augment", 4);
+      assert.equal(augment.result.isError, false);
+      assert.match(augment.result.content[0].text, /failureReport: reports\/retrieval-failures\//);
+    } finally {
+      child.kill();
+    }
+
+    const reportDirectory = path.join(workspaceRoot, "reports", "retrieval-failures");
+    const [reportName] = await readdir(reportDirectory);
+    const report = JSON.parse(await readFile(path.join(reportDirectory, reportName), "utf8"));
+    assert.equal(report.roundId, "comparison-test-r1");
+    assert.equal(report.failureMode, "corpuswire_materially_weaker_than_augment");
+    assert.equal(report.scores.corpuswire.overall, 2);
+    assert.equal(report.scores.augment.overall, 4);
+    assert.deepEqual(report.resultPaths, ["src/corpuswire/onboarding.py"]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("both Node entry points cite only delivered complete source lines", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-delivery-"));
+  try {
+    const { sdkPath } = await writeMockSdk(tempDir);
+    const fixturePath = path.join(tempDir, "selected-hits.json");
+    const hitTexts = [
+      `RQT_DELIVERED_1 ${"e".repeat(24)}`,
+      `RQT_DELIVERED_2 ${"b".repeat(244)}`,
+      `RQT_DELIVERED_3 ${"c".repeat(18)}\n${"t".repeat(24)}`,
+      `RQT_DELIVERED_4 ${"d".repeat(40)}\nRQT_TAIL_4 ${"d".repeat(96)}`,
+      `RQT_DELIVERED_5 ${"e".repeat(4)}`,
+    ];
+    const hits = [1, 2, 3, 4, 5].map((number) => withDisplayProjection({
+      chunk_id: `selected-${number}`,
+      score: 1 - number / 10,
+      text: hitTexts[number - 1],
+      metadata: {
+        source_path: `src/source-${number}.py`,
+        start_line: number * 10,
+        end_line: number * 10 + (number === 3 || number === 4 ? 1 : 0),
+        indexed_commit: "fixture-commit",
+      },
+    }));
+    await writeFile(fixturePath, JSON.stringify({
+      result: {
+        retrieval_query: "synthetic delivery check",
+        retrieval_backend: "fixture",
+        retrieval_evidence_policy: "generic-v2",
+        retrieved_chunks: hits,
+        agent_context_packets: [{
+          source_path: "src/source-5.py",
+          role: "implementation",
+          inspection_order: 1,
+          score: 1,
+          reasons: ["synthetic fixture"],
+          line_ranges: ["50-50"],
+        }],
+        citations: hits.map((hit) => `${hit.metadata.source_path}:${hit.metadata.start_line}-${hit.metadata.end_line}`),
+      },
+      context: { workspace_id: "fixture-delivery", collection: "fixture", index: { manifest_revision: 1 } },
+    }), "utf8");
+
+    for (const server of [SERVER_BIN, WRAPPER_BIN]) {
+      const child = spawn("node", [server], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...globalThis.process.env,
+          CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+          CORPUSWIRE_SDK_PATH: sdkPath,
+          CORPUSWIRE_SYNC_ENABLED: "false",
+          CORPUSWIRE_WORKSPACE_ID: "fixture-delivery",
+          MOCK_QUERY_FIXTURE_PATH: fixturePath,
+          MOCK_REQUESTS_PATH: path.join(tempDir, "requests.jsonl"),
+        },
+      });
+      const rpc = createRpc(child);
+      try {
+        for (const [id, maxChars] of [[1, 12000], [2, 200]]) {
+          const response = await rpc({ jsonrpc: "2.0", id, method: "tools/call", params: {
+            name: "corpuswire_search",
+            arguments: { query: "synthetic delivery check", workspaceId: "fixture-delivery", topK: 5, maxChars },
+          } });
+          assert.equal(response.result.isError, false);
+          const rendered = response.result.content[0].text;
+          assert.match(rendered, /manifestRevision: 1/);
+          assert.match(rendered, /contextWorkspaceId: fixture-delivery/);
+          assert.match(rendered, /1\. src\/source-1\.py[\s\S]*?lines: 10-10[\s\S]*?RQT_DELIVERED_1/);
+          if (maxChars === 12000) {
+            for (const number of [2, 3, 4, 5]) {
+              assert.match(rendered, new RegExp(`RQT_DELIVERED_${number}`));
+            }
+            assert.ok(rendered.indexOf("RQT_DELIVERED_1") < rendered.indexOf("RQT_DELIVERED_5"));
+            for (const number of [1, 2, 3, 4, 5]) {
+              assert.match(rendered, new RegExp(`src/source-${number}\\.py:${number * 10}-${hits[number - 1].metadata.end_line}`));
+            }
+          } else {
+            assert.match(rendered, /Response truncated: 2 selected hit\(s\) clipped or omitted/);
+            for (const number of [1, 3, 4, 5]) {
+              assert.match(rendered, new RegExp(`RQT_DELIVERED_${number}`));
+            }
+            assert.match(rendered, /lines: 40-40/);
+            assert.doesNotMatch(rendered, /RQT_TAIL_4/);
+            for (const number of [1, 3, 5]) {
+              assert.match(rendered, new RegExp(`src/source-${number}\\.py:${number * 10}-${hits[number - 1].metadata.end_line}`));
+            }
+            assert.doesNotMatch(rendered, /RQT_DELIVERED_2/);
+            assert.doesNotMatch(rendered, /src\/source-2\.py:20-21/);
+            assert.doesNotMatch(rendered, /src\/source-4\.py:40-41/);
+            assert.match(rendered, /src\/source-4\.py:40-40/);
+            assert.ok(rendered.indexOf("RQT_DELIVERED_1") < rendered.indexOf("RQT_DELIVERED_5"));
+          }
+        }
+      } finally {
+        child.kill();
+      }
+    }
+
+    const legacyHits = hits.map((hit, index) => ({
+      ...hit,
+      metadata: { ...hit.metadata, end_line: (index + 1) * 10 + 1 },
+    }));
+    await writeFile(fixturePath, JSON.stringify({
+      result: {
+        retrieval_query: "synthetic delivery check",
+        retrieval_backend: "fixture",
+        retrieval_evidence_policy: "legacy",
+        retrieved_chunks: legacyHits,
+        agent_context_packets: [{
+          source_path: "src/source-5.py",
+          role: "implementation",
+          inspection_order: 1,
+          score: 1,
+          reasons: ["synthetic fixture"],
+          line_ranges: ["50-51"],
+        }],
+        citations: legacyHits.map((hit) => `${hit.metadata.source_path}:${hit.metadata.start_line}-${hit.metadata.end_line}`),
+      },
+      context: { workspace_id: "fixture-delivery", collection: "fixture", index: { manifest_revision: 1 } },
+    }), "utf8");
+    const legacyOutputs = [];
+    for (const server of [SERVER_BIN, WRAPPER_BIN]) {
+      const child = spawn("node", [server], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...globalThis.process.env,
+          CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+          CORPUSWIRE_SDK_PATH: sdkPath,
+          CORPUSWIRE_SYNC_ENABLED: "false",
+          CORPUSWIRE_WORKSPACE_ID: "fixture-delivery",
+          MOCK_QUERY_FIXTURE_PATH: fixturePath,
+          MOCK_REQUESTS_PATH: path.join(tempDir, "requests.jsonl"),
+        },
+      });
+      const rpc = createRpc(child);
+      try {
+        const response = await rpc({ jsonrpc: "2.0", id: 4, method: "tools/call", params: {
+          name: "corpuswire_search",
+          arguments: { query: "synthetic delivery check", workspaceId: "fixture-delivery", topK: 5, maxChars: 200 },
+        } });
+        assert.equal(response.result.isError, false);
+        legacyOutputs.push(response.result.content[0].text);
+      } finally {
+        child.kill();
+      }
+    }
+    assert.equal(legacyOutputs[0], legacyOutputs[1]);
+    assert.equal(
+      createHash("sha256").update(legacyOutputs[0], "utf8").digest("hex"),
+      "515d349f792e892a04cec0b8923785f8faf27109d90148ad4df82b46f73d07cc",
+    );
+
+    const unicodeHits = [{
+      chunk_id: "unicode-boundary",
+      score: 1,
+      text: `${"x".repeat(185)}😀${"y".repeat(20)}`,
+      metadata: { source_path: "src/unicode.py", start_line: 1, end_line: 2 },
+    }];
+    await writeFile(fixturePath, JSON.stringify({
+      result: {
+        retrieval_query: "synthetic unicode boundary",
+        retrieval_backend: "fixture",
+        retrieval_evidence_policy: "generic-v2",
+        retrieved_chunks: unicodeHits,
+        agent_context_packets: [{
+          source_path: "src/unicode.py",
+          role: "implementation",
+          inspection_order: 1,
+          score: 1,
+          reasons: ["synthetic fixture"],
+          line_ranges: ["1-2"],
+        }],
+        citations: ["src/unicode.py:1-2"],
+      },
+      context: { workspace_id: "fixture-delivery", collection: "fixture", index: { manifest_revision: 1 } },
+    }), "utf8");
+    for (const server of [SERVER_BIN, WRAPPER_BIN]) {
+      const child = spawn("node", [server], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...globalThis.process.env,
+          CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+          CORPUSWIRE_SDK_PATH: sdkPath,
+          CORPUSWIRE_SYNC_ENABLED: "false",
+          CORPUSWIRE_WORKSPACE_ID: "fixture-delivery",
+          MOCK_QUERY_FIXTURE_PATH: fixturePath,
+          MOCK_REQUESTS_PATH: path.join(tempDir, "requests.jsonl"),
+        },
+      });
+      const rpc = createRpc(child);
+      try {
+        const response = await rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: {
+          name: "corpuswire_search",
+          arguments: { query: "synthetic unicode boundary", workspaceId: "fixture-delivery", topK: 5, maxChars: 200 },
+        } });
+        const rendered = response.result.content[0].text;
+        assert.equal(response.result.isError, false);
+        assert.doesNotMatch(rendered, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+        assert.doesNotMatch(rendered, /[\uDC00-\uDFFF](?<![\uD800-\uDBFF])/);
+        assert.doesNotMatch(rendered, /lines: 1-2/);
+        assert.doesNotMatch(rendered, /Citations:/);
+      } finally {
+        child.kill();
+      }
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("generic-v2 hides unproven ranges and never clips an oversized source line", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-source-lines-"));
+  try {
+    const { sdkPath } = await writeMockSdk(tempDir);
+    const fixturePath = path.join(tempDir, "source-lines.json");
+    const scenarios = [
+      {
+        maxChars: 12000,
+        hits: [
+          withDisplayProjection({
+            chunk_id: "outer-blank-lines",
+            score: 1,
+            text: " \n  alpha  \n\n",
+            metadata: { source_path: "src/outer.py", start_line: 10, end_line: 12 },
+          }, { text: "  alpha  ", startLine: 11, endLine: 11, sourceText: " \n  alpha  \n\n" }),
+          withDisplayProjection({
+            chunk_id: "crlf-lines",
+            score: 0.9,
+            text: "one\r\ntwo\r\n",
+            metadata: { source_path: "src/crlf.py", start_line: 20, end_line: 21 },
+          }, { text: "one\r\ntwo\r", sourceText: "one\r\ntwo\r\n" }),
+          {
+            chunk_id: "wrong-range",
+            score: 0.8,
+            text: "gamma\ndelta",
+            metadata: { source_path: "src/mismatch.py", start_line: 30, end_line: 32 },
+          },
+          {
+            chunk_id: "unproved-single-line",
+            score: 0.7,
+            text: "middle of a source line",
+            metadata: { source_path: "src/unproved.py", start_line: 40, end_line: 40 },
+          },
+          (() => {
+            const hit = withDisplayProjection({
+              chunk_id: "tampered-projection",
+              score: 0.6,
+              text: "trusted-looking line",
+              metadata: { source_path: "src/tampered.py", start_line: 50, end_line: 50 },
+            });
+            hit.metadata.extras.corpuswire_display_lines.text_sha256 = "0".repeat(64);
+            return hit;
+          })(),
+        ],
+        check(rendered) {
+          assert.match(rendered, /src\/outer\.py[\s\S]*?lines: 11-11[\s\S]*?alpha/);
+          assert.match(rendered, /src\/crlf\.py[\s\S]*?lines: 20-21[\s\S]*?one\r/);
+          assert.match(rendered, /src\/mismatch\.py[\s\S]*?sourceRange: unavailable[\s\S]*?gamma/);
+          assert.match(rendered, /src\/unproved\.py[\s\S]*?sourceRange: unavailable/);
+          assert.match(rendered, /src\/tampered\.py[\s\S]*?sourceRange: unavailable/);
+          assert.match(rendered, /- src\/outer\.py:11-11/);
+          assert.match(rendered, /- src\/crlf\.py:20-21/);
+          assert.doesNotMatch(rendered, /- src\/mismatch\.py/);
+          assert.doesNotMatch(rendered, /- src\/unproved\.py/);
+          assert.doesNotMatch(rendered, /- src\/tampered\.py/);
+          assert.doesNotMatch(rendered, /lines: 30-32/);
+        },
+      },
+      {
+        maxChars: 200,
+        hits: [{
+          chunk_id: "oversized-line",
+          score: 1,
+          text: "😀".repeat(120),
+          metadata: { source_path: "src/oversized.py", start_line: 40, end_line: 40 },
+        }],
+        check(rendered) {
+          assert.match(rendered, /Response truncated: 1 selected hit\(s\) clipped or omitted/);
+          assert.doesNotMatch(rendered, /   lines: 40-40/);
+          assert.doesNotMatch(rendered, /Citations:/);
+          assert.doesNotMatch(rendered, /😀/);
+        },
+      },
+      {
+        maxChars: 12000,
+        hits: [
+          (() => {
+            const source = "# Heading\n\nalpha beta\n";
+            const hit = withDisplayProjection({
+              chunk_id: "markdown-source-context", score: 1, text: "alpha beta",
+              metadata: { source_path: "docs/context.md", start_line: 3, end_line: 3 },
+            }, { text: "# Heading\n\nalpha beta", startLine: 1, endLine: 3, sourceText: source });
+            hit.metadata.extras.corpuswire_display_lines.mapping_kind = "source-context/v1";
+            hit.metadata.extras.corpuswire_display_lines.chunk_text_sha256 = createHash("sha256").update(hit.text).digest("hex");
+            return hit;
+          })(),
+          (() => {
+            const source = "ordinary code\n\nalpha beta\n";
+            const hit = withDisplayProjection({
+              chunk_id: "invalid-source-context", score: 0.5, text: "alpha beta",
+              metadata: { source_path: "src/context.py", start_line: 3, end_line: 3 },
+            }, { text: "ordinary code\n\nalpha beta", startLine: 1, endLine: 3, sourceText: source });
+            hit.metadata.extras.corpuswire_display_lines.mapping_kind = "source-context/v1";
+            hit.metadata.extras.corpuswire_display_lines.chunk_text_sha256 = createHash("sha256").update(hit.text).digest("hex");
+            return hit;
+          })(),
+          (() => {
+            const source = "last line\n\n";
+            const hit = withDisplayProjection({
+              chunk_id: "trailing-blank-context", score: 0.4, text: "last line",
+              metadata: { source_path: "src/trailing.py", start_line: 1, end_line: 1 },
+            }, { text: "last line\n", startLine: 1, endLine: 2, sourceText: source });
+            hit.metadata.extras.corpuswire_display_lines.mapping_kind = "source-context/v1";
+            hit.metadata.extras.corpuswire_display_lines.chunk_text_sha256 = createHash("sha256").update(hit.text).digest("hex");
+            return hit;
+          })(),
+        ],
+        check(rendered) {
+          assert.match(rendered, /- docs\/context\.md:1-3/);
+          assert.match(rendered, /- src\/trailing\.py:1-2/);
+          assert.match(rendered, /# Heading/);
+          assert.match(rendered, /src\/context\.py[\s\S]*?sourceRange: unavailable/);
+          assert.doesNotMatch(rendered, /- src\/context\.py:/);
+        },
+      },
+      {
+        maxChars: 200,
+        hits: [(() => {
+          const heading = `# ${"H".repeat(190)}`;
+          const hit = withDisplayProjection({
+            chunk_id: "budgeted-source-context", score: 1, text: "alpha beta",
+            metadata: { source_path: "docs/budget.md", start_line: 3, end_line: 3 },
+          }, { text: `${heading}\n\nalpha beta`, startLine: 1, endLine: 3 });
+          hit.metadata.extras.corpuswire_display_lines.mapping_kind = "source-context/v1";
+          hit.metadata.extras.corpuswire_display_lines.chunk_text_sha256 = createHash("sha256").update(hit.text).digest("hex");
+          return hit;
+        })()],
+        check(rendered) {
+          assert.match(rendered, /docs\/budget\.md[\s\S]*?lines: 3-3[\s\S]*?alpha beta/);
+          assert.match(rendered, /- docs\/budget\.md:3-3/);
+          assert.doesNotMatch(rendered, /# H{20}/);
+        },
+      },
+      {
+        maxChars: 12000,
+        hits: [(() => {
+          const hit = withDisplayProjection({
+            chunk_id: "misplaced-chunk-text", score: 1, text: "trusted-looking line",
+            metadata: { source_path: "docs/tampered.md", start_line: 3, end_line: 3 },
+          }, { text: "# trusted-looking line\n\nunrelated", startLine: 1, endLine: 3 });
+          hit.metadata.extras.corpuswire_display_lines.mapping_kind = "source-context/v1";
+          hit.metadata.extras.corpuswire_display_lines.chunk_text_sha256 = createHash("sha256").update(hit.text).digest("hex");
+          return hit;
+        })()],
+        check(rendered) {
+          assert.match(rendered, /docs\/tampered\.md[\s\S]*?sourceRange: unavailable/);
+          assert.doesNotMatch(rendered, /- docs\/tampered\.md:/);
+        },
+      },
+    ];
+
+    for (const [scenarioIndex, scenario] of scenarios.entries()) {
+      await writeFile(fixturePath, JSON.stringify({
+        result: {
+          retrieval_query: "synthetic source line check",
+          retrieval_backend: "fixture",
+          retrieval_evidence_policy: "generic-v2",
+          retrieved_chunks: scenario.hits,
+          citations: scenario.hits.map((hit) =>
+            `${hit.metadata.source_path}:${hit.metadata.start_line}-${hit.metadata.end_line}`),
+        },
+        context: { workspace_id: "fixture-delivery", collection: "fixture", index: { manifest_revision: 1 } },
+      }), "utf8");
+      const outputs = [];
+      for (const server of [SERVER_BIN, WRAPPER_BIN]) {
+        const child = spawn("node", [server], {
+          stdio: ["pipe", "pipe", "pipe"],
+          env: {
+            ...globalThis.process.env,
+            CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+            CORPUSWIRE_SDK_PATH: sdkPath,
+            CORPUSWIRE_SYNC_ENABLED: "false",
+            CORPUSWIRE_WORKSPACE_ID: "fixture-delivery",
+            MOCK_QUERY_FIXTURE_PATH: fixturePath,
+            MOCK_REQUESTS_PATH: path.join(tempDir, `requests-${scenarioIndex}.jsonl`),
+          },
+        });
+        const rpc = createRpc(child);
+        try {
+          const response = await rpc({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+            name: "corpuswire_search",
+            arguments: {
+              query: "synthetic source line check",
+              workspaceId: "fixture-delivery",
+              topK: 5,
+              maxChars: scenario.maxChars,
+            },
+          } });
+          assert.equal(response.result.isError, false);
+          outputs.push(response.result.content[0].text);
+        } finally {
+          child.kill();
+        }
+      }
+      assert.equal(outputs[0], outputs[1]);
+      scenario.check(outputs[0]);
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("both Node hosts validate transformed JSON source mappings before citing", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-json-mapping-"));
+  try {
+    const { sdkPath } = await writeMockSdk(tempDir);
+    const fixturePath = path.join(tempDir, "transformed.json");
+    const ndjsonSource = '{"event":"ready","count":2}\n';
+    const configSource = '{\n  "service": {"enabled": true, "port": 8080}\n}\n';
+    const mapped = [
+      withDisplayProjection({
+        chunk_id: "json-record",
+        score: 1,
+        text: JSON.stringify(JSON.parse(ndjsonSource), null, 2),
+        metadata: {
+          source_path: "events.ndjson", symbol_kind: "data_record",
+          section_heading: "record line 1", start_line: 1, end_line: 4,
+        },
+      }, { text: ndjsonSource.trimEnd(), startLine: 1, endLine: 1, sourceText: ndjsonSource }),
+      withDisplayProjection({
+        chunk_id: "json-value",
+        score: 0.9,
+        text: JSON.stringify(JSON.parse(configSource).service, null, 2),
+        metadata: {
+          source_path: "settings.json.example", symbol_kind: "config_section",
+          section_heading: "service", start_line: 2, end_line: 5,
+        },
+      }, { text: configSource.trimEnd(), startLine: 1, endLine: 3, sourceText: configSource }),
+    ];
+    for (const [index, hit] of mapped.entries()) {
+      const projection = hit.metadata.extras.corpuswire_display_lines;
+      projection.mapping_kind = index === 0 ? "json-record/v1" : "json-top-level-value/v1";
+      projection.chunk_text_sha256 = createHash("sha256").update(hit.text).digest("hex");
+    }
+    const tampered = structuredClone(mapped[0]);
+    tampered.chunk_id = "tampered-json-record";
+    tampered.metadata.source_path = "tampered.ndjson";
+    tampered.metadata.extras.corpuswire_display_lines.chunk_text_sha256 = "0".repeat(64);
+    await writeFile(fixturePath, JSON.stringify({
+      result: {
+        retrieval_query: "synthetic JSON mapping",
+        retrieval_backend: "fixture",
+        retrieval_evidence_policy: "generic-v2",
+        retrieved_chunks: [...mapped, tampered],
+        citations: ["stale:1-999"],
+      },
+      context: { workspace_id: "fixture-delivery", collection: "fixture", index: { manifest_revision: 1 } },
+    }), "utf8");
+    const outputs = [];
+    for (const server of [SERVER_BIN, WRAPPER_BIN]) {
+      const child = spawn("node", [server], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...globalThis.process.env,
+          CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+          CORPUSWIRE_SDK_PATH: sdkPath,
+          CORPUSWIRE_SYNC_ENABLED: "false",
+          CORPUSWIRE_WORKSPACE_ID: "fixture-delivery",
+          MOCK_QUERY_FIXTURE_PATH: fixturePath,
+          MOCK_REQUESTS_PATH: path.join(tempDir, "requests.jsonl"),
+        },
+      });
+      const rpc = createRpc(child);
+      try {
+        const response = await rpc({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+          name: "corpuswire_search",
+          arguments: { query: "synthetic JSON mapping", workspaceId: "fixture-delivery", topK: 3, maxChars: 12000 },
+        } });
+        assert.equal(response.result.isError, false);
+        outputs.push(response.result.content[0].text);
+      } finally {
+        child.kill();
+      }
+    }
+    assert.equal(outputs[0], outputs[1]);
+    assert.match(outputs[0], /- events\.ndjson:1-1/);
+    assert.match(outputs[0], /- settings\.json\.example:1-3/);
+    assert.match(outputs[0], /tampered\.ndjson[\s\S]*?sourceRange: unavailable/);
+    assert.doesNotMatch(outputs[0], /- tampered\.ndjson:/);
+    assert.doesNotMatch(outputs[0], /stale:1-999/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("generic-v2 bounds a line-aligned donor trim before reserving a short successor", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-successor-reservation-"));
+  try {
+    const { sdkPath } = await writeMockSdk(tempDir);
+    const fixturePath = path.join(tempDir, "selected-hits.json");
+    const fixture = (donorFirstLineLength) => {
+      const anchorText = "a".repeat(1800);
+      const donorText = `${"d".repeat(donorFirstLineLength)}\n${"e".repeat(9394 - donorFirstLineLength)}`;
+      const successorText = "s".repeat(883);
+      const hits = [
+        {
+          chunk_id: "anchor",
+          score: 1,
+          text: anchorText,
+          metadata: { source_path: "src/anchor.py", start_line: 1, end_line: 1 },
+        },
+        {
+          chunk_id: "donor",
+          score: 0.9,
+          text: donorText,
+          metadata: { source_path: "src/donor.py", start_line: 10, end_line: 11 },
+        },
+        {
+          chunk_id: "successor",
+          score: 0.8,
+          text: successorText,
+          metadata: { source_path: "src/successor.py", start_line: 20, end_line: 20 },
+        },
+      ].map((hit) => withDisplayProjection(hit));
+      return {
+        result: {
+          retrieval_query: "synthetic bounded successor reservation",
+          retrieval_backend: "fixture",
+          retrieval_evidence_policy: "generic-v2",
+          retrieved_chunks: hits,
+          citations: hits.map(
+            (hit) => `${hit.metadata.source_path}:${hit.metadata.start_line}-${hit.metadata.end_line}`,
+          ),
+        },
+        context: {
+          workspace_id: "fixture-delivery",
+          collection: "fixture",
+          index: { manifest_revision: 1 },
+        },
+      };
+    };
+
+    for (const server of [SERVER_BIN, WRAPPER_BIN]) {
+      await writeFile(fixturePath, JSON.stringify(fixture(9000)), "utf8");
+      let child = spawn("node", [server], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...globalThis.process.env,
+          CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+          CORPUSWIRE_SDK_PATH: sdkPath,
+          CORPUSWIRE_SYNC_ENABLED: "false",
+          CORPUSWIRE_WORKSPACE_ID: "fixture-delivery",
+          MOCK_QUERY_FIXTURE_PATH: fixturePath,
+          MOCK_REQUESTS_PATH: path.join(tempDir, "requests.jsonl"),
+        },
+      });
+      let rpc = createRpc(child);
+      try {
+        const response = await rpc({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+          name: "corpuswire_search",
+          arguments: {
+            query: "synthetic bounded successor reservation",
+            workspaceId: "fixture-delivery",
+            topK: 3,
+            maxChars: 12000,
+          },
+        } });
+        const rendered = response.result.content[0].text;
+        assert.equal(response.result.isError, false);
+        assert.match(rendered, /2\. src\/donor\.py[\s\S]*?lines: 10-10[\s\S]*?excerptStatus: shortened/);
+        assert.match(rendered, /3\. src\/successor\.py[\s\S]*?lines: 20-20/);
+        assert.doesNotMatch(rendered, /src\/donor\.py:10-11/);
+        assert.match(rendered, /src\/successor\.py:20-20/);
+      } finally {
+        child.kill();
+      }
+
+      await writeFile(fixturePath, JSON.stringify(fixture(8000)), "utf8");
+      child = spawn("node", [server], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...globalThis.process.env,
+          CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+          CORPUSWIRE_SDK_PATH: sdkPath,
+          CORPUSWIRE_SYNC_ENABLED: "false",
+          CORPUSWIRE_WORKSPACE_ID: "fixture-delivery",
+          MOCK_QUERY_FIXTURE_PATH: fixturePath,
+          MOCK_REQUESTS_PATH: path.join(tempDir, "requests.jsonl"),
+        },
+      });
+      rpc = createRpc(child);
+      try {
+        const response = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {
+          name: "corpuswire_search",
+          arguments: {
+            query: "synthetic bounded successor reservation",
+            workspaceId: "fixture-delivery",
+            topK: 3,
+            maxChars: 12000,
+          },
+        } });
+        const rendered = response.result.content[0].text;
+        assert.equal(response.result.isError, false);
+        assert.match(rendered, /2\. src\/donor\.py[\s\S]*?lines: 10-11/);
+        assert.doesNotMatch(rendered, /3\. src\/successor\.py/);
+        assert.match(rendered, /src\/donor\.py:10-11/);
+        assert.doesNotMatch(rendered, /src\/successor\.py:20-20/);
+      } finally {
+        child.kill();
+      }
+    }
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -1366,8 +2227,8 @@ test("sync path probe applies leading globstar, basename, and exclusion semantic
       const globstar = await rpc({ jsonrpc: "2.0", id: 31, method: "tools/call", params: {
         name: "corpuswire_sync_probe_paths",
         arguments: {
-          paths: ["README.md", "docs/guide.md", "main.py", "src/main.py", "skip.py", "src/skip.py", "notes.txt"],
-          includeGlobs: ["**/*.md", "**/*.py"],
+          paths: ["README.md", "docs/guide.md", "main.py", "src/main.py", "skip.py", "src/skip.py", "notes.txt", "reports/retrieval-failures/failure.json"],
+          includeGlobs: ["**/*.md", "**/*.py", "**/*.json"],
           excludeGlobs: ["**/skip.py"],
         },
       } });
@@ -1375,6 +2236,7 @@ test("sync path probe applies leading globstar, basename, and exclusion semantic
       assert.equal((globstarText.match(/pathAccepted: true/g) ?? []).length, 4);
       assert.equal((globstarText.match(/reason: exclude_filter/g) ?? []).length, 2);
       assert.equal((globstarText.match(/reason: include_filter/g) ?? []).length, 1);
+      assert.match(globstarText, /reports\/retrieval-failures\/failure\.json[\s\S]*?reason: protected_diagnostic/);
 
       const basename = await rpc({ jsonrpc: "2.0", id: 32, method: "tools/call", params: {
         name: "corpuswire_sync_probe_paths",
@@ -1739,7 +2601,7 @@ async function writeMockSdk(tempDir) {
   await writeFile(
     sdkPath,
     `
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 
 export function assertReviewContextV2Result(value) {
   if (!value || value.schema_version !== "review-context/v2") {
@@ -1763,6 +2625,9 @@ export class CorpusWireClient {
 
   async queryRaw(request) {
     appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify(request) + "\\n", "utf8");
+    if (process.env.MOCK_QUERY_FIXTURE_PATH) {
+      return JSON.parse(readFileSync(process.env.MOCK_QUERY_FIXTURE_PATH, "utf8"));
+    }
     if (process.env.MOCK_QUERY_EMPTY === "true") {
       return {
         result: {
@@ -2333,6 +3198,16 @@ export class CorpusWireClient {
 
   async enhance(request) {
     appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify(request) + "\\n", "utf8");
+    if (process.env.MOCK_ENHANCE_EMPTY === "true") {
+      return {
+        retrieval_query: request.prompt,
+        retrieval_not_found: true,
+        retrieved_chunks: [],
+        agent_context_packets: [],
+        output_mode: request.outputMode,
+        enhanced_prompt: "",
+      };
+    }
     if (request.localOnly !== true) {
       const error = new CorpusWireHttpError("Prompt rewriting requires a configured generation backend");
       error.errorMessage = "Prompt rewriting requires a configured generation backend";
