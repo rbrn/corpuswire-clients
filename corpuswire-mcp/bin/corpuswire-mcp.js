@@ -3,11 +3,12 @@
 import { execFile } from "node:child_process";
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, watch as watchFileSystem } from "node:fs";
-import { mkdir, readdir, readFile, rename, stat, lstat, writeFile } from "node:fs/promises";
+import { constants as fsConstants, existsSync, watch as watchFileSystem } from "node:fs";
+import { link, mkdir, readdir, readFile, realpath, rename, stat, lstat, open, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { planSelectedNeighbor } from "../lib/selected-neighbor.mjs";
 
 const JSONRPC_VERSION = "2.0";
 const PROTOCOL_VERSION = "2024-11-05";
@@ -32,6 +33,10 @@ const DEFAULT_SYNC_SESSION_CONFLICT_RETRY_MAX_DELAY_MS = 5000;
 const DEFAULT_SYNC_RECENT_EVENTS_LIMIT = 25;
 const DEFAULT_SYNC_LATENCY_SAMPLE_LIMIT = 20;
 const DEFAULT_SYNC_CACHE_SCHEMA_VERSION = 2;
+const PRIVATE_SEARCH_TELEMETRY_ENV = "CORPUSWIRE_PRIVATE_SEARCH_TELEMETRY_PATH";
+const PRIVATE_SEARCH_TELEMETRY_MAX_EVENTS = 1000;
+const PRIVATE_SEARCH_TELEMETRY_MAX_FILE_BYTES = 128 * 1024;
+const PRIVATE_SEARCH_TELEMETRY_PREFIX = "cw-search-timing-";
 const DIRECTORY_GLOB_PROBE = "__corpuswire_directory_probe__";
 const OUTPUT_MODES = new Set(["generic", "copilot", "claude-code", "sequential"]);
 const QUALITY_WORK_TYPES = Object.freeze([
@@ -4137,7 +4142,282 @@ function nullableBoundedInteger(value, name, minimum, maximum) {
   return optionalBoundedInteger(value, name, minimum, maximum);
 }
 
-async function searchContext(args) {
+const SELECTED_NEIGHBOR_MAX_FILE_BYTES = 1024 * 1024;
+
+let privateSearchTelemetryQueue = Promise.resolve();
+
+function searchTimingMs(start) {
+  return Math.round(Number(process.hrtime.bigint() - start) / 1000) / 1000;
+}
+
+function privateSearchTelemetryState() {
+  const target = process.env[PRIVATE_SEARCH_TELEMETRY_ENV];
+  if (typeof target !== "string" || !target.startsWith("/private/tmp/")) return null;
+  return {
+    target, started: process.hrtime.bigint(), backendQueryRawMs: null,
+    selectedNeighborEntered: false, selectedNeighborEntryMs: null,
+    selectedNeighborMs: null, selectedNeighborSourceReadMs: null,
+    selectedNeighborProposalMs: null, treatmentProduced: false,
+  };
+}
+
+async function privateSearchTelemetryWrite(state, totalHandlerMs, outcome) {
+  const target = state.target;
+  const resolved = await realpath(target);
+  if (!resolved.startsWith("/private/tmp/") || resolved === "/private/tmp/") return;
+  const info = await lstat(target);
+  if (info.isSymbolicLink() || (typeof process.getuid === "function"
+    && info.uid !== process.getuid())) return;
+  const event = {
+    schema_version: "rqt110g-search-timing/v1",
+    totalHandlerMs,
+    backendQueryRawMs: state.backendQueryRawMs,
+    selectedNeighborEntered: state.selectedNeighborEntered,
+    selectedNeighborEntryMs: state.selectedNeighborEntryMs,
+    selectedNeighborMs: state.selectedNeighborMs,
+    selectedNeighborSourceReadMs: state.selectedNeighborSourceReadMs,
+    selectedNeighborProposalMs: state.selectedNeighborProposalMs,
+    treatmentProduced: state.treatmentProduced,
+    outcome,
+  };
+  const line = `${JSON.stringify(event)}\n`;
+  if (Buffer.byteLength(line, "utf8") > 512) return;
+  const directory = info.isDirectory();
+  if (directory) {
+    if ((info.mode & 0o777) !== 0o700) return;
+  } else if (info.isFile()) {
+    const parentInfo = await lstat(path.dirname(target));
+    if ((info.mode & 0o777) !== 0o600 || !parentInfo.isDirectory()
+      || parentInfo.isSymbolicLink() || (parentInfo.mode & 0o777) !== 0o700
+      || (typeof process.getuid === "function" && parentInfo.uid !== process.getuid())) return;
+  } else return;
+  const parent = directory ? target : path.dirname(target);
+  const temp = path.join(parent, `.${PRIVATE_SEARCH_TELEMETRY_PREFIX}${randomUUID()}.tmp`);
+  const lockPath = directory ? null : `${target}.lock`;
+  let lockHandle;
+  let handle;
+  try {
+    let body = line;
+    if (!directory) {
+      try {
+        lockHandle = await open(lockPath, fsConstants.O_WRONLY | fsConstants.O_CREAT
+          | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+        await lockHandle.chmod(0o600);
+      } catch (error) {
+        if (error?.code === "EEXIST") return;
+        throw error;
+      }
+      if (info.size > PRIVATE_SEARCH_TELEMETRY_MAX_FILE_BYTES) return;
+      const previous = await readFile(target, "utf8");
+      const rows = previous.trimEnd() ? previous.trimEnd().split("\n") : [];
+      if (rows.length >= PRIVATE_SEARCH_TELEMETRY_MAX_EVENTS
+        || rows.some((row) => {
+          try { return JSON.parse(row).schema_version !== "rqt110g-search-timing/v1"; }
+          catch { return true; }
+        })) return;
+      body = previous + line;
+      if (Buffer.byteLength(body, "utf8") > PRIVATE_SEARCH_TELEMETRY_MAX_FILE_BYTES) return;
+    }
+    handle = await open(temp, fsConstants.O_WRONLY | fsConstants.O_CREAT
+      | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    await handle.chmod(0o600);
+    await handle.writeFile(body, "utf8");
+    await handle.close();
+    handle = null;
+    if (directory) {
+      for (let slot = 0; slot < PRIVATE_SEARCH_TELEMETRY_MAX_EVENTS; slot += 1) {
+        const final = path.join(target,
+          `${PRIVATE_SEARCH_TELEMETRY_PREFIX}${String(slot).padStart(4, "0")}.json`);
+        try {
+          await link(temp, final);
+          break;
+        } catch (error) {
+          if (error?.code !== "EEXIST") throw error;
+        }
+      }
+    } else await rename(temp, target);
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+    await unlink(temp).catch(() => {});
+    if (lockHandle) {
+      await lockHandle.close().catch(() => {});
+      await unlink(lockPath).catch(() => {});
+    }
+  }
+}
+
+async function writePrivateSearchTelemetrySafely(state, totalHandlerMs, outcome) {
+  if (!state) return;
+  const next = privateSearchTelemetryQueue.then(
+    () => privateSearchTelemetryWrite(state, totalHandlerMs, outcome),
+  ).catch(() => {});
+  privateSearchTelemetryQueue = next;
+  await next;
+}
+
+function selectedNeighborSourcePath(value) {
+  if (typeof value !== "string" || !value || value.startsWith("/")
+    || value.includes("\\") || value.includes("\0")) return null;
+  const parts = value.split("/");
+  return parts.some((part) => !part || part === "." || part === "..") ? null : parts;
+}
+
+async function readSelectedNeighborSource(root, relativePath, expectedHash) {
+  const parts = selectedNeighborSourcePath(relativePath);
+  if (!parts || typeof expectedHash !== "string" || !/^[0-9a-f]{64}$/.test(expectedHash)) {
+    return null;
+  }
+  const rootInfo = await lstat(root);
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) return null;
+  let current = root;
+  for (const [index, part] of parts.entries()) {
+    current = path.join(current, part);
+    const info = await lstat(current);
+    if (info.isSymbolicLink()) return null;
+    if (index < parts.length - 1 && !info.isDirectory()) return null;
+    if (index === parts.length - 1
+      && (!info.isFile() || info.size > SELECTED_NEIGHBOR_MAX_FILE_BYTES)) return null;
+  }
+  if (typeof fsConstants.O_NOFOLLOW !== "number") return null;
+  const handle = await open(current, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let bytes;
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.size > SELECTED_NEIGHBOR_MAX_FILE_BYTES) return null;
+    const chunks = [];
+    let offset = 0;
+    while (true) {
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, SELECTED_NEIGHBOR_MAX_FILE_BYTES + 1 - offset));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+      if (offset > SELECTED_NEIGHBOR_MAX_FILE_BYTES) return null;
+      chunks.push(buffer.subarray(0, bytesRead));
+    }
+    bytes = Buffer.concat(chunks, offset);
+  } finally {
+    await handle.close();
+  }
+  if (createHash("sha256").update(bytes).digest("hex") !== expectedHash) return null;
+  const source = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  if (!Buffer.from(source, "utf8").equals(bytes)
+    || /[\r\u000b\f\u0085\u2028\u2029]/u.test(source)) return null;
+  return source;
+}
+
+function selectedNeighborDelivered(observed, sourceTexts) {
+  if (observed.length === 0 || observed.length > 5) return null;
+  const runs = [];
+  const completeLines = new Set();
+  let excerptChars = 0;
+  for (const { hit, formatted } of observed) {
+    const metadata = asRecord(hit?.metadata);
+    const sourcePath = metadata.source_path;
+    const sourceHash = metadata.source_hash;
+    const source = sourceTexts.get(sourcePath);
+    const match = /^(\d+)-(\d+)$/.exec(formatted.renderedLineRange ?? "");
+    if (typeof source !== "string" || !match || !verifiedDisplayLines(hit)
+      || createHash("sha256").update(source, "utf8").digest("hex") !== sourceHash) return null;
+    const startLine = Number(match[1]);
+    const endLine = Number(match[2]);
+    const physical = source.split("\n");
+    if (source.endsWith("\n")) physical.pop();
+    if (!Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine)
+      || startLine < 1 || endLine < startLine || endLine > physical.length) return null;
+    const exact = physical.slice(startLine - 1, endLine).join("\n");
+    if (formatted.snippet !== exact) return null;
+    excerptChars += exact.length;
+    for (let line = startLine; line <= endLine; line += 1) {
+      completeLines.add(JSON.stringify([sourcePath, sourceHash, line, physical[line - 1]]));
+    }
+    runs.push({ chunkId: hit.chunk_id, startLine, endLine, text: exact });
+  }
+  return { runs, completeLines, excerptChars };
+}
+
+async function selectedNeighborResult({ formatInput, formatted, deliveredControl, telemetry, maxRadius }) {
+  const neighborStarted = telemetry ? process.hrtime.bigint() : null;
+  if (telemetry) {
+    telemetry.selectedNeighborEntered = true;
+    telemetry.selectedNeighborEntryMs = searchTimingMs(telemetry.started);
+  }
+  try {
+  const { result, context, hits, workspaceId, topK, maxChars, query } = formatInput;
+  const rootRaw = optionalString(process.env.CORPUSWIRE_SELECTED_NEIGHBOR_ROOT
+    ?? process.env.CORPUSWIRE_SYNC_ROOT);
+  if (optionalString(result.retrieval_evidence_policy) !== "generic-v2"
+    || !workspaceId || context.workspace_id !== workspaceId
+    || topK !== 5 || maxChars > 12_000 || hits.length < 1 || hits.length > 5
+    || !rootRaw || !path.isAbsolute(rootRaw)) return formatted;
+  try {
+    const root = path.resolve(rootRaw);
+    const sourceTexts = new Map();
+    let generation = null;
+    let scopedPublication = null;
+    const sourceReadStarted = telemetry ? process.hrtime.bigint() : null;
+    try {
+    for (const hit of hits) {
+      const metadata = asRecord(hit?.metadata);
+      if (!Number.isInteger(metadata.source_generation)
+        || metadata.source_generation < 1) return formatted;
+      const scoped = metadata.index_scope !== null && metadata.index_scope !== undefined;
+      if (scopedPublication !== null && scopedPublication !== scoped) return formatted;
+      scopedPublication = scoped;
+      if (scoped) {
+        if (generation !== null && metadata.source_generation !== generation) return formatted;
+        generation = metadata.source_generation;
+      }
+      const sourcePath = metadata.source_path;
+      const sourceHash = metadata.source_hash;
+      if (sourceTexts.has(sourcePath)) {
+        if (createHash("sha256").update(sourceTexts.get(sourcePath), "utf8").digest("hex")
+          !== sourceHash) return formatted;
+        continue;
+      }
+      const source = await readSelectedNeighborSource(root, sourcePath, sourceHash);
+      if (source === null) return formatted;
+      sourceTexts.set(sourcePath, source);
+    }
+    } finally {
+      if (telemetry) telemetry.selectedNeighborSourceReadMs = searchTimingMs(sourceReadStarted);
+    }
+    const control = selectedNeighborDelivered(deliveredControl, sourceTexts);
+    if (!control || control.excerptChars > maxChars) return formatted;
+    const proposalStarted = telemetry ? process.hrtime.bigint() : null;
+    const proposal = planSelectedNeighbor({
+      baselineHits: hits,
+      deliveredRuns: control.runs,
+      sourceTexts,
+      query,
+      maxChars,
+      generation,
+      maxRadius,
+    });
+    if (telemetry) telemetry.selectedNeighborProposalMs = searchTimingMs(proposalStarted);
+    if (!proposal.usedNeighbor || !Array.isArray(proposal.hits)
+      || proposal.hits.length > 5) return formatted;
+    const deliveredTreatment = [];
+    const treatment = formatSearchResult({
+      ...formatInput,
+      hits: proposal.hits,
+      onRenderedHit: (item) => deliveredTreatment.push(item),
+    });
+    const treated = selectedNeighborDelivered(deliveredTreatment, sourceTexts);
+    if (!treated || treated.excerptChars > maxChars
+      || [...control.completeLines].some((line) => !treated.completeLines.has(line))) {
+      return formatted;
+    }
+    if (telemetry) telemetry.treatmentProduced = true;
+    return treatment;
+  } catch {
+    return formatted;
+  }
+  } finally {
+    if (telemetry) telemetry.selectedNeighborMs = searchTimingMs(neighborStarted);
+  }
+}
+
+async function searchContextCore(args, telemetry) {
   const query = requiredString(args, "query");
   const topK = optionalPositiveInteger(args.topK ?? process.env.CORPUSWIRE_TOP_K, DEFAULT_TOP_K);
   const minScore = optionalScore(args.minScore ?? process.env.CORPUSWIRE_MIN_SCORE);
@@ -4161,14 +4441,29 @@ async function searchContext(args) {
     includeAnswer: false,
     sourceFilter,
   };
-  const response = typeof client.queryRaw === "function"
-    ? await client.queryRaw(request)
-    : { result: await client.query(request), context: {} };
+  let response;
+  if (typeof client.queryRaw === "function") {
+    const queryStarted = telemetry ? process.hrtime.bigint() : null;
+    try {
+      response = await client.queryRaw(request);
+    } finally {
+      if (telemetry) telemetry.backendQueryRawMs = searchTimingMs(queryStarted);
+    }
+  } else {
+    response = { result: await client.query(request), context: {} };
+  }
   const result = response.result ?? response;
   const context = response.context ?? {};
   const hits = Array.isArray(result.retrieved_chunks) ? result.retrieved_chunks : [];
 
-  const formatted = formatSearchResult({
+  // The personal local default is v2; explicit off/unknown values retain the
+  // original renderer and provide an immediate per-host rollback.
+  const selectedNeighborPolicy = process.env.CORPUSWIRE_SELECTED_NEIGHBOR_POLICY
+    || "selected-neighbor-v2";
+  const observeNeighbor = selectedNeighborPolicy === "selected-neighbor-v1"
+    || selectedNeighborPolicy === "selected-neighbor-v2";
+  const deliveredControl = [];
+  const formatInput = {
     baseUrl: client.baseUrl,
     query,
     repoPath,
@@ -4180,10 +4475,20 @@ async function searchContext(args) {
     context,
     hits,
     readPreparation,
+  };
+  const formatted = formatSearchResult({
+    ...formatInput,
+    ...(observeNeighbor ? { onRenderedHit: (item) => deliveredControl.push(item) } : {}),
   });
+  const delivered = observeNeighbor
+    ? await selectedNeighborResult({
+      formatInput, formatted, deliveredControl, telemetry,
+      maxRadius: selectedNeighborPolicy === "selected-neighbor-v2" ? 20 : 8,
+    })
+    : formatted;
   const failureMode = searchFailureMode({ result, hits, readPreparation });
   if (!failureMode) {
-    return formatted;
+    return delivered;
   }
   const failureReportPath = await writeRetrievalFailureReportSafely({
     workspaceId: workspaceId ?? optionalString(context.workspace_id),
@@ -4201,7 +4506,23 @@ async function searchContext(args) {
       retrievalConfidence: finiteScore(result.retrieval_confidence),
     },
   });
-  return appendFailureReportPath(formatted, failureReportPath);
+  return appendFailureReportPath(delivered, failureReportPath);
+}
+
+async function searchContext(args) {
+  const telemetry = privateSearchTelemetryState();
+  let outcome = "ok";
+  try {
+    return await searchContextCore(args, telemetry);
+  } catch (error) {
+    outcome = "error";
+    throw error;
+  } finally {
+    if (telemetry) {
+      const totalHandlerMs = searchTimingMs(telemetry.started);
+      await writePrivateSearchTelemetrySafely(telemetry, totalHandlerMs, outcome);
+    }
+  }
 }
 
 async function health() {
@@ -4775,7 +5096,7 @@ function formatIndexActivity({ baseUrl, workspaceId, collection, windowHours, li
   return lines.join("\n");
 }
 
-function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minScore, maxChars, result, context, hits, readPreparation }) {
+function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minScore, maxChars, result, context, hits, readPreparation, onRenderedHit }) {
   const index = asRecord(context.index);
   const retrievalWarning = optionalString(result.retrieval_warning);
   const lines = [
@@ -4874,6 +5195,7 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minSc
       continue;
     }
     renderedHits.push(formatted.text);
+    onRenderedHit?.({ hit, formatted });
     renderedHitCount += 1;
     remainingChars -= hitBudget - formatted.remainingChars;
     if (formatted.renderedLineRange) {
@@ -5154,6 +5476,7 @@ function formatSearchHit(hit, ordinal, remainingChars) {
     truncated: !complete,
     sourcePath,
     renderedLineRange,
+    snippet,
     text: [
       `\n${ordinal}. ${sourcePath}`,
       `   score: ${score}`,
@@ -5645,8 +5968,11 @@ async function writeRetrievalFailureReportSafely(report) {
       workspaceId,
       workType: optionalString(report.workType),
       toolName: optionalString(report.toolName),
-      query: queryFields.query,
-      queryRedacted: queryFields.redacted,
+      // Automatic diagnostics are written inside the workspace and may be
+      // picked up by other tools. Keep only a stable digest of the query;
+      // pattern redaction cannot reliably identify private evaluation text.
+      query: "[redacted: automatic retrieval diagnostic]",
+      queryRedacted: true,
       querySha256: queryFields.sha256,
       failureMode: optionalString(report.failureMode) ?? "unspecified_failure",
       scores: safeScores,
@@ -5705,7 +6031,7 @@ function sanitizeDiagnosticDetails(value) {
 }
 
 function appendFailureReportPath(text, reportPath) {
-  return reportPath ? `${text}\n- failureReport: ${reportPath}` : text;
+  return reportPath ? `${text}\n\nDiagnostics:\n- failureReport: ${reportPath}` : text;
 }
 
 async function reviewQualityResults(args) {

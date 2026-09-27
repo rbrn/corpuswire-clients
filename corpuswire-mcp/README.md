@@ -35,6 +35,20 @@ returns them. These are ordered file-level inspection hints with roles such as
 Use them as the first files to inspect; raw hits remain available below the
 packet block for evidence and citations.
 
+For the owner's local `generic-v2` searches, the default
+`selected-neighbor-v2` policy adds up to 20 verified neighboring source lines
+around each selected, actually delivered excerpt. It uses the absolute local
+source root from `CORPUSWIRE_SELECTED_NEIGHBOR_ROOT`, falling back to
+`CORPUSWIRE_SYNC_ROOT`. Set `CORPUSWIRE_SELECTED_NEIGHBOR_POLICY=off` for an
+immediate per-host rollback, or `selected-neighbor-v1` for the eight-line
+comparison policy. The five-hit and 12,000-character limits remain. The
+client reads only selected files under that root and
+returns the unchanged search result if a source hash, line mapping, generation,
+workspace identity, or final rendered evidence check fails. This setting does
+not change backend retrieval or index contents. The local postprocessor
+requires `topK=5` and
+`maxChars<=12000`; it does not change prompt-enhancement output.
+
 ## Build And Test
 
 ```bash
