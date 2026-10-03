@@ -40,6 +40,10 @@ function generationIdentity(metadata, expected) {
 
 function selectedHit(hit, sourceTexts, expectedGeneration, scopeIdentity) {
   const metadata = hit?.metadata;
+  if (isRecord(metadata?.extras)
+    && Object.hasOwn(metadata.extras, "corpuswire_partial_source_line")) {
+    return { reason: "partial_source_line" };
+  }
   const path = metadata?.source_path;
   const hash = metadata?.source_hash;
   const projection = metadata?.extras?.corpuswire_display_lines;
@@ -125,6 +129,37 @@ function projectionFits(windows, proposed, budget) {
     && excerptChars(windows) - windowText(windows[proposed.index]).length + text.length <= budget;
 }
 
+function headingOutsideCode(lines, headingLine) {
+  let fence = null;
+  for (const line of lines.slice(0, headingLine)) {
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence) {
+      if (marker && marker[1][0] === fence.character
+        && marker[1].length >= fence.length && !marker[2].trim()) fence = null;
+      continue;
+    }
+    // Container fences and HTML require a fuller block parser; do not guess.
+    if (/^\s*(?:>|[-+*]\s|\d+[.)]\s).*(`{3,}|~{3,})/.test(line)
+      || /<(?:!--|\/?[a-zA-Z][\w-]*(?:\s|\/?>|$)|[!?])/.test(line)) return false;
+    if (marker) {
+      if (marker[1][0] === "`" && marker[2].includes("`")) return false;
+      fence = { character: marker[1][0], length: marker[1].length };
+    }
+  }
+  return fence === null;
+}
+
+function headingPrefixStart(window) {
+  if (!window.source.path.toLowerCase().endsWith(".md")) return null;
+  for (let line = window.start - 1; line >= Math.max(1, window.start - 3); line -= 1) {
+    const text = window.source.lines[line - 1];
+    if (/^[ \t]*$/.test(text)) continue;
+    if (!/^ {0,3}#{1,6}[ \t]+\S/.test(text)) return null;
+    return headingOutsideCode(window.source.lines, line) ? line : null;
+  }
+  return null;
+}
+
 function bundledHit(window, queryDigest) {
   const text = windowText(window);
   if (!text.trim() || Buffer.byteLength(text, "utf8") > 16_000) return null;
@@ -176,7 +211,7 @@ function bundledHit(window, queryDigest) {
  */
 export function planSelectedNeighbor({
   baselineHits, deliveredRuns, sourceTexts, query, maxChars = 12_000, generation,
-  maxRadius = 8,
+  maxRadius = 8, headingPrefix = false,
 }) {
   const fallback = (reason) => ({ hits: baselineHits, usedNeighbor: false, reason });
   if (!Array.isArray(baselineHits) || baselineHits.length === 0 || baselineHits.length > 5
@@ -251,6 +286,17 @@ export function planSelectedNeighbor({
           window.end = proposal.end;
           window.changed = true;
         } else window.blockedAfter = true;
+      }
+    }
+  }
+  if (headingPrefix === true && maxRadius === 20) {
+    for (const window of windows) {
+      const start = headingPrefixStart(window);
+      if (start === null) continue;
+      const proposal = { ...window, start };
+      if (projectionFits(windows, proposal, budget)) {
+        window.start = start;
+        window.changed = true;
       }
     }
   }

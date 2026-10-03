@@ -587,6 +587,100 @@ test("generic-v2 hides unproven ranges and never clips an oversized source line"
       {
         maxChars: 12000,
         hits: [
+          (() => {
+            const source = "alpha\r\nbeta\r\n";
+            const hit = withDisplayProjection({
+              chunk_id: "source-windows-v1-direct", score: 1, text: source,
+              metadata: { source_path: "src/treatment.py", start_line: 10, end_line: 11,
+                extras: { corpuswire_chunk_policy: {
+                  mode: "embedding_tokens_v1", boundary_strategy: "source_windows_v1",
+                } } },
+            }, { text: "alpha\r\nbeta\r", sourceText: source });
+            return hit;
+          })(),
+          (() => {
+            const hit = withDisplayProjection({
+              chunk_id: "source-windows-v1-stale", score: 0.5, text: "stale\n",
+              metadata: { source_path: "src/stale-treatment.py", start_line: 20,
+                end_line: 20, extras: { corpuswire_chunk_policy: {
+                  mode: "embedding_tokens_v1", boundary_strategy: "source_windows_v1",
+                } } },
+            }, { text: "stale", sourceText: "stale\n" });
+            hit.metadata.extras.corpuswire_display_lines.text_sha256 = "0".repeat(64);
+            return hit;
+          })(),
+        ],
+        check(rendered) {
+          assert.match(rendered, /src\/treatment\.py[\s\S]*?lines: 10-11[\s\S]*?alpha/);
+          assert.match(rendered, /- src\/treatment\.py:10-11/);
+          assert.match(rendered, /src\/stale-treatment\.py[\s\S]*?sourceRange: unavailable/);
+          assert.doesNotMatch(rendered, /- src\/stale-treatment\.py:/);
+        },
+      },
+      {
+        maxChars: 12000,
+        hits: [(() => {
+          const hit = withDisplayProjection({
+            chunk_id: "marked-partial-line", score: 1, text: "partial excerpt",
+            metadata: { source_path: "src/long.py", start_line: 42, end_line: 42 },
+          }, { text: "partial excerpt with withheld remainder" });
+          hit.metadata.extras.corpuswire_partial_source_line = {
+            schema_version: "v1", source_line: 42, start_char: 100,
+            end_char: 115, text_sha256: "a".repeat(64), line_sha256: "b".repeat(64),
+          };
+          return hit;
+        })()],
+        check(rendered) {
+          assert.match(rendered, /src\/long\.py[\s\S]*?sourceRange: unavailable/);
+          assert.match(rendered, /excerptStatus: partial source line/);
+          assert.doesNotMatch(rendered, /- src\/long\.py:42-42/);
+          assert.doesNotMatch(rendered, /   lines: 42-42/);
+        },
+      },
+      {
+        maxChars: 12000,
+        policy: "legacy",
+        citations: ["src/legacy-long.py#partial-source", "src/legacy-long.py#full-source",
+          "src/legacy-long.py#short-source", "src/normal.py#normal-source"],
+        packets: [{ source_path: "src/legacy-long.py", inspection_order: 1,
+          line_ranges: ["42-42", "43-43"] },
+          { source_path: "src/normal.py", inspection_order: 2, line_ranges: ["5-5"] }],
+        hits: [{
+          chunk_id: "legacy-marked-partial", score: 1, text: "partial excerpt",
+          metadata: { source_path: "src/legacy-long.py", start_line: 42,
+            end_line: 42, extras: { corpuswire_partial_source_line: {
+              schema_version: "v1", source_line: 42, start_char: 100,
+              end_char: 115, text_sha256: "a".repeat(64), line_sha256: "b".repeat(64),
+            } } },
+        }, (() => withDisplayProjection({
+          chunk_id: "legacy-complete-same-path", score: 0.9, text: "complete line",
+          metadata: { source_path: "src/legacy-long.py", title: "Full Source",
+            start_line: 43, end_line: 43 },
+        }, { text: "complete line", sourceText: "complete line\n" }))(),
+        (() => withDisplayProjection({
+          chunk_id: "legacy-short-same-path", score: 0.85, text: "value",
+          metadata: { source_path: "src/legacy-long.py", title: "Short Source",
+            start_line: 44, end_line: 44 },
+        }, { text: "value = 1", sourceText: "value = 1\n" }))(), {
+          chunk_id: "legacy-complete-other-path", score: 0.8, text: "other line",
+          metadata: { source_path: "src/normal.py", start_line: 5, end_line: 5 },
+        }],
+        check(rendered) {
+          assert.match(rendered, /src\/legacy-long\.py[\s\S]*?sourceRange: unavailable/);
+          assert.match(rendered, /excerptStatus: partial source line/);
+          assert.doesNotMatch(rendered, /   lines: 42-42/);
+          assert.match(rendered, /Agent context packets:[\s\S]*?lines: 43-43/);
+          assert.match(rendered, /Citations:[\s\S]*?- src\/legacy-long\.py:43-43/);
+          assert.match(rendered, /- src\/normal\.py#normal-source/);
+          assert.doesNotMatch(rendered, /- src\/legacy-long\.py:42-42/);
+          assert.doesNotMatch(rendered, /- src\/legacy-long\.py:44-44/);
+          assert.doesNotMatch(rendered, /- src\/legacy-long\.py#partial-source/);
+          assert.doesNotMatch(rendered, /- src\/legacy-long\.py#short-source/);
+        },
+      },
+      {
+        maxChars: 12000,
+        hits: [
           withDisplayProjection({
             chunk_id: "outer-blank-lines",
             score: 1,
@@ -755,9 +849,10 @@ test("generic-v2 hides unproven ranges and never clips an oversized source line"
         result: {
           retrieval_query: "synthetic source line check",
           retrieval_backend: "fixture",
-          retrieval_evidence_policy: "generic-v2",
+          retrieval_evidence_policy: scenario.policy ?? "generic-v2",
           retrieved_chunks: scenario.hits,
-          citations: scenario.hits.map((hit) =>
+          agent_context_packets: scenario.packets ?? [],
+          citations: scenario.citations ?? scenario.hits.map((hit) =>
             `${hit.metadata.source_path}:${hit.metadata.start_line}-${hit.metadata.end_line}`),
         },
         context: { workspace_id: "fixture-delivery", collection: "fixture", index: { manifest_revision: 1 } },
@@ -1057,6 +1152,183 @@ test("selected-neighbor-v2 extends twenty lines with direct and wrapper byte par
   }
 });
 
+test("both Node hosts default to source-verified Markdown heading prefixes with explicit rollback", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-heading-default-"));
+  try {
+    const { sdkPath } = await writeMockSdk(tempDir);
+    const sourceRoot = path.join(tempDir, "workspace");
+    await mkdir(path.join(sourceRoot, "docs"), { recursive: true });
+    const lines = Array.from({ length: 60 }, (_, index) => `document line ${index + 1}`);
+    lines[2] = "## Authenticated section heading";
+    lines[3] = "";
+    const source = `${lines.join("\n")}\n`;
+    const sourcePath = path.join(sourceRoot, "docs/section.md");
+    await writeFile(sourcePath, source, "utf8");
+    const selected = withDisplayProjection({
+      chunk_id: "heading-anchor", score: 1, text: lines[24],
+      metadata: {
+        source_path: "docs/section.md", start_line: 25, end_line: 25,
+        source_generation: 1,
+      },
+    }, { text: lines[24], startLine: 25, endLine: 25, sourceText: source });
+    const fixturePath = path.join(tempDir, "response.json");
+    await writeFile(fixturePath, JSON.stringify({
+      result: {
+        retrieval_query: "synthetic section question", retrieval_backend: "fixture",
+        retrieval_evidence_policy: "generic-v2", retrieval_not_found: false,
+        retrieved_chunks: [selected],
+      },
+      context: { workspace_id: "fixture-heading", collection: "fixture",
+        index: { manifest_revision: 1 } },
+    }), "utf8");
+    const invoke = async (server, headingPrefix, policy = undefined) => {
+      const child = spawn("node", [server], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...globalThis.process.env,
+          CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+          CORPUSWIRE_SDK_PATH: sdkPath,
+          CORPUSWIRE_SYNC_ENABLED: "false",
+          CORPUSWIRE_WORKSPACE_ID: "fixture-heading",
+          CORPUSWIRE_SYNC_ROOT: sourceRoot,
+          CORPUSWIRE_SELECTED_NEIGHBOR_ROOT: sourceRoot,
+          CORPUSWIRE_SELECTED_NEIGHBOR_POLICY: policy,
+          CORPUSWIRE_SELECTED_HEADING_PREFIX: headingPrefix,
+          CORPUSWIRE_SOURCE_ROOT_COALESCING: "off",
+          MOCK_QUERY_FIXTURE_PATH: fixturePath,
+          MOCK_REQUESTS_PATH: path.join(tempDir, "requests.jsonl"),
+        },
+      });
+      try {
+        const response = await createRpc(child)({
+          jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+            name: "corpuswire_search", arguments: {
+              query: "synthetic section question", workspaceId: "fixture-heading",
+              topK: 5, maxChars: 12000,
+            },
+          },
+        });
+        assert.equal(response.result.isError, false);
+        return response.result.content[0].text;
+      } finally {
+        child.kill();
+      }
+    };
+    const directDefault = await invoke(SERVER_BIN, undefined);
+    const directRollback = await invoke(SERVER_BIN, "false");
+    assert.match(directDefault, /## Authenticated section heading/);
+    assert.match(directDefault, /docs\/section\.md:3-45/);
+    assert.match(directRollback, /docs\/section\.md:5-45/);
+    assert.doesNotMatch(directRollback, /Authenticated section heading/);
+    // All lines from the prior twenty-line neighbor window remain delivered.
+    for (const line of lines.slice(4, 45)) assert.ok(directDefault.includes(line));
+    assert.equal(await invoke(WRAPPER_BIN, undefined), directDefault);
+    assert.equal(await invoke(WRAPPER_BIN, "false"), directRollback);
+    assert.equal(await invoke(SERVER_BIN, "true"), directDefault);
+    assert.equal(await invoke(WRAPPER_BIN, "true"), directDefault);
+    for (const server of [SERVER_BIN, WRAPPER_BIN]) {
+      const v1 = await invoke(server, "true", "selected-neighbor-v1");
+      assert.match(v1, /docs\/section\.md:17-33/);
+      assert.doesNotMatch(v1, /Authenticated section heading/);
+    }
+    // The new default still fails closed when the authenticated source changes.
+    const control = await invoke(SERVER_BIN, "false", "off");
+    await writeFile(sourcePath, "changed Markdown bytes\n", "utf8");
+    assert.equal(await invoke(SERVER_BIN, undefined), control);
+    assert.equal(await invoke(WRAPPER_BIN, undefined), control);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("source-verified neighbor restores a definition line just before a selected class", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-definition-boundary-"));
+  try {
+    const { sdkPath } = await writeMockSdk(tempDir);
+    const sourceRoot = path.join(tempDir, "workspace");
+    const relativePath = "src/corpuswire/artifacts/models.py";
+    const sourcePath = path.join(sourceRoot, relativePath);
+    await mkdir(path.dirname(sourcePath), { recursive: true });
+    const lines = Array.from({ length: 65 }, (_, index) => `source line ${index + 1}`);
+    lines[36] = "@dataclass(frozen=True, slots=True)";
+    lines[37] = "class DiscoveryLimits:";
+    lines[38] = "    max_files: int = 100_000";
+    const source = `${lines.join("\n")}\n`;
+    await writeFile(sourcePath, source, "utf8");
+    const selected = withDisplayProjection({
+      chunk_id: "definition-boundary", score: 1,
+      text: lines.slice(37, 60).join("\n"),
+      metadata: {
+        source_path: relativePath, start_line: 38, end_line: 60,
+        source_generation: 1,
+      },
+    }, {
+      text: lines.slice(37, 60).join("\n"), startLine: 38, endLine: 60,
+      sourceText: source,
+    });
+    const fixturePath = path.join(tempDir, "response.json");
+    await writeFile(fixturePath, JSON.stringify({
+      result: {
+        retrieval_query: "synthetic definition boundary",
+        retrieval_backend: "fixture",
+        retrieval_evidence_policy: "generic-v2",
+        retrieval_not_found: false,
+        retrieved_chunks: [selected],
+      },
+      context: {
+        workspace_id: "fixture-definition-boundary", collection: "fixture",
+        index: { manifest_revision: 1 },
+      },
+    }), "utf8");
+    const invoke = async (server, policy) => {
+      const child = spawn("node", [server], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...globalThis.process.env,
+          CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+          CORPUSWIRE_SDK_PATH: sdkPath,
+          CORPUSWIRE_SYNC_ENABLED: "false",
+          CORPUSWIRE_WORKSPACE_ID: "fixture-definition-boundary",
+          CORPUSWIRE_SYNC_ROOT: sourceRoot,
+          CORPUSWIRE_SELECTED_NEIGHBOR_POLICY: policy,
+          MOCK_QUERY_FIXTURE_PATH: fixturePath,
+          MOCK_REQUESTS_PATH: path.join(tempDir, "requests.jsonl"),
+        },
+      });
+      try {
+        const response = await createRpc(child)({
+          jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+            name: "corpuswire_search",
+            arguments: {
+              query: "synthetic definition boundary",
+              workspaceId: "fixture-definition-boundary", topK: 5, maxChars: 12000,
+            },
+          },
+        });
+        assert.equal(response.result.isError, false);
+        return response.result.content[0].text;
+      } finally {
+        child.kill();
+      }
+    };
+    const control = await invoke(SERVER_BIN, "off");
+    assert.match(control, /src\/corpuswire\/artifacts\/models\.py:38-60/);
+    assert.doesNotMatch(control, /@dataclass\(frozen=True, slots=True\)/);
+    const direct = await invoke(SERVER_BIN, "selected-neighbor-v2");
+    const wrapper = await invoke(WRAPPER_BIN, "selected-neighbor-v2");
+    assert.equal(wrapper, direct);
+    assert.match(direct, /@dataclass\(frozen=True, slots=True\)/);
+    assert.match(direct, /class DiscoveryLimits:/);
+    assert.match(direct, /src\/corpuswire\/artifacts\/models\.py:18-65/);
+    assert.match(direct, /- src\/corpuswire\/artifacts\/models\.py:18-65/);
+    await writeFile(sourcePath, "changed source\n", "utf8");
+    assert.equal(await invoke(SERVER_BIN, "selected-neighbor-v2"), control);
+    assert.equal(await invoke(WRAPPER_BIN, "selected-neighbor-v2"), control);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("private search telemetry records only timings and does not alter MCP results", async () => {
   const tempDir = await mkdtemp("/private/tmp/corpuswire-search-telemetry-");
   await chmod(tempDir, 0o700);
@@ -1278,6 +1550,162 @@ test("generic-v2 bounds a line-aligned donor trim before reserving a short succe
       } finally {
         child.kill();
       }
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("five-hit rendering preserves a short terminal source chunk within twelve thousand excerpt characters", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-terminal-reservation-"));
+  try {
+    const { sdkPath } = await writeMockSdk(tempDir);
+    const sourceRoot = path.join(tempDir, "workspace");
+    const sizedLines = (length, count, character) => {
+      const contentLength = length - count + 1;
+      const width = Math.floor(contentLength / count);
+      const extra = contentLength % count;
+      return Array.from({ length: count }, (_, index) => character.repeat(width + (index < extra ? 1 : 0)));
+    };
+    const head = sizedLines(5429, 97, "c");
+    const tail = ["t".repeat(15), "t".repeat(15), "t".repeat(15), "t".repeat(15), "TAIL_REQUIRED_102"];
+    const donor = [...sizedLines(3947, 97, "d"), ...Array(3).fill("e".repeat(75))];
+    const sources = {
+      "src/anchor.py": "a".repeat(673),
+      "src/review.yml": "b".repeat(1840),
+      "docker-compose.yml": [...head, ...tail].join("\n"),
+      "scripts/check.py": donor.join("\n"),
+    };
+    for (const [relativePath, source] of Object.entries(sources)) {
+      const sourcePath = path.join(sourceRoot, relativePath);
+      await mkdir(path.dirname(sourcePath), { recursive: true });
+      await writeFile(sourcePath, source, "utf8");
+    }
+    const selected = [
+      ["anchor", "src/anchor.py", 1, 1, sources["src/anchor.py"]],
+      ["review", "src/review.yml", 1, 1, sources["src/review.yml"]],
+      ["compose-head", "docker-compose.yml", 1, 97, head.join("\n")],
+      ["donor", "scripts/check.py", 1, 100, sources["scripts/check.py"]],
+      ["compose-tail", "docker-compose.yml", 98, 102, tail.join("\n")],
+    ].map(([id, relativePath, startLine, endLine, text]) => withDisplayProjection({
+      chunk_id: id, score: 1, text,
+      metadata: { source_path: relativePath, start_line: startLine,
+        end_line: endLine, source_generation: 1 },
+    }, { sourceText: sources[relativePath] }));
+    assert.equal(selected.reduce((total, hit) => total + hit.text.length, 0), 12198);
+    const fixturePath = path.join(tempDir, "response.json");
+    await writeFile(fixturePath, JSON.stringify({
+      result: { retrieval_query: "synthetic terminal source boundary",
+        retrieval_backend: "fixture", retrieval_evidence_policy: "generic-v2",
+        retrieval_not_found: false, retrieved_chunks: selected },
+      context: { workspace_id: "fixture-terminal", collection: "fixture",
+        index: { manifest_revision: 1 } },
+    }), "utf8");
+    for (const server of [SERVER_BIN, WRAPPER_BIN]) {
+      for (const policy of ["off", "selected-neighbor-v2"]) {
+        const child = spawn("node", [server], {
+          stdio: ["pipe", "pipe", "pipe"],
+          env: { ...globalThis.process.env, CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+            CORPUSWIRE_SDK_PATH: sdkPath, CORPUSWIRE_SYNC_ENABLED: "false",
+            CORPUSWIRE_WORKSPACE_ID: "fixture-terminal",
+            CORPUSWIRE_SYNC_ROOT: sourceRoot,
+            CORPUSWIRE_SELECTED_NEIGHBOR_POLICY: policy,
+            MOCK_QUERY_FIXTURE_PATH: fixturePath,
+            MOCK_REQUESTS_PATH: path.join(tempDir, "requests.jsonl") },
+        });
+        try {
+          const response = await createRpc(child)({ jsonrpc: "2.0", id: 1,
+            method: "tools/call", params: { name: "corpuswire_search",
+              arguments: { query: "synthetic terminal source boundary",
+                workspaceId: "fixture-terminal", topK: 5, maxChars: 12000 } } });
+          assert.equal(response.result.isError, false);
+          const rendered = response.result.content[0].text;
+          assert.ok(rendered.includes("TAIL_REQUIRED_102"), `terminal line missing for ${server} ${policy}`);
+          assert.ok(rendered.includes("docker-compose.yml:98-102"), `terminal citation missing for ${server} ${policy}`);
+          assert.ok(!rendered.includes("docker-compose.yml:98-100"), `terminal citation clipped for ${server} ${policy}`);
+        } finally {
+          child.kill();
+        }
+      }
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("opt-in per-file source coalescing preserves exact lines and falls back on source drift", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-per-file-coalescing-"));
+  try {
+    const { sdkPath } = await writeMockSdk(tempDir);
+    const sourceRoot = path.join(tempDir, "workspace");
+    const relativePath = "src/source.ts";
+    const sourcePath = path.join(sourceRoot, relativePath);
+    await mkdir(path.dirname(sourcePath), { recursive: true });
+    const lines = Array.from({ length: 50 }, (_, index) => `const source_${index + 1} = ${index + 1};`);
+    const source = lines.join("\n") + "\n";
+    await writeFile(sourcePath, source, "utf8");
+    const selected = [["first", 25, 30], ["second", 30, 35]].map(([id, start, end]) =>
+      withDisplayProjection({
+        chunk_id: id, score: 1,
+        text: lines.slice(start - 1, end).join("\n"),
+        metadata: { source_path: relativePath, start_line: start,
+          end_line: end, source_generation: 1, index_scope: null },
+      }, { sourceText: source }));
+    const fixturePath = path.join(tempDir, "response.json");
+    const makeResponse = (hits, notFound = false) => ({
+      result: { retrieval_query: "synthetic source boundary", retrieval_backend: "fixture",
+        retrieval_evidence_policy: "generic-v2", retrieval_not_found: notFound,
+        retrieved_chunks: hits },
+      context: { workspace_id: "fixture-per-file", collection: "fixture",
+        index: { manifest_revision: 1 } },
+    });
+    const render = async (server, mode) => {
+      const child = spawn("node", [server], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...globalThis.process.env, CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+          CORPUSWIRE_SDK_PATH: sdkPath, CORPUSWIRE_SYNC_ENABLED: "false",
+          CORPUSWIRE_WORKSPACE_ID: "fixture-per-file", CORPUSWIRE_SYNC_ROOT: sourceRoot,
+          CORPUSWIRE_SELECTED_NEIGHBOR_POLICY: "selected-neighbor-v2",
+          CORPUSWIRE_SOURCE_ROOT_COALESCING: mode,
+          MOCK_QUERY_FIXTURE_PATH: fixturePath,
+          MOCK_REQUESTS_PATH: path.join(tempDir, "requests.jsonl") },
+      });
+      try {
+        const response = await createRpc(child)({ jsonrpc: "2.0", id: 1,
+          method: "tools/call", params: { name: "corpuswire_search",
+            arguments: { query: "synthetic source boundary", workspaceId: "fixture-per-file",
+              topK: 5, maxChars: 12000 } } });
+        assert.equal(response.result.isError, false);
+        return response.result.content[0].text;
+      } finally {
+        child.kill();
+      }
+    };
+    await writeFile(fixturePath, JSON.stringify(makeResponse(selected)), "utf8");
+    for (const server of [SERVER_BIN, WRAPPER_BIN]) {
+      const control = await render(server, "off");
+      const treatment = await render(server, "per-file-v1");
+      assert.match(treatment, /src\/source\.ts:1-50/);
+      assert.doesNotMatch(treatment, /\n2\. src\/source\.ts/);
+      assert.match(treatment, /const source_1 = 1;/);
+      assert.match(treatment, /const source_50 = 50;/);
+      for (const line of lines.slice(24, 35)) assert.ok(treatment.includes(line));
+      assert.ok(treatment.length > control.length / 2);
+
+      await writeFile(sourcePath, source + "changed", "utf8");
+      assert.equal(await render(server, "per-file-v1"), await render(server, "off"));
+      await writeFile(sourcePath, source, "utf8");
+      const withoutHash = structuredClone(selected);
+      delete withoutHash[0].metadata.source_hash;
+      await writeFile(fixturePath, JSON.stringify(makeResponse(withoutHash)), "utf8");
+      assert.equal(await render(server, "per-file-v1"), await render(server, "off"));
+      await writeFile(fixturePath, JSON.stringify(makeResponse(selected)), "utf8");
+      await writeFile(fixturePath, JSON.stringify(makeResponse(selected, true)), "utf8");
+      const negativeTreatment = await render(server, "per-file-v1");
+      const negativeControl = await render(server, "off");
+      assert.equal(negativeTreatment.split("\nDiagnostics:\n")[0],
+        negativeControl.split("\nDiagnostics:\n")[0]);
+      await writeFile(fixturePath, JSON.stringify(makeResponse(selected)), "utf8");
     }
   } finally {
     await rm(tempDir, { recursive: true, force: true });
@@ -3773,7 +4201,7 @@ test("verified cache rehashes content and refuses lineage adopted from another c
       async diagnoseWorkspace() { return {status:'ready',can_retrieve:true,collection:'fixture',collection_exists:true,point_count:1,
         index:{health_status:'ok',coverage:{state:'verified',coverage_token:existsSync(process.env.FOREIGN_MARKER)?'foreign':token,selection_policy_digest:'policy'}},checks:[],recovery_actions:[]}; }
       async indexWorkspace(request) {
-        appendFileSync(process.env.MOCK_REQUESTS_PATH,JSON.stringify({mode:request.mode,token:request.baseCoverageToken,files:request.files.map(f=>f.relativePath)})+'\\n');
+        appendFileSync(process.env.MOCK_REQUESTS_PATH,JSON.stringify({mode:request.mode,token:request.baseCoverageToken,policy:request.selectionPolicyDigest,files:request.files.map(f=>f.relativePath)})+'\\n');
         token+='x';
         return {ok:true,result:{collection:'fixture'},status:{collection_name:'fixture',coverage:{state:'verified',coverage_token:token,selection_policy_digest:'policy'}},
           transfer:{complete:true,files_submitted:request.files.length,files_transferred:request.files.length,files_reused:0,
@@ -3797,10 +4225,89 @@ test("verified cache rehashes content and refuses lineage adopted from another c
     const changed = await invoke(3,'corpuswire_sync_delta',{changedPaths:['a.py'],flush:true});
     assert.match(changed.result.content[0].text,/filesUploaded: 1/);
     await writeFile(foreign,'1');
-    await invoke(4,'corpuswire_sync_delta',{changedPaths:['a.py'],flush:true});
+    const mismatch = await invoke(4,'corpuswire_sync_delta',{changedPaths:['a.py'],flush:true});
+    assert.match(mismatch.result.content[0].text,/needsReconcile: true/);
     const calls = (await readFile(requestsPath,'utf8')).trim().split('\n').map(JSON.parse);
-    assert.equal(calls.length,3);
+    assert.equal(calls.length,2);
     assert.equal(calls[1].token,'baselinex');
-    assert.equal(calls[2].token,undefined);
+    assert.equal(calls[1].policy,'policy');
+  } finally {child.kill();await rm(root,{recursive:true,force:true});}
+});
+
+test("fresh MCP process defers incremental writes, including backend no-op candidates", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cw-fresh-coverage-"));
+  const sourceRoot = path.join(root, "repo");
+  const sdkPath = path.join(root, "sdk.mjs");
+  const requestsPath = path.join(root, "calls.jsonl");
+  await mkdir(sourceRoot);
+  await writeFile(path.join(sourceRoot, "a.py"), "unchanged");
+  await writeFile(sdkPath, `import {appendFileSync} from 'node:fs';
+    export class CorpusWireClient {
+      async diagnoseWorkspace() { return {status:'ready',can_retrieve:true,collection:'fixture',collection_exists:true,point_count:1,
+        index:{health_status:'ok',coverage:{state:'verified',coverage_token:'existing',selection_policy_digest:'policy'}},
+        checks:[],recovery_actions:[]}; }
+      async indexWorkspace(request) {
+        appendFileSync(process.env.MOCK_REQUESTS_PATH,JSON.stringify({mode:request.mode,token:request.baseCoverageToken})+'\\n');
+        return {ok:true,status:{coverage:{state:'verified',coverage_token:'new',selection_policy_digest:'policy'}},
+          transfer:{complete:true,files_submitted:request.files.length,files_transferred:0,files_reused:request.files.length}};
+      }
+    }`);
+  const child = spawn("node", [SERVER_BIN], { stdio: ["pipe", "pipe", "pipe"], env: {
+    ...process.env, CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000", CORPUSWIRE_SDK_PATH: sdkPath,
+    CORPUSWIRE_SYNC_ENABLED: "true", CORPUSWIRE_SYNC_ROOT: sourceRoot,
+    CORPUSWIRE_WORKSPACE_ID: "fixture", MOCK_REQUESTS_PATH: requestsPath,
+  }});
+  const rpc = createRpc(child);
+  const invoke = (id, name, args = {}) => rpc({jsonrpc:"2.0",id,method:"tools/call",params:{name,arguments:args}});
+  try {
+    const empty = await invoke(1, "corpuswire_sync_delta", {flush:true});
+    assert.equal(empty.result.isError, false);
+    const checked = await invoke(2, "corpuswire_sync_bootstrap");
+    assert.match(checked.result.content[0].text, /bootstrapState: ready/);
+    const deferred = await invoke(3, "corpuswire_sync_delta", {changedPaths:["a.py"],flush:true});
+    assert.equal(deferred.result.isError, false);
+    assert.match(deferred.result.content[0].text, /needsReconcile: true/);
+    const status = await invoke(4, "corpuswire_sync_status");
+    assert.match(status.result.content[0].text, /needs_reconcile/);
+    await assert.rejects(readFile(requestsPath, "utf8"), {code:"ENOENT"});
+  } finally {child.kill();await rm(root,{recursive:true,force:true});}
+});
+
+test("incremental sync defers when the verified selection policy digest changes", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cw-policy-drift-"));
+  const sourceRoot = path.join(root, "repo");
+  const sdkPath = path.join(root, "sdk.mjs");
+  const requestsPath = path.join(root, "calls.jsonl");
+  const policyMarker = path.join(root, "policy-drift");
+  await mkdir(sourceRoot);
+  await writeFile(path.join(sourceRoot, "a.py"), "a=1");
+  await writeFile(sdkPath, `import {appendFileSync,existsSync} from 'node:fs';
+    export class CorpusWireClient {
+      async diagnoseWorkspace() { return {status:'ready',can_retrieve:true,collection:'fixture',collection_exists:true,point_count:1,
+        index:{health_status:'ok',coverage:{state:'verified',coverage_token:'baseline',
+          selection_policy_digest:existsSync(process.env.POLICY_MARKER)?'changed-policy':'policy'}},
+        checks:[],recovery_actions:[]}; }
+      async indexWorkspace(request) {
+        appendFileSync(process.env.MOCK_REQUESTS_PATH,JSON.stringify({mode:request.mode,token:request.baseCoverageToken})+'\\n');
+        return {ok:true,result:{collection:'fixture'},status:{collection_name:'fixture',coverage:{state:'verified',
+          coverage_token:'baseline',selection_policy_digest:'policy'}},
+          transfer:{complete:true,files_submitted:request.files.length,files_transferred:request.files.length,
+            files_reused:0,acknowledged_files:[]}};
+      }
+    }`);
+  const child = spawn("node", [SERVER_BIN], {stdio:["pipe","pipe","pipe"],env:{...process.env,
+    CORPUSWIRE_BASE_URL:"http://127.0.0.1:8000",CORPUSWIRE_SDK_PATH:sdkPath,
+    CORPUSWIRE_SYNC_ENABLED:"true",CORPUSWIRE_SYNC_ROOT:sourceRoot,
+    CORPUSWIRE_WORKSPACE_ID:"fixture",MOCK_REQUESTS_PATH:requestsPath,POLICY_MARKER:policyMarker}});
+  const rpc = createRpc(child);
+  const invoke = (id, name, args={}) => rpc({jsonrpc:"2.0",id,method:"tools/call",params:{name,arguments:args}});
+  try {
+    const full = await invoke(1,"corpuswire_sync_reconcile");
+    assert.equal(full.result.isError,false);
+    await writeFile(policyMarker,"1");
+    const deferred = await invoke(2,"corpuswire_sync_delta",{changedPaths:["a.py"],flush:true});
+    assert.match(deferred.result.content[0].text,/needsReconcile: true/);
+    const calls = (await readFile(requestsPath,"utf8")).trim().split("\n").map(JSON.parse);
+    assert.deepEqual(calls,[{mode:"full"}]);
   } finally {child.kill();await rm(root,{recursive:true,force:true});}
 });

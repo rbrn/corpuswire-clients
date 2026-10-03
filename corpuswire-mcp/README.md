@@ -49,6 +49,22 @@ not change backend retrieval or index contents. The local postprocessor
 requires `topK=5` and
 `maxChars<=12000`; it does not change prompt-enhancement output.
 
+In `0.1.4-beta.1`, eligible v2 searches also preserve one immediately
+preceding authenticated Markdown heading and up to two blank lines when the
+existing budget permits. Set `CORPUSWIRE_SELECTED_HEADING_PREFIX=false` and
+restart the MCP host to disable this addition. The pure planner and offline
+renderer still require an explicit opt-in, so experiments stay reproducible.
+
+For a bounded local experiment, set
+`CORPUSWIRE_SOURCE_ROOT_COALESCING=per-file-v1` alongside the default
+`selected-neighbor-v2` policy. When two delivered hits come from the same
+SHA-verified file of at most 4,096 characters, it can merge them into one
+complete file excerpt if the 12,000-character budget and every previously
+delivered source line survive canonical rendering. It adds no new file and
+falls back byte-for-byte on any failed check. Unset the variable or set it to
+`off` to disable this experimental path. This proves displayed file bytes,
+not the identity of the whole published index.
+
 ## Build And Test
 
 ```bash

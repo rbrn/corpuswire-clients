@@ -9,11 +9,12 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { planSelectedNeighbor } from "../lib/selected-neighbor.mjs";
+import { canonicalCoalescingDeliveryComplete, planSourceRootCoalescing } from "../lib/source-root-coalescing.mjs";
 
 const JSONRPC_VERSION = "2.0";
 const PROTOCOL_VERSION = "2024-11-05";
 const SERVER_NAME = "corpuswire-context-engine";
-const SERVER_VERSION = "0.1.3";
+const SERVER_VERSION = "0.1.4-beta.1";
 const DEFAULT_BASE_URL = "http://127.0.0.1:8000";
 const DEFAULT_OUTPUT_MODE = "generic";
 const DEFAULT_TOP_K = 5;
@@ -960,8 +961,11 @@ class SyncManager {
       ? await client.diagnoseWorkspace({ repoPath, workspaceId })
       : diagnosisFromHealth(await client.health({ repoPath, workspaceId }), { repoPath, workspaceId });
     const bootstrapStatus = bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId });
-    if (this.observationGap === false && this.bootstrapStatus.coverage?.coverage_token
-      && this.bootstrapStatus.coverage.coverage_token !== bootstrapStatus.coverage?.coverage_token) {
+    if (this.observationGap === false && (
+      this.bootstrapStatus.coverage?.coverage_token !== bootstrapStatus.coverage?.coverage_token
+      || this.bootstrapStatus.coverage?.selection_policy_digest
+        !== bootstrapStatus.coverage?.selection_policy_digest
+    )) {
       this.observationGap = true;
     }
     this.recordBootstrapStatus(bootstrapStatus);
@@ -1110,6 +1114,17 @@ class SyncManager {
         return timeoutResult();
       }
       summaries.push(waited.value);
+      if (waited.value?.needsReconcile) {
+        this.requeueBatch(batch);
+        return {
+          enabled: true,
+          flushed: false,
+          timedOut: false,
+          needsReconcile: true,
+          summaries,
+          status: this.snapshot(),
+        };
+      }
       if (waited.value?.requeued) {
         return {
           enabled: true,
@@ -1209,6 +1224,31 @@ class SyncManager {
       return result;
     }
 
+    const coverage = this.bootstrapStatus.coverage;
+    if (this.observationGap !== false || this.bootstrapStatus.needsReconcile === true
+      || coverage?.state !== "verified" || !coverage.coverage_token
+      || !coverage.selection_policy_digest
+      || this.coverageContextKey !== syncContextKey(batch)) {
+      this.observationGap = true;
+      this.bootstrapStatus = {
+        ...this.bootstrapStatus,
+        state: "needs_reconcile",
+        needsReconcile: true,
+        reason: "Incremental sync requires matching verified coverage from a full reconcile in this MCP process.",
+      };
+      const result = {
+        ok: false,
+        needsReconcile: true,
+        error: this.bootstrapStatus.reason,
+        filesQueued: batch.changedPaths.length,
+        filesUploaded: 0,
+        filesDeleted: deletedPaths.size,
+        filesSkipped: skippedPaths.length,
+      };
+      this.recordResult(result, "flush");
+      return result;
+    }
+
     const client = buildClient();
     if (typeof client.indexWorkspace !== "function") {
       throw new Error("@corpuswire/sdk does not expose indexWorkspace; update the SDK before enabling sync.");
@@ -1222,11 +1262,8 @@ class SyncManager {
         name: path.basename(batch.sourceRoot),
       },
       mode: "incremental",
-      ...(this.observationGap === false && this.bootstrapStatus.coverage?.state === "verified"
-        && this.coverageContextKey === syncContextKey(batch) ? {
-        baseCoverageToken: this.bootstrapStatus.coverage.coverage_token,
-        selectionPolicyDigest: this.bootstrapStatus.coverage.selection_policy_digest,
-      } : {}),
+      baseCoverageToken: coverage.coverage_token,
+      selectionPolicyDigest: coverage.selection_policy_digest,
       client: removeUndefinedValues({
         name: SERVER_NAME,
         transport: "codex-mcp",
@@ -4335,7 +4372,7 @@ function selectedNeighborDelivered(observed, sourceTexts) {
   return { runs, completeLines, excerptChars };
 }
 
-async function selectedNeighborResult({ formatInput, formatted, deliveredControl, telemetry, maxRadius }) {
+async function selectedNeighborResult({ formatInput, formatted, deliveredControl, telemetry, maxRadius, headingPrefix = false, onAccepted }) {
   const neighborStarted = telemetry ? process.hrtime.bigint() : null;
   if (telemetry) {
     telemetry.selectedNeighborEntered = true;
@@ -4392,6 +4429,7 @@ async function selectedNeighborResult({ formatInput, formatted, deliveredControl
       maxChars,
       generation,
       maxRadius,
+      headingPrefix,
     });
     if (telemetry) telemetry.selectedNeighborProposalMs = searchTimingMs(proposalStarted);
     if (!proposal.usedNeighbor || !Array.isArray(proposal.hits)
@@ -4407,6 +4445,9 @@ async function selectedNeighborResult({ formatInput, formatted, deliveredControl
       || [...control.completeLines].some((line) => !treated.completeLines.has(line))) {
       return formatted;
     }
+    if (typeof onAccepted === "function") {
+      onAccepted({ hits: proposal.hits, delivered: deliveredTreatment });
+    }
     if (telemetry) telemetry.treatmentProduced = true;
     return treatment;
   } catch {
@@ -4414,6 +4455,72 @@ async function selectedNeighborResult({ formatInput, formatted, deliveredControl
   }
   } finally {
     if (telemetry) telemetry.selectedNeighborMs = searchTimingMs(neighborStarted);
+  }
+}
+
+async function sourceRootCoalescingResult({ formatInput, formatted, selectedHits, observedControl }) {
+  const { result, context, workspaceId, topK, maxChars } = formatInput;
+  const rootRaw = optionalString(process.env.CORPUSWIRE_SELECTED_NEIGHBOR_ROOT
+    ?? process.env.CORPUSWIRE_SYNC_ROOT);
+  if (optionalString(result.retrieval_evidence_policy) !== "generic-v2"
+    || result.retrieval_not_found === true || !workspaceId
+    || context.workspace_id !== workspaceId || topK !== 5 || maxChars > 12_000
+    || selectedHits.length < 2 || selectedHits.length > 5
+    || !rootRaw || !path.isAbsolute(rootRaw)) return formatted;
+  try {
+    const root = path.resolve(rootRaw);
+    const sourceTexts = new Map();
+    let generation = null;
+    for (const hit of selectedHits) {
+      const metadata = asRecord(hit?.metadata);
+      if (metadata.index_scope != null || !Number.isInteger(metadata.source_generation)
+        || metadata.source_generation < 1) return formatted;
+      if (generation !== null && metadata.source_generation !== generation) return formatted;
+      generation = metadata.source_generation;
+      const sourcePath = metadata.source_path;
+      const sourceHash = metadata.source_hash;
+      if (sourceTexts.has(sourcePath)) {
+        if (createHash("sha256").update(sourceTexts.get(sourcePath), "utf8").digest("hex")
+          !== sourceHash) return formatted;
+        continue;
+      }
+      const source = await readSelectedNeighborSource(root, sourcePath, sourceHash);
+      if (source === null) return formatted;
+      sourceTexts.set(sourcePath, source);
+    }
+    const control = selectedNeighborDelivered(observedControl, sourceTexts);
+    if (!control || control.excerptChars > maxChars) return formatted;
+    const proposal = planSourceRootCoalescing({
+      proofMode: "per-file-source/v1",
+      baselineHits: selectedHits,
+      deliveredRuns: control.runs,
+      sourceRecords: [...sourceTexts].map(([sourcePath, source]) => ({
+        path: sourcePath,
+        sourceHash: createHash("sha256").update(source, "utf8").digest("hex"),
+        text: source,
+      })),
+      publicationFence: null,
+      topK,
+      maxChars,
+      maxRadius: 20,
+    });
+    if (!proposal.usedPacking || !Array.isArray(proposal.hits)
+      || proposal.hits.length > topK || proposal.excerptChars > maxChars) return formatted;
+    const observedTreatment = [];
+    const treatment = formatSearchResult({
+      ...formatInput,
+      hits: proposal.hits,
+      onRenderedHit: (item) => observedTreatment.push(item),
+    });
+    const treated = selectedNeighborDelivered(observedTreatment, sourceTexts);
+    if (!canonicalCoalescingDeliveryComplete(proposal, observedTreatment, treated)
+      || treated.excerptChars > maxChars
+      || [...control.completeLines].some((line) => !treated.completeLines.has(line))) {
+      return formatted;
+    }
+    return treatment;
+  } catch {
+    return formatted;
   }
 }
 
@@ -4480,15 +4587,28 @@ async function searchContextCore(args, telemetry) {
     ...formatInput,
     ...(observeNeighbor ? { onRenderedHit: (item) => deliveredControl.push(item) } : {}),
   });
+  let neighborAccepted = null;
   const delivered = observeNeighbor
     ? await selectedNeighborResult({
       formatInput, formatted, deliveredControl, telemetry,
       maxRadius: selectedNeighborPolicy === "selected-neighbor-v2" ? 20 : 8,
+      headingPrefix: selectedNeighborPolicy === "selected-neighbor-v2"
+        && (process.env.CORPUSWIRE_SELECTED_HEADING_PREFIX ?? "true") === "true",
+      onAccepted: (accepted) => { neighborAccepted = accepted; },
     })
     : formatted;
+  const coalesced = process.env.CORPUSWIRE_SOURCE_ROOT_COALESCING === "per-file-v1"
+    && selectedNeighborPolicy === "selected-neighbor-v2"
+    ? await sourceRootCoalescingResult({
+      formatInput,
+      formatted: delivered,
+      selectedHits: neighborAccepted?.hits ?? hits,
+      observedControl: neighborAccepted?.delivered ?? deliveredControl,
+    })
+    : delivered;
   const failureMode = searchFailureMode({ result, hits, readPreparation });
   if (!failureMode) {
-    return delivered;
+    return coalesced;
   }
   const failureReportPath = await writeRetrievalFailureReportSafely({
     workspaceId: workspaceId ?? optionalString(context.workspace_id),
@@ -4506,7 +4626,7 @@ async function searchContextCore(args, telemetry) {
       retrievalConfidence: finiteScore(result.retrieval_confidence),
     },
   });
-  return appendFailureReportPath(delivered, failureReportPath);
+  return appendFailureReportPath(coalesced, failureReportPath);
 }
 
 async function searchContext(args) {
@@ -5140,10 +5260,28 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minSc
 
   const packets = Array.isArray(result.agent_context_packets) ? result.agent_context_packets : [];
   if (optionalString(result.retrieval_evidence_policy) !== "generic-v2") {
+    const partialPaths = new Set(hits.filter(hasPartialSourceLine)
+      .map((hit) => asRecord(hit.metadata).source_path));
+    const completeRanges = new Set();
+    let previewRemaining = maxChars;
+    for (const hit of hits) {
+      const length = typeof hit.text === "string" ? hit.text.trim().length : 0;
+      const projection = hasPartialSourceLine(hit) ? null : verifiedDisplayLines(hit);
+      if (projection && projection.text.trim() === hit.text.trim()
+        && length > 0 && length <= previewRemaining) {
+        completeRanges.add(`${asRecord(hit.metadata).source_path}:${projection.start_line}-${projection.end_line}`);
+      }
+      previewRemaining = Math.max(0, previewRemaining - Math.min(length, previewRemaining));
+    }
     if (packets.length > 0) {
       lines.push("", "Agent context packets:");
       for (const packet of packets) {
-        lines.push(formatAgentContextPacket(packet));
+        lines.push(formatAgentContextPacket(packet, {
+          lineRanges: partialPaths.has(packet?.source_path)
+            ? (Array.isArray(packet.line_ranges) ? packet.line_ranges.filter((range) =>
+              completeRanges.has(`${packet.source_path}:${range}`)) : [])
+            : packet.line_ranges,
+        }));
       }
     }
     lines.push("", "Hits:");
@@ -5157,8 +5295,18 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minSc
         break;
       }
     }
-    if (Array.isArray(result.citations) && result.citations.length > 0) {
-      lines.push("", "Citations:", ...result.citations.map((citation) => `- ${citation}`));
+    const citations = Array.isArray(result.citations)
+      ? (partialPaths.size === 0 ? result.citations : result.citations.filter((citation) => typeof citation === "string"
+        && [...partialPaths].every((sourcePath) =>
+          (!citation.startsWith(`${sourcePath}:`) && !citation.startsWith(`${sourcePath}#`))
+          || completeRanges.has(citation))))
+      : [];
+    for (const citation of completeRanges) {
+      if ([...partialPaths].some((sourcePath) => citation.startsWith(`${sourcePath}:`))
+        && !citations.includes(citation)) citations.push(citation);
+    }
+    if (citations.length > 0) {
+      lines.push("", "Citations:", ...citations.map((citation) => `- ${citation}`));
     }
     return lines.join("\n");
   }
@@ -5299,7 +5447,8 @@ function formatLegacySearchHit(hit, ordinal, remainingChars) {
   const tags = Array.isArray(metadata.tags) && metadata.tags.length > 0
     ? metadata.tags.filter((tag) => typeof tag === "string" && tag.trim()).join(", ")
     : "";
-  const lineRange = Number.isInteger(metadata.start_line) && Number.isInteger(metadata.end_line)
+  const partialSourceLine = hasPartialSourceLine(hit);
+  const lineRange = !partialSourceLine && Number.isInteger(metadata.start_line) && Number.isInteger(metadata.end_line)
     ? `${metadata.start_line}-${metadata.end_line}`
     : "";
   const rawText = typeof hit.text === "string" ? hit.text.trim() : "";
@@ -5317,6 +5466,7 @@ function formatLegacySearchHit(hit, ordinal, remainingChars) {
       ...(heading ? [`   heading: ${heading}`] : []),
       ...(docType ? [`   docType: ${docType}`] : []),
       ...(lineRange ? [`   lines: ${lineRange}`] : []),
+      ...(partialSourceLine ? ["   sourceRange: unavailable", "   excerptStatus: partial source line"] : []),
       ...(metadata.package_name ? [`   package: ${metadata.package_name}`] : []),
       ...(metadata.symbol_kind ? [`   symbolKind: ${metadata.symbol_kind}`] : []),
       ...(metadata.indexed_commit ? [`   indexedCommit: ${metadata.indexed_commit}`] : []),
@@ -5328,7 +5478,12 @@ function formatLegacySearchHit(hit, ordinal, remainingChars) {
   };
 }
 
+function hasPartialSourceLine(hit) {
+  return Object.hasOwn(asRecord(asRecord(hit?.metadata).extras), "corpuswire_partial_source_line");
+}
+
 function verifiedDisplayLines(hit) {
+  if (hasPartialSourceLine(hit)) return null;
   const metadata = asRecord(hit.metadata);
   const projection = asRecord(asRecord(metadata.extras).corpuswire_display_lines);
   const sourceHash = metadata.source_hash;
@@ -5438,6 +5593,7 @@ function formatSearchHit(hit, ordinal, remainingChars) {
     ? metadata.tags.filter((tag) => typeof tag === "string" && tag.trim()).join(", ")
     : "";
   const projection = verifiedDisplayLines(hit);
+  const partialSourceLine = hasPartialSourceLine(hit);
   const rawText = searchHitDisplayText(hit);
   if (!rawText || remainingChars <= 0) {
     return null;
@@ -5486,6 +5642,7 @@ function formatSearchHit(hit, ordinal, remainingChars) {
       ...(docType ? [`   docType: ${docType}`] : []),
       ...(renderedLineRange ? [`   lines: ${renderedLineRange}`] : []),
       ...(!renderedLineRange ? ["   sourceRange: unavailable"] : []),
+      ...(partialSourceLine ? ["   excerptStatus: partial source line"] : []),
       ...(!complete ? ["   excerptStatus: shortened"] : []),
       ...(metadata.package_name ? [`   package: ${metadata.package_name}`] : []),
       ...(metadata.symbol_kind ? [`   symbolKind: ${metadata.symbol_kind}`] : []),
@@ -5525,9 +5682,16 @@ function boundedSuccessorReservation(hit, successor, remainingChars, maxChars) {
     return 0;
   }
   const clipped = truncateAtLineBoundary(rawLines, remainingChars - successorLength);
+  // A very short final hit should not disappear just because whole-line
+  // clipping crosses the five-percent donor threshold by one source line.
+  // Keep the extra allowance bounded and preserve line-aligned citations.
+  const boundaryAllowance = successorLength <= Math.floor(maxChars * 0.01)
+    ? Math.min(80, (rawLines[clipped?.lineCount] ?? "").length + 1)
+    : 0;
   if (
     !clipped
-    || rawText.length - clipped.text.length > Math.floor(rawText.length * 0.05)
+    || rawText.length - clipped.text.length
+      > Math.floor(rawText.length * 0.05) + boundaryAllowance
   ) {
     return 0;
   }

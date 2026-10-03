@@ -60,6 +60,18 @@ function plan(item, source, overrides = {}) {
   });
 }
 
+test("a marked partial line cannot seed complete-line neighbor expansion", () => {
+  const source = "alpha\nbeta\ngamma";
+  const item = hit("partial", { source, start: 2 });
+  item.metadata.extras.corpuswire_partial_source_line = {
+    schema_version: "v1", source_line: 2, start_char: 6, end_char: 8,
+    text_sha256: digest("be"), line_sha256: digest("beta"),
+  };
+  const result = plan(item, source);
+  assert.equal(result.usedNeighbor, false);
+  assert.equal(result.reason, "partial_source_line");
+});
+
 test("expands whole LF source lines at most eight on each side", () => {
   const source = Array.from({ length: 25 }, (_, index) => `line ${index + 1}`).join("\n");
   const anchor = hit("anchor", { source, start: 13 });
