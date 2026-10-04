@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile, readFile, readdir, chmod, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readFile, readdir, chmod, symlink, rename } from "node:fs/promises";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
@@ -8,6 +9,7 @@ import { PassThrough, Readable } from "node:stream";
 import {
   createIndexTraceCollector,
   createProgressRenderer,
+  createWatchFetch,
   formatProgressLine,
   main,
   parseCliArgs,
@@ -307,7 +309,7 @@ test("main indexes the current folder with no arguments after printing the previ
 test("main prints the installed CLI version", async () => {
   const writes = [];
   await main(["--version"], { write: (line) => writes.push(line) });
-  assert.deepEqual(writes, ["0.1.4-beta.1"]);
+  assert.deepEqual(writes, ["0.1.4-beta.2"]);
 });
 
 test("parseCliArgs supports the interactive index command", () => {
@@ -953,7 +955,7 @@ test("malformed configuration fails closed before indexing and init preserves or
   await writeFile(settingsPath, original);
   let calls = 0;
   try {
-    for (const command of ["init", "index", "reconcile", "doctor"]) {
+    for (const command of ["init", "index", "reconcile", "doctor", "watch"]) {
       await assert.rejects(main([command, "--yes"], {
         cwd: fixture, env: {}, homeDirectory: fixture, write: () => {},
         client: fakeIndexClient({ getIndexCapabilities: async () => { calls += 1; } }),
@@ -1114,4 +1116,502 @@ test("CLI complete scan carries inventory evidence and cancellation cannot reach
     await assert.rejects(runCliCommand({ ...indexOptions(fixture), yes: true }, { ...dependencies, signal: controller.signal }), { code: "scan_incomplete" });
     assert.equal(requests, 1);
   } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
+async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, onPreview, onDiagnosis, onSetup, watcherUnavailable = false } = {}) {
+  const root = await syntheticWorkspace();
+  const controller = new AbortController();
+  const state = {
+    root, controller, requests: [], calls: { capabilities: 0, preview: 0, health: 0, diagnosis: 0 },
+    writes: [], waits: 0, opened: 0, closed: 0, active: 0, maximumActive: 0,
+    notify: () => {}, extraPaths: [],
+  };
+  const client = fakeIndexClient({
+    getIndexCapabilities: async () => {
+      state.calls.capabilities += 1;
+      return { supported_extensions: [".md", ".js"], supported_filenames: ["package.json"], max_file_size_bytes: 1048576 };
+    },
+    previewIndexWorkspace: async (request) => {
+      state.calls.preview += 1;
+      await onPreview?.(state, request);
+      return { workspace_id: request.workspace.workspaceId, collection_name: "synthetic-watch", requested_mode: "full", expected_mode: "full", included: request.files.length, candidates: request.files.length, changed: request.files.length, unchanged: 0, deleted: 0, excluded: 0, candidate_bytes: 0, destructive_risk: false };
+    },
+    indexWorkspace: async (request) => {
+      state.requests.push({
+        workspaceId: request.workspace.workspaceId, mode: request.mode,
+        files: request.files.map((file) => ({ path: file.relativePath, content: Buffer.from(file.content).toString("utf8") })),
+        inventoryScan: request.inventoryScan, signal: request.signal,
+      });
+      state.active += 1;
+      state.maximumActive = Math.max(state.maximumActive, state.active);
+      try {
+        const result = await onIndex?.(state, request);
+        return result ?? { ok: true, result: {}, status: { phase: "completed", coverage: { state: "verified" } }, transfer: { complete: true } };
+      } finally { state.active -= 1; }
+    },
+    health: async () => { state.calls.health += 1; return { ok: true, index: { coverage: { state: "verified" } } }; },
+    diagnoseWorkspace: async (request) => {
+      state.calls.diagnosis += 1;
+      return await onDiagnosis?.(state, request) ?? { status: "ready", can_retrieve: true, resolved_workspace_id: request.workspaceId, index: { health_status: "ok", coverage: { state: "verified" } } };
+    },
+  });
+  try {
+    await onSetup?.(state);
+    const args = argv.includes("watch") || argv.includes("--watch")
+      ? [...argv, "--poll-ms", "100", "--debounce-ms", "10"] : argv;
+    state.result = await main(args, {
+      cwd: root, homeDirectory: root, env: {}, client, signal: controller.signal, isTTY,
+      write: (line) => state.writes.push(line), writeRaw: () => {},
+      confirm: () => { throw new Error("Local watch must not request indexing confirmation"); },
+      watchFactory: (sourceRoot, options, callback) => {
+        assert.equal(sourceRoot, root);
+        assert.equal(options.recursive, true);
+        if (watcherUnavailable) throw new Error("Synthetic recursive watcher unavailable");
+        state.opened += 1;
+        const watcher = new EventEmitter();
+        state.notify = (filename = "README.md", event = "change") => callback(event, filename);
+        watcher.close = () => { state.closed += 1; watcher.removeAllListeners(); };
+        return watcher;
+      },
+      waitForWatch: async (_ms, signal) => {
+        state.waits += 1;
+        if (state.waits > 50) controller.abort();
+        await onWait?.(state);
+        if (!signal?.aborted) await new Promise((resolve) => setTimeout(resolve, 15));
+      },
+    });
+  } catch (error) { state.error = error; }
+  finally {
+    controller.abort();
+    await rm(root, { recursive: true, force: true });
+    for (const extra of state.extraPaths) await rm(extra, { recursive: true, force: true });
+  }
+  assert.equal(state.closed, state.opened, "Every created watcher must close");
+  assert.equal(state.maximumActive <= 1, true, "Index sessions must never overlap");
+  return state;
+}
+
+test("watch timing flags reject unsafe or ambiguous values", () => {
+  for (const args of [["watch", "--poll-ms", "99"], ["watch", "--poll-ms", "1.5"],
+    ["watch", "--debounce-ms", "9"], ["watch", "--debounce-ms", "-10"], ["watch", "--poll-ms", "NaN"]]) {
+    assert.throws(() => parseCliArgs(args));
+  }
+});
+
+test("explicit watch and --watch cache capabilities and perform no idle API calls", { timeout: 5000 }, async () => {
+  for (const argv of [["watch"], ["--watch"]]) {
+    let initialCalls;
+    const state = await watchFixture({ argv, onWait: async (current) => {
+      initialCalls ??= { ...current.calls };
+      assert.deepEqual(current.calls, initialCalls, "Idle waits must not contact backend");
+      if (current.waits === 8) current.controller.abort();
+    } });
+    assert.ifError(state.error);
+    assert.equal(state.requests.length, 1);
+    assert.equal(state.calls.capabilities, 1);
+    assert.equal(state.calls.preview, 1);
+    assert.equal(state.calls.diagnosis, 1);
+    assert.equal(state.opened, 1);
+  }
+});
+
+test("bare TTY invocation watches while --once and non-TTY invocations finish after one index", { timeout: 5000 }, async () => {
+  const tty = await watchFixture({ argv: [], isTTY: true, onWait: (state) => state.controller.abort() });
+  assert.ifError(tty.error);
+  assert.equal(tty.opened, 1);
+  for (const options of [{ argv: [], isTTY: false }, { argv: ["--once"], isTTY: true }]) {
+    const state = await watchFixture(options);
+    assert.ifError(state.error);
+    assert.equal(state.requests.length, 1);
+    assert.equal(state.opened, 0);
+    assert.equal(state.waits, 0);
+  }
+});
+
+test("excluded edits, unknown watcher filenames, and unchanged bytes do not trigger indexing", { timeout: 5000 }, async () => {
+  let modified = false;
+  const state = await watchFixture({ argv: ["watch", "--include", "**/*.md", "--exclude", "private/**"],
+    onWait: async (current) => {
+      if (!modified) {
+        modified = true;
+        await writeFile(path.join(current.root, "README.md"), "# Synthetic\n");
+        await writeFile(path.join(current.root, "node_modules", "secret.js"), "excluded update\n");
+        await mkdir(path.join(current.root, "private"));
+        await writeFile(path.join(current.root, "private", "notes.md"), "excluded synthetic\n");
+        current.notify("private/notes.md"); current.notify(null); current.notify("README.md");
+      }
+      if (current.waits === 12) current.controller.abort();
+    },
+  });
+  assert.ifError(state.error);
+  assert.equal(state.requests.length, 1);
+  assert.equal(state.calls.capabilities, 1);
+  assert.equal(state.calls.preview, 1);
+  assert.deepEqual(state.requests[0].files.map((file) => file.path), ["README.md"]);
+});
+
+test("watch reconciles add, delete, and rename with complete full inventories", { timeout: 5000 }, async () => {
+  let stage = 0;
+  const state = await watchFixture({ onWait: async (current) => {
+    if (stage === 0 && current.requests.length === 1) {
+      stage = 1; await writeFile(path.join(current.root, "src", "added.js"), "export const added = true;\n"); current.notify("src/added.js", "rename");
+    } else if (stage === 1 && current.requests.length === 2) {
+      stage = 2; await rm(path.join(current.root, "README.md")); current.notify("README.md", "rename");
+    } else if (stage === 2 && current.requests.length === 3) {
+      stage = 3; await rename(path.join(current.root, "src", "added.js"), path.join(current.root, "src", "renamed.js")); current.notify("src/added.js", "rename"); current.notify("src/renamed.js", "rename");
+    } else if (stage === 3 && current.requests.length === 4) current.controller.abort();
+  } });
+  assert.ifError(state.error);
+  assert.equal(state.requests.length, 4);
+  const paths = state.requests.map((request) => request.files.map((file) => file.path).sort());
+  assert.deepEqual(paths, [["README.md", "src/index.js"], ["README.md", "src/added.js", "src/index.js"], ["src/added.js", "src/index.js"], ["src/index.js", "src/renamed.js"]]);
+  assert.equal(new Set(state.requests.map((request) => request.workspaceId)).size, 1);
+  assert.equal(state.calls.capabilities, 1);
+  assert.equal(state.calls.diagnosis, 4);
+  for (const request of state.requests) { assert.equal(request.mode, "full"); assert.equal(request.inventoryScan.complete, true); }
+});
+
+test("changes during an active index produce one serial follow-up", { timeout: 5000 }, async () => {
+  const state = await watchFixture({ onIndex: async (current) => {
+    if (current.requests.length === 1) {
+      await writeFile(path.join(current.root, "README.md"), "# Updated during indexing\n");
+      current.notify("README.md");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }, onWait: (current) => { if (current.requests.length === 2) current.controller.abort(); } });
+  assert.ifError(state.error);
+  assert.equal(state.requests.length, 2);
+  assert.equal(state.maximumActive, 1);
+  assert.equal(state.requests[1].files.find((file) => file.path === "README.md").content, "# Updated during indexing\n");
+});
+
+test("watch falls back to bounded polling when recursive file watching is unavailable", { timeout: 5000 }, async () => {
+  let modified = false;
+  const state = await watchFixture({ watcherUnavailable: true, onWait: async (current) => {
+    if (!modified) { modified = true; await writeFile(path.join(current.root, "README.md"), "# Polling update\n"); }
+    if (current.requests.length === 2) current.controller.abort();
+  } });
+  assert.ifError(state.error);
+  assert.equal(state.requests.length, 2);
+  assert.equal(state.calls.capabilities, 1);
+});
+
+test("watch fences root replacement before a second index", { timeout: 5000 }, async () => {
+  let replaced = false;
+  const state = await watchFixture({ onWait: async (current) => {
+    if (!replaced) {
+      replaced = true;
+      const oldRoot = `${current.root}-original`;
+      current.extraPaths.push(oldRoot);
+      await rename(current.root, oldRoot); await mkdir(current.root);
+      await writeFile(path.join(current.root, "README.md"), "# Replacement root\n");
+      current.notify("README.md", "rename");
+    }
+  } });
+  assert.equal(state.requests.length, 1);
+  assert.equal(state.waits < 50, true, "Root replacement must stop promptly rather than poll indefinitely");
+  assert.equal(state.opened, 1);
+});
+
+test("watch fences workspace configuration changes before a second index", { timeout: 5000 }, async () => {
+  let configured = false;
+  const state = await watchFixture({ onWait: async (current) => {
+    if (!configured) {
+      configured = true; await mkdir(path.join(current.root, ".vscode"));
+      await writeFile(path.join(current.root, ".vscode", "settings.json"), JSON.stringify({ "corpuswire.remoteIndexing.workspaceId": "local-docker://different#main" }));
+      current.notify(".vscode/settings.json");
+    }
+  } });
+  assert.equal(state.requests.length, 1);
+  assert.equal(state.waits < 50, true, "Changed destination configuration must stop promptly");
+});
+
+test("watch retries transient failures serially but stops on authentication rejection", { timeout: 5000 }, async () => {
+  let modified = false;
+  const transient = await watchFixture({ onWait: async (current) => {
+    if (!modified) { modified = true; await writeFile(path.join(current.root, "README.md"), "# Retry update\n"); current.notify("README.md"); }
+    if (current.requests.length === 3) current.controller.abort();
+  }, onIndex: (current) => { if (current.requests.length === 2) throw Object.assign(new Error("Synthetic transient failure"), { status: 503 }); } });
+  assert.ifError(transient.error);
+  assert.equal(transient.requests.length, 3);
+  assert.equal(transient.maximumActive, 1);
+  assert.deepEqual(transient.requests[1].files, transient.requests[2].files);
+  const rejected = await watchFixture({ onIndex: () => { throw Object.assign(new Error("Synthetic authentication rejection"), { status: 401 }); } });
+  assert.equal(rejected.requests.length, 1);
+  assert.equal(rejected.waits, 0);
+});
+
+test("abort closes watcher and prevents follow-up mutation", { timeout: 5000 }, async () => {
+  const state = await watchFixture({ onWait: async (current) => {
+    await writeFile(path.join(current.root, "README.md"), "# Aborted update\n");
+    current.notify("README.md"); current.controller.abort();
+  } });
+  assert.equal(state.requests.length, 1);
+  assert.equal(state.opened, 1);
+  assert.equal(state.closed, 1);
+});
+
+test("a disappeared watch root never publishes an empty deletion inventory", { timeout: 5000 }, async () => {
+  let removed = false;
+  const state = await watchFixture({ onWait: async (current) => {
+    if (!removed) { removed = true; await rm(current.root, { recursive: true }); current.notify(null, "rename"); }
+  } });
+  assert.equal(state.requests.length, 1);
+  assert.equal(state.error?.code, "watch_fence");
+  assert.match(state.error.message, /disappeared/);
+  assert.equal(state.waits < 50, true);
+});
+
+test("an intact watch root with zero eligible files publishes a complete empty inventory", { timeout: 5000 }, async () => {
+  let cleared = false;
+  const state = await watchFixture({ onWait: async (current) => {
+    if (!cleared) {
+      cleared = true; await rm(path.join(current.root, "README.md"));
+      await rm(path.join(current.root, "src", "index.js")); current.notify(null, "rename");
+    }
+    if (current.requests.length === 2) current.controller.abort();
+  } });
+  assert.ifError(state.error);
+  assert.equal(state.requests.length, 2);
+  assert.deepEqual(state.requests[1].files, []);
+  assert.equal(state.requests[1].inventoryScan.complete, true);
+  assert.equal(state.calls.diagnosis, 2);
+});
+
+test("an edit after scan during preview is rescanned before any index mutation", { timeout: 5000 }, async () => {
+  let changed = false;
+  const state = await watchFixture({ onPreview: async (current) => {
+    if (!changed) {
+      changed = true; await writeFile(path.join(current.root, "README.md"), "# Changed between scan and publication\n");
+      current.notify("README.md");
+    }
+  }, onWait: (current) => { if (current.requests.length === 1) current.controller.abort(); } });
+  assert.ifError(state.error);
+  assert.equal(state.calls.preview, 2);
+  assert.equal(state.requests.length, 1);
+  assert.equal(state.requests[0].files.find((file) => file.path === "README.md").content, "# Changed between scan and publication\n");
+});
+
+test("watch stops without a verified baseline when doctor coverage is unverified", { timeout: 5000 }, async () => {
+  const state = await watchFixture({ onDiagnosis: (_current, request) => ({
+    status: "ready", can_retrieve: true, resolved_workspace_id: request.workspaceId,
+    index: { health_status: "ok", coverage: { state: "unknown" } },
+  }) });
+  assert.equal(state.requests.length, 1);
+  assert.equal(state.calls.diagnosis, 1);
+  assert.equal(state.waits, 0);
+  assert.equal(state.error?.code, "watch_fence");
+  assert.equal(state.writes.some((line) => line.includes("Index verified")), false);
+});
+
+test("watch stops when an SDK index result has not reached completed", { timeout: 5000 }, async () => {
+  const state = await watchFixture({ onIndex: () => ({ ok: true, result: {}, status: { phase: "processing" } }) });
+  assert.equal(state.requests.length, 1);
+  assert.equal(state.calls.diagnosis, 0);
+  assert.equal(state.waits, 0);
+  assert.equal(state.error?.code, "watch_fence");
+  assert.equal(state.writes.some((line) => line.includes("Index verified")), false);
+});
+
+test("unsupported, malformed, and destructive watch options fail before any API call", { timeout: 5000 }, async () => {
+  for (const argv of [["watch", "--profile", "hosted", "--api-base-url", "https://example.invalid"],
+    ["watch", "--mode", "incremental"], ["watch", "--rebuild"], ["watch", "--attach", "synthetic-session"],
+    ["watch", "--unrecognized"], ["watch", "--once"], ["watch", "--api-base-url", "file:///private/tmp/invalid"]]) {
+    const state = await watchFixture({ argv });
+    assert.ok(state.error, `Invalid watch options must fail: ${argv.join(" ")}`);
+    assert.equal(state.requests.length, 0);
+    assert.deepEqual(state.calls, { capabilities: 0, preview: 0, health: 0, diagnosis: 0 });
+    assert.equal(state.opened, 0);
+  }
+});
+
+test("watch passes the active abort signal to the SDK and closes the watcher after cancellation", { timeout: 5000 }, async () => {
+  let observedAbort = false;
+  const state = await watchFixture({ onIndex: async (current, request) => {
+    assert.equal(request.signal, current.controller.signal);
+    await new Promise((resolve) => {
+      request.signal.addEventListener("abort", () => { observedAbort = true; resolve(); }, { once: true });
+      queueMicrotask(() => current.controller.abort());
+    });
+    return { ok: false, cancelled: true, status: { phase: "cancelled" } };
+  } });
+  assert.ifError(state.error);
+  assert.equal(observedAbort, true);
+  assert.equal(state.requests.length, 1);
+  assert.equal(state.calls.diagnosis, 0);
+  assert.equal(state.opened, 1);
+  assert.equal(state.closed, 1);
+});
+
+test("excluded MCP configuration paths still fence destination changes", { timeout: 5000 }, async () => {
+  let changed = false;
+  const state = await watchFixture({ argv: ["watch", "--exclude", "**/.vscode/**"],
+    onSetup: async (current) => {
+      await mkdir(path.join(current.root, ".vscode"));
+      await writeFile(path.join(current.root, ".vscode", "mcp.json"), JSON.stringify({ servers: { "corpuswire-context-engine": { env: {} } } }));
+    },
+    onWait: async (current) => {
+      if (!changed) {
+        changed = true;
+        await writeFile(path.join(current.root, ".vscode", "mcp.json"), JSON.stringify({ servers: { "corpuswire-context-engine": { env: { CORPUSWIRE_BASE_URL: "http://127.0.0.1:19999" } } } }));
+        current.notify(".vscode/mcp.json");
+      }
+    },
+  });
+  assert.equal(state.requests.length, 1);
+  assert.equal(state.error?.code, "watch_fence");
+  assert.equal(state.waits < 50, true);
+});
+
+test("watch rejects unsuccessful SDK results even when their phase says completed", { timeout: 5000 }, async () => {
+  const state = await watchFixture({ onIndex: () => ({ ok: false, result: {}, status: { phase: "completed" } }) });
+  assert.equal(state.requests.length, 1);
+  assert.equal(state.calls.diagnosis, 0);
+  assert.equal(state.waits, 0);
+  assert.equal(state.error?.code, "watch_fence");
+});
+
+test("NDJSON watch output stays parseable through fallback, retry, publication, and abort", { timeout: 5000 }, async () => {
+  const state = await watchFixture({ argv: ["--watch", "--ndjson"], watcherUnavailable: true,
+    onIndex: (current) => {
+      if (current.requests.length === 1) throw Object.assign(new Error("Synthetic retryable NDJSON failure"), { status: 503 });
+    },
+    onWait: (current) => { if (current.requests.length === 2) current.controller.abort(); },
+  });
+  assert.ifError(state.error);
+  assert.equal(state.requests.length, 2);
+  const records = state.writes.map((line) => JSON.parse(line));
+  const lifecycle = records.filter((record) => record.schema_version === "watch-progress/v1");
+  assert.ok(lifecycle.some((record) => /periodic complete scans/.test(record.message)));
+  assert.ok(lifecycle.some((record) => /retry 1\/3/.test(record.message)));
+  assert.ok(lifecycle.some((record) => /Index verified/.test(record.message)));
+  assert.ok(lifecycle.some((record) => /Watch stopped/.test(record.message)));
+});
+
+test("current-session inventory and transfer must be verified even when doctor is ready", { timeout: 5000 }, async () => {
+  for (const result of [
+    { ok: true, result: {}, status: { phase: "completed", coverage: { state: "unknown" } }, transfer: { complete: true } },
+    { ok: true, result: {}, status: { phase: "completed", coverage: { state: "verified" } }, transfer: { complete: false } },
+    { ok: true, result: {}, status: { phase: "completed", coverage: { state: "verified" } } },
+  ]) {
+    const state = await watchFixture({ onIndex: () => result });
+    assert.equal(state.requests.length, 1);
+    assert.equal(state.waits, 0);
+    assert.equal(state.error?.code, "watch_fence");
+    assert.equal(state.writes.some((line) => line.includes("Index verified")), false);
+  }
+});
+
+test("hanging read-only watch fetch aborts on the first stop signal", { timeout: 1000 }, async () => {
+  const stop = new AbortController();
+  let entered;
+  const started = new Promise((resolve) => { entered = resolve; });
+  const fetchFn = async (_input, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(new DOMException("Synthetic abort", "AbortError")), { once: true });
+    entered();
+  });
+  const wrapped = createWatchFetch(fetchFn, { signal: stop.signal, timeoutMs: 500 });
+  const pending = wrapped("http://127.0.0.1:18080/v1/index/capabilities");
+  const rejection = assert.rejects(pending, { name: "AbortError" });
+  await started;
+  stop.abort();
+  await rejection;
+});
+
+test("a hanging mutation response body survives first stop but settles on detach or timeout", { timeout: 1000 }, async () => {
+  for (const reason of ["detach", "timeout"]) {
+    const stop = new AbortController();
+    const detach = new AbortController();
+    let entered;
+    let receivedSignal;
+    const started = new Promise((resolve) => { entered = resolve; });
+    const fetchFn = async (_input, init) => {
+      receivedSignal = init.signal;
+      return new Response(new ReadableStream({ start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"partial":'));
+        init.signal.addEventListener("abort", () => controller.error(new DOMException("Synthetic body abort", "AbortError")), { once: true });
+        entered();
+      } }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    const wrapped = createWatchFetch(fetchFn, { signal: stop.signal, detachSignal: detach.signal, timeoutMs: reason === "timeout" ? 10 : 500 });
+    const pending = wrapped("http://127.0.0.1:18080/v1/index/sessions", { method: "POST" });
+    const rejection = assert.rejects(pending, { name: "AbortError" });
+    await started;
+    stop.abort();
+    await Promise.resolve();
+    assert.equal(receivedSignal.aborted, false, "First interruption must leave mutation transport available for SDK cancellation");
+    if (reason === "detach") detach.abort();
+    await rejection;
+    assert.equal(receivedSignal.aborted, true);
+  }
+});
+
+test("verified empty backend diagnosis permits watching and a later source addition", { timeout: 5000 }, async () => {
+  let added = false;
+  const state = await watchFixture({
+    onSetup: async (current) => { await rm(path.join(current.root, "README.md")); await rm(path.join(current.root, "src", "index.js")); },
+    onDiagnosis: (current, request) => current.requests.at(-1).files.length === 0 ? {
+      status: "blocked", can_retrieve: false, resolved_workspace_id: request.workspaceId,
+      index: { health_status: "degraded", health_warnings: ["No indexed Qdrant points were found for this context."], coverage: { state: "verified", eligible_file_count: 0 } },
+    } : undefined,
+    onWait: async (current) => {
+      if (!added) { added = true; await writeFile(path.join(current.root, "README.md"), "# Added after verified empty inventory\n"); current.notify("README.md"); }
+      if (current.requests.length === 2) current.controller.abort();
+    },
+  });
+  assert.ifError(state.error);
+  assert.equal(state.requests.length, 2);
+  assert.deepEqual(state.requests[0].files, []);
+  assert.deepEqual(state.requests[1].files.map((file) => file.path), ["README.md"]);
+  assert.equal(state.result.publications, 2);
+});
+
+test("empty inventory never excuses divergent warnings, authorization failure, or another session", { timeout: 5000 }, async () => {
+  for (const failure of ["warning", "authentication", "session"]) {
+    const state = await watchFixture({
+      onSetup: async (current) => { await rm(path.join(current.root, "README.md")); await rm(path.join(current.root, "src", "index.js")); },
+      onIndex: () => ({ ok: true, result: {}, status: { phase: "completed", coverage: { state: "verified", session_id: "synthetic-current" } }, transfer: { complete: true } }),
+      onDiagnosis: (_current, request) => {
+        if (failure === "authentication") throw Object.assign(new Error("Synthetic rejected auth"), { status: 403 });
+        return { status: "blocked", can_retrieve: false, resolved_workspace_id: request.workspaceId,
+          index: { health_status: "degraded", health_warnings: [failure === "warning" ? "Unexpected synthetic index failure" : "No indexed Qdrant points were found for this context."],
+            coverage: { state: "verified", eligible_file_count: 0, session_id: failure === "session" ? "synthetic-previous" : "synthetic-current" } },
+        };
+      },
+    });
+    assert.equal(state.requests.length, 1);
+    assert.equal(state.waits, 0);
+    assert.ok(state.error, `Empty ${failure} must stop watch`);
+    assert.equal(state.writes.some((line) => line.includes("Index verified")), false);
+  }
+});
+
+test("watch retries startup capabilities and stops cleanly when startup is interrupted", { timeout: 2000 }, async () => {
+  for (const interruption of [false, true]) {
+    const root = await syntheticWorkspace();
+    const controller = new AbortController();
+    let capabilities = 0;
+    let closed = 0;
+    try {
+      const client = fakeIndexClient({
+        getIndexCapabilities: async () => {
+          capabilities += 1;
+          if (interruption) {
+            queueMicrotask(() => controller.abort());
+            return new Promise((_resolve, reject) => controller.signal.addEventListener("abort", () => reject(new DOMException("Stopped", "AbortError")), { once: true }));
+          }
+          throw Object.assign(new Error("Synthetic startup unavailable"), { status: 503 });
+        },
+      });
+      const result = await main(["watch"], { cwd: root, homeDirectory: root, env: {}, client,
+        signal: controller.signal, write: () => {}, writeRaw: () => {},
+        watchFactory: () => ({ close: () => { closed += 1; } }),
+        waitForWatch: async () => controller.abort(),
+      });
+      assert.equal(result.stopped, true);
+      assert.equal(result.exitCode, 0);
+      assert.equal(capabilities, 1);
+      assert.equal(closed, 1);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
 });

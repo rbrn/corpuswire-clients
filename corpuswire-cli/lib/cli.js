@@ -1,8 +1,8 @@
 import { isRetrievalExcludedPath } from "@corpuswire/sdk";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { readFile, readdir, stat, lstat, mkdir, writeFile, open } from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
+import { readFile, readdir, stat, lstat, mkdir, writeFile, open, realpath } from "node:fs/promises";
+import { constants as fsConstants, watch as watchFiles } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -24,13 +24,15 @@ const INDEX_TRACE_STAGES = new Set([
   "filtering_hashing", "parsing_chunking", "model_wait", "embedding_batch",
   "vector_writes", "cleanup", "total",
 ]);
-const CLI_VERSION = "0.1.4-beta.1";
+const CLI_VERSION = "0.1.4-beta.2";
 
 export function printHelp(write = console.log) {
   write(`corpuswire
 
 Usage:
-  corpuswire                         Index the current folder using local Docker
+  corpuswire                         Index and watch this folder in an interactive terminal
+  corpuswire watch [options]         Index and keep reconciling local source changes
+  corpuswire --once                  Index once and exit
   corpuswire init [--index] [--verify] Configure this workspace
   corpuswire doctor [options]        Check service and verified inventory (read-only)
   corpuswire reconcile [options]     Full workspace indexing with confirmation
@@ -64,6 +66,10 @@ Options:
   --include <glob>         Include glob; repeatable
   --exclude <glob>         Exclude glob; repeatable
   --max-file-size <bytes>  Maximum file size to read
+  --watch                  Stay open watching (also works without a TTY)
+  --once                   Index once and exit
+  --debounce-ms <number>   Quiet-edit delay. Default: 500
+  --poll-ms <number>       Fallback scan interval. Default: 10000
   --yes                    Accept the indexing confirmation non-interactively
   --index                  Index after init (uses normal indexing confirmation)
   --verify                 Run doctor after init
@@ -116,7 +122,7 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
     args[0] === "health" ||
     args[0] === "index-events" ||
     args[0] === "index-activity"
-    || ["index", "init", "doctor", "reconcile"].includes(args[0])
+    || ["index", "init", "doctor", "reconcile", "watch"].includes(args[0])
   ) {
     command = args.shift();
   }
@@ -154,7 +160,11 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
     confirmRebuild: undefined,
     attachSessionId: undefined,
     trace: false,
-    implicitIndex: argv.length === 0,
+    implicitIndex: argv.length === 0 || argv[0]?.startsWith("-"),
+    watch: command === "watch",
+    once: false,
+    debounceMs: 500,
+    pollMs: 10000,
     indexAfterInit: false,
     verifyAfterInit: false,
   };
@@ -254,6 +264,21 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
         options.maxFileSizeBytes = parseNumber(requireValue(args, index, arg), "max-file-size");
         index += 1;
         break;
+      case "--watch":
+        options.watch = true;
+        break;
+      case "--once":
+        options.once = true;
+        break;
+      case "--debounce-ms":
+      case "--poll-ms": {
+        const value = parseNumber(requireValue(args, index, arg), arg);
+        const minimum = arg === "--poll-ms" ? 100 : 10;
+        if (!Number.isInteger(value) || value < minimum || value > 60000) throw new Error(`${arg} must be an integer between ${minimum} and 60000.`);
+        options[arg === "--poll-ms" ? "pollMs" : "debounceMs"] = value;
+        index += 1;
+        break;
+      }
       case "--yes":
         options.yes = true;
         break;
@@ -297,12 +322,15 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
   if (command === "reconcile" && options.mode !== "full") {
     throw new Error("reconcile requires --mode full.");
   }
+  if (options.watch && options.once) throw new Error("--watch and --once cannot be combined.");
+  if (options.watch && !["watch", "index", "reconcile"].includes(command)) throw new Error("Watching requires an indexing command.");
   return options;
 }
 
 export async function runCliCommand(options, dependencies = {}) {
   const write = dependencies.write ?? console.log;
-  if (["index", "reconcile", "init", "doctor"].includes(options.command)) {
+  const configurationInputs = { ...options };
+  if (["index", "reconcile", "init", "doctor", "watch"].includes(options.command)) {
     const sourceRoot = path.resolve(options.sourceRoot || process.cwd());
     const sourceStats = await stat(sourceRoot);
     if (!sourceStats.isDirectory()) throw new Error(`Workspace root is not a directory: ${sourceRoot}`);
@@ -317,6 +345,11 @@ export async function runCliCommand(options, dependencies = {}) {
   const sdk = dependencies.client ? undefined : dependencies.sdk ?? await loadSdk();
   const authorization = dependencies.client ? {} : await resolveServiceAuthorization(options, dependencies);
   const traceCollector = createIndexTraceCollector();
+  const fetchFn = options.watch
+    ? createWatchFetch(dependencies.fetchFn ?? globalThis.fetch, {
+      signal: dependencies.signal, detachSignal: dependencies.detachSignal,
+      timeoutMs: dependencies.watchRequestTimeoutMs ?? 30000,
+    }) : dependencies.fetchFn;
   const client =
     dependencies.client ??
     new sdk.CorpusWireClient({
@@ -327,9 +360,11 @@ export async function runCliCommand(options, dependencies = {}) {
         ? { [INDEX_OBSERVABILITY_HEADER]: "1" }
         : undefined,
       fetchFn: options.trace
-        ? traceCollector.wrapFetch(dependencies.fetchFn ?? globalThis.fetch)
-        : dependencies.fetchFn,
+        ? traceCollector.wrapFetch(fetchFn ?? globalThis.fetch)
+        : fetchFn,
     });
+
+  if (options.watch) return runWatchCommand(options, { ...dependencies, client, sdk, write, traceCollector, configurationInputs });
 
   if (["index", "reconcile"].includes(options.command) || (options.command === "init" && options.indexAfterInit)) {
     const result = await runIndexCommand(options, {
@@ -464,6 +499,251 @@ export async function runCliCommand(options, dependencies = {}) {
   write((sdk?.requireEnhancedPrompt ?? requireEnhancedPromptFallback)(response.result));
 }
 
+// Keep mutation calls alive long enough for the SDK to identify and cancel its own session.
+// Read-only preflight calls may stop immediately; a second interrupt aborts any request.
+export function createWatchFetch(fetchFn, { signal, detachSignal, timeoutMs = 30000 } = {}) {
+  return async (input, init = {}) => {
+    const controller = new AbortController();
+    const pathname = new URL(typeof input === "string" || input instanceof URL ? input : input.url).pathname;
+    const signals = [init.signal, detachSignal];
+    if (["/v1/index/capabilities", "/v1/index/preview"].includes(pathname)) signals.push(signal);
+    const abort = () => controller.abort();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; abort(); }, timeoutMs);
+    for (const linked of signals.filter(Boolean)) {
+      linked.addEventListener("abort", abort, { once: true });
+      if (linked.aborted) abort();
+    }
+    try {
+      const response = await fetchFn(input, { ...init, signal: controller.signal });
+      const body = await response.arrayBuffer();
+      return new Response([101, 204, 205, 304].includes(response.status) ? null : body, {
+        status: response.status, statusText: response.statusText, headers: response.headers,
+      });
+    } catch (error) {
+      if (timedOut) throw Object.assign(new Error("Watch HTTP request timed out."), { name: "AbortError", code: "ETIMEDOUT" });
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      for (const linked of signals.filter(Boolean)) linked.removeEventListener("abort", abort);
+    }
+  };
+}
+
+function isWithinRoot(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function watchConfigurationIdentity(configuration) {
+  return JSON.stringify({
+    profile: configuration.profile, baseUrl: configuration.baseUrl, workspaceId: configuration.workspaceId,
+    includeGlobs: [...configuration.includeGlobs].sort(), excludeGlobs: [...configuration.excludeGlobs].sort(),
+    maxFileSizeBytes: configuration.maxFileSizeBytes,
+  });
+}
+
+function watchRetryable(error) {
+  const status = error.status ?? error.statusCode;
+  return error.code === "scan_incomplete" || error.code === "watch_unavailable" || status >= 500
+    || error.name === "TypeError" || ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ENOENT"].includes(error.code);
+}
+
+function watchFailure(message, code = "watch_fence") {
+  return Object.assign(new Error(message), { code });
+}
+
+async function validateWatchFiles(root, scan) {
+  for (const identity of scan.fileIdentities) {
+    const filePath = path.join(root, identity.relativePath);
+    const current = await lstat(filePath);
+    if (!current.isFile() || current.isSymbolicLink() || !isWithinRoot(root, await realpath(filePath))
+      || ["dev", "ino", "size", "mtimeMs", "ctimeMs"].some((key) => current[key] !== identity[key])) {
+      throw watchFailure("Source changed before publication; rescanning.", "scan_incomplete");
+    }
+  }
+}
+
+// The watcher is a wake-up hint; complete, content-hashed scans are the source of truth.
+export async function runWatchCommand(options, dependencies) {
+  if (options.configuration.profile !== "local" || options.mode !== "full" || options.rebuild || options.attachSessionId) {
+    throw new Error("Watching supports local full reconciliation only, without --rebuild or --attach.");
+  }
+  const output = dependencies.write ?? console.log;
+  const write = (message) => output(options.json || options.ndjson
+    ? JSON.stringify({ schema_version: "watch-progress/v1", type: "watch_status", workspaceId: options.workspaceId, message })
+    : message);
+  const signal = dependencies.signal;
+  const requestedRoot = options.sourceRoot;
+  const root = await realpath(requestedRoot);
+  const rootIdentity = await stat(root);
+  const configurationInputs = dependencies.configurationInputs ?? options;
+  const configurationIdentity = watchConfigurationIdentity(options.configuration);
+  const readAuthorization = () => dependencies.client && !dependencies.sdk ? Promise.resolve({}) : resolveServiceAuthorization(options, dependencies);
+  const authorizationIdentity = createHash("sha256").update(JSON.stringify(await readAuthorization())).digest("hex");
+  let watcher;
+  let generation = 0;
+  let lastEventAt = 0;
+  let wake;
+  let publishedDigest = null;
+  let failures = 0;
+  let publications = 0;
+  let stopped = false;
+  let watcherErrorReported = false;
+
+  const onChange = (_event, filename) => {
+    if (stopped) return;
+    const relative = filename?.toString().split(path.sep).join("/");
+    const controlPath = [".vscode/settings.json", ".vscode/mcp.json", ".mcp.json"].includes(relative);
+    if (relative && !controlPath && (relative.split("/").some((part) => part.startsWith(".") || DEFAULT_EXCLUDED_DIRECTORIES.has(part))
+      || matchesAnyGlob(relative, options.excludeGlobs) || isRetrievalExcludedPath(relative))) return;
+    generation += 1;
+    lastEventAt = Date.now();
+    wake?.();
+  };
+  const closeWatcher = () => {
+    if (stopped) return;
+    stopped = true;
+    watcher?.close();
+    wake?.();
+  };
+  signal?.addEventListener("abort", closeWatcher, { once: true });
+  const wait = dependencies.waitForWatch ?? ((ms, waitSignal) => new Promise((resolve) => {
+    let timer;
+    const finish = () => {
+      clearTimeout(timer);
+      waitSignal?.removeEventListener("abort", finish);
+      if (wake === finish) wake = undefined;
+      resolve();
+    };
+    wake = finish;
+    timer = setTimeout(finish, ms);
+    waitSignal?.addEventListener("abort", finish, { once: true });
+    if (waitSignal?.aborted) finish();
+  }));
+  const assertFence = async () => {
+    let currentRoot;
+    let currentIdentity;
+    try {
+      currentRoot = await realpath(requestedRoot);
+      currentIdentity = await stat(currentRoot);
+    } catch { throw watchFailure("Workspace root disappeared. Watch stopped; no empty deletion inventory was published."); }
+    if (currentRoot !== root || currentIdentity.dev !== rootIdentity.dev || currentIdentity.ino !== rootIdentity.ino) {
+      throw watchFailure("Workspace root was replaced. Restart corpuswire to select the new folder.");
+    }
+    const configuration = await resolveIndexConfiguration(configurationInputs, requestedRoot, dependencies);
+    if (watchConfigurationIdentity(configuration) !== configurationIdentity) {
+      throw watchFailure("Workspace, service, or indexing filters changed. Restart corpuswire to apply the new configuration.");
+    }
+    const authorization = createHash("sha256").update(JSON.stringify(await readAuthorization())).digest("hex");
+    if (authorization !== authorizationIdentity) throw watchFailure("Service credentials changed. Restart corpuswire to use the new credentials.");
+  };
+  try {
+    if (signal?.aborted) return { ok: true, stopped: true, publications, exitCode: 0 };
+    try {
+      watcher = (dependencies.watchFactory ?? watchFiles)(root, { recursive: true }, onChange);
+      watcher.on?.("error", () => {
+        watcher?.close();
+        if (!watcherErrorReported) write("Filesystem notifications unavailable; periodic complete scans remain active.");
+        watcherErrorReported = true;
+        onChange("change", null);
+      });
+    } catch {
+      write("Filesystem notifications unavailable; using periodic complete scans.");
+    }
+    let capabilities;
+    for (let attempt = 0; ; attempt += 1) {
+      try { capabilities = await dependencies.client.getIndexCapabilities(); break; }
+      catch (error) {
+        if (signal?.aborted || attempt >= 3 || !watchRetryable(error)) throw error;
+        write(`Service temporarily unavailable; retry ${attempt + 1}/3.`);
+        await wait(1000 * 2 ** attempt, signal);
+        if (signal?.aborted) break;
+      }
+    }
+    if (signal?.aborted) return { ok: true, stopped: true, publications, exitCode: 0 };
+    write(`Watching ${sanitizeTerminalText(root)} → ${sanitizeTerminalText(options.workspaceId)} at ${displayServiceUrl(options.apiBaseUrl)}. Press Ctrl+C to stop.`);
+    while (!signal?.aborted) {
+      try {
+        await assertFence();
+        const quietDelay = lastEventAt + options.debounceMs - Date.now();
+        if (quietDelay > 0) {
+          await wait(quietDelay, signal);
+          continue;
+        }
+        const scanGeneration = generation;
+        const scan = await scanWorkspace(root, {
+          capabilities, includeGlobs: options.includeGlobs, excludeGlobs: options.excludeGlobs,
+          maxFileSizeBytes: Math.min(options.maxFileSizeBytes ?? capabilities.max_file_size_bytes, capabilities.max_file_size_bytes),
+          onProgress: () => {}, signal, workspaceId: options.workspaceId, startedAt: Date.now(),
+        });
+        await assertFence();
+        await validateWatchFiles(root, scan);
+        if (generation !== scanGeneration) continue;
+        const digest = createHash("sha256").update(JSON.stringify(scan.files.map((file) => [file.relativePath, file.sha256]).sort((a, b) => a[0].localeCompare(b[0])))).digest("hex");
+        if (digest !== publishedDigest) {
+          const result = await runIndexCommand({ ...options, sourceRoot: root, yes: true, nonInteractive: true }, {
+            ...dependencies, capabilities, preparedScan: scan,
+            write: (line) => {
+              if (!options.json && !options.ndjson) return output(line);
+              try { JSON.parse(line); } catch { return write(line); }
+              output(line);
+            },
+            beforeIndex: async () => {
+              await assertFence();
+              await validateWatchFiles(root, scan);
+              if (signal?.aborted || generation !== scanGeneration) throw watchFailure("Source changed before publication; rescanning.", "scan_incomplete");
+            },
+          });
+          if (signal?.aborted) break;
+          if (result.ok === false || result.cancelled || result.conflict || result.started === false || result.status?.phase !== "completed"
+            || result.status?.coverage?.state !== "verified" || result.transfer?.complete !== true) {
+            throw watchFailure("Reconciliation did not complete. Watch stopped; run corpuswire doctor before restarting.");
+          }
+          let diagnosisEvidence;
+          const doctor = await runDoctorCommand(options, { ...dependencies, write: () => {}, onDiagnosis: (evidence) => { diagnosisEvidence = evidence; } });
+          const diagnosedIndex = diagnosisEvidence?.diagnosis?.index;
+          if (diagnosedIndex?.coverage?.session_id && result.status.coverage.session_id
+            && diagnosedIndex.coverage.session_id !== result.status.coverage.session_id) {
+            throw watchFailure("The verified publication changed before the readiness check. Restart corpuswire to reconcile again.");
+          }
+          const verifiedEmpty = scan.files.length === 0 && doctor.coverage.state === "verified"
+            && diagnosedIndex?.coverage?.eligible_file_count === 0
+            && (diagnosedIndex.health_warnings ?? []).every((warning) => warning === "No indexed Qdrant points were found for this context.")
+            && doctor.reasons.every((reason) => ["retrieval_blocked", "index_health_degraded", "index_health_warnings"].includes(reason));
+          if (!doctor.ok && !verifiedEmpty) {
+            const authFailure = doctor.reasons.includes("authentication_rejected");
+            const unavailable = doctor.checks.some((check) => check.code === "unavailable");
+            throw watchFailure(`Reconciliation could not be verified (${doctor.reasons.join(", ")}).`, authFailure ? "authentication_rejected" : unavailable ? "watch_unavailable" : "watch_fence");
+          }
+          publishedDigest = digest;
+          publications += 1;
+          write(`Index verified (${scan.files.length} files). Watching for the next change.`);
+        }
+        failures = 0;
+        if (generation !== scanGeneration) continue;
+        await wait(options.pollMs, signal);
+      } catch (error) {
+        if (signal?.aborted) break;
+        if (!watchRetryable(error) || ++failures > 3) throw error;
+        write(`Reconciliation temporarily interrupted; retry ${failures}/3. The last verified inventory is unchanged.`);
+        await wait(Math.min(30000, 1000 * 2 ** (failures - 1)), signal);
+      }
+    }
+    write("Watch stopped.");
+    return { ok: true, stopped: true, publications, exitCode: 0 };
+  } catch (error) {
+    if (signal?.aborted) {
+      write("Watch stopped.");
+      return { ok: true, stopped: true, publications, exitCode: 0 };
+    }
+    throw error;
+  } finally {
+    closeWatcher();
+    signal?.removeEventListener("abort", closeWatcher);
+  }
+}
+
 export async function runIndexCommand(options, dependencies) {
   const write = dependencies.write ?? console.log;
   const writeRaw = dependencies.writeRaw ?? ((value) => process.stdout.write(value));
@@ -525,8 +805,8 @@ export async function runIndexCommand(options, dependencies) {
     return status;
   }
 
-  const capabilities = await dependencies.client.getIndexCapabilities();
-  const scan = await scanWorkspace(sourceRoot, {
+  const capabilities = dependencies.capabilities ?? await dependencies.client.getIndexCapabilities();
+  const scan = dependencies.preparedScan ?? await scanWorkspace(sourceRoot, {
     capabilities,
     includeGlobs: options.includeGlobs ?? [],
     excludeGlobs: options.excludeGlobs ?? [],
@@ -595,6 +875,8 @@ export async function runIndexCommand(options, dependencies) {
     }
   }
 
+  await dependencies.beforeIndex?.(scan);
+  if (dependencies.signal?.aborted) return { ok: false, cancelled: true };
   const mutationStartedAt = Date.now();
   let lastProgress = null;
   request.processingTimeoutMs = options.timeoutMs;
@@ -871,6 +1153,7 @@ async function runDoctorCommand(options, dependencies) {
     const code = httpStatus === 401 || httpStatus === 403 ? "authentication_rejected" : "unavailable";
     return { name, status: "error", code, ...(httpStatus === undefined ? {} : { httpStatus }) };
   });
+  dependencies.onDiagnosis?.({ health, diagnosis });
   const coverage = diagnosis?.index?.coverage ?? health?.index?.coverage;
   const reasons = [];
   if (!health) reasons.push("health_unavailable");
@@ -944,6 +1227,9 @@ async function scanWorkspaceComplete(sourceRoot, options) {
   const discoveryStartedAt = performance.now();
   async function walk(directory) {
     if (options.signal?.aborted) throw Object.assign(new Error("Workspace scan cancelled"), { code: "scan_incomplete" });
+    const directoryStats = await lstat(directory);
+    const resolvedDirectory = await realpath(directory);
+    if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink() || !isWithinRoot(sourceRoot, resolvedDirectory)) throw new Error("Workspace directory changed during scan");
     const entries = await readdir(directory, { withFileTypes: true });
     for (const entry of entries) {
       const absolutePath = path.join(directory, entry.name);
@@ -1012,6 +1298,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
   let fileReadMs = 0;
   for (const [index, candidate] of selected.entries()) {
     const readStartedAt = performance.now();
+    if (!isWithinRoot(sourceRoot, await realpath(candidate.absolutePath))) throw new Error("Workspace file escaped the source root");
     const content = await readFile(candidate.absolutePath);
     fileReadMs += performance.now() - readStartedAt;
     const after = await lstat(candidate.absolutePath);
@@ -1050,6 +1337,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
     included: selected.length,
     excluded,
     candidateBytes,
+    fileIdentities: selected.map(({ relativePath, fileStats }) => ({ relativePath, dev: fileStats.dev, ino: fileStats.ino, size: fileStats.size, mtimeMs: fileStats.mtimeMs, ctimeMs: fileStats.ctimeMs })),
     stageTimingsMs: {
       file_discovery: fileDiscoveryMs,
       filtering_hashing: Math.max(0, Math.round(filteringHashingMs)),
@@ -1734,7 +2022,9 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     }
     return result;
   };
-  const indexingCommand = ["index", "reconcile"].includes(options.command)
+  const interactive = dependencies.isTTY ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  if (options.implicitIndex && interactive && !options.once && !options.nonInteractive && !options.json && !options.ndjson) options.watch = true;
+  const indexingCommand = ["index", "reconcile", "watch"].includes(options.command)
     || (options.command === "init" && options.indexAfterInit);
   if (!indexingCommand || dependencies.signal) {
     return recordExitCode(await runCliCommand(options, dependencies));
@@ -1748,7 +2038,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     interrupts += 1;
     if (interrupts === 1) {
       (dependencies.writeError ?? console.error)(
-        "Cancelling: requesting backend abort and waiting for acknowledgement…",
+        options.watch ? "Stopping watch; cancelling any indexing owned by this process…" : "Cancelling: requesting backend abort and waiting for acknowledgement…",
       );
       controller.abort();
       return;
@@ -1759,6 +2049,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     detachController.abort();
   };
   runtimeProcess.on("SIGINT", onInterrupt);
+  runtimeProcess.on("SIGTERM", onInterrupt);
   try {
     return recordExitCode(await runCliCommand(options, {
       ...dependencies,
@@ -1768,5 +2059,6 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     }));
   } finally {
     runtimeProcess.off("SIGINT", onInterrupt);
+    runtimeProcess.off("SIGTERM", onInterrupt);
   }
 }
