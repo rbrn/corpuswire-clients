@@ -7,14 +7,52 @@ terminal output.
 
 ## Scope
 
+The Node CLI defaults to the existing local Docker service at
+`http://127.0.0.1:18080`. No host Python installation is required.
+
+From any repository folder:
+
+```bash
+corpuswire init                 # Save reusable, secret-free local workspace settings
+corpuswire doctor               # Read-only readiness and inventory checks
+corpuswire                      # Index this folder using its saved settings
+corpuswire reconcile            # Explicit full reconciliation, with preview/confirmation
+corpuswire --help                # Show supported commands without indexing
+```
+
+`init` configures the CLI workspace; it does not install Docker, create service
+credentials, register a new MCP server, or replace existing editor/MCP settings.
+`init --index --verify` also indexes and checks readiness. Bare local invocation
+runs the normal full-index preview and indexing without another confirmation;
+explicit `index`/`reconcile` retain the existing confirmation unless `--yes` is
+provided. Hosted upload and collection rebuild are never implicitly enabled.
+
+Existing workspace identities, include/exclude filters and file-size limits are
+retained. New unconfigured identities include a directory fingerprint so two
+folders with the same name do not share an index. Present malformed settings
+stop the operation rather than silently falling back to a broader scan.
+Environment authentication takes precedence. The CLI can also read an owner-only
+`~/.local/share/corpuswire/cli-credentials.json` file, with credentials scoped to
+exact local service URLs; malformed, shared or symlinked files are rejected.
+On macOS, the existing OS keychain is an additional fallback. No token is written
+into workspace settings. A new folder still requires authorization from the local
+service; a scope error is reported rather than bypassed.
+
+The Python management package also installs a binary named `corpuswire`.
+Check `command -v corpuswire` and `corpuswire --help` if the commands shown do
+not match this interface. Versions before this Node beta may lack these
+commands. `corpuswire_doctor` remains an MCP tool, not a shell executable.
+
 The CLI supports:
 
+- `init` for idempotent local workspace configuration.
+- `doctor` for read-only service, authorization and verified inventory readiness.
 - `health` for backend and active index status.
 - `search` and `query` for `POST /query` retrieval.
 - `enhance` or a bare prompt for `POST /v1/enhance`.
 - `index-events` for `GET /v1/index/events`.
 - `index-activity` for `GET /v1/index/activity`.
-- `index` for previewed, confirmed remote workspace indexing with live
+- `index` and `reconcile` for previewed, confirmed workspace indexing with live
   `index-progress/v1` output.
 
 `corpuswire index` defaults the source root to the current folder. It resolves
@@ -60,7 +98,7 @@ npm pack ./corpuswire-sdk --pack-destination /tmp/corpuswire-snapshot
 npm pack ./corpuswire-cli --pack-destination /tmp/corpuswire-snapshot
 npm install --prefix /tmp/corpuswire-install \
   /tmp/corpuswire-snapshot/corpuswire-sdk-0.1.3.tgz \
-  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.3.tgz
+  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.4-beta.1.tgz
 /tmp/corpuswire-install/node_modules/.bin/corpuswire --version
 ```
 
@@ -77,7 +115,7 @@ Command-line flags override environment defaults.
 
 | Source | Setting | Purpose |
 | --- | --- | --- |
-| `--api-base-url` or `CORPUSWIRE_BASE_URL` | Backend base URL | Defaults to `http://127.0.0.1:8000` |
+| `--api-base-url` or `CORPUSWIRE_BASE_URL` | Backend base URL | Defaults to `http://127.0.0.1:18080` |
 | `--basic-auth` or `CORPUSWIRE_BASIC_AUTH` | Basic Auth credentials | Sent as HTTP Basic Auth by the SDK |
 | `--workspace-id` or `CORPUSWIRE_WORKSPACE_ID` | Remote workspace selector | Used for remote-indexed retrieval/enhancement |
 | `--repo-path` or `CORPUSWIRE_REPO_PATH` | Service-local path selector | Only valid when the service can see that path |

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readFile, readdir, chmod, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
@@ -14,6 +14,27 @@ import {
   runCliCommand,
   sanitizeTerminalText,
 } from "../lib/cli.js";
+
+test("workspace commands are parsed and unknown flags fail before contacting the backend", async () => {
+  for (const command of ["init", "doctor", "reconcile"]) assert.equal(parseCliArgs([command]).command, command);
+  let requests = 0;
+  await assert.rejects(main(["doctor", "--unknown"], {
+    client: { health: async () => { requests += 1; } }, write: () => {},
+  }), /Unknown option/);
+  assert.equal(requests, 0);
+  assert.equal(parseCliArgs(["--yes"]).command, "index");
+  assert.equal(parseCliArgs([], {}).apiBaseUrl, "http://127.0.0.1:18080");
+});
+
+test("repair words remain valid in explicit enhancement and ordinary bare prompts", () => {
+  for (const word of ["init", "doctor", "reconcile"]) {
+    const parsed = parseCliArgs(["enhance", word, "the", "workspace"]);
+    assert.equal(parsed.command, "enhance");
+    assert.deepEqual(parsed.promptParts, [word, "the", "workspace"]);
+  }
+  assert.deepEqual(parseCliArgs(["reconcile the workspace"]).promptParts,
+    ["reconcile the workspace"]);
+});
 
 test("parseCliArgs handles enhance flags", () => {
   const parsed = parseCliArgs([
@@ -262,21 +283,31 @@ test("runCliCommand prints index events", async () => {
   assert.match(writes[0], /completed local_ingest/);
 });
 
-test("main prints help when no argv are provided", async () => {
+test("main indexes the current folder with no arguments after printing the preview", async () => {
+  const fixture = await syntheticWorkspace();
   const writes = [];
-  await main([], {
-    write: (line) => writes.push(line),
-  });
-
-  assert.equal(writes.length, 1);
-  assert.match(writes[0], /corpuswire/);
-  assert.match(writes[0], /Usage:/);
+  let request;
+  try {
+    await main([], {
+      cwd: fixture, homeDirectory: fixture, env: {},
+      client: fakeIndexClient({ indexWorkspace: async (value) => {
+        request = value;
+        assert.match(writes.join("\n"), /Preview|preview/);
+        return { ok: true, result: {}, status: {} };
+      } }),
+      write: (line) => writes.push(line), writeRaw: () => {},
+      confirm: () => { throw new Error("Implicit local indexing must not ask confirmation"); },
+    });
+    assert.equal(request.workspace.displayRoot, fixture);
+    assert.equal(request.mode, "full");
+    assert.match(request.workspace.workspaceId, /^local-docker:\/\/corpuswire-cli-test-.*-[a-f0-9]{12}#main$/);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
 });
 
 test("main prints the installed CLI version", async () => {
   const writes = [];
   await main(["--version"], { write: (line) => writes.push(line) });
-  assert.deepEqual(writes, ["0.1.3"]);
+  assert.deepEqual(writes, ["0.1.4-beta.1"]);
 });
 
 test("parseCliArgs supports the interactive index command", () => {
@@ -354,11 +385,11 @@ test("index confirmation treats an actual stdin EOF as no and reports no mutatio
   }
 });
 
-test("index preview redacts credentials from the service URL", async () => {
+test("index rejects credentials embedded in service URLs before contacting the service", async () => {
   const fixture = await syntheticWorkspace();
   const writes = [];
   try {
-    await runCliCommand({
+    await assert.rejects(runCliCommand({
       ...indexOptions(fixture),
       apiBaseUrl: "http://user:password@127.0.0.1:18080/?token=sensitive",
     }, {
@@ -367,11 +398,30 @@ test("index preview redacts credentials from the service URL", async () => {
       writeRaw: () => {},
       isTTY: false,
       confirm: async () => "",
-    });
+    }), /base URLs must not contain credentials/);
     const output = writes.join("\n");
     assert.equal(output.includes("password"), false);
     assert.equal(output.includes("sensitive"), false);
-    assert.match(output, /token=\[redacted\]/);
+    assert.equal(output, "");
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test("index rejects query strings and fragments before contacting the service", async () => {
+  const fixture = await syntheticWorkspace();
+  try {
+    for (const suffix of ["?token=private", "#private"]) {
+      await assert.rejects(runCliCommand({
+        ...indexOptions(fixture),
+        apiBaseUrl: `http://127.0.0.1:18080/${suffix}`,
+      }, {
+        client: fakeIndexClient(),
+        write: () => assert.fail("Must reject before producing output"),
+        writeRaw: () => {},
+        isTTY: false,
+      }), /base URLs must not contain a query string or fragment/);
+    }
   } finally {
     await rm(fixture, { recursive: true, force: true });
   }
@@ -726,6 +776,247 @@ function indexOptions(sourceRoot) {
     promptParts: [],
   };
 }
+
+test("init is idempotent, preserves unrelated settings and MCP config, and writes no credentials", async () => {
+  const fixture = await syntheticWorkspace();
+  await mkdir(path.join(fixture, ".vscode"));
+  const settingsPath = path.join(fixture, ".vscode", "settings.json");
+  const mcpPath = path.join(fixture, ".vscode", "mcp.json");
+  const mcpText = JSON.stringify({ servers: {
+    unrelated: { command: "keep-me" },
+    "corpuswire-context-engine": { command: "existing-server", env: {
+      CORPUSWIRE_WORKSPACE_ID: "local-docker://pinned#branch",
+      CORPUSWIRE_BASE_URL: "http://127.0.0.1:19090",
+      CORPUSWIRE_SYNC_INCLUDE_GLOBS: '["**/*.md"]',
+      CORPUSWIRE_SYNC_EXCLUDE_GLOBS: "private/**,reports/**",
+      CORPUSWIRE_SYNC_MAX_FILE_SIZE_BYTES: "128",
+    } },
+  } });
+  await writeFile(settingsPath, '{ // Preserve semantic unrelated configuration.\n"editor.fontSize": 15, "other": {"value": true},\n}\n');
+  await writeFile(mcpPath, mcpText);
+  try {
+    const dependencies = { cwd: fixture, homeDirectory: fixture,
+      env: { CORPUSWIRE_BEARER_TOKEN: "must-never-be-saved" }, write: () => {},
+      client: { health: () => { throw new Error("init must not call backend"); } },
+    };
+    const first = await main(["init"], dependencies);
+    const firstText = await readFile(settingsPath, "utf8");
+    const second = await main(["init"], dependencies);
+    assert.equal(first.changed, true);
+    assert.equal(second.changed, false);
+    assert.equal(await readFile(settingsPath, "utf8"), firstText);
+    assert.equal(await readFile(mcpPath, "utf8"), mcpText);
+    const settings = JSON.parse(firstText);
+    assert.equal(settings["editor.fontSize"], 15);
+    assert.deepEqual(settings.other, { value: true });
+    assert.equal(settings["corpuswire.remoteIndexing.workspaceId"], "local-docker://pinned#branch");
+    assert.equal(settings["corpuswire.serviceDefaults.url"], "http://127.0.0.1:19090");
+    assert.deepEqual(settings["corpuswire.remoteIndexing.includeGlobs"], ["**/*.md"]);
+    assert.equal(settings["corpuswire.remoteIndexing.maxFileSizeBytes"], 128);
+    assert.equal(firstText.includes("must-never-be-saved"), false);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
+test("reconcile reuses full indexing and configured MCP identity and file selection", async () => {
+  const fixture = await syntheticWorkspace();
+  await writeFile(path.join(fixture, ".mcp.json"), JSON.stringify({ mcpServers: {
+    "corpuswire-context-engine": { env: {
+      CORPUSWIRE_WORKSPACE_ID: "local-docker://existing#main",
+      CORPUSWIRE_SYNC_INCLUDE_GLOBS: "**/*.md",
+      CORPUSWIRE_SYNC_EXCLUDE_GLOBS: "private/**",
+      CORPUSWIRE_SYNC_MAX_FILE_SIZE_BYTES: "256",
+    } },
+  } }));
+  let request;
+  try {
+    await main(["reconcile", "--yes"], {
+      cwd: fixture, env: {}, homeDirectory: fixture,
+      client: fakeIndexClient({ indexWorkspace: async (value) => {
+        request = value; return { ok: true, result: {}, status: {} };
+      } }), write: () => {}, writeRaw: () => {},
+    });
+    assert.equal(request.mode, "full");
+    assert.equal(request.workspace.workspaceId, "local-docker://existing#main");
+    assert.deepEqual(request.files.map((file) => file.relativePath), ["README.md"]);
+    assert.deepEqual(request.includeGlobs, ["**/*.md"]);
+    assert.deepEqual(request.excludeGlobs, ["private/**"]);
+    assert.equal(request.maxFileSizeBytes, 256);
+    assert.equal(request.inventoryScan.complete, true);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
+test("explicit reconcile retains confirmation and hosted implicit indexing never autoaccepts", async () => {
+  const fixture = await syntheticWorkspace();
+  let mutations = 0;
+  let confirmations = 0;
+  try {
+    const dependencies = {
+      cwd: fixture, env: {}, homeDirectory: fixture,
+      client: fakeIndexClient({ indexWorkspace: async () => { mutations += 1; } }),
+      write: () => {}, writeRaw: () => {}, confirm: async () => { confirmations += 1; return ""; },
+    };
+    await main(["reconcile"], dependencies);
+    await main([], { ...dependencies, env: { CORPUSWIRE_PROFILE: "hosted", CORPUSWIRE_BASE_URL: "https://example.invalid" } });
+    assert.equal(confirmations, 2);
+    assert.equal(mutations, 0);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
+test("doctor requires verified inventory, reports unavailable service, and never writes files", async () => {
+  const fixture = await syntheticWorkspace();
+  const initialEntries = await readdir(fixture);
+  const priorExitCode = process.exitCode;
+  try {
+    const writes = [];
+    const baseDiagnosis = { status: "ready", can_retrieve: true,
+      resolved_workspace_id: "local-docker://verified#main", index: { health_status: "ok" } };
+    for (const [state, status, exitCode] of [["verified", "ready", 0], ["unknown", "attention", 1], ["invalidated", "attention", 1], [undefined, "attention", 1]]) {
+      const result = await main(["doctor", "--workspace-id", "local-docker://verified#main", "--json"], {
+        cwd: fixture, env: {}, homeDirectory: fixture, write: (line) => writes.push(line),
+        client: {
+          health: async () => ({ ok: true }),
+          diagnoseWorkspace: async () => ({ ...baseDiagnosis, index: { health_status: "ok", coverage: state ? { state } : undefined } }),
+        },
+      });
+      assert.equal(result.status, status);
+      assert.equal(result.exitCode, exitCode);
+      assert.equal(JSON.parse(writes.at(-1)).schema_version, "workspace-doctor/v1");
+    }
+    const unavailable = await main(["doctor"], {
+      cwd: fixture, env: {}, homeDirectory: fixture, write: () => {},
+      client: { health: async () => { throw new Error("secret error must not print"); },
+        diagnoseWorkspace: async () => { throw new Error("unavailable"); } },
+    });
+    assert.equal(unavailable.status, "blocked");
+    assert.equal(unavailable.exitCode, 2);
+    const rejectedWrites = [];
+    const rejected = await main(["doctor", "--json"], {
+      cwd: fixture, env: {}, homeDirectory: fixture, write: (line) => rejectedWrites.push(line),
+      client: { health: async () => { throw Object.assign(new Error("private-token must not print"), { status: 401 }); },
+        diagnoseWorkspace: async () => { throw Object.assign(new Error("private backend detail"), { status: 403 }); } },
+    });
+    assert.equal(rejected.status, "blocked");
+    assert.deepEqual(rejected.checks, [
+      { name: "health", status: "error", code: "authentication_rejected", httpStatus: 401 },
+      { name: "diagnosis", status: "error", code: "authentication_rejected", httpStatus: 403 },
+    ]);
+    assert.equal(rejectedWrites.join("\n").includes("private"), false);
+    assert.deepEqual(await readdir(fixture), initialEntries);
+    assert.equal(process.exitCode, priorExitCode);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
+test("doctor uses resolved service URL before constructing client and reads native credentials privately", async () => {
+  const fixture = await syntheticWorkspace();
+  await mkdir(path.join(fixture, ".vscode"));
+  await writeFile(path.join(fixture, ".vscode", "settings.json"), JSON.stringify({
+    "corpuswire.remoteIndexing.workspaceId": "local-docker://auth-synthetic#main",
+    "corpuswire.serviceDefaults.url": "http://127.0.0.1:19090/",
+  }));
+  let constructorOptions;
+  let credentialLookups = 0;
+  const writes = [];
+  class FakeClient {
+    constructor(options) { constructorOptions = options; }
+    async health() { return { ok: true }; }
+    async diagnoseWorkspace() { return { status: "ready", can_retrieve: true, index: { coverage: { state: "verified" } } }; }
+  }
+  const dependencies = {
+    cwd: fixture, homeDirectory: fixture, env: {}, platform: "darwin", sdk: { CorpusWireClient: FakeClient },
+    execFile: async (command, args) => {
+      credentialLookups += 1;
+      assert.equal(command, "/usr/bin/security");
+      assert.deepEqual(args, ["find-generic-password", "-s", "corpuswire-service-auth-v1", "-a", "http://127.0.0.1:19090", "-w"]);
+      return { stdout: "private-stored-token\n" };
+    }, write: (line) => writes.push(line),
+  };
+  try {
+    await main(["doctor"], dependencies);
+    assert.equal(constructorOptions.baseUrl, "http://127.0.0.1:19090/");
+    assert.equal(constructorOptions.bearerToken, "private-stored-token");
+    assert.equal(writes.join("\n").includes("private-stored-token"), false);
+    await main(["doctor"], { ...dependencies, env: { CORPUSWIRE_BEARER_TOKEN: "env-token" } });
+    assert.equal(constructorOptions.bearerToken, "env-token");
+    assert.equal(credentialLookups, 1);
+    await main(["doctor"], { ...dependencies, env: { CORPUSWIRE_BASIC_AUTH: "user:password" } });
+    assert.equal(constructorOptions.basicAuth, "user:password");
+    assert.equal(constructorOptions.bearerToken, "");
+    assert.equal(credentialLookups, 1);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
+test("malformed configuration fails closed before indexing and init preserves original bytes", async () => {
+  const fixture = await syntheticWorkspace();
+  await mkdir(path.join(fixture, ".vscode"));
+  const settingsPath = path.join(fixture, ".vscode", "settings.json");
+  const original = '{"corpuswire.remoteIndexing.includeGlobs": [ broken';
+  await writeFile(settingsPath, original);
+  let calls = 0;
+  try {
+    for (const command of ["init", "index", "reconcile", "doctor"]) {
+      await assert.rejects(main([command, "--yes"], {
+        cwd: fixture, env: {}, homeDirectory: fixture, write: () => {},
+        client: fakeIndexClient({ getIndexCapabilities: async () => { calls += 1; } }),
+      }), /Cannot read CorpusWire configuration/);
+    }
+    assert.equal(calls, 0);
+    assert.equal(await readFile(settingsPath, "utf8"), original);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
+test("private CLI credentials are scoped by URL, permission checked, and overridden by environment", async () => {
+  const fixture = await syntheticWorkspace();
+  const credentialFile = path.join(fixture, "cli-credentials.json");
+  const linkPath = path.join(fixture, "linked-credentials.json");
+  let constructorOptions;
+  let nativeLookups = 0;
+  let backendCalls = 0;
+  const writes = [];
+  class FakeClient {
+    constructor(options) { constructorOptions = options; }
+    async health() { backendCalls += 1; return { ok: true }; }
+    async diagnoseWorkspace() { backendCalls += 1; return { status: "ready", can_retrieve: true, index: { coverage: { state: "verified" } } }; }
+  }
+  const dependencies = {
+    cwd: fixture, homeDirectory: fixture, credentialFile, env: {}, platform: "darwin", sdk: { CorpusWireClient: FakeClient },
+    execFile: async () => { nativeLookups += 1; return { stdout: "native-fallback-token\n" }; },
+    write: (line) => writes.push(line),
+  };
+  const writeCredentials = async (value, mode = 0o600) => {
+    await writeFile(credentialFile, typeof value === "string" ? value : JSON.stringify(value), { mode });
+    await chmod(credentialFile, mode);
+  };
+  try {
+    const valid = { schemaVersion: 1, services: { "http://127.0.0.1:18080": { bearerToken: "private-file-token" } } };
+    await writeCredentials(valid);
+    await main(["doctor"], dependencies);
+    assert.equal(constructorOptions.bearerToken, "private-file-token");
+    assert.equal(nativeLookups, 0);
+    await main(["doctor"], { ...dependencies, env: { CORPUSWIRE_BEARER_TOKEN: "environment-token" } });
+    assert.equal(constructorOptions.bearerToken, "environment-token");
+    await main(["doctor", "--api-base-url", "http://127.0.0.1:19588"], dependencies);
+    assert.equal(constructorOptions.bearerToken, "native-fallback-token");
+    assert.equal(nativeLookups, 1);
+    await main(["doctor"], { ...dependencies, platform: "linux" });
+    assert.equal(constructorOptions.bearerToken, "private-file-token");
+    const precedingBackendCalls = backendCalls;
+    for (const [value, mode] of [[valid, 0o644], ["malformed private-token", 0o600],
+      [{ schemaVersion: 1, services: { "http://127.0.0.1:18080/?token=private": { bearerToken: "private-token" } } }, 0o600],
+      [{ schemaVersion: 1, services: { "http://127.0.0.1:18080": { bearerToken: "token\nheader" } } }, 0o600]]) {
+      await writeCredentials(value, mode);
+      await assert.rejects(main(["doctor"], dependencies), /credential file is invalid or insecure/);
+    }
+    assert.equal(backendCalls, precedingBackendCalls);
+    await writeCredentials(valid);
+    await assert.rejects(main(["doctor"], { ...dependencies, getuid: () => -1 }), /credential file is invalid or insecure/);
+    await symlink(credentialFile, linkPath);
+    await assert.rejects(main(["doctor"], { ...dependencies, credentialFile: linkPath }), /credential file is invalid or insecure/);
+    await chmod(credentialFile, 0o644);
+    await main(["doctor"], { ...dependencies, env: { CORPUSWIRE_BASIC_AUTH: "env-user:env-password" } });
+    assert.equal(constructorOptions.basicAuth, "env-user:env-password");
+    assert.equal(writes.join("\n").includes("token"), false);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
 
 function fakeIndexClient(overrides = {}) {
   return {

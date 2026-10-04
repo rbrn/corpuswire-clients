@@ -1,15 +1,16 @@
 import { isRetrievalExcludedPath } from "@corpuswire/sdk";
 import { createHash } from "node:crypto";
-import { readFile, readdir, stat, lstat } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { readFile, readdir, stat, lstat, mkdir, writeFile, open } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline/promises";
+import { promisify } from "node:util";
 
-const DEFAULT_BASE_URL = process.env.CORPUSWIRE_BASE_URL ?? "http://127.0.0.1:8000";
-const DEFAULT_BASIC_AUTH = process.env.CORPUSWIRE_BASIC_AUTH ?? "";
-const DEFAULT_REPO_PATH = process.env.CORPUSWIRE_REPO_PATH ?? "";
-const DEFAULT_WORKSPACE_ID = process.env.CORPUSWIRE_WORKSPACE_ID ?? "";
+const DEFAULT_BASE_URL = "http://127.0.0.1:18080";
+const execFileAsync = promisify(execFile);
 const SUPPORTED_OUTPUT_MODES = new Set(["generic", "copilot", "claude-code", "sequential"]);
 const DEFAULT_EXCLUDED_DIRECTORIES = new Set([
   ".git", ".mypy_cache", ".pytest_cache", ".qdrant", ".ruff_cache", ".venv",
@@ -23,12 +24,16 @@ const INDEX_TRACE_STAGES = new Set([
   "filtering_hashing", "parsing_chunking", "model_wait", "embedding_batch",
   "vector_writes", "cleanup", "total",
 ]);
-const CLI_VERSION = "0.1.3";
+const CLI_VERSION = "0.1.4-beta.1";
 
 export function printHelp(write = console.log) {
   write(`corpuswire
 
 Usage:
+  corpuswire                         Index the current folder using local Docker
+  corpuswire init [--index] [--verify] Configure this workspace
+  corpuswire doctor [options]        Check service and verified inventory (read-only)
+  corpuswire reconcile [options]     Full workspace indexing with confirmation
   corpuswire "<prompt>" [options]
   corpuswire enhance "<prompt>" [options]
   corpuswire search "<query>" [options]
@@ -39,7 +44,7 @@ Usage:
 
 Options:
   --api-base-url <url>     Backend base URL. Default: ${DEFAULT_BASE_URL}
-  --workspace-id <id>      Remote workspace ID to query/enhance
+  --workspace-id <id>      Stable workspace identity to index/query/check
   --repo-path <path>       Service-local repo path for compatibility
   --output-mode <mode>     generic | copilot | claude-code | sequential
   --top-k <number>         Override retrieval top-k
@@ -60,6 +65,8 @@ Options:
   --exclude <glob>         Exclude glob; repeatable
   --max-file-size <bytes>  Maximum file size to read
   --yes                    Accept the indexing confirmation non-interactively
+  --index                  Index after init (uses normal indexing confirmation)
+  --verify                 Run doctor after init
   --non-interactive        Never prompt; requires --yes to mutate
   --timeout-ms <number>    Explicit caller wait budget; backend continues on expiry
   --rebuild                Allow destructive collection recreation (second confirmation)
@@ -92,16 +99,16 @@ function requireValue(args, index, flag) {
   return value;
 }
 
-export function parseCliArgs(argv) {
+export function parseCliArgs(argv, env = process.env, currentFolder = process.cwd()) {
   if (argv.length === 1 && (argv[0] === "-V" || argv[0] === "--version")) {
     return { version: true };
   }
-  if (argv.length === 0 || argv.includes("-h") || argv.includes("--help")) {
+  if (argv.includes("-h") || argv.includes("--help")) {
     return { help: true };
   }
 
   const args = [...argv];
-  let command = "enhance";
+  let command = argv.length === 0 || argv[0]?.startsWith("-") ? "index" : "enhance";
   if (
     args[0] === "enhance" ||
     args[0] === "search" ||
@@ -109,7 +116,7 @@ export function parseCliArgs(argv) {
     args[0] === "health" ||
     args[0] === "index-events" ||
     args[0] === "index-activity"
-    || args[0] === "index"
+    || ["index", "init", "doctor", "reconcile"].includes(args[0])
   ) {
     command = args.shift();
   }
@@ -117,12 +124,12 @@ export function parseCliArgs(argv) {
   const options = {
     help: false,
     command,
-    apiBaseUrl: DEFAULT_BASE_URL,
-    apiBaseUrlExplicit: Boolean(process.env.CORPUSWIRE_BASE_URL),
+    apiBaseUrl: env.CORPUSWIRE_BASE_URL || DEFAULT_BASE_URL,
+    apiBaseUrlExplicit: Boolean(env.CORPUSWIRE_BASE_URL),
     outputMode: "generic",
-    repoPath: DEFAULT_REPO_PATH,
-    workspaceId: DEFAULT_WORKSPACE_ID,
-    workspaceIdExplicit: Boolean(process.env.CORPUSWIRE_WORKSPACE_ID),
+    repoPath: env.CORPUSWIRE_REPO_PATH || "",
+    workspaceId: env.CORPUSWIRE_WORKSPACE_ID || "",
+    workspaceIdExplicit: Boolean(env.CORPUSWIRE_WORKSPACE_ID),
     topK: undefined,
     minScore: undefined,
     collection: undefined,
@@ -131,11 +138,11 @@ export function parseCliArgs(argv) {
     limit: undefined,
     localOnly: false,
     json: false,
-    basicAuth: DEFAULT_BASIC_AUTH,
+    basicAuth: env.CORPUSWIRE_BASIC_AUTH || "",
     promptParts: [],
     ndjson: false,
-    sourceRoot: process.cwd(),
-    profile: process.env.CORPUSWIRE_PROFILE ?? "local",
+    sourceRoot: currentFolder,
+    profile: env.CORPUSWIRE_PROFILE ?? "local",
     mode: "full",
     includeGlobs: [],
     excludeGlobs: [],
@@ -147,6 +154,9 @@ export function parseCliArgs(argv) {
     confirmRebuild: undefined,
     attachSessionId: undefined,
     trace: false,
+    implicitIndex: argv.length === 0,
+    indexAfterInit: false,
+    verifyAfterInit: false,
   };
 
   for (let index = 0; index < args.length; index += 1) {
@@ -247,6 +257,12 @@ export function parseCliArgs(argv) {
       case "--yes":
         options.yes = true;
         break;
+      case "--index":
+        options.indexAfterInit = true;
+        break;
+      case "--verify":
+        options.verifyAfterInit = true;
+        break;
       case "--non-interactive":
         options.nonInteractive = true;
         break;
@@ -266,23 +282,47 @@ export function parseCliArgs(argv) {
         index += 1;
         break;
       default:
+        if (arg.startsWith("-")) throw new Error(`Unknown option: ${arg}`);
         options.promptParts.push(arg);
         break;
     }
   }
 
+  if (command !== "init" && (options.indexAfterInit || options.verifyAfterInit)) {
+    throw new Error("--index and --verify are only supported with init.");
+  }
+  if (!["enhance", "search", "query"].includes(command) && options.promptParts.length) {
+    throw new Error(`Unexpected argument for ${command}: ${options.promptParts[0]}`);
+  }
+  if (command === "reconcile" && options.mode !== "full") {
+    throw new Error("reconcile requires --mode full.");
+  }
   return options;
 }
 
 export async function runCliCommand(options, dependencies = {}) {
   const write = dependencies.write ?? console.log;
-  const sdk = dependencies.client ? undefined : await loadSdk();
+  if (["index", "reconcile", "init", "doctor"].includes(options.command)) {
+    const sourceRoot = path.resolve(options.sourceRoot || process.cwd());
+    const sourceStats = await stat(sourceRoot);
+    if (!sourceStats.isDirectory()) throw new Error(`Workspace root is not a directory: ${sourceRoot}`);
+    const configuration = await resolveIndexConfiguration(options, sourceRoot, dependencies);
+    validateIndexDestination(configuration);
+    options = { ...options, ...configuration, apiBaseUrl: configuration.baseUrl, sourceRoot, configuration };
+    if (options.command === "init") {
+      const result = await initializeWorkspace(options, dependencies);
+      if (!options.indexAfterInit && !options.verifyAfterInit) return result;
+    }
+  }
+  const sdk = dependencies.client ? undefined : dependencies.sdk ?? await loadSdk();
+  const authorization = dependencies.client ? {} : await resolveServiceAuthorization(options, dependencies);
   const traceCollector = createIndexTraceCollector();
   const client =
     dependencies.client ??
     new sdk.CorpusWireClient({
       baseUrl: options.apiBaseUrl,
       basicAuth: options.basicAuth,
+      ...authorization,
       defaultHeaders: options.trace
         ? { [INDEX_OBSERVABILITY_HEADER]: "1" }
         : undefined,
@@ -291,14 +331,19 @@ export async function runCliCommand(options, dependencies = {}) {
         : dependencies.fetchFn,
     });
 
-  if (options.command === "index") {
-    return runIndexCommand(options, {
+  if (["index", "reconcile"].includes(options.command) || (options.command === "init" && options.indexAfterInit)) {
+    const result = await runIndexCommand(options, {
       ...dependencies,
       client,
       sdk,
       write,
       traceCollector,
     });
+    if (options.command !== "init" || !options.verifyAfterInit) return result;
+  }
+
+  if (options.command === "doctor" || (options.command === "init" && options.verifyAfterInit)) {
+    return runDoctorCommand(options, { ...dependencies, client, write });
   }
 
   if (options.command === "health") {
@@ -430,7 +475,8 @@ export async function runIndexCommand(options, dependencies) {
     throw new Error(`Index source root is not a directory: ${sourceRoot}`);
   }
 
-  const configuration = await resolveIndexConfiguration(options, sourceRoot);
+  const configuration = options.configuration ?? await resolveIndexConfiguration(options, sourceRoot, dependencies);
+  options = { ...options, ...configuration };
   validateIndexDestination(configuration);
   const renderer = createProgressRenderer({
     write,
@@ -519,7 +565,7 @@ export async function runIndexCommand(options, dependencies) {
     ndjson: options.ndjson || options.json,
   });
 
-  const approved = options.yes === true
+  const approved = options.yes === true || (options.implicitIndex === true && configuration.profile === "local" && options.rebuild !== true)
     ? true
     : options.nonInteractive === true
     ? false
@@ -627,17 +673,29 @@ export async function runIndexCommand(options, dependencies) {
   }
 }
 
-async function resolveIndexConfiguration(options, sourceRoot) {
+async function resolveIndexConfiguration(options, sourceRoot, dependencies = {}) {
+  const env = dependencies.env ?? process.env;
   const workspaceSettings = await readJsonIfPresent(path.join(sourceRoot, ".vscode", "settings.json"));
+  const mcpConfigurations = await Promise.all([
+    readJsonIfPresent(path.join(sourceRoot, ".vscode", "mcp.json")),
+    readJsonIfPresent(path.join(sourceRoot, ".mcp.json")),
+  ]);
+  const mcpEnvironments = mcpConfigurations.map((config) =>
+    (config.servers ?? config.mcpServers ?? {})["corpuswire-context-engine"]?.env
+    ?? (config.servers ?? config.mcpServers ?? {}).corpuswire?.env ?? {});
+  const mcpValue = (key) => mcpEnvironments.find((values) => values[key] !== undefined)?.[key];
+  const userHome = dependencies.homeDirectory ?? homedir();
   const userSettings = await readFirstJson([
-    path.join(homedir(), ".config", "corpuswire", "vscode-extension.json"),
-    path.join(homedir(), ".corpuswire", "vscode-extension.json"),
+    path.join(userHome, ".config", "corpuswire", "vscode-extension.json"),
+    path.join(userHome, ".corpuswire", "vscode-extension.json"),
   ]);
   const configuredWorkspaceId = nestedString(workspaceSettings, "corpuswire.remoteIndexing.workspaceId")
+    || mcpValue("CORPUSWIRE_WORKSPACE_ID")
     || nestedString(userSettings, "remoteIndexing.workspaceId");
   const configuredBaseUrl = nestedString(workspaceSettings, "corpuswire.services.indexer.url")
     || nestedString(workspaceSettings, "corpuswire.serviceDefaults.url")
     || nestedString(workspaceSettings, "corpuswire.baseUrl")
+    || mcpValue("CORPUSWIRE_BASE_URL")
     || nestedString(userSettings, "services.indexer.url")
     || nestedString(userSettings, "serviceDefaults.url")
     || nestedString(userSettings, "baseUrl");
@@ -650,7 +708,197 @@ async function resolveIndexConfiguration(options, sourceRoot) {
       ? options.apiBaseUrl
       : configuredBaseUrl || options.apiBaseUrl || DEFAULT_BASE_URL,
     source: configuredWorkspaceId || configuredBaseUrl ? "workspace/profile configuration" : "folder defaults",
+    includeGlobs: options.includeGlobs?.length ? options.includeGlobs : globList(
+      env.CORPUSWIRE_SYNC_INCLUDE_GLOBS
+      ?? nestedValue(workspaceSettings, "corpuswire.remoteIndexing.includeGlobs")
+      ?? mcpValue("CORPUSWIRE_SYNC_INCLUDE_GLOBS")
+      ?? nestedValue(userSettings, "remoteIndexing.includeGlobs")),
+    excludeGlobs: options.excludeGlobs?.length ? options.excludeGlobs : globList(
+      env.CORPUSWIRE_SYNC_EXCLUDE_GLOBS
+      ?? nestedValue(workspaceSettings, "corpuswire.remoteIndexing.excludeGlobs")
+      ?? mcpValue("CORPUSWIRE_SYNC_EXCLUDE_GLOBS")
+      ?? nestedValue(userSettings, "remoteIndexing.excludeGlobs")),
+    maxFileSizeBytes: options.maxFileSizeBytes ?? configuredPositiveInteger(
+      env.CORPUSWIRE_SYNC_MAX_FILE_SIZE_BYTES
+      ?? nestedValue(workspaceSettings, "corpuswire.remoteIndexing.maxFileSizeBytes")
+      ?? mcpValue("CORPUSWIRE_SYNC_MAX_FILE_SIZE_BYTES")
+      ?? nestedValue(userSettings, "remoteIndexing.maxFileSizeBytes")),
   };
+}
+
+function nestedValue(record, dottedPath) {
+  if (Object.hasOwn(record ?? {}, dottedPath)) return record[dottedPath];
+  let value = record;
+  for (const key of dottedPath.split(".")) value = value?.[key];
+  return value;
+}
+
+function globList(value) {
+  if (value === undefined || value === null || value === "") return [];
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    value = trimmed.startsWith("[") ? JSON.parse(trimmed) : trimmed.split(/[,\n]+/);
+  }
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error("CorpusWire indexing filters must be arrays or comma-separated glob lists.");
+  }
+  return value.map((item) => item.trim()).filter(Boolean);
+}
+
+function configuredPositiveInteger(value) {
+  if (value === undefined || value === null || value === "") return undefined;
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 1) throw new Error("Maximum file size must be a positive integer.");
+  return number;
+}
+
+async function resolveServiceAuthorization(options, dependencies) {
+  const env = dependencies.env ?? process.env;
+  const basicAuth = options.basicAuth || env.CORPUSWIRE_BASIC_AUTH || "";
+  const bearerToken = env.CORPUSWIRE_BEARER_TOKEN?.trim() || "";
+  if (basicAuth || bearerToken) return { basicAuth, bearerToken };
+  const url = new URL(options.apiBaseUrl);
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password
+    || !["localhost", "127.0.0.1", "[::1]", "::1"].includes(url.hostname)) {
+    return { basicAuth: "", bearerToken: "" };
+  }
+  const account = `${url.protocol}//${url.host.toLowerCase()}${url.pathname.replace(/\/+$/, "")}`;
+  const credentialFile = dependencies.credentialFile ?? path.join(
+    dependencies.homeDirectory ?? homedir(), ".local", "share", "corpuswire", "cli-credentials.json",
+  );
+  const fileToken = await readPrivateServiceToken(credentialFile, account, dependencies);
+  if (fileToken) return { basicAuth: "", bearerToken: fileToken };
+  if ((dependencies.platform ?? process.platform) !== "darwin") return { basicAuth: "", bearerToken: "" };
+  try {
+    const result = await (dependencies.execFile ?? execFileAsync)("/usr/bin/security", [
+      "find-generic-password", "-s", "corpuswire-service-auth-v1", "-a", account, "-w",
+    ], { encoding: "utf8", timeout: 5000, maxBuffer: 64 * 1024 });
+    return { basicAuth: "", bearerToken: result.stdout.trim() };
+  } catch {
+    // Missing credentials are resolved by the service's normal authorization response.
+    return { basicAuth: "", bearerToken: "" };
+  }
+}
+
+async function readPrivateServiceToken(filePath, account, dependencies) {
+  const failure = () => new Error("CorpusWire CLI credential file is invalid or insecure. Require a regular owner-only file with schemaVersion 1 and service bearer tokens.");
+  let fileStats;
+  try { fileStats = await lstat(filePath); }
+  catch (error) {
+    if (error?.code === "ENOENT") return "";
+    throw failure();
+  }
+  const uid = (dependencies.getuid ?? process.getuid)?.();
+  const isPrivate = (value) => value.isFile() && !value.isSymbolicLink()
+    && (value.mode & 0o7177) === 0 && (uid === undefined || value.uid === uid);
+  if (!isPrivate(fileStats)) throw failure();
+  let handle;
+  try {
+    handle = await open(filePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const openedStats = await handle.stat();
+    if (!isPrivate(openedStats) || openedStats.size > 64 * 1024) throw failure();
+    const buffer = Buffer.alloc(64 * 1024 + 1);
+    let bytesRead = 0;
+    while (bytesRead < buffer.length) {
+      const chunk = await handle.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead);
+      if (!chunk.bytesRead) break;
+      bytesRead += chunk.bytesRead;
+    }
+    if (bytesRead > 64 * 1024) throw failure();
+    const value = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
+    if (value?.schemaVersion !== 1 || !value.services || typeof value.services !== "object" || Array.isArray(value.services)) throw failure();
+    for (const [service, credential] of Object.entries(value.services)) {
+      const serviceUrl = new URL(service);
+      const normalized = `${serviceUrl.protocol}//${serviceUrl.host.toLowerCase()}${serviceUrl.pathname.replace(/\/+$/, "")}`;
+      if (!["http:", "https:"].includes(serviceUrl.protocol) || serviceUrl.username || serviceUrl.password
+        || serviceUrl.search || serviceUrl.hash || service !== normalized
+        || !["localhost", "127.0.0.1", "[::1]", "::1"].includes(serviceUrl.hostname)) throw failure();
+      if (!credential || typeof credential !== "object" || Array.isArray(credential)
+        || typeof credential.bearerToken !== "string" || !credential.bearerToken.trim()
+        || /[\r\n]/.test(credential.bearerToken)) throw failure();
+    }
+    return value.services[account]?.bearerToken.trim() || "";
+  } catch {
+    throw failure();
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function initializeWorkspace(options, dependencies) {
+  const settingsPath = path.join(options.sourceRoot, ".vscode", "settings.json");
+  const settings = await readJsonIfPresent(settingsPath);
+  const url = new URL(options.apiBaseUrl);
+  url.username = "";
+  url.password = "";
+  url.search = "";
+  url.hash = "";
+  const additions = {
+    "corpuswire.remoteIndexing.workspaceId": options.workspaceId,
+    "corpuswire.serviceDefaults.url": url.toString().replace(/\/$/, ""),
+    "corpuswire.remoteIndexing.includeGlobs": options.includeGlobs,
+    "corpuswire.remoteIndexing.excludeGlobs": options.excludeGlobs,
+  };
+  if (options.maxFileSizeBytes !== undefined) additions["corpuswire.remoteIndexing.maxFileSizeBytes"] = options.maxFileSizeBytes;
+  const changed = Object.entries(additions).some(([key, value]) => JSON.stringify(nestedValue(settings, key)) !== JSON.stringify(value));
+  if (changed) {
+    await mkdir(path.dirname(settingsPath), { recursive: true });
+    await writeFile(settingsPath, `${JSON.stringify({ ...settings, ...additions }, null, 2)}\n`);
+  }
+  const result = {
+    schema_version: "workspace-init/v1", ok: true, changed,
+    workspaceId: options.workspaceId, serviceUrl: displayServiceUrl(options.apiBaseUrl),
+    settingsPath,
+  };
+  const write = dependencies.write ?? console.log;
+  write(options.json ? JSON.stringify(result, null, 2)
+    : `${changed ? "Configured" : "Already configured"}: ${sanitizeTerminalText(options.workspaceId)}\nSettings: ${settingsPath}`);
+  return result;
+}
+
+async function runDoctorCommand(options, dependencies) {
+  const request = { workspaceId: options.workspaceId, repoPath: options.repoPath || undefined };
+  const results = await Promise.allSettled([
+    Promise.resolve().then(() => dependencies.client.health(request)),
+    Promise.resolve().then(() => dependencies.client.diagnoseWorkspace(request)),
+  ]);
+  const health = results[0].status === "fulfilled" ? results[0].value : null;
+  const diagnosis = results[1].status === "fulfilled" ? results[1].value : null;
+  const checks = results.map((result, index) => {
+    const name = index === 0 ? "health" : "diagnosis";
+    if (result.status === "fulfilled") return { name, status: "available" };
+    const httpStatus = Number.isInteger(result.reason?.status) ? result.reason.status : undefined;
+    const code = httpStatus === 401 || httpStatus === 403 ? "authentication_rejected" : "unavailable";
+    return { name, status: "error", code, ...(httpStatus === undefined ? {} : { httpStatus }) };
+  });
+  const coverage = diagnosis?.index?.coverage ?? health?.index?.coverage;
+  const reasons = [];
+  if (!health) reasons.push("health_unavailable");
+  else if (health.ok !== true) reasons.push("service_unhealthy");
+  if (!diagnosis) reasons.push("diagnosis_unavailable");
+  else {
+    if (diagnosis.can_retrieve !== true || diagnosis.status === "blocked") reasons.push("retrieval_blocked");
+    else if (diagnosis.status !== "ready") reasons.push("workspace_degraded");
+    if (diagnosis.resolved_workspace_id && diagnosis.resolved_workspace_id !== options.workspaceId) reasons.push("workspace_identity_mismatch");
+    if (diagnosis.index?.read_needs_reconcile === true || diagnosis.index?.readNeedsReconcile === true) reasons.push("needs_reconcile");
+    if (diagnosis.index?.health_status && !["ok", "ready", "healthy"].includes(diagnosis.index.health_status)) reasons.push("index_health_degraded");
+    if (diagnosis.index?.health_warnings?.length) reasons.push("index_health_warnings");
+  }
+  if (coverage?.state !== "verified") reasons.push("inventory_not_verified");
+  if (checks.some((check) => check.code === "authentication_rejected")) reasons.push("authentication_rejected");
+  const blocked = reasons.some((reason) => ["health_unavailable", "service_unhealthy", "diagnosis_unavailable", "retrieval_blocked", "workspace_identity_mismatch"].includes(reason));
+  const status = blocked ? "blocked" : reasons.length ? "attention" : "ready";
+  const result = {
+    schema_version: "workspace-doctor/v1", ok: status === "ready", status,
+    exitCode: status === "ready" ? 0 : blocked ? 2 : 1,
+    workspaceId: options.workspaceId, serviceUrl: displayServiceUrl(options.apiBaseUrl),
+    coverage: { state: coverage?.state ?? "unavailable", reasonCodes: coverage?.reason_codes ?? [] },
+    reasons, checks,
+    recoveryActions: status === "ready" ? [] : ["Check service/authentication, then run corpuswire reconcile --yes and corpuswire doctor."],
+  };
+  dependencies.write(options.json ? JSON.stringify(result, null, 2)
+    : `status: ${status}\nworkspace: ${sanitizeTerminalText(result.workspaceId)}\nservice: ${result.serviceUrl}\ninventory coverage: ${result.coverage.state}${reasons.length ? `\nchecks: ${reasons.join(", ")}` : ""}${checks.filter((check) => check.status === "error").map((check) => `\n${check.name}: ${check.code}${check.httpStatus === undefined ? "" : ` (HTTP ${check.httpStatus})`}`).join("")}`);
+  return result;
 }
 
 function validateIndexDestination(configuration) {
@@ -658,12 +906,15 @@ function validateIndexDestination(configuration) {
   try {
     url = new URL(configuration.baseUrl);
   } catch {
-    throw new Error(`Invalid CorpusWire base URL: ${configuration.baseUrl}`);
+    throw new Error("Invalid CorpusWire base URL.");
   }
+  if (!["http:", "https:"].includes(url.protocol)) throw new Error("CorpusWire base URL must use HTTP or HTTPS.");
+  if (url.username || url.password) throw new Error("CorpusWire base URLs must not contain credentials. Use environment authentication or the service credential store.");
+  if (url.search || url.hash) throw new Error("CorpusWire base URLs must not contain a query string or fragment.");
   if (configuration.profile === "hosted" && url.protocol !== "https:") {
     throw new Error("Hosted indexing profiles require an https:// base URL.");
   }
-  if (configuration.profile === "local" && !["localhost", "127.0.0.1", "::1"].includes(url.hostname)) {
+  if (configuration.profile === "local" && !["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname)) {
     throw new Error("Local indexing profiles require a loopback CorpusWire service. Use --profile hosted for HTTPS services.");
   }
 }
@@ -677,7 +928,8 @@ function deriveWorkspaceId(sourceRoot) {
   if (!slug) {
     throw new Error("Could not derive a workspace identity; pass --workspace-id explicitly.");
   }
-  return `local-docker://${slug}#main`;
+  const suffix = createHash("sha256").update(path.resolve(sourceRoot)).digest("hex").slice(0, 12);
+  return `local-docker://${slug}-${suffix}#main`;
 }
 
 async function scanWorkspace(sourceRoot, options) {
@@ -1268,12 +1520,14 @@ function globToRegExp(glob) {
 
 async function readJsonIfPresent(filePath) {
   try {
-    return JSON.parse(stripJsonCommentsAndTrailingCommas(await readFile(filePath, "utf8")));
+    const value = JSON.parse(stripJsonCommentsAndTrailingCommas(await readFile(filePath, "utf8")));
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected an object");
+    return value;
   } catch (error) {
     if (error?.code === "ENOENT") {
       return {};
     }
-    return {};
+    throw new Error(`Cannot read CorpusWire configuration: ${filePath}`);
   }
 }
 
@@ -1463,7 +1717,7 @@ function formatIndexEvent(event) {
 }
 
 export async function main(argv = process.argv.slice(2), dependencies = {}) {
-  const options = parseCliArgs(argv);
+  const options = parseCliArgs(argv, dependencies.env ?? process.env, dependencies.cwd ?? process.cwd());
   if (options.version) {
     (dependencies.write ?? console.log)(CLI_VERSION);
     return;
@@ -1473,9 +1727,17 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     return;
   }
 
-  if (options.command !== "index" || dependencies.signal) {
-    await runCliCommand(options, dependencies);
-    return;
+  const recordExitCode = (result) => {
+    if (result?.exitCode !== undefined) {
+      if (dependencies.process) dependencies.process.exitCode = result.exitCode;
+      else if (Object.keys(dependencies).length === 0) process.exitCode = result.exitCode;
+    }
+    return result;
+  };
+  const indexingCommand = ["index", "reconcile"].includes(options.command)
+    || (options.command === "init" && options.indexAfterInit);
+  if (!indexingCommand || dependencies.signal) {
+    return recordExitCode(await runCliCommand(options, dependencies));
   }
 
   const controller = new AbortController();
@@ -1498,12 +1760,12 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   };
   runtimeProcess.on("SIGINT", onInterrupt);
   try {
-    await runCliCommand(options, {
+    return recordExitCode(await runCliCommand(options, {
       ...dependencies,
       signal: controller.signal,
       detachSignal: detachController.signal,
       output: options.ndjson || options.json ? runtimeProcess.stderr : dependencies.output,
-    });
+    }));
   } finally {
     runtimeProcess.off("SIGINT", onInterrupt);
   }
