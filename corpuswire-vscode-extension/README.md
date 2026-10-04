@@ -225,6 +225,12 @@ The command:
 7. Skips files larger than `remoteIndexing.maxFileSizeBytes`.
 8. Calls `client.indexWorkspace({ mode: "full", recreateCollection: false, files, ... })`.
 
+The cancellable notification renders the shared `index-progress/v1` contract:
+phase, processed/total work, elapsed time, numeric progress when a denominator
+exists, and active heartbeat during long CPU work. Cancelling sends a backend
+abort and waits for its terminal acknowledgement; it no longer only dismisses
+an indeterminate client notification.
+
 In full mode, the SDK sends a complete manifest. The backend compares the new
 manifest generation with stored records, skips unchanged files, asks the client
 to upload only changed or new files, and deletes stale records during commit.
@@ -368,3 +374,7 @@ valid for hosted services that cannot mount the local path.
   settings include `semanticSearch` for shared configuration consistency.
 - Backend `index-events` and `index-activity` are the preferred way to diagnose
   stale or failed update flows.
+
+## Full-scan readiness
+
+Full indexing now fails if an eligible file cannot be read or changes during its read. It supplies a declared inventory for the selected include/exclude policy and skips symlinks. Watcher batches retain incremental semantics and cannot establish a full baseline by themselves. Completion notifications display inventory coverage and acknowledged transferred files separately; unsupported older services display unknown coverage.

@@ -1,5 +1,7 @@
-import type { EnhanceErrorEnvelope, FetchLike, ReviewContextErrorV1 } from "./types.js";
+import type { EnhanceErrorEnvelope, IndexTransferSummary, FetchLike, ReviewContextErrorV1, ReviewContextErrorV2 } from "./types.js";
+type ReviewContextErrorEnvelope = ReviewContextErrorV1 | ReviewContextErrorV2;
 export declare class CorpusWireHttpError extends Error {
+    readonly transfer?: IndexTransferSummary;
     readonly status: number;
     readonly statusText: string;
     readonly responseBody: string;
@@ -8,7 +10,7 @@ export declare class CorpusWireHttpError extends Error {
     readonly errorCode: string | null;
     readonly errorMessage: string | null;
     readonly errorDetail: unknown;
-    readonly errorEnvelope: EnhanceErrorEnvelope | ReviewContextErrorV1 | null;
+    readonly errorEnvelope: EnhanceErrorEnvelope | ReviewContextErrorEnvelope | null;
     readonly retryable: boolean;
     readonly retryAfterSeconds: number | null;
     readonly recoveryGuidance: readonly string[];
@@ -18,7 +20,7 @@ export declare class CorpusWireHttpError extends Error {
         errorCode?: string | null;
         errorMessage?: string | null;
         errorDetail?: unknown;
-        errorEnvelope?: EnhanceErrorEnvelope | ReviewContextErrorV1 | null;
+        errorEnvelope?: EnhanceErrorEnvelope | ReviewContextErrorEnvelope | null;
         retryable?: boolean;
         retryAfterSeconds?: number | null;
         recoveryGuidance?: readonly string[];
@@ -39,3 +41,4 @@ export declare function createBasicAuthHeader(credentials: string): string;
 export declare function createBearerAuthHeader(token: string): string;
 export declare function buildHeaders(defaultHeaders?: Record<string, string>, basicAuth?: string, initHeaders?: HeadersInit): Headers;
 export declare function requestJson<T>(options: RequestJsonOptions): Promise<T>;
+export {};

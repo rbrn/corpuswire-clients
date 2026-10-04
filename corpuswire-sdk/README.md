@@ -16,8 +16,8 @@ health, index observability, or remote indexing.
 - `GET /v1/index/capabilities` for remote indexing limits.
 - `GET /v1/index/events` and `GET /v1/index/activity` for index observability.
 - Full remote indexing session helpers for `/v1/index/*`.
-- Typed Codebase, GitHub binding, review-context request/polling, review-status,
-  telemetry-summary, and overlay-purge helpers for the opt-in review sidecar.
+- Typed Codebase, GitHub binding, v1 review-context, and structurally isolated
+  v2 deterministic symbol-change request/poll/status helpers.
 - Bounded retries for transient `502`, `503`, `504`, connection reset, timeout,
   refused connection, pipe, and Undici socket failures.
 - Stable error parsing through `CorpusWireHttpError`, including backend request
@@ -50,13 +50,15 @@ this repository:
 }
 ```
 
-The SDK ships committed `dist/` output. If you change TypeScript source, rebuild
-with the workspace TypeScript toolchain and rerun the tests:
+The SDK ships committed `dist/` output. The repository pins TypeScript 5.4.5 as
+a development-only dependency; the package continues to have zero runtime
+dependencies. If you change TypeScript source, use the locked toolchain:
 
 ```bash
-cd /Users/constantinaldea/workspace/my-context-engine
-npx tsc -p clients/corpuswire-sdk/tsconfig.json
-node --test clients/corpuswire-sdk/tests/client.test.js
+npm --prefix clients/corpuswire-sdk ci
+npm --prefix clients/corpuswire-sdk run check
+npm --prefix clients/corpuswire-sdk run build
+npm --prefix clients/corpuswire-sdk test
 ```
 
 If you are consuming the package directly from Node:
@@ -99,6 +101,37 @@ The SDK exposes the provider-neutral review-sidecar control plane through
 `requestReviewContextAndWait`, `getReviewContextJob`,
 `pollReviewContextJob`, `cancelReviewContextJob`, `getReviewTelemetrySummary`,
 `getReviewStatus`, and `purgeReviewOverlay`.
+
+Those unqualified method names are the byte-compatible v1 API. Deterministic
+before/after symbol evidence is a separate v2 surface:
+
+- `getReviewContextCapabilitiesV2`
+- `requestReviewContextV2` / `requestReviewContextV2AndWait`
+- `getReviewContextJobV2` / `pollReviewContextJobV2` /
+  `cancelReviewContextJobV2`
+- `getReviewStatusV2`
+
+V2 serializes each symbol change with exact BASE/HEAD identities, normalized
+diff hunks, relationship deltas, full required symbol extents, and explicit
+whole-bundle omissions. It makes evidence construction deterministic; it does
+not make a language model's conclusions deterministic.
+
+```ts
+const evidence = await client.requestReviewContextV2AndWait({
+  codebaseId: "codebase-payments",
+  targetRepositoryId: "repository-42",
+  providerReviewId: "314",
+  objective: "Compare exact BASE and HEAD behavior",
+  budgets: {
+    evidenceItems: 40,
+    serializedCharacters: 200_000,
+    serializedUtf8Bytes: 524_288,
+  },
+});
+```
+
+The v2 package changes are delivered as `merge_unpublished`: merging the
+clients repository commit and parent gitlink does not authorize an npm publish.
 
 ```ts
 const codebase = await client.createCodebase({ displayName: "Payments" });
@@ -282,6 +315,32 @@ const commit = await client.indexWorkspace({
 console.log(commit.status.files_indexed, commit.status.files_deleted);
 ```
 
+Preview the same hashed manifest without acquiring a workspace lock or starting
+a session, then subscribe to semantic progress:
+
+```ts
+const preview = await client.previewIndexWorkspace(request);
+console.log(preview.expected_mode, preview.changed, preview.unchanged);
+
+const commit = await client.indexWorkspace({
+  ...request,
+  onProgress: (event) => {
+    console.log(event.phase, event.overall_percent, event.elapsed_ms);
+  },
+});
+```
+
+The stable `index-progress/v1` event preserves unknown denominators as `null`,
+caps unverified overall progress below 100, and reports 100 only after verified
+commit. It includes heartbeat/liveness, phase timing, throughput, queue, retry,
+warning, ETA-confidence, and cumulative count fields.
+
+`processingTimeoutMs` is an explicit caller wait budget, not a backend job
+timeout. Expiry raises `RemoteIndexDetachedError`; backend work continues and
+the error contains the session id. Use `followIndexSession(sessionId, ...)` to
+reattach. An `AbortSignal` sends `DELETE /v1/index/sessions/{id}` and waits for
+the terminal `aborted` status before raising `RemoteIndexCancelledError`.
+
 Use `mode: "full"` when the file list represents the complete workspace
 snapshot. The backend stores a new manifest generation and, during commit,
 deletes stale records from older generations that were not present in the new
@@ -395,3 +454,9 @@ try {
 The SDK retries transient gateway and socket failures. It does not retry stable
 request errors such as invalid prompt payloads, unsupported output modes, or
 incomplete index sessions.
+
+## Inventory coverage and transfer measurements
+
+Full filesystem producers pass `inventoryScan` to `indexWorkspace()`. The SDK freezes and hashes uploaded buffers, computes `workspace-inventory/v1`, and negotiates `inventory_coverage_versions` before sending new fields. Supplying a `files` array alone does not certify a complete scan. Legacy servers receive the compatible request without coverage fields. Capability failures propagate before session creation.
+
+`status.coverage` describes a verified full baseline and compatible observed deltas. Session completion and 100% progress retain their existing meaning. The optional `transfer` result separates submitted, upload-required, reused and acknowledged unique transferred files; source bytes exclude multipart/TLS overhead. `upload_attempts` and `source_bytes_attempted` include HTTP retries. Error/detach objects retain partial counters with `complete: false`; do not interpret absent counters as zero. `acknowledged_files` is for authorized local cache updates and must not be copied into broad telemetry.
