@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -3322,6 +3322,251 @@ test("corpuswire-mcp reports explicit SDK skew for a missing valueRollup capabil
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+});
+
+async function withRetrievalJournalFixture(run) {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "cw-private-journal-")));
+  const workspace = path.join(root, "workspace");
+  const journal = path.join(root, "journal");
+  await mkdir(workspace);
+  const { sdkPath, requestsPath } = await writeMockSdk(root);
+  const children = [];
+  const launch = (env = {}, server = SERVER_BIN) => {
+    const child = spawn("node", [server], { cwd: workspace, stdio: ["pipe", "pipe", "pipe"], env: {
+      ...process.env, CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+      CORPUSWIRE_SDK_PATH: sdkPath, MOCK_REQUESTS_PATH: requestsPath,
+      CORPUSWIRE_SYNC_ENABLED: "false", CORPUSWIRE_SYNC_ROOT: workspace,
+      CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK: "false", CORPUSWIRE_REPO_PATH: workspace,
+      CORPUSWIRE_SELECTED_NEIGHBOR_POLICY: "off",
+      CORPUSWIRE_PRIVATE_SEARCH_TELEMETRY_PATH: "",
+      CORPUSWIRE_WORKSPACE_ID: "local-docker://journal-test#main",
+      CORPUSWIRE_RETRIEVAL_LOG_DIR: journal, CORPUSWIRE_RETRIEVAL_LOG_MODE: "full",
+      CORPUSWIRE_RETRIEVAL_LOG_MAX_INPUT_BYTES: "65536",
+      CORPUSWIRE_RETRIEVAL_LOG_MAX_RESULT_BYTES: "1048576",
+      CORPUSWIRE_RETRIEVAL_LOG_MAX_EVENTS: "10000",
+      CORPUSWIRE_RETRIEVAL_LOG_MAX_BYTES: "268435456", ...env,
+    } });
+    children.push(child);
+    const state = { stdout: "", stderr: "", child };
+    child.stdout.on("data", (chunk) => { state.stdout += chunk; });
+    child.stderr.on("data", (chunk) => { state.stderr += chunk; });
+    const rpc = createRpc(child);
+    state.call = (id, name = "corpuswire_search", args = { query: "retrieve routing evidence" }) =>
+      rpc({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
+    return state;
+  };
+  const readEvents = async (directory = journal) => {
+    const names = (await readdir(directory)).filter((name) => name.endsWith(".json"));
+    return Promise.all(names.map(async (name) => ({
+      event: JSON.parse(await readFile(path.join(directory, name), "utf8")),
+      info: await lstat(path.join(directory, name)),
+    })));
+  };
+  try { await run({ root, workspace, journal, launch, readEvents }); }
+  finally {
+    for (const child of children) child.kill();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test("private retrieval journal captures exact delivered search and enhancement with private permissions", async () => {
+  await withRetrievalJournalFixture(async ({ journal, launch, readEvents }) => {
+    for (const server of [SERVER_BIN, WRAPPER_BIN]) {
+      const host = launch({}, server);
+      for (const [id, tool, args] of [[1, "corpuswire_search", { query: "routing evidence", topK: 3 }],
+        [2, "corpuswire_enhance_prompt", { prompt: "Improve routing evidence", localOnly: true }]]) {
+        const response = await host.call(id, tool, args);
+        assert.equal(response.result.isError, false);
+        const rows = await readEvents();
+        // Match by timestamp-independent delivered bytes rather than the random event id.
+        const captured = rows.filter(({ event }) => event.tool === tool && event.input.text === (args.query ?? args.prompt));
+        assert.ok(captured.length >= 1);
+        const saved = captured.at(-1).event;
+        assert.deepEqual(JSON.parse(saved.result.text), response.result);
+        assert.equal(saved.result.rawSha256, createHash("sha256").update(JSON.stringify(response.result)).digest("hex"));
+        assert.equal(saved.result.storedSha256, saved.result.rawSha256);
+        assert.equal(saved.workspaceId, "local-docker://journal-test#main");
+        assert.match(saved.server.executableSha256, /^[a-f0-9]{64}$/);
+        assert.equal(saved.server.executableHashSemantics,
+          "entry_file_on_disk_at_first_capture_not_loaded_dependency_identity");
+        assert.ok(saved.elapsedMs >= 0);
+        assert.equal(saved.result.truncated, false);
+        assert.equal(saved.backendOrigin, "http://127.0.0.1:8000");
+        assert.ok(rows.every(({ info }) => (info.mode & 0o777) === 0o600 && info.nlink === 1));
+      }
+      const lines = host.stdout.trim().split("\n").map((line) => JSON.parse(line));
+      assert.equal(lines.length, 2);
+      assert.equal(host.stderr, "");
+    }
+    assert.equal((await lstat(journal)).mode & 0o777, 0o700);
+    assert.equal((await readEvents()).length, 4);
+  });
+});
+
+test("private retrieval journal disables capture and metadata omits private text", async () => {
+  await withRetrievalJournalFixture(async ({ journal, launch, readEvents }) => {
+    for (const env of [{ CORPUSWIRE_RETRIEVAL_LOG_DIR: "" }, { CORPUSWIRE_RETRIEVAL_LOG_MODE: "off" }]) {
+      const response = await launch(env).call(1);
+      assert.equal(response.result.isError, false);
+      await assert.rejects(lstat(journal), { code: "ENOENT" });
+    }
+    const host = launch({ CORPUSWIRE_RETRIEVAL_LOG_MODE: "metadata" });
+    const response = await host.call(1, "corpuswire_search", { query: "my baby has symptom private-fact" });
+    assert.equal(response.result.isError, false);
+    const [{ event }] = await readEvents();
+    assert.equal(event.mode, "metadata");
+    assert.equal(event.input.text, null);
+    assert.equal(event.result.text, null);
+    assert.doesNotMatch(JSON.stringify(event), /private-fact|symptom/);
+    assert.match(event.input.rawSha256, /^[a-f0-9]{64}$/);
+  });
+});
+
+test("private retrieval journal redacts credentials while preserving explicitly authorized health text", async () => {
+  await withRetrievalJournalFixture(async ({ launch, readEvents }) => {
+    const query = "my baby symptom; Bearer abc123token; Basic dXNlcjpwYXNz; token='secret with spaces'; "
+      + "https://user:privatepass@example.com/path; configured-secret; "
+      + "-----BEGIN PRIVATE KEY-----\nprivate material\n-----END PRIVATE KEY-----";
+    const host = launch({ CORPUSWIRE_BEARER_TOKEN: "configured-secret", CORPUSWIRE_BASIC_AUTH: "" });
+    const response = await host.call(1, "corpuswire_search", { query });
+    assert.equal(response.result.isError, false);
+    const [{ event }] = await readEvents();
+    assert.match(event.input.text, /my baby symptom/);
+    assert.equal(event.input.redacted, true);
+    const saved = JSON.stringify(event);
+    assert.doesNotMatch(saved, /abc123token|dXNlcjpwYXNz|secret with spaces|privatepass|configured-secret|private material/);
+    assert.match(saved, /REDACTED/);
+    assert.doesNotThrow(() => JSON.parse(event.result.text));
+    assert.equal(event.input.rawSha256, createHash("sha256").update(query).digest("hex"));
+    assert.notEqual(event.input.storedSha256, event.input.rawSha256);
+    assert.match(response.result.content[0].text, /configured-secret/);
+  });
+});
+
+test("private retrieval journal errors omit unsafe exception text and cannot change MCP errors", async () => {
+  await withRetrievalJournalFixture(async ({ root, launch, readEvents }) => {
+    const sdkPath = path.join(root, "throw-sdk.mjs");
+    await writeFile(sdkPath, 'export class CorpusWireClient { async queryRaw(){throw new Error("unsafe-error-private-material");} }');
+    const host = launch({ CORPUSWIRE_SDK_PATH: sdkPath });
+    const response = await host.call(1);
+    assert.equal(response.result.isError, true);
+    assert.match(response.result.content[0].text, /unsafe-error-private-material/);
+    const [{ event }] = await readEvents();
+    assert.equal(event.outcome, "error");
+    assert.equal(event.result.capture, "omitted_unsafe_error");
+    assert.equal(event.result.text, null);
+    assert.doesNotMatch(JSON.stringify(event), /unsafe-error-private-material/);
+  });
+});
+
+test("private retrieval journal rejects workspace, symlink, broad permissions, and existing unsafe contents", async () => {
+  await withRetrievalJournalFixture(async ({ root, workspace, journal, launch }) => {
+    const outside = path.join(root, "outside");
+    await mkdir(outside, { mode: 0o700 });
+    const alias = path.join(root, "alias");
+    await symlink(outside, alias);
+    const cases = [
+      { directory: path.join(workspace, "capture"), reason: "workspace_directory" },
+      { directory: alias, reason: "unsafe_directory" },
+      { directory: path.join(alias, "nested"), reason: "unsafe_directory" },
+    ];
+    await mkdir(journal, { mode: 0o755 });
+    await chmod(journal, 0o755);
+    cases.push({ directory: journal, reason: "unsafe_permissions" });
+    for (const { directory, reason } of cases) {
+      const host = launch({ CORPUSWIRE_RETRIEVAL_LOG_DIR: directory });
+      const response = await host.call(1);
+      assert.equal(response.result.isError, false);
+      assert.match(host.stderr, new RegExp(reason));
+      assert.doesNotMatch(host.stderr, new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assert.doesNotMatch(host.stdout, /private retrieval journal|capture skipped/);
+    }
+    assert.deepEqual(await readdir(outside), []);
+    await assert.rejects(lstat(path.join(workspace, "capture")), { code: "ENOENT" });
+    await chmod(journal, 0o700);
+    await symlink(path.join(root, "private-target"), path.join(journal, "cw-retrieval-malicious.json"));
+    const host = launch();
+    assert.equal((await host.call(2)).result.isError, false);
+    assert.match(host.stderr, /unsafe_contents/);
+  });
+});
+
+test("private retrieval journal bounds UTF8 bytes and shared event and disk quotas", async () => {
+  await withRetrievalJournalFixture(async ({ journal, launch, readEvents }) => {
+    const host = launch({ CORPUSWIRE_RETRIEVAL_LOG_MAX_INPUT_BYTES: "5",
+      CORPUSWIRE_RETRIEVAL_LOG_MAX_RESULT_BYTES: "17", CORPUSWIRE_RETRIEVAL_LOG_MAX_EVENTS: "2" });
+    for (let id = 1; id <= 3; id += 1) assert.equal((await host.call(id, "corpuswire_search", {
+      query: "🙂🙂🙂 unicode input",
+    })).result.isError, false);
+    const events = await readEvents();
+    assert.equal(events.length, 2);
+    for (const { event } of events) {
+      assert.equal(event.input.text, "🙂");
+      assert.ok(Buffer.byteLength(event.input.text) <= 5);
+      assert.ok(Buffer.byteLength(event.result.text) <= 17);
+      assert.equal(event.input.truncated, true);
+      assert.equal(event.result.truncated, true);
+      assert.doesNotMatch(event.input.text, /\uFFFD/);
+    }
+    assert.match(host.stderr, /capacity_reached/);
+    assert.equal(host.stderr.match(/capacity_reached/g).length, 1);
+    const tiny = launch({ CORPUSWIRE_RETRIEVAL_LOG_MAX_BYTES: "1" });
+    assert.equal((await tiny.call(4)).result.isError, false);
+    assert.match(tiny.stderr, /capacity_reached/);
+    assert.equal((await readEvents()).length, 2);
+    assert.equal((await readdir(journal)).length, 2);
+  });
+});
+
+test("private retrieval journal serializes races across independent MCP hosts", async () => {
+  await withRetrievalJournalFixture(async ({ launch, readEvents }) => {
+    const hosts = Array.from({ length: 5 }, () => launch({ CORPUSWIRE_RETRIEVAL_LOG_MAX_EVENTS: "3" }));
+    const responses = await Promise.all(hosts.map((host, i) => host.call(i + 1)));
+    assert.ok(responses.every((response) => response.result.isError === false));
+    const events = await readEvents();
+    assert.equal(events.length, 3);
+    assert.equal(new Set(events.map(({ event }) => event.eventId)).size, 3);
+    assert.ok(events.every(({ info }) => (info.mode & 0o777) === 0o600 && info.nlink === 1));
+  });
+});
+
+test("private retrieval journal records effective replay defaults and bounds source filters", async () => {
+  await withRetrievalJournalFixture(async ({ launch, readEvents }) => {
+    const host = launch({ CORPUSWIRE_TOP_K: "8", CORPUSWIRE_MAX_SEARCH_CHARS: "16000",
+      CORPUSWIRE_MIN_SCORE: "0.25", CORPUSWIRE_SELECTED_NEIGHBOR_POLICY: "selected-neighbor-v2",
+      CORPUSWIRE_SELECTED_HEADING_PREFIX: "unexpected", CORPUSWIRE_LOCAL_ONLY: "false" });
+    const filters = Array.from({ length: 40 }, (_, i) => `${i}-${"🙂".repeat(100)}`);
+    assert.equal((await host.call(1, "corpuswire_search", { query: "replay defaults", sourceFilter: filters })).result.isError, false);
+    const [{ event }] = await readEvents();
+    assert.equal(event.request.topK, 8);
+    assert.equal(event.request.maxChars, 16000);
+    assert.equal(event.request.minScore, 0.25);
+    assert.equal(event.profile.headingPrefix, false);
+    assert.equal(event.profile.localOnly, false);
+    assert.equal(event.profile.semantics, "configured_or_requested_not_delivery_proof");
+    assert.equal(event.request.sourceFilter.length, 32);
+    assert.ok(event.request.sourceFilter.every((value) => Buffer.byteLength(value) <= 256));
+    assert.equal(event.request.sourceFilterTruncated, true);
+    assert.equal(event.request.sourceFilterCount, 40);
+  });
+});
+
+test("private retrieval journal distinguishes requested profile from applied enhancement fallback", async () => {
+  await withRetrievalJournalFixture(async ({ launch, readEvents }) => {
+    const host = launch({ CORPUSWIRE_OUTPUT_MODE: " copilot ", CORPUSWIRE_LOCAL_ONLY: "false",
+      CORPUSWIRE_SELECTED_NEIGHBOR_POLICY: "selected-neighbor-v2", CORPUSWIRE_SOURCE_ROOT_COALESCING: "per-file-v1" });
+    assert.equal((await host.call(1, "corpuswire_enhance_prompt", { prompt: "Honest fallback metadata" })).result.isError, false);
+    const [{ event }] = await readEvents();
+    assert.equal(event.profile.outputMode, "copilot");
+    assert.equal(event.profile.localOnly, false);
+    assert.equal(event.profile.selectedNeighborPolicy, "selected-neighbor-v2");
+    assert.equal(event.deliveryBehavior.searchPostprocessingApplicable, false);
+    assert.equal(event.deliveryBehavior.selectedNeighborChangedResult, false);
+    assert.equal(event.deliveryBehavior.headingPrefixAdded, false);
+    assert.equal(event.deliveryBehavior.sourceRootCoalescingChangedResult, false);
+    assert.equal(event.deliveryBehavior.enhancementLocalFallback, true);
+    assert.equal(event.deliveryBehavior.enhancementLocalOnlyUsed, true);
+  });
 });
 
 async function writeMockSdk(tempDir) {

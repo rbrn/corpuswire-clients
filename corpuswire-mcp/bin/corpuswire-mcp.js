@@ -3,7 +3,7 @@
 import { execFile } from "node:child_process";
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
-import { constants as fsConstants, existsSync, watch as watchFileSystem } from "node:fs";
+import { constants as fsConstants, existsSync, watch as watchFileSystem, writeSync } from "node:fs";
 import { link, mkdir, readdir, readFile, realpath, rename, stat, lstat, open, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -2248,7 +2248,7 @@ async function handleRequest(method, params) {
     case "tools/list":
       return { tools: await listToolsWithPlugins() };
     case "tools/call":
-      return callTool(params);
+      return callToolWithRetrievalJournal(params);
     case "resources/list":
       return { resources: [] };
     case "prompts/list":
@@ -2275,7 +2275,260 @@ function initialize(params) {
   };
 }
 
-async function callTool(params) {
+// Private capture is independent of indexing and is never sent to the backend.
+// A shared directory lock serializes quota accounting across MCP processes.
+let retrievalJournalQueue = Promise.resolve();
+let retrievalJournalExecutableHash;
+const retrievalJournalWarnings = new Set();
+const RETRIEVAL_JOURNAL_PREFIX = "cw-retrieval-";
+
+function retrievalJournalWarn(reason) {
+  if (retrievalJournalWarnings.has(reason)) return;
+  retrievalJournalWarnings.add(reason);
+  try { writeSync(2, `CorpusWire private retrieval journal: ${reason}; capture skipped.\n`); }
+  catch { /* A closed diagnostic stream must never change a tool response. */ }
+}
+
+function retrievalJournalLimit(name, ceiling) {
+  const raw = process.env[`CORPUSWIRE_RETRIEVAL_LOG_${name}`];
+  if (raw === undefined) return ceiling;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1 || value > ceiling) {
+    throw new Error("invalid_limits");
+  }
+  return value;
+}
+
+function retrievalJournalDigest(value) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function retrievalJournalRedact(value) {
+  const secrets = [process.env.CORPUSWIRE_BEARER_TOKEN,
+    process.env.CORPUSWIRE_BASIC_AUTH].filter((item) => typeof item === "string" && item)
+    .flatMap((item) => [item, item.trim()]).filter(Boolean);
+  const basic = process.env.CORPUSWIRE_BASIC_AUTH?.trim();
+  if (basic) {
+    secrets.push(Buffer.from(basic).toString("base64"));
+    const separator = basic.indexOf(":");
+    if (separator >= 0 && basic.slice(separator + 1)) secrets.push(basic.slice(separator + 1));
+  }
+  let text = value;
+  for (const secret of secrets.sort((a, b) => b.length - a.length)) {
+    text = text.split(secret).join("[REDACTED CREDENTIAL]");
+  }
+  return redactCredentialText(text);
+}
+
+function retrievalJournalCapture(raw, limit, full, sanitized = undefined) {
+  const rawBytes = Buffer.byteLength(raw, "utf8");
+  if (!full) return { rawSha256: retrievalJournalDigest(raw), rawBytes,
+    capture: "metadata", text: null, truncated: false };
+  const redacted = sanitized ?? retrievalJournalRedact(raw);
+  const buffer = Buffer.from(redacted, "utf8");
+  let end = Math.min(buffer.length, limit);
+  // Do not split a multibyte UTF-8 codepoint at the storage boundary.
+  while (end < buffer.length && end > 0 && (buffer[end] & 0xc0) === 0x80) end -= 1;
+  const text = buffer.subarray(0, end).toString("utf8");
+  return { rawSha256: retrievalJournalDigest(raw), rawBytes,
+    redactedSha256: retrievalJournalDigest(redacted), storedSha256: retrievalJournalDigest(text),
+    redacted: redacted !== raw, redactedBytes: buffer.length, storedBytes: end,
+    capture: "full", text, truncated: end < buffer.length };
+}
+
+function retrievalJournalContains(root, target) {
+  const relative = path.relative(root, target);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`)
+    && relative !== ".." && !path.isAbsolute(relative));
+}
+
+async function retrievalJournalDirectory(target, args) {
+  if (!path.isAbsolute(target) || target.includes("\0")) throw new Error("unsafe_directory");
+  target = path.resolve(target);
+  const roots = [process.cwd(), process.env.CORPUSWIRE_SYNC_ROOT,
+    process.env.CORPUSWIRE_REPO_PATH, args.repoPath].filter((root) => typeof root === "string" && root);
+  for (const root of roots) {
+    const canonical = await realpath(root).catch(() => path.resolve(root));
+    if (retrievalJournalContains(canonical, target)) throw new Error("workspace_directory");
+  }
+  // Verify every ancestor rather than following an arbitrary symlink to a private
+  // destination. The last directory may be created; parents must already exist.
+  let current = path.parse(target).root;
+  for (const part of target.slice(current.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    if (current === target) {
+      try { await mkdir(current, { mode: 0o700 }); }
+      catch (error) { if (error?.code !== "EEXIST") throw error; }
+    }
+    const info = await lstat(current);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("unsafe_directory");
+  }
+  const info = await lstat(target);
+  const parent = await lstat(path.dirname(target));
+  const owned = (entry) => typeof process.getuid !== "function" || entry.uid === process.getuid();
+  if ((info.mode & 0o777) !== 0o700 || !owned(info)
+    || !owned(parent) || (parent.mode & 0o022) !== 0) throw new Error("unsafe_permissions");
+  return { target, device: info.dev, inode: info.ino };
+}
+
+async function retrievalJournalVerifyDirectory(directory) {
+  const info = await lstat(directory.target);
+  if (info.isSymbolicLink() || !info.isDirectory()
+    || info.dev !== directory.device || info.ino !== directory.inode
+    || (info.mode & 0o777) !== 0o700
+    || await realpath(directory.target) !== directory.target) throw new Error("directory_changed");
+}
+
+async function writeRetrievalJournal(params, result, startedAt, elapsedMs, observation) {
+  const mode = process.env.CORPUSWIRE_RETRIEVAL_LOG_MODE ?? "metadata";
+  if (mode !== "metadata" && mode !== "full") throw new Error("invalid_mode");
+  const limits = {
+    inputBytes: retrievalJournalLimit("MAX_INPUT_BYTES", 65536),
+    resultBytes: retrievalJournalLimit("MAX_RESULT_BYTES", 1048576),
+    events: retrievalJournalLimit("MAX_EVENTS", 10000),
+    bytes: retrievalJournalLimit("MAX_BYTES", 268435456),
+  };
+  const args = asRecord(params.arguments);
+  const directory = await retrievalJournalDirectory(process.env.CORPUSWIRE_RETRIEVAL_LOG_DIR, args);
+  const input = typeof (args.query ?? args.prompt) === "string" ? (args.query ?? args.prompt) : "";
+  const delivered = JSON.stringify(result ?? null);
+  let origin = "unavailable";
+  try { origin = new URL(process.env.CORPUSWIRE_BASE_URL ?? DEFAULT_BASE_URL).origin; } catch {}
+  const enumProfile = (value, allowed, fallback) => allowed.includes(value) ? value : fallback;
+  const full = mode === "full";
+  const safeOption = (read) => { try { return read(); } catch { return null; } };
+  const neighborPolicy = enumProfile(process.env.CORPUSWIRE_SELECTED_NEIGHBOR_POLICY || "selected-neighbor-v2",
+    ["off", "selected-neighbor-v1", "selected-neighbor-v2"], "off");
+  const sourceFilter = safeOption(() => optionalStringArray(args, "sourceFilter")) ?? [];
+  const storedSourceFilter = full ? sourceFilter.slice(0, 32)
+    .map((value) => retrievalJournalCapture(value, 256, true)) : [];
+  retrievalJournalExecutableHash ??= await readFile(new URL(import.meta.url))
+    .then((bytes) => createHash("sha256").update(bytes).digest("hex"));
+  const event = {
+    schemaVersion: "corpuswire-private-retrieval/v1", eventId: randomUUID(),
+    server: {
+      name: SERVER_NAME, version: SERVER_VERSION,
+      executableSha256: retrievalJournalExecutableHash,
+      executableHashSemantics: "entry_file_on_disk_at_first_capture_not_loaded_dependency_identity",
+    }, tool: params.name,
+    startedAt, completedAt: new Date().toISOString(), elapsedMs,
+    workspaceId: retrievalJournalRedact(String(args.workspaceId ?? process.env.CORPUSWIRE_WORKSPACE_ID ?? "")).slice(0, 1024),
+    backendOrigin: retrievalJournalRedact(origin), mode, limits,
+    profile: {
+      semantics: "configured_or_requested_not_delivery_proof",
+      outputMode: safeOption(() => readOutputMode(args.outputMode ?? process.env.CORPUSWIRE_OUTPUT_MODE ?? DEFAULT_OUTPUT_MODE)),
+      localOnly: safeOption(() => optionalBoolean(args.localOnly ?? process.env.CORPUSWIRE_LOCAL_ONLY, true)),
+      selectedNeighborPolicy: neighborPolicy,
+      headingPrefix: neighborPolicy === "selected-neighbor-v2"
+        && (process.env.CORPUSWIRE_SELECTED_HEADING_PREFIX ?? "true") === "true",
+      sourceRootCoalescing: neighborPolicy === "selected-neighbor-v2"
+        && process.env.CORPUSWIRE_SOURCE_ROOT_COALESCING === "per-file-v1",
+    },
+    deliveryBehavior: {
+      searchPostprocessingApplicable: params.name === "corpuswire_search",
+      selectedNeighborChangedResult: params.name === "corpuswire_search" ? "unknown" : false,
+      headingPrefixAdded: params.name === "corpuswire_search" ? "unknown" : false,
+      sourceRootCoalescingChangedResult: params.name === "corpuswire_search" ? "unknown" : false,
+      enhancementLocalFallback: observation.enhancementLocalFallback ?? "unknown",
+      enhancementLocalOnlyUsed: observation.enhancementLocalOnlyUsed ?? "unknown",
+    },
+    // Only scalar retrieval options are retained; never arbitrary extra fields.
+    request: {
+      topK: safeOption(() => optionalPositiveInteger(args.topK ?? process.env.CORPUSWIRE_TOP_K, DEFAULT_TOP_K)),
+      minScore: safeOption(() => optionalScore(args.minScore ?? process.env.CORPUSWIRE_MIN_SCORE)) ?? null,
+      maxChars: params.name === "corpuswire_search" ? safeOption(() => Math.min(Math.max(
+        optionalPositiveInteger(args.maxChars ?? process.env.CORPUSWIRE_MAX_SEARCH_CHARS, 12000), 200), 50000)) : null,
+      repoPath: full ? retrievalJournalCapture(String(args.repoPath ?? process.env.CORPUSWIRE_REPO_PATH ?? ""), 1024, true) : null,
+      sourceFilter: storedSourceFilter.map((capture) => capture.text),
+      sourceFilterCount: sourceFilter.length,
+      sourceFilterSha256: retrievalJournalDigest(JSON.stringify(sourceFilter)),
+      sourceFilterTruncated: full && (sourceFilter.length > 32 || storedSourceFilter.some((capture) => capture.truncated)),
+    },
+    outcome: result?.isError || !result ? "error" : "success",
+    input: retrievalJournalCapture(input, limits.inputBytes, full),
+    result: result?.isError || !result
+      ? { rawSha256: retrievalJournalDigest(delivered), rawBytes: Buffer.byteLength(delivered),
+          capture: "omitted_unsafe_error", text: null, truncated: false }
+      : retrievalJournalCapture(delivered, limits.resultBytes, full, full
+        ? JSON.stringify(result, (key, value) => /^(?:password|secret|api[_ -]?key|token|authorization)$/i.test(key)
+          ? "[REDACTED]" : typeof value === "string" ? retrievalJournalRedact(value) : value)
+        : undefined),
+  };
+  const body = `${JSON.stringify(event)}\n`;
+  const bytes = Buffer.byteLength(body);
+  if (bytes > 8 * 1024 * 1024 || bytes > limits.bytes) throw new Error("capacity_reached");
+  const lockPath = path.join(directory.target, ".cw-retrieval.lock");
+  let lock;
+  let file;
+  let temporary;
+  try {
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      await retrievalJournalVerifyDirectory(directory);
+      try {
+        lock = await open(lockPath, fsConstants.O_WRONLY | fsConstants.O_CREAT
+          | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+        break;
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+        if (attempt === 24) throw new Error("directory_busy");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    await lock.chmod(0o600);
+    let count = 0, used = 0;
+    const names = await readdir(directory.target);
+    if (names.length > limits.events + 2) throw new Error("capacity_reached");
+    for (const name of names) {
+      if (name === ".cw-retrieval.lock") continue;
+      const info = await lstat(path.join(directory.target, name));
+      if (!name.startsWith(RETRIEVAL_JOURNAL_PREFIX) || !name.endsWith(".json")
+        || !info.isFile() || info.isSymbolicLink() || info.nlink !== 1
+        || (info.mode & 0o777) !== 0o600) throw new Error("unsafe_contents");
+      count += 1; used += info.size;
+    }
+    if (count >= limits.events || used + bytes > limits.bytes) throw new Error("capacity_reached");
+    await retrievalJournalVerifyDirectory(directory);
+    temporary = path.join(directory.target, `.cw-retrieval-${event.eventId}.tmp`);
+    file = await open(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT
+      | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    await file.chmod(0o600);
+    await file.writeFile(body, "utf8");
+    await file.close(); file = null;
+    await retrievalJournalVerifyDirectory(directory);
+    const destination = path.join(directory.target, `${RETRIEVAL_JOURNAL_PREFIX}${event.eventId}.json`);
+    await link(temporary, destination);
+  } finally {
+    if (file) await file.close().catch(() => {});
+    if (temporary) await unlink(temporary).catch(() => {});
+    if (lock) {
+      await lock.close().catch(() => {});
+      await unlink(lockPath).catch(() => {});
+    }
+  }
+}
+
+async function callToolWithRetrievalJournal(params) {
+  if (!process.env.CORPUSWIRE_RETRIEVAL_LOG_DIR
+    || process.env.CORPUSWIRE_RETRIEVAL_LOG_MODE === "off"
+    || !["corpuswire_search", "corpuswire_enhance_prompt"].includes(params.name)) return callTool(params);
+  const startedAt = new Date().toISOString(), started = process.hrtime.bigint();
+  let result;
+  const observation = {};
+  try { result = await callTool(params, observation); return result; }
+  finally {
+    const elapsedMs = searchTimingMs(started);
+    const next = retrievalJournalQueue.then(() => writeRetrievalJournal(params, result, startedAt, elapsedMs, observation))
+      .catch((error) => {
+        const safeReasons = ["invalid_limits", "invalid_mode", "unsafe_directory", "workspace_directory",
+          "unsafe_permissions", "directory_changed", "capacity_reached", "directory_busy", "unsafe_contents"];
+        retrievalJournalWarn(safeReasons.includes(error?.message) ? error.message : "write_failed");
+      });
+    retrievalJournalQueue = next;
+    await next;
+  }
+}
+
+async function callTool(params, observation = undefined) {
   const name = params.name;
   if (typeof name !== "string" || !name.trim()) {
     throw new JsonRpcError(-32602, "Invalid params: tool name is required.");
@@ -2315,7 +2568,7 @@ async function callTool(params) {
   }
   if (name === "corpuswire_enhance_prompt") {
     try {
-      return textToolResult(await enhancePrompt(args));
+      return textToolResult(await enhancePrompt(args, observation));
     } catch (error) {
       const message = formatToolError(error, "enhancement request");
       const reportPath = await reportToolFailureSafely(name, args, error);
@@ -5746,7 +5999,7 @@ function indentSnippet(text) {
     .join("\n");
 }
 
-async function enhancePrompt(args) {
+async function enhancePrompt(args, observation = undefined) {
   const prompt = requiredString(args, "prompt");
   const outputMode = readOutputMode(args.outputMode ?? process.env.CORPUSWIRE_OUTPUT_MODE ?? DEFAULT_OUTPUT_MODE);
   const topK = optionalPositiveInteger(args.topK ?? process.env.CORPUSWIRE_TOP_K, DEFAULT_TOP_K);
@@ -5770,6 +6023,10 @@ async function enhancePrompt(args) {
     sourceFilter,
   };
   const { result, usedLocalFallback } = await enhanceWithLocalFallback(client, request);
+  if (observation) {
+    observation.enhancementLocalFallback = usedLocalFallback;
+    observation.enhancementLocalOnlyUsed = usedLocalFallback || localOnly;
+  }
 
   const enhancedPrompt = resolveEnhancedPrompt(result);
   if (!enhancedPrompt) {
@@ -6154,15 +6411,20 @@ async function writeRetrievalFailureReportSafely(report) {
   }
 }
 
+function redactCredentialText(value) {
+  return value
+    .replace(/-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )?PRIVATE KEY-----|$)/gi, "[REDACTED PRIVATE KEY]")
+    .replace(/\b((?:Bearer|Basic)\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1[REDACTED]")
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{16,})\b/gi, "[REDACTED TOKEN]")
+    .replace(/\b(password|secret|api[_ -]?key|token|authorization)["']?\s*[:=]\s*(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s,;]+)/gi, "$1=[REDACTED]")
+    .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1[REDACTED]@");
+}
+
 function diagnosticQueryFields(value) {
   const raw = optionalString(value) ?? "";
   const sha256 = raw ? createHash("sha256").update(raw, "utf8").digest("hex") : null;
   const privateContent = /\b(patient|diagnos(?:is|ed)|symptom|medication|prescription|medical history|date of birth|passport|social security|health record|my child|my baby)\b/i.test(raw);
-  let query = raw
-    .replace(/-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
-    .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1[REDACTED]")
-    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{16,})\b/gi, "[REDACTED TOKEN]")
-    .replace(/\b(password|secret|api[_ -]?key|token|authorization)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]")
+  let query = redactCredentialText(raw)
     .replace(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/g, "[REDACTED EMAIL]")
     .replace(/\+?\d[\d().\s-]{7,}\d/g, "[REDACTED PHONE]")
     .trim()
