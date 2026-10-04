@@ -15,7 +15,9 @@ From any repository folder:
 ```bash
 corpuswire init                 # Save reusable, secret-free local workspace settings
 corpuswire doctor               # Read-only readiness and inventory checks
-corpuswire                      # Index this folder using its saved settings
+corpuswire                      # Index, then watch this folder until Ctrl+C
+corpuswire --once               # Index once and exit (for scripts)
+corpuswire watch                # Explicit persistent watch, including non-TTY use
 corpuswire reconcile            # Explicit full reconciliation, with preview/confirmation
 corpuswire --help                # Show supported commands without indexing
 ```
@@ -24,7 +26,9 @@ corpuswire --help                # Show supported commands without indexing
 credentials, register a new MCP server, or replace existing editor/MCP settings.
 `init --index --verify` also indexes and checks readiness. Bare local invocation
 runs the normal full-index preview and indexing without another confirmation;
-explicit `index`/`reconcile` retain the existing confirmation unless `--yes` is
+in an interactive terminal it then watches for source changes. Piped/non-TTY bare
+calls, `--once`, and explicit `index`/`reconcile` remain one-shot; explicit
+`watch` or `--watch` stays open in either environment. Explicit `index`/`reconcile` retain the existing confirmation unless `--yes` is
 provided. Hosted upload and collection rebuild are never implicitly enabled.
 
 Existing workspace identities, include/exclude filters and file-size limits are
@@ -98,7 +102,7 @@ npm pack ./corpuswire-sdk --pack-destination /tmp/corpuswire-snapshot
 npm pack ./corpuswire-cli --pack-destination /tmp/corpuswire-snapshot
 npm install --prefix /tmp/corpuswire-install \
   /tmp/corpuswire-snapshot/corpuswire-sdk-0.1.3.tgz \
-  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.4-beta.1.tgz
+  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.4-beta.2.tgz
 /tmp/corpuswire-install/node_modules/.bin/corpuswire --version
 ```
 
@@ -223,6 +227,35 @@ Stream machine-readable progress or follow an existing session:
 corpuswire index --yes --non-interactive --ndjson --trace
 corpuswire index --attach 8a4f... --api-base-url http://127.0.0.1:18080
 ```
+
+## Automatic watching
+
+Run `corpuswire` in the repository terminal and leave it open while you edit.
+The initial full reconciliation is followed by native filesystem notifications,
+a 500 ms quiet-edit delay, and a complete content scan every 10 seconds as a
+fallback for missed events. Change these with `--debounce-ms` and `--poll-ms`.
+Unchanged eligible content makes no backend requests. Actual changes publish a
+complete filtered inventory; the backend requests only changed file uploads and
+removes deleted eligible paths after verification. At most one cycle runs at a
+time, with edits during indexing queued for the next cycle.
+
+Watching respects existing file selection, credentials and workspace identity.
+It does not recreate collections or broaden access. Root replacement, changed
+workspace/service/filters/credentials, authentication rejection, unverified
+completion or detached work stops the watcher with an error. Transient scan or
+network failures retry at most three times; the last verified digest remains
+unchanged. Continuous edits defer publication until a stable scan is possible.
+A local filesystem is not an atomic snapshot; a later edit can race publication,
+but notifications and periodic scans converge to the next stable inventory.
+
+Ctrl+C or SIGTERM closes the watcher and cancels this process's active indexing;
+it does not cancel another process's session. A second interrupt can detach.
+Watch HTTP requests have a 30-second deadline, including response-body reads.
+The first interrupt cancels read-only preflight immediately, while mutation
+requests let the SDK identify and cancel its own session. A second interrupt
+can abort the transport; the backend may still need verification afterward.
+Use `corpuswire doctor` to check readiness. `watch --ndjson` includes structured
+`watch-progress/v1` lifecycle records alongside normal index progress.
 
 ## Ingestion And Update Behavior
 
