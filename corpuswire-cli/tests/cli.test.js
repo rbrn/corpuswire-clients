@@ -309,7 +309,7 @@ test("main indexes the current folder with no arguments after printing the previ
 test("main prints the installed CLI version offline for command and flags", async () => {
   const metadata = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const lock = JSON.parse(await readFile(new URL("../package-lock.json", import.meta.url), "utf8"));
-  assert.equal(metadata.version, "0.1.4-beta.3");
+  assert.equal(metadata.version, "0.1.4-beta.4");
   assert.deepEqual(metadata.bin, { cw: "bin/corpuswire.js" });
   assert.equal(lock.version, metadata.version);
   assert.equal(lock.packages[""].version, metadata.version);
@@ -322,7 +322,7 @@ test("main prints the installed CLI version offline for command and flags", asyn
       fetchFn: () => { throw new Error("Version must not contact the backend"); },
       sdk: { CorpusWireClient: class { constructor() { throw new Error("Version must not load a client"); } } },
     });
-    assert.deepEqual(writes, ["0.1.4-beta.3"]);
+    assert.deepEqual(writes, ["0.1.4-beta.4"]);
   }
   const help = [];
   await main(["--help"], { write: (line) => help.push(line) });
@@ -795,6 +795,26 @@ test("progress formatting preserves unknown denominators, ETA confidence, heartb
   assert.match(line, /eta 12\.0s \(low\)/);
   assert.match(line, /heartbeat active/);
   assert.equal(sanitizeTerminalText(unknown.message).includes("secret-value"), false);
+});
+
+test("phase percentages advance independently of file-level progress", () => {
+  const event = progressEvent(1, "embedding", 89.1, "running");
+  event.phase_total = 1455;
+  event.phase_completed = 580;
+  assert.match(formatProgressLine(event), /phase 39\.9%/);
+  assert.match(formatProgressLine(event), /overall 89\.1%/);
+  event.phase_completed = 744;
+  assert.match(formatProgressLine(event), /phase 51\.1%/);
+  assert.match(formatProgressLine(event), /overall 89\.1%/);
+  event.phase_completed = 1455;
+  assert.match(formatProgressLine(event), /phase 100\.0%/);
+  assert.match(formatProgressLine(event), /overall 89\.1%/);
+  for (const [completed, total] of [[0, null], [0, 0], [1, -1], [NaN, 1455], [Infinity, 1455], [-1, 1455], [1456, 1455], [1, Infinity], ["744", 1455]]) {
+    const invalid = formatProgressLine({ ...event, phase_completed: completed, phase_total: total });
+    assert.match(invalid, /phase \[indeterminate\]/);
+    assert.match(invalid, /overall 89\.1%/);
+    assert.doesNotMatch(invalid, /phase (?:NaN|Infinity|100\.0)%/);
+  }
 });
 
 test("progress renderer emits verified 100 percent exactly once", () => {

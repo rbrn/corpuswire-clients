@@ -24,7 +24,7 @@ const INDEX_TRACE_STAGES = new Set([
   "filtering_hashing", "parsing_chunking", "model_wait", "embedding_batch",
   "vector_writes", "cleanup", "total",
 ]);
-const CLI_VERSION = "0.1.4-beta.3";
+const CLI_VERSION = "0.1.4-beta.4";
 
 export function printHelp(write = console.log) {
   write(`cw
@@ -1573,9 +1573,15 @@ export function createProgressRenderer({ write, writeRaw, isTTY, ndjson }) {
 
 export function formatProgressLine(event) {
   const overall = numericPercent(event.overall_percent);
-  const progressLabel = overall === null
-    ? "[indeterminate]"
-    : `${progressBar(overall)} ${overall.toFixed(1)}%`;
+  const phase = Number.isSafeInteger(event.phase_completed) && event.phase_completed >= 0
+    && Number.isSafeInteger(event.phase_total) && event.phase_total > 0
+    && event.phase_completed <= event.phase_total
+    ? (event.phase_completed / event.phase_total) * 100
+    : null;
+  const progressLabel = phase === null
+    ? "phase [indeterminate]"
+    : `${progressBar(phase)} phase ${phase.toFixed(1)}%`;
+  const overallLabel = overall === null ? "overall [indeterminate]" : `overall ${overall.toFixed(1)}%`;
   const work = event.phase_total === null || event.phase_total === undefined
     ? `${event.phase_completed ?? 0} ${event.unit ?? "items"}`
     : `${event.phase_completed ?? 0}/${event.phase_total} ${event.unit ?? "items"}`;
@@ -1587,7 +1593,7 @@ export function formatProgressLine(event) {
     : " eta -- (unknown)";
   const heartbeat = event.active_heartbeat || event.heartbeat ? " heartbeat active" : "";
   return sanitizeTerminalText(
-    `${event.phase} ${progressLabel} elapsed ${formatDuration(event.elapsed_ms)} `
+    `${event.phase} ${progressLabel} ${overallLabel} elapsed ${formatDuration(event.elapsed_ms)} `
     + `phase ${formatDuration(event.phase_elapsed_ms)} ${work}${throughput} `
     + `queue ${event.queue_depth ?? 0} retries ${event.retries ?? 0}${eta}${heartbeat}`,
   );

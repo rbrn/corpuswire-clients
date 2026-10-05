@@ -301,9 +301,13 @@ Default output is compact and human-readable:
 - `index-events` prints one line per event with timestamp, status, operation,
   source, and counts.
 - `index-activity` prints freshness fields.
-- `index` shows a live TTY bar with phase, defensible percentage, elapsed and
-  phase time, work units, throughput, queue depth, retries, ETA confidence, and
-  heartbeat. Redirected output uses line-oriented updates; `--ndjson` emits the
+- `index` shows a live TTY bar for the current phase, its completion percentage,
+  a separately labeled file-based overall percentage, elapsed and phase time,
+  work units, throughput, queue depth, retries, ETA confidence, and heartbeat.
+  For example, `580/1455 chunks` means `phase 39.9%` during embedding; an
+  unchanged `overall 89.1%` counts completed file decisions and can remain fixed
+  while a file is embedding. Unknown or zero phase totals are indeterminate.
+  A phase reaching 100% is separate from verified overall completion. Redirected output uses line-oriented updates; `--ndjson` emits the
   same semantic events as JSON records.
 
 Use `--json` when another process needs the full backend envelope.
