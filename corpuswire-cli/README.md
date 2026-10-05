@@ -1,4 +1,4 @@
-# `corpuswire`
+# `cw`
 
 Node.js CLI for CorpusWire health checks, semantic search, prompt enhancement,
 and observable workspace indexing. It delegates typed HTTP behavior to
@@ -13,13 +13,14 @@ The Node CLI defaults to the existing local Docker service at
 From any repository folder:
 
 ```bash
-corpuswire init                 # Save reusable, secret-free local workspace settings
-corpuswire doctor               # Read-only readiness and inventory checks
-corpuswire                      # Index, then watch this folder until Ctrl+C
-corpuswire --once               # Index once and exit (for scripts)
-corpuswire watch                # Explicit persistent watch, including non-TTY use
-corpuswire reconcile            # Explicit full reconciliation, with preview/confirmation
-corpuswire --help                # Show supported commands without indexing
+cw init                 # Save reusable, secret-free local workspace settings
+cw doctor               # Read-only readiness and inventory checks
+cw                      # Index, then watch this folder until Ctrl+C
+cw --once               # Index once and exit (for scripts)
+cw watch                # Explicit persistent watch, including non-TTY use
+cw reconcile            # Explicit full reconciliation, with preview/confirmation
+cw --help               # Show supported commands without indexing
+cw version              # Show this CLI's version without contacting the service
 ```
 
 `init` configures the CLI workspace; it does not install Docker, create service
@@ -42,16 +43,28 @@ On macOS, the existing OS keychain is an additional fallback. No token is writte
 into workspace settings. A new folder still requires authorization from the local
 service; a scope error is reported rather than bypassed.
 
-The Python management package also installs a binary named `corpuswire`.
-Check `command -v corpuswire` and `corpuswire --help` if the commands shown do
-not match this interface. Versions before this Node beta may lack these
-commands. `corpuswire_doctor` remains an MCP tool, not a shell executable.
+The Node CLI executable is `cw`; the Python management CLI remains `corpuswire`.
+They can coexist, including in an activated Python virtual environment. Check
+`type -a cw`, `cw --version`, and `cw --help` to confirm the intended Node
+installation. `version`, `--version`, and `-V` report the Node CLI version
+offline; they do not report the Docker backend version. `corpuswire_doctor`
+remains an MCP tool, not a shell executable.
+
+If startup reports `CorpusWire API unavailable`, the error names the resolved
+service URL. Start Docker Desktop and your existing CorpusWire service for a
+loopback URL, then run `cw doctor`. The CLI connects to that existing
+service; it does not start Docker or create containers. An unexpected URL can
+come from `CORPUSWIRE_BASE_URL`, workspace `.vscode/settings.json`,
+`.vscode/mcp.json` or `.mcp.json`, or the CorpusWire user profile. Inspect those
+settings or explicitly select the intended service with `--api-base-url <url>`.
+Authentication rejections retain their separate HTTP errors.
 
 The CLI supports:
 
 - `init` for idempotent local workspace configuration.
 - `doctor` for read-only service, authorization and verified inventory readiness.
 - `health` for backend and active index status.
+- `version` (or `--version` / `-V`) for the installed CLI version, offline.
 - `search` and `query` for `POST /query` retrieval.
 - `enhance` or a bare prompt for `POST /v1/enhance`.
 - `index-events` for `GET /v1/index/events`.
@@ -59,7 +72,7 @@ The CLI supports:
 - `index` and `reconcile` for previewed, confirmed workspace indexing with live
   `index-progress/v1` output.
 
-`corpuswire index` defaults the source root to the current folder. It resolves
+`cw index` defaults the source root to the current folder. It resolves
 the destination from explicit flags, workspace settings, user profile settings,
 or a stable `local-docker://<folder-slug>#main` folder identity. It scans and
 hashes locally, asks the backend for a read-only manifest preview, and prints the
@@ -88,7 +101,7 @@ cd /path/to/corpuswire-clients/corpuswire-cli
 npm install
 ```
 
-Run the local executable:
+Run the source-tree executable:
 
 ```bash
 node ./bin/corpuswire.js health
@@ -102,8 +115,8 @@ npm pack ./corpuswire-sdk --pack-destination /tmp/corpuswire-snapshot
 npm pack ./corpuswire-cli --pack-destination /tmp/corpuswire-snapshot
 npm install --prefix /tmp/corpuswire-install \
   /tmp/corpuswire-snapshot/corpuswire-sdk-0.1.3.tgz \
-  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.4-beta.2.tgz
-/tmp/corpuswire-install/node_modules/.bin/corpuswire --version
+  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.4-beta.3.tgz
+/tmp/corpuswire-install/node_modules/.bin/cw --version
 ```
 
 Run tests:
@@ -155,14 +168,14 @@ Avoid storing Basic Auth values or bearer tokens in shell history.
 Check the backend:
 
 ```bash
-node ./bin/corpuswire.js health
-node ./bin/corpuswire.js health --workspace-id github://rbrn/corpuswire#main --json
+cw health
+cw health --workspace-id github://rbrn/corpuswire#main --json
 ```
 
 Search an already indexed workspace:
 
 ```bash
-node ./bin/corpuswire.js search "where is remote indexing committed?" \
+cw search "where is remote indexing committed?" \
   --workspace-id github://rbrn/corpuswire#main \
   --top-k 5
 ```
@@ -170,7 +183,7 @@ node ./bin/corpuswire.js search "where is remote indexing committed?" \
 Enhance a prompt:
 
 ```bash
-node ./bin/corpuswire.js enhance "document the VS Code index watcher" \
+cw enhance "document the VS Code index watcher" \
   --workspace-id github://rbrn/corpuswire#main \
   --output-mode claude-code
 ```
@@ -178,14 +191,14 @@ node ./bin/corpuswire.js enhance "document the VS Code index watcher" \
 Use the bare prompt shorthand:
 
 ```bash
-node ./bin/corpuswire.js "fix stale remote search results" \
+cw "fix stale remote search results" \
   --workspace-id github://rbrn/corpuswire#main
 ```
 
 Inspect recent indexing events:
 
 ```bash
-node ./bin/corpuswire.js index-events \
+cw index-events \
   --workspace-id github://rbrn/corpuswire#main \
   --status completed \
   --limit 10
@@ -194,7 +207,7 @@ node ./bin/corpuswire.js index-events \
 Inspect freshness activity:
 
 ```bash
-node ./bin/corpuswire.js index-activity \
+cw index-activity \
   --workspace-id github://rbrn/corpuswire#main
 ```
 
@@ -202,7 +215,7 @@ Preview and index the current folder against a local service:
 
 ```bash
 cd /path/to/reviewed-workspace
-corpuswire index \
+cw index \
   --profile local \
   --api-base-url http://127.0.0.1:18080 \
   --workspace-id local-docker://reviewed-workspace#main \
@@ -224,13 +237,13 @@ second confirmation; non-interactive rebuilds must also pass
 Stream machine-readable progress or follow an existing session:
 
 ```bash
-corpuswire index --yes --non-interactive --ndjson --trace
-corpuswire index --attach 8a4f... --api-base-url http://127.0.0.1:18080
+cw index --yes --non-interactive --ndjson --trace
+cw index --attach 8a4f... --api-base-url http://127.0.0.1:18080
 ```
 
 ## Automatic watching
 
-Run `corpuswire` in the repository terminal and leave it open while you edit.
+Run `cw` in the repository terminal and leave it open while you edit.
 The initial full reconciliation is followed by native filesystem notifications,
 a 500 ms quiet-edit delay, and a complete content scan every 10 seconds as a
 fallback for missed events. Change these with `--debounce-ms` and `--poll-ms`.
@@ -254,7 +267,7 @@ Watch HTTP requests have a 30-second deadline, including response-body reads.
 The first interrupt cancels read-only preflight immediately, while mutation
 requests let the SDK identify and cancel its own session. A second interrupt
 can abort the transport; the backend may still need verification afterward.
-Use `corpuswire doctor` to check readiness. `watch --ndjson` includes structured
+Use `cw doctor` to check readiness. `watch --ndjson` includes structured
 `watch-progress/v1` lifecycle records alongside normal index progress.
 
 ## Ingestion And Update Behavior

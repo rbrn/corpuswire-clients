@@ -14,8 +14,8 @@ import { canonicalCoalescingDeliveryComplete, planSourceRootCoalescing } from ".
 const JSONRPC_VERSION = "2.0";
 const PROTOCOL_VERSION = "2024-11-05";
 const SERVER_NAME = "corpuswire-context-engine";
-const SERVER_VERSION = "0.1.4-beta.1";
-const DEFAULT_BASE_URL = "http://127.0.0.1:8000";
+const SERVER_VERSION = "0.1.4-beta.2";
+const DEFAULT_BASE_URL = "http://127.0.0.1:18080";
 const DEFAULT_OUTPUT_MODE = "generic";
 const DEFAULT_TOP_K = 5;
 const DEFAULT_SYNC_DEBOUNCE_MS = 1000;
@@ -161,6 +161,11 @@ const SAFE_INDEXABLE_PATHS = new Set([".vscode/mcp.json.example"]);
 const CONFIG_EXAMPLE_SUFFIXES = new Set([".json.example"]);
 
 const execFileAsync = promisify(execFile);
+// Version inspection must work without credentials, an SDK, or a running API.
+if (process.argv.length === 3 && ["version", "--version", "-V"].includes(process.argv[2])) {
+  process.stdout.write(`${SERVER_VERSION}\n`);
+  process.exit(0);
+}
 const sdk = await loadSdk();
 
 class JsonRpcError extends Error {
@@ -2603,6 +2608,9 @@ async function callTool(params, observation = undefined) {
       return textToolResult(formatToolError(error, "value rollup request"), true);
     }
   }
+  if (name === "corpuswire_version") {
+    return textToolResult(JSON.stringify(await versionInfo(args), null, 2));
+  }
   if (name === "corpuswire_health") {
     try {
       return textToolResult(await health());
@@ -3193,6 +3201,17 @@ function toolDefinitions() {
           days: { type: "integer", minimum: 1, maximum: 3650, default: 30 },
           workspaceId: { type: "string" },
           hourlyRate: { type: "number", minimum: 0 },
+        },
+      },
+    },
+    {
+      name: "corpuswire_version",
+      description: "Identify this running MCP client independently of backend availability. Optionally check the backend version with one read-only health request capped at five seconds.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          checkBackend: { type: "boolean", default: false },
         },
       },
     },
@@ -4896,6 +4915,40 @@ async function searchContext(args) {
       await writePrivateSearchTelemetrySafely(telemetry, totalHandlerMs, outcome);
     }
   }
+}
+
+async function versionInfo(args) {
+  const checkBackend = optionalBoolean(args.checkBackend, false);
+  let origin = null;
+  try { origin = new URL(process.env.CORPUSWIRE_BASE_URL ?? DEFAULT_BASE_URL).origin; } catch {}
+  const result = {
+    schemaVersion: "corpuswire-version/v1",
+    mcp: { name: SERVER_NAME, version: SERVER_VERSION, protocolVersion: PROTOCOL_VERSION },
+    nodeVersion: process.version,
+    backend: { origin, status: "not_checked", version: null },
+  };
+  if (!checkBackend) return result;
+  try {
+    const policy = resolveBackendPolicy();
+    const response = await fetch(`${policy.baseUrl.replace(/\/+$/, "")}/health`, {
+      headers: corpuswireHttpHeaders(),
+      redirect: "error",
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) {
+      result.backend.status = [401, 403].includes(response.status) ? "authentication_rejected" : "http_error";
+      await response.body?.cancel();
+      return result;
+    }
+    const payload = await response.json();
+    const version = payload?.version ?? payload?.build?.version;
+    result.backend.status = payload?.ok === true ? "available" : "unhealthy";
+    result.backend.version = typeof version === "string" && /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}$/.test(version)
+      ? version : null;
+  } catch (error) {
+    result.backend.status = error instanceof JsonRpcError ? "configuration_error" : "unavailable";
+  }
+  return result;
 }
 
 async function health() {

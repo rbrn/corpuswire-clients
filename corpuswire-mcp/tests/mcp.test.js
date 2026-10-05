@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { createHash } from "node:crypto";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -19,6 +20,105 @@ const VENDORED_SDK_INDEX = new URL(
   "../vendor/corpuswire-sdk/dist/index.js",
   import.meta.url,
 );
+
+test("MCP version flags work offline before SDK loading through both entrypoints", async () => {
+  const expected = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).version;
+  for (const entrypoint of [SERVER_BIN, WRAPPER_BIN]) {
+    for (const argument of ["version", "--version", "-V"]) {
+      const child = spawn("node", [entrypoint, argument], {
+        env: { ...process.env, CORPUSWIRE_SDK_PATH: "/missing-sdk-for-offline-version.mjs", CORPUSWIRE_BASE_URL: "invalid" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "", stderr = "";
+      child.stdout.on("data", (data) => { stdout += data; });
+      child.stderr.on("data", (data) => { stderr += data; });
+      const code = await new Promise((resolve, reject) => {
+        child.once("error", reject);
+        child.once("close", resolve);
+      });
+      assert.equal(code, 0, stderr);
+      assert.equal(stdout.trim(), expected);
+      assert.equal(stderr, "");
+    }
+  }
+});
+
+test("MCP version tool preserves client identity offline and uses the local Docker default", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cw-version-offline-"));
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(root);
+    for (const entrypoint of [SERVER_BIN, WRAPPER_BIN]) {
+      const env = { ...process.env, CORPUSWIRE_SDK_PATH: sdkPath, MOCK_REQUESTS_PATH: requestsPath,
+        CORPUSWIRE_SYNC_ENABLED: "false", CORPUSWIRE_RETRIEVAL_LOG_DIR: "" };
+      delete env.CORPUSWIRE_BASE_URL;
+      const child = spawn("node", [entrypoint], { env, stdio: ["pipe", "pipe", "pipe"] });
+      const rpc = createRpc(child);
+      try {
+        const initialize = await rpc({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+        const result = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "corpuswire_version", arguments: {} } });
+        assert.equal(result.result.isError, false);
+        const info = JSON.parse(result.result.content[0].text);
+        assert.equal(info.schemaVersion, "corpuswire-version/v1");
+        assert.equal(info.mcp.version, initialize.result.serverInfo.version);
+        assert.deepEqual(info.backend, { origin: "http://127.0.0.1:18080", status: "not_checked", version: null });
+        assert.match(info.nodeVersion, /^v\d+\./);
+        assert.equal(await readFile(requestsPath, "utf8"), "");
+      } finally { child.kill(); }
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("MCP version tool distinguishes backend version, auth rejection, and unavailability", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cw-version-health-"));
+  let status = 200, requests = 0, backendVersion = "0.1.33b1";
+  const server = createServer((request, response) => {
+    requests += 1;
+    assert.equal(request.url, "/health");
+    assert.equal(request.headers.authorization, "Bearer synthetic-version-test");
+    response.writeHead(status, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, version: backendVersion }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const closeServer = () => new Promise((resolve) => server.close(resolve));
+  const { sdkPath, requestsPath } = await writeMockSdk(root);
+  const child = spawn("node", [SERVER_BIN], {
+    env: { ...process.env, CORPUSWIRE_SDK_PATH: sdkPath, MOCK_REQUESTS_PATH: requestsPath,
+      CORPUSWIRE_SYNC_ENABLED: "false", CORPUSWIRE_RETRIEVAL_LOG_DIR: "",
+      CORPUSWIRE_BASE_URL: `http://127.0.0.1:${server.address().port}`,
+      CORPUSWIRE_BASIC_AUTH: "", CORPUSWIRE_BEARER_TOKEN: "synthetic-version-test" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const rpc = createRpc(child);
+  const inspect = async (id, checkBackend = true) => {
+    const response = await rpc({ jsonrpc: "2.0", id, method: "tools/call",
+      params: { name: "corpuswire_version", arguments: { checkBackend } } });
+    assert.equal(response.result.isError, false);
+    return JSON.parse(response.result.content[0].text);
+  };
+  try {
+    assert.equal((await inspect(0, false)).backend.status, "not_checked");
+    assert.equal(requests, 0); // Count real HTTP, not only mocked SDK calls.
+    const healthy = await inspect(1);
+    assert.equal(healthy.backend.status, "available");
+    assert.equal(healthy.backend.version, "0.1.33b1");
+    assert.notEqual(healthy.mcp.version, healthy.backend.version);
+    status = 401;
+    assert.equal((await inspect(2)).backend.status, "authentication_rejected");
+    status = 200;
+    backendVersion = "token=synthetic-secret\nunsafe";
+    assert.equal((await inspect(4)).backend.version, null);
+    await closeServer();
+    const unavailable = await inspect(3);
+    assert.equal(unavailable.mcp.version, healthy.mcp.version);
+    assert.equal(unavailable.backend.status, "unavailable");
+    assert.equal(unavailable.backend.version, null);
+    assert.equal(requests, 3);
+  } finally {
+    child.kill();
+    if (server.listening) await closeServer();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 function withDisplayProjection(hit, { text = hit.text, startLine = hit.metadata.start_line,
   endLine = hit.metadata.end_line, sourceText = text } = {}) {
@@ -63,6 +163,7 @@ test("corpuswire-mcp exposes tools and maps search requests to the SDK", async (
     try {
       const tools = await rpc({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
       assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_search"), true);
+      assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_version"), true);
       assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_diagnose_workspace"), true);
       assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_rate_result"), true);
       assert.equal(tools.result.tools.some((tool) => tool.name === "corpuswire_quality_review"), true);

@@ -1,6 +1,6 @@
 {
   "name": "@corpuswire/mcp",
-  "version": "0.1.4-beta.1",
+  "version": "0.1.4-beta.2",
   "description": "STDIO MCP server for secure local or remote CorpusWire retrieval, prompt enhancement, and workspace sync",
   "type": "module",
   "bin": {
