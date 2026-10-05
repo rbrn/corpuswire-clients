@@ -24,25 +24,26 @@ const INDEX_TRACE_STAGES = new Set([
   "filtering_hashing", "parsing_chunking", "model_wait", "embedding_batch",
   "vector_writes", "cleanup", "total",
 ]);
-const CLI_VERSION = "0.1.4-beta.2";
+const CLI_VERSION = "0.1.4-beta.3";
 
 export function printHelp(write = console.log) {
-  write(`corpuswire
+  write(`cw
 
 Usage:
-  corpuswire                         Index and watch this folder in an interactive terminal
-  corpuswire watch [options]         Index and keep reconciling local source changes
-  corpuswire --once                  Index once and exit
-  corpuswire init [--index] [--verify] Configure this workspace
-  corpuswire doctor [options]        Check service and verified inventory (read-only)
-  corpuswire reconcile [options]     Full workspace indexing with confirmation
-  corpuswire "<prompt>" [options]
-  corpuswire enhance "<prompt>" [options]
-  corpuswire search "<query>" [options]
-  corpuswire health [options]
-  corpuswire index-events [options]
-  corpuswire index-activity [options]
-  corpuswire index [options]
+  cw                         Index and watch this folder in an interactive terminal
+  cw watch [options]         Index and keep reconciling local source changes
+  cw --once                  Index once and exit
+  cw init [--index] [--verify] Configure this workspace
+  cw doctor [options]        Check service and verified inventory (read-only)
+  cw reconcile [options]     Full workspace indexing with confirmation
+  cw "<prompt>" [options]
+  cw enhance "<prompt>" [options]
+  cw search "<query>" [options]
+  cw health [options]
+  cw index-events [options]
+  cw index-activity [options]
+  cw index [options]
+  cw version                 Show the installed CLI version (offline)
 
 Options:
   --api-base-url <url>     Backend base URL. Default: ${DEFAULT_BASE_URL}
@@ -106,7 +107,7 @@ function requireValue(args, index, flag) {
 }
 
 export function parseCliArgs(argv, env = process.env, currentFolder = process.cwd()) {
-  if (argv.length === 1 && (argv[0] === "-V" || argv[0] === "--version")) {
+  if (argv.length === 1 && ["version", "-V", "--version"].includes(argv[0])) {
     return { version: true };
   }
   if (argv.includes("-h") || argv.includes("--help")) {
@@ -345,11 +346,12 @@ export async function runCliCommand(options, dependencies = {}) {
   const sdk = dependencies.client ? undefined : dependencies.sdk ?? await loadSdk();
   const authorization = dependencies.client ? {} : await resolveServiceAuthorization(options, dependencies);
   const traceCollector = createIndexTraceCollector();
+  const serviceFetch = createServiceFetch(dependencies.fetchFn ?? globalThis.fetch, options.apiBaseUrl);
   const fetchFn = options.watch
-    ? createWatchFetch(dependencies.fetchFn ?? globalThis.fetch, {
+    ? createWatchFetch(serviceFetch, {
       signal: dependencies.signal, detachSignal: dependencies.detachSignal,
       timeoutMs: dependencies.watchRequestTimeoutMs ?? 30000,
-    }) : dependencies.fetchFn;
+    }) : serviceFetch;
   const client =
     dependencies.client ??
     new sdk.CorpusWireClient({
@@ -530,6 +532,26 @@ export function createWatchFetch(fetchFn, { signal, detachSignal, timeoutMs = 30
   };
 }
 
+function createServiceFetch(fetchFn, baseUrl) {
+  return async (input, init) => {
+    try { return await fetchFn(input, init); }
+    catch (error) {
+      if (error?.name === "AbortError" || error?.status || error?.statusCode) throw error;
+      const code = error?.code ?? error?.cause?.code;
+      const networkCodes = ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN", "EPIPE", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT"];
+      if (!networkCodes.includes(code) && !/fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EPIPE|UND_ERR_SOCKET/i.test(error?.message ?? "")) throw error;
+      const local = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(new URL(baseUrl).hostname);
+      const guidance = local
+        ? "Start Docker Desktop and your existing CorpusWire service, then run cw doctor."
+        : "Check the service address and network access, then retry.";
+      throw Object.assign(new Error(
+        `CorpusWire API unavailable at ${displayServiceUrl(baseUrl)} (fetch failed).\n${guidance}\nIf this URL is unexpected, check CORPUSWIRE_BASE_URL, workspace .vscode/settings.json, .vscode/mcp.json or .mcp.json, and your CorpusWire user profile. Use --api-base-url <url> to explicitly select the intended service.`,
+        { cause: error },
+      ), { name: error.name, code });
+    }
+  };
+}
+
 function isWithinRoot(root, candidate) {
   const relative = path.relative(root, candidate);
   return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
@@ -629,14 +651,14 @@ export async function runWatchCommand(options, dependencies) {
       currentIdentity = await stat(currentRoot);
     } catch { throw watchFailure("Workspace root disappeared. Watch stopped; no empty deletion inventory was published."); }
     if (currentRoot !== root || currentIdentity.dev !== rootIdentity.dev || currentIdentity.ino !== rootIdentity.ino) {
-      throw watchFailure("Workspace root was replaced. Restart corpuswire to select the new folder.");
+      throw watchFailure("Workspace root was replaced. Restart cw to select the new folder.");
     }
     const configuration = await resolveIndexConfiguration(configurationInputs, requestedRoot, dependencies);
     if (watchConfigurationIdentity(configuration) !== configurationIdentity) {
-      throw watchFailure("Workspace, service, or indexing filters changed. Restart corpuswire to apply the new configuration.");
+      throw watchFailure("Workspace, service, or indexing filters changed. Restart cw to apply the new configuration.");
     }
     const authorization = createHash("sha256").update(JSON.stringify(await readAuthorization())).digest("hex");
-    if (authorization !== authorizationIdentity) throw watchFailure("Service credentials changed. Restart corpuswire to use the new credentials.");
+    if (authorization !== authorizationIdentity) throw watchFailure("Service credentials changed. Restart cw to use the new credentials.");
   };
   try {
     if (signal?.aborted) return { ok: true, stopped: true, publications, exitCode: 0 };
@@ -698,14 +720,14 @@ export async function runWatchCommand(options, dependencies) {
           if (signal?.aborted) break;
           if (result.ok === false || result.cancelled || result.conflict || result.started === false || result.status?.phase !== "completed"
             || result.status?.coverage?.state !== "verified" || result.transfer?.complete !== true) {
-            throw watchFailure("Reconciliation did not complete. Watch stopped; run corpuswire doctor before restarting.");
+            throw watchFailure("Reconciliation did not complete. Watch stopped; run cw doctor before restarting.");
           }
           let diagnosisEvidence;
           const doctor = await runDoctorCommand(options, { ...dependencies, write: () => {}, onDiagnosis: (evidence) => { diagnosisEvidence = evidence; } });
           const diagnosedIndex = diagnosisEvidence?.diagnosis?.index;
           if (diagnosedIndex?.coverage?.session_id && result.status.coverage.session_id
             && diagnosedIndex.coverage.session_id !== result.status.coverage.session_id) {
-            throw watchFailure("The verified publication changed before the readiness check. Restart corpuswire to reconcile again.");
+            throw watchFailure("The verified publication changed before the readiness check. Restart cw to reconcile again.");
           }
           const verifiedEmpty = scan.files.length === 0 && doctor.coverage.state === "verified"
             && diagnosedIndex?.coverage?.eligible_file_count === 0
@@ -907,7 +929,7 @@ export async function runIndexCommand(options, dependencies) {
     if (error?.name === "RemoteIndexDetachedError") {
       write(
         `Detached from session ${sanitizeTerminalText(error.sessionId)}; backend work continues. `
-        + `Reattach with: corpuswire index --attach ${sanitizeTerminalText(error.sessionId)}`,
+        + `Reattach with: cw index --attach ${sanitizeTerminalText(error.sessionId)}`,
       );
       emitTrace({ scan, status: error.status, lastProgress, errorState: "detached" });
       throw error;
@@ -1177,7 +1199,7 @@ async function runDoctorCommand(options, dependencies) {
     workspaceId: options.workspaceId, serviceUrl: displayServiceUrl(options.apiBaseUrl),
     coverage: { state: coverage?.state ?? "unavailable", reasonCodes: coverage?.reason_codes ?? [] },
     reasons, checks,
-    recoveryActions: status === "ready" ? [] : ["Check service/authentication, then run corpuswire reconcile --yes and corpuswire doctor."],
+    recoveryActions: status === "ready" ? [] : ["Check service/authentication, then run cw reconcile --yes and cw doctor."],
   };
   dependencies.write(options.json ? JSON.stringify(result, null, 2)
     : `status: ${status}\nworkspace: ${sanitizeTerminalText(result.workspaceId)}\nservice: ${result.serviceUrl}\ninventory coverage: ${result.coverage.state}${reasons.length ? `\nchecks: ${reasons.join(", ")}` : ""}${checks.filter((check) => check.status === "error").map((check) => `\n${check.name}: ${check.code}${check.httpStatus === undefined ? "" : ` (HTTP ${check.httpStatus})`}`).join("")}`);

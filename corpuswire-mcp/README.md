@@ -16,6 +16,7 @@ This package is the preferred distributable MCP entrypoint for the VS Code/Copil
 - `corpuswire_rate_result`: records a 1-5 semantic-retrieval or prompt-enhancement scorecard for any engine in the central cross-workspace quality ledger.
 - `corpuswire_quality_review`: reviews central ratings by engine, workspace, work type, and quality dimension, then reports recurring improvements and recommended actions.
 - `corpuswire_health`: checks backend health.
+- `corpuswire_version`: identifies the running MCP client and Node runtime without contacting the backend. Set `checkBackend=true` to separately check the backend version with one read-only health request and a five-second deadline. Backend failure does not hide the client version.
 - `corpuswire_diagnose_workspace`: checks the requested local `repoPath` or workspace id before retrieval and returns collection readiness plus recovery actions.
 - `corpuswire_doctor`: runs a read-only readiness check across health, diagnosis, sync state, active sessions, and backend activity.
 - `corpuswire_sync_delta`: queues changed/deleted paths for local API workspace indexing.
@@ -189,7 +190,7 @@ Minimal direct-checkout shape:
         "${workspaceFolder}/clients/corpuswire-mcp/bin/corpuswire-mcp.js"
       ],
       "env": {
-        "CORPUSWIRE_BASE_URL": "http://127.0.0.1:8000",
+        "CORPUSWIRE_BASE_URL": "http://127.0.0.1:18080",
         "CORPUSWIRE_REPO_PATH": "${workspaceFolder}",
         "CORPUSWIRE_OUTPUT_MODE": "copilot",
         "CORPUSWIRE_LOCAL_ONLY": "true",
@@ -230,7 +231,13 @@ Enable sync tools only when the server has the intended local workspace root and
 
 ## Correct Configuration
 
-Set `CORPUSWIRE_BASE_URL` to the API that should answer retrieval requests. Use `http://127.0.0.1:8000` for the local Docker/API default. Remote access is fail-closed: set `CORPUSWIRE_REMOTE_ENABLED=true`, use HTTPS, list the exact origin in `CORPUSWIRE_ALLOWED_ORIGINS`, and provide `CORPUSWIRE_BEARER_TOKEN` or legacy `CORPUSWIRE_BASIC_AUTH`. Redirects are rejected.
+Set `CORPUSWIRE_BASE_URL` to the API that should answer retrieval requests. The local Docker/API default is `http://127.0.0.1:18080`; an explicit configuration overrides it. Remote access is fail-closed: set `CORPUSWIRE_REMOTE_ENABLED=true`, use HTTPS, list the exact origin in `CORPUSWIRE_ALLOWED_ORIGINS`, and provide `CORPUSWIRE_BEARER_TOKEN` or legacy `CORPUSWIRE_BASIC_AUTH`. Redirects are rejected.
+
+### Identify the installed client
+
+From an installed package, run `corpuswire-mcp --version` (or `corpuswire-mcp version`). From a source checkout, run `node clients/corpuswire-mcp/bin/corpuswire-mcp.js --version`. These commands exit immediately without starting sync, loading the SDK, reading credentials, or requiring Docker.
+
+Inside an MCP host, call `corpuswire_version` with `{}`. It reports this running process's MCP version, protocol version, Node version, and configured backend origin. Calling it with `{"checkBackend":true}` also checks Docker and reports its backend version separately; the CLI, MCP client, and backend have independent version numbers. Restart the MCP host after changing installed client code. A version report identifies software; use `corpuswire_doctor` to check workspace readiness.
 
 Choose the workspace scope deliberately:
 
@@ -249,7 +256,7 @@ Recommended prompt settings:
 
 ## Environment
 
-- `CORPUSWIRE_BASE_URL`: backend URL, default `http://127.0.0.1:8000`
+- `CORPUSWIRE_BASE_URL`: backend URL, default `http://127.0.0.1:18080`
 - `CORPUSWIRE_WORKSPACE_ID`: local API workspace id for retrieval and sync
 - `CORPUSWIRE_REPO_PATH`: service-local repository path for retrieval
 - `CORPUSWIRE_OUTPUT_MODE`: `generic`, `copilot`, `claude-code`, or `sequential`

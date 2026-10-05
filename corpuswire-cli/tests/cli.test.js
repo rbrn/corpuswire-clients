@@ -29,7 +29,7 @@ test("workspace commands are parsed and unknown flags fail before contacting the
 });
 
 test("repair words remain valid in explicit enhancement and ordinary bare prompts", () => {
-  for (const word of ["init", "doctor", "reconcile"]) {
+  for (const word of ["init", "doctor", "reconcile", "version"]) {
     const parsed = parseCliArgs(["enhance", word, "the", "workspace"]);
     assert.equal(parsed.command, "enhance");
     assert.deepEqual(parsed.promptParts, [word, "the", "workspace"]);
@@ -306,10 +306,82 @@ test("main indexes the current folder with no arguments after printing the previ
   } finally { await rm(fixture, { recursive: true, force: true }); }
 });
 
-test("main prints the installed CLI version", async () => {
-  const writes = [];
-  await main(["--version"], { write: (line) => writes.push(line) });
-  assert.deepEqual(writes, ["0.1.4-beta.2"]);
+test("main prints the installed CLI version offline for command and flags", async () => {
+  const metadata = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  const lock = JSON.parse(await readFile(new URL("../package-lock.json", import.meta.url), "utf8"));
+  assert.equal(metadata.version, "0.1.4-beta.3");
+  assert.deepEqual(metadata.bin, { cw: "bin/corpuswire.js" });
+  assert.equal(lock.version, metadata.version);
+  assert.equal(lock.packages[""].version, metadata.version);
+  assert.deepEqual(lock.packages[""].bin, metadata.bin);
+  for (const argument of ["version", "--version", "-V"]) {
+    const writes = [];
+    await main([argument], {
+      write: (line) => writes.push(line), cwd: "/missing/corpuswire-version-workspace",
+      env: { CORPUSWIRE_BASE_URL: "invalid-url" },
+      fetchFn: () => { throw new Error("Version must not contact the backend"); },
+      sdk: { CorpusWireClient: class { constructor() { throw new Error("Version must not load a client"); } } },
+    });
+    assert.deepEqual(writes, ["0.1.4-beta.3"]);
+  }
+  const help = [];
+  await main(["--help"], { write: (line) => help.push(line) });
+  assert.match(help[0], /^cw\n/);
+  assert.match(help[0], /cw version/);
+  assert.equal(help[0].includes("corpuswire "), false);
+});
+
+test("one-shot startup explains a failed connection at the resolved or explicitly selected service", async () => {
+  const fixture = await syntheticWorkspace();
+  await mkdir(path.join(fixture, ".vscode"));
+  const settingsPath = path.join(fixture, ".vscode", "settings.json");
+  const settings = JSON.stringify({ "corpuswire.serviceDefaults.url": "http://127.0.0.1:19090" });
+  await writeFile(settingsPath, settings);
+  try {
+    for (const explicit of [false, true]) {
+      const requests = [];
+      const selectedUrl = explicit ? "http://127.0.0.1:18080" : "http://127.0.0.1:19090";
+      await assert.rejects(main(explicit ? ["--once", "--api-base-url", selectedUrl] : ["--once"], {
+        cwd: fixture, homeDirectory: fixture, env: {}, platform: "linux", isTTY: false,
+        signal: new AbortController().signal, write: () => {}, writeRaw: () => {},
+        fetchFn: async (input) => {
+          requests.push(input);
+          throw new TypeError("fetch failed: private connection detail", { cause: { code: "ECONNREFUSED" } });
+        },
+      }), (error) => {
+        assert.ok(error.message.includes(`CorpusWire API unavailable at ${selectedUrl}`));
+        assert.match(error.message, /Start Docker Desktop and your existing CorpusWire service/);
+        assert.match(error.message, /cw doctor/);
+        assert.match(error.message, /CORPUSWIRE_BASE_URL.*\.vscode\/settings\.json/);
+        assert.match(error.message, /--api-base-url <url>/);
+        assert.equal(error.message.includes("private connection detail"), false);
+        assert.equal(error.code, "ECONNREFUSED");
+        return true;
+      });
+      assert.equal(requests.length, 3); // Existing SDK retry policy remains active.
+      assert.ok(requests.every((input) => input === `${selectedUrl}/v1/index/capabilities`));
+      assert.equal(await readFile(settingsPath, "utf8"), settings);
+    }
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
+test("connection guidance redacts secrets, distinguishes hosted services, and preserves other fetch failures", async () => {
+  await assert.rejects(main(["health", "--api-base-url", "https://user:password@example.test/api?token=secret"], {
+    env: {}, write: () => {}, fetchFn: async () => { throw Object.assign(new Error("offline"), { code: "ENOTFOUND" }); },
+  }), (error) => {
+    assert.match(error.message, /Check the service address and network access/);
+    assert.equal(/Docker Desktop|user:password|token=secret/.test(error.message), false);
+    return true;
+  });
+  for (const failure of [new DOMException("Stopped", "AbortError"), new TypeError("Invalid synthetic request")]) {
+    await assert.rejects(main(["health"], {
+      env: {}, platform: "linux", write: () => {}, fetchFn: async () => { throw failure; },
+    }), (error) => error === failure);
+  }
+  await assert.rejects(main(["health"], {
+    env: {}, platform: "linux", write: () => {},
+    fetchFn: async () => new Response('{"detail":"Authentication required"}', { status: 401, statusText: "Unauthorized" }),
+  }), (error) => error.status === 401 && !error.message.includes("API unavailable"));
 });
 
 test("parseCliArgs supports the interactive index command", () => {
