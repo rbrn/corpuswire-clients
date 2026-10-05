@@ -70,13 +70,15 @@ test("MCP version tool preserves client identity offline and uses the local Dock
 
 test("MCP version tool distinguishes backend version, auth rejection, and unavailability", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "cw-version-health-"));
-  let status = 200, requests = 0, backendVersion = "0.1.33b1";
+  let status = 200, requests = 0, backendVersion = "0.1.33b1", fullHealth = false;
   const server = createServer((request, response) => {
     requests += 1;
     assert.equal(request.url, "/health");
     assert.equal(request.headers.authorization, "Bearer synthetic-version-test");
     response.writeHead(status, { "content-type": "application/json" });
-    response.end(JSON.stringify({ ok: true, version: backendVersion }));
+    response.end(JSON.stringify(fullHealth
+      ? { ok: true, build: { app_version: backendVersion } }
+      : { ok: true, version: backendVersion }));
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const closeServer = () => new Promise((resolve) => server.close(resolve));
@@ -102,6 +104,8 @@ test("MCP version tool distinguishes backend version, auth rejection, and unavai
     assert.equal(healthy.backend.status, "available");
     assert.equal(healthy.backend.version, "0.1.33b1");
     assert.notEqual(healthy.mcp.version, healthy.backend.version);
+    fullHealth = true;
+    assert.equal((await inspect(5)).backend.version, "0.1.33b1");
     status = 401;
     assert.equal((await inspect(2)).backend.status, "authentication_rejected");
     status = 200;
@@ -112,7 +116,7 @@ test("MCP version tool distinguishes backend version, auth rejection, and unavai
     assert.equal(unavailable.mcp.version, healthy.mcp.version);
     assert.equal(unavailable.backend.status, "unavailable");
     assert.equal(unavailable.backend.version, null);
-    assert.equal(requests, 3);
+    assert.equal(requests, 4);
   } finally {
     child.kill();
     if (server.listening) await closeServer();

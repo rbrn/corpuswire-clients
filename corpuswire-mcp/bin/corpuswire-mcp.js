@@ -4941,7 +4941,7 @@ async function versionInfo(args) {
       return result;
     }
     const payload = await response.json();
-    const version = payload?.version ?? payload?.build?.version;
+    const version = payload?.version ?? payload?.build?.app_version ?? payload?.build?.version;
     result.backend.status = payload?.ok === true ? "available" : "unhealthy";
     result.backend.version = typeof version === "string" && /^[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}$/.test(version)
       ? version : null;
