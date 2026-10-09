@@ -90,6 +90,8 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 function extensionHarness(folders, overrides = new Map()) {
   const warnings = [], information = [], progress = [], requests = [], diagnoses = [], timers = new Map();
+  const confirmations = [];
+  let confirmationSelection;
   const settings = new Map(folders.map((root) => [root.uri.toString(), rootSettings(root, overrides.get(root.name))]));
   let nextTimer = 0;
   let watcherGlob;
@@ -123,7 +125,10 @@ function extensionHarness(folders, overrides = new Map()) {
       },
     },
     window: {
-      showWarningMessage: (message) => { warnings.push(message); },
+      showWarningMessage: (message, options, ...items) => {
+        warnings.push(message);
+        if (options?.modal) { confirmations.push({ message, options, items }); return confirmationSelection; }
+      },
       showInformationMessage: (message) => { information.push(message); },
       withProgress: async (_options, work) => work({ report: (event) => progress.push(event) }, token),
     },
@@ -148,16 +153,18 @@ function extensionHarness(folders, overrides = new Map()) {
     const MAX_CONCURRENT_INDEX_ROOTS = 2;
     ${rootsHelpers}
     ${source.slice(relativeStart, relativeEnd)}
+    ${source.slice(rootsEnd, commandStart)}
     ${source.slice(commandStart, commandEnd)}
     ${source.slice(watcherStart, watcherEnd)}
     ${source.slice(statusStart, statusEnd)}
     function formatIndexingError(error) { return error.message; }
     function formatIndexProgressMessage() { return 'upload progress'; }
     const INDEX_INCLUDE_GLOB = ${JSON.stringify(includeGlob)};
-    return { indexCurrentWorkspace, registerRemoteIndexWatchers, relativePathForUri, runIndexStatusCheck, indexRootStatus };
+    return { indexCurrentWorkspace, rebuildCurrentWorkspaceIndex, registerRemoteIndexWatchers, relativePathForUri, runIndexStatusCheck, indexRootStatus };
   `)(vscode, readSettings, Client, () => ({}), collectWorkspaceFiles, collectUriFiles, excludedPath,
     (handler) => { const id = ++nextTimer; timers.set(id, handler); return id; }, (id) => timers.delete(id));
-  return { ...functions, warnings, information, progress, requests, diagnoses, callbacks, settings, subscriptions,
+  return { ...functions, warnings, information, progress, requests, diagnoses, callbacks, settings, subscriptions, confirmations,
+    setConfirmation(selection) { confirmationSelection = selection; },
     get capabilities() { return capabilities; }, setUpload(handler) { upload = handler; },
     get watcherGlob() { return watcherGlob; },
     setDiagnosis(handler) { diagnose = handler; },
@@ -200,6 +207,30 @@ test('full indexing handles every enabled root with at most two concurrent root 
   assert.ok(harness.progress.some((event) => event.message === 'repo-0 · Code ready to serve · documentation pending'));
   assert.equal(harness.progress.at(-1).message.includes('pending'), false);
   assert.equal(harness.information.length, 11);
+});
+
+test('multi-root rebuild confirms the exact participating names and identities and cancellation starts no requests', async () => {
+  const roots = ['one', 'two', 'disabled'].map(folder);
+  const harness = extensionHarness(roots, new Map([['disabled', { enabled: false }]]));
+  await harness.rebuildCurrentWorkspaceIndex();
+  assert.equal(harness.confirmations.length, 1);
+  assert.match(harness.confirmations[0].message, /Rebuild 2 CorpusWire workspace/);
+  assert.match(harness.confirmations[0].message, /one: test:\/\/one/);
+  assert.match(harness.confirmations[0].message, /two: test:\/\/two/);
+  assert.doesNotMatch(harness.confirmations[0].message, /disabled/);
+  assert.equal(harness.capabilities, 0);
+  assert.equal(harness.requests.length, 0);
+  harness.setConfirmation('Rebuild Index');
+  await harness.rebuildCurrentWorkspaceIndex();
+  assert.deepEqual(harness.requests.map((request) => request.workspace.workspaceId).sort(), ['test://one', 'test://two']);
+  assert.ok(harness.requests.every((request) => request.recreateCollection === true));
+  const duplicate = extensionHarness(roots.slice(0, 2), new Map([['one', { workspaceId: 'test://shared' }], ['two', { workspaceId: 'test://shared' }]]));
+  duplicate.setConfirmation('Rebuild Index');
+  await duplicate.rebuildCurrentWorkspaceIndex();
+  assert.equal(duplicate.confirmations.length, 0);
+  assert.equal(duplicate.capabilities, 0);
+  assert.equal(duplicate.requests.length, 0);
+  assert.match(duplicate.warnings[0], /distinct remoteIndexing.workspaceId/);
 });
 
 test('single-root manual command preserves explicit indexing when automatic indexing is disabled', async () => {
@@ -536,6 +567,29 @@ test('per-root readiness rejects unhealthy index metadata and diagnosis warnings
   assert.equal(warning.state, 'stale');
   assert.equal(warning.code_ready, false);
   assert.match(warning.message, /Synthetic diagnosis warning/);
+});
+
+test('degraded top-level diagnosis blocks healthy pending and verified code coverage and aggregate readiness', async () => {
+  const roots = ['healthy', 'pending', 'verified'].map(folder);
+  const harness = extensionHarness(roots);
+  const pending = { state: 'pending', reason_codes: ['background_ingestion_pending'], code_ready: true, documentation_pending: true };
+  const degraded = (coverage) => ({ ...readyDiagnosis(coverage), status: 'degraded' });
+  for (const coverage of [pending, { state: 'verified', code_ready: true }]) {
+    const result = harness.indexRootStatus('one', 'test://one', degraded(coverage));
+    assert.equal(result.state, 'stale');
+    assert.equal(result.code_ready, false);
+  }
+  const legacy = { status: 'degraded', can_retrieve: true, checks: [], index: { indexed: true, readiness: 'ready' } };
+  assert.equal(harness.indexRootStatus('legacy', 'test://legacy', legacy).state, 'stale');
+  harness.setDiagnosis(async ({ workspaceId }) => workspaceId === 'test://healthy' ? readyDiagnosis(pending)
+    : degraded(workspaceId === 'test://pending' ? pending : { state: 'verified', code_ready: true }));
+  const messages = [];
+  await harness.runIndexStatusCheck((message) => messages.push(message));
+  const result = messages.at(-1);
+  assert.equal(result.state, 'stale');
+  assert.equal(result.code_ready, false);
+  assert.equal(result.roots.find((root) => root.name === 'healthy').code_ready, true);
+  assert.ok(result.roots.filter((root) => root.name !== 'healthy').every((root) => root.state === 'stale' && root.code_ready === false));
 });
 
 test('aggregate readiness cannot mask degraded, warning or error roots behind healthy code-ready roots', async () => {

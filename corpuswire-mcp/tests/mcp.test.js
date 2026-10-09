@@ -4667,12 +4667,22 @@ test("MCP recognizes code readiness without certifying full inventory", async ()
   const start = source.indexOf('function bootstrapStatusFromDiagnosis(');
   const end = source.indexOf('\nfunction compactStringArray', start);
   assert.ok(start >= 0 && end > start);
+  const freshnessStart = source.indexOf('function hasBootstrapFreshnessSignal(');
+  const freshnessEnd = source.indexOf('\nfunction formatWorkspaceDiagnosis', freshnessStart);
+  assert.ok(freshnessStart >= 0 && freshnessEnd > freshnessStart);
+  const freshnessSignal = new Function(source.slice(freshnessStart, freshnessEnd)
+    + '; return hasBootstrapFreshnessSignal;')();
+  const stringStart = source.indexOf('function optionalString(');
+  const stringEnd = source.indexOf('\nfunction readOutputMode', stringStart);
+  assert.ok(stringStart >= 0 && stringEnd > stringStart);
+  const optionalString = new Function(source.slice(stringStart, stringEnd)
+    + '; return optionalString;')();
   const readBootstrap = new Function('asRecord', 'compactStringArray', 'isRecord',
     'optionalString', 'hasBootstrapFreshnessSignal', 'firstNonEmptyString',
     source.slice(start, end) + '; return bootstrapStatusFromDiagnosis;')(
       (value) => value ?? {}, (value) => Array.isArray(value) ? value : [],
       (value) => value && typeof value === 'object',
-      (value) => typeof value === 'string' ? value : null, () => false,
+      optionalString, freshnessSignal,
       (...values) => values.find(Boolean));
   const diagnosis = {status:'ready',can_retrieve:true,collection_exists:true,point_count:2,
     checks:[],recovery_actions:[],index:{health_status:'ok',readiness:'code_ready',
@@ -4702,4 +4712,26 @@ test("MCP recognizes code readiness without certifying full inventory", async ()
   diagnosis.index.coverage.reason_codes = ['background_ingestion_pending'];
   diagnosis.index.health_status = 'degraded';
   assert.equal(readBootstrap(diagnosis, {}).state, 'needs_reconcile');
+  for (const state of ['pending', 'verified']) {
+    const healthy = {...diagnosis, index:{...diagnosis.index, health_status:'ok',
+      coverage:{...diagnosis.index.coverage, state}}};
+    assert.equal(readBootstrap(healthy, {}).state, 'ready');
+    for (const change of [
+      {status:'blocked'}, {status:'degraded'}, {can_retrieve:false},
+      {index:{...healthy.index, health_status:'error'}},
+      {index:{...healthy.index, health_warnings:['vector connection failed']}},
+      {qdrant_error:'vector connection failed'},
+      {checks:[{name:'vectors', status:'error', message:'vector connection failed'}]},
+      {checks:[{name:'vectors', status:'warning', message:'vector connection failed'}]},
+      {checks:[{name:'vectors', status:'blocked', message:'vector connection failed'}]},
+      {checks:[{name:'vectors', status:'failed', message:'vector connection failed'}]},
+    ]) {
+      const rejected = readBootstrap({...healthy, ...change}, {});
+      assert.notEqual(rejected.state, 'ready', `${state}: ${JSON.stringify(change)}`);
+      assert.equal(rejected.codeReady, false);
+    }
+  }
+  const legacy = {can_retrieve:true, index:{coverage:{state:'verified'}}};
+  assert.equal(readBootstrap(legacy, {}).state, 'ready');
+  assert.equal(readBootstrap({...legacy, status:'ready'}, {}).state, 'ready');
 });

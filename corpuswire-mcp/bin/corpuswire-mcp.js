@@ -5201,6 +5201,11 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
   const canRetrieve = typeof diagnosis.can_retrieve === "boolean" ? diagnosis.can_retrieve : null;
   const pointCount = Number.isInteger(diagnosis.point_count) ? diagnosis.point_count : null;
   const statusLooksBlocked = ["blocked", "error", "missing"].includes((diagnosisStatus ?? "").toLowerCase());
+  const hasHealthProblem = Boolean(optionalString(diagnosis.qdrant_error))
+    || healthWarnings.length > 0
+    || (indexHealthStatus != null && !["ok", "ready", "healthy"].includes(indexHealthStatus.toLowerCase()))
+    || checks.some((check) => ["warning", "error", "blocked", "failed"].includes(
+      String(check.status ?? "").toLowerCase()));
   const coverage = asRecord(index.coverage);
   const codeReady = index.readiness === "code_ready" && coverage.code_ready === true
     && coverage.state === "pending"
@@ -5210,10 +5215,7 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
     && canRetrieve === true && diagnosisStatus === "ready"
     && collectionExists === true && Number.isInteger(pointCount) && pointCount > 0
     && indexHealthStatus === "ok" && healthWarnings.length === 0
-    && !optionalString(diagnosis.qdrant_error)
-    && !hasFreshnessProblem
-    && checks.every((check) => !["warning", "error", "blocked", "failed"].includes(
-      String(check.status ?? "").toLowerCase()));
+    && !hasHealthProblem && !hasFreshnessProblem;
   const coverageUnknown = !["verified", "not_applicable"].includes(coverage.state);
   const needsReconcile = (coverageUnknown && !codeReady) || hasFreshnessProblem
     || collectionExists === false
@@ -5223,10 +5225,11 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
   const firstActionableSignal = textSignals.find(hasBootstrapFreshnessSignal);
   const state = needsReconcile
     ? "needs_reconcile"
-    : canRetrieve === true || diagnosisStatus === "ready"
-      ? "ready"
-      : statusLooksBlocked || canRetrieve === false
-        ? "blocked"
+    : statusLooksBlocked || hasHealthProblem || canRetrieve === false
+      ? "blocked"
+      : (diagnosisStatus == null || diagnosisStatus === "ready")
+        && (canRetrieve === true || diagnosisStatus === "ready")
+        ? "ready"
         : "unknown";
 
   return {

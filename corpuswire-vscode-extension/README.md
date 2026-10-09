@@ -232,7 +232,7 @@ The command:
 3. Creates `CorpusWireClient` for the configured indexer service with
    `endpointMode: "v1-only"`.
 4. Finds workspace files with:
-   `**/*.{md,txt,csv,pdf,java,py,sh,cjs,js,jsx,mjs,ts,tsx,json,toml,yaml,yml}`.
+   `{**/*.{md,txt,csv,pdf,bat,scala,sh,cjs,js,jsx,mjs,cts,mts,ts,tsx,java,kt,kts,py,pyi,hcl,tf,html,htm,json,jsonl,ndjson,toml,yaml,yml},**/{mvnw,gradlew},**/*.json.example}`.
 5. Excludes:
    `.git`, `.vscode`, `node_modules`, `dist`, `build`, `target`, and
    `__pycache__`.

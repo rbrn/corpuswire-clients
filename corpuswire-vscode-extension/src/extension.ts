@@ -465,8 +465,7 @@ function indexRootStatus(name: string, workspaceId: string, diagnosis: Workspace
     ? coverage.state === "verified" || coverage.state === "not_applicable"
     : index.readiness === "ready" || diagnosis.status === "ready");
   const warnings = diagnosis.checks.filter((check) => check.status === "warning");
-  const ready = !blocked && (codeReady || fullReady) && warnings.length === 0
-    && (diagnosis.status === "ready" || codeReady);
+  const ready = diagnosis.status === "ready" && !blocked && (codeReady || fullReady) && warnings.length === 0;
   const state = ready ? "indexed" : blocked ? "error" : diagnosis.index.indexed ? "stale" : "not-indexed";
   return {
     name, workspaceId, state,
@@ -672,19 +671,29 @@ function formatCodeReadyMessage(status: Pick<RemoteIndexStatus, "coverage">): st
 }
 
 async function rebuildCurrentWorkspaceIndex(): Promise<void> {
-  const selection = await vscode.window.showWarningMessage(
-    "Rebuild the CorpusWire workspace index by recreating the target collection. Use this only after an embedding-model or vector-dimension change.",
-    { modal: true },
-    "Rebuild Index",
-  );
-  if (selection !== "Rebuild Index") {
-    return;
+  try {
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    const roots = folders.map((folder) => ({ folder, settings: readSettings(folder.uri) }))
+      .filter(({ settings }) => folders.length === 1 || settings.remoteIndexing.enabled);
+    if (roots.length === 0) {
+      void vscode.window.showWarningMessage("Open a workspace with remote indexing enabled before rebuilding its index.");
+      return;
+    }
+    assertDistinctIndexRoots(roots);
+    const targets = roots.map(({ folder, settings }) => `${folder.name}: ${settings.remoteIndexing.workspaceId}`).join("\n");
+    const selection = await vscode.window.showWarningMessage(
+      `Rebuild ${roots.length} CorpusWire workspace index(es) by recreating these target collections:\n${targets}\nUse this only after an embedding-model or vector-dimension change.`,
+      { modal: true },
+      "Rebuild Index",
+    );
+    if (selection !== "Rebuild Index") return;
+    await indexCurrentWorkspace({ recreateCollection: true }, roots);
+  } catch (error) {
+    void vscode.window.showWarningMessage(error instanceof Error ? error.message : String(error));
   }
-
-  await indexCurrentWorkspace({ recreateCollection: true });
 }
 
-async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}): Promise<void> {
+async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}, confirmedRoots?: IndexWorkspaceRoot[]): Promise<void> {
   const folders = vscode.workspace.workspaceFolders ?? [];
   if (folders.length === 0) {
     void vscode.window.showWarningMessage("Open a workspace before running CorpusWire: Index Workspace.");
@@ -693,7 +702,7 @@ async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}): Promi
 
   try {
     // An explicit command historically works in a single folder even when automatic indexing is disabled.
-    const roots = folders.map((folder) => ({ folder, settings: readSettings(folder.uri) }))
+    const roots = confirmedRoots ?? folders.map((folder) => ({ folder, settings: readSettings(folder.uri) }))
       .filter(({ settings }) => folders.length === 1 || settings.remoteIndexing.enabled);
     if (roots.length === 0) {
       void vscode.window.showWarningMessage("Enable remote indexing for at least one workspace folder before indexing this multi-folder workspace.");

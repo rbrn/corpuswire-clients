@@ -326,8 +326,11 @@ final-commit contract.
 
 Temporary queue saturation is retried within `queueWaitTimeoutMs` (default
 600000), preserving the original payload and honoring the request's
-`AbortSignal`. Permanent quotas fail immediately. Upload concurrency and batch
-bytes are clamped to advertised server limits.
+`AbortSignal`. A positive budget bounds HTTP admission, response reading,
+retry backoff and queue cooldown. Zero permits one initial request without an
+admission deadline or retries; cancellation still applies. Permanent quotas
+fail immediately. Upload concurrency and batch bytes are clamped to advertised
+server limits, and inventories needing no uploads require no upload capacity.
 
 Preview the same hashed manifest without acquiring a workspace lock or starting
 a session, then subscribe to semantic progress:

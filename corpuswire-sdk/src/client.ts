@@ -947,39 +947,48 @@ export class CorpusWireClient {
     const multipart = buildMultipartMixed(metadata, files);
     const timeoutMs = validateNonNegativeNumber(options.queueWaitTimeoutMs ?? DEFAULT_QUEUE_WAIT_TIMEOUT_MS, "queueWaitTimeoutMs");
     const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      if (options.signal?.aborted) throw new DOMException("Upload aborted", "AbortError");
-      try {
-        const response = await requestJson<{ ok: true; result: RemoteFileBatchResult }>({
-          retryHttp429: false,
-          baseUrl: this.baseUrl,
-          paths: [`/v1/index/sessions/${encodeURIComponent(sessionId)}/files/batch`],
-          fetchFn: (input, init) => { onAttempt?.(); return (this.fetchFn ?? globalThis.fetch)(input, init); },
-          defaultHeaders: this.defaultHeaders,
-          basicAuth: this.basicAuth,
-          init: {
-            method: "POST",
-            signal: options.signal,
-            headers: {
-              "Content-Type": multipart.contentType,
-              Prefer: "respond-async",
+    let lastQueueError: CorpusWireHttpError | undefined;
+    return withUploadAdmissionBudget(async (signal) => {
+      for (;;) {
+        if (signal.aborted) throw new DOMException("Upload aborted", "AbortError");
+        try {
+          const response = await requestJson<{ ok: true; result: RemoteFileBatchResult }>({
+            retryHttp429: false,
+            retryAttempts: timeoutMs === 0 ? 0 : undefined,
+            baseUrl: this.baseUrl,
+            paths: [`/v1/index/sessions/${encodeURIComponent(sessionId)}/files/batch`],
+            fetchFn: (input, init) => {
+              if (signal.aborted) throw new DOMException("Upload aborted", "AbortError");
+              onAttempt?.();
+              return (this.fetchFn ?? globalThis.fetch)(input, init);
             },
-            body: new Blob([toArrayBuffer(multipart.body)]),
-          },
-        });
-        return response.result;
-      } catch (error) {
-        if (!(error instanceof CorpusWireHttpError) || error.status !== 429
-          || error.errorCode !== "index_queue_full" || !error.retryable) throw error;
-        const remainingMs = deadline - Date.now();
-        if (remainingMs <= 0) throw error;
-        await waitForAbortableDelay(
-          Math.min(remainingMs, Math.max(10, (error.retryAfterSeconds ?? 1) * 1_000)),
-          options.signal,
-        );
-        if (Date.now() >= deadline) throw error;
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: {
+              method: "POST",
+              signal,
+              headers: {
+                "Content-Type": multipart.contentType,
+                Prefer: "respond-async",
+              },
+              body: new Blob([toArrayBuffer(multipart.body)]),
+            },
+          });
+          return response.result;
+        } catch (error) {
+          if (!(error instanceof CorpusWireHttpError) || error.status !== 429
+            || error.errorCode !== "index_queue_full" || !error.retryable) throw error;
+          lastQueueError = error;
+          const remainingMs = deadline - Date.now();
+          if (remainingMs <= 0) throw error;
+          await waitForAbortableDelay(
+            Math.min(remainingMs, Math.max(10, (error.retryAfterSeconds ?? 1) * 1_000)),
+            signal,
+          );
+          if (Date.now() >= deadline) throw error;
+        }
       }
-    }
+    }, timeoutMs, options.signal, () => lastQueueError ?? new Error("Upload admission timeout elapsed"));
   }
 
   async checkpointIndexSessionCode(sessionId: string): Promise<RemoteIndexStatus> {
@@ -1302,14 +1311,15 @@ export class CorpusWireClient {
         }
         const tierFiles = filesToUpload.filter(({ file }) => ingestionPriority(file.relativePath) === priority);
         let tierQueued = false;
-        const uploadBatches = buildUploadBatches(
+        const uploadBatches = tierFiles.length === 0 ? [] : buildUploadBatches(
           tierFiles,
           clampUploadLimit(request.batchBytes, session.max_batch_bytes, "batchBytes"),
           session.max_batch_files,
         );
         await runWithConcurrency(
           uploadBatches,
-          clampUploadLimit(request.maxConcurrentUploads, session.max_concurrent_uploads, "maxConcurrentUploads"),
+          uploadBatches.length === 0 ? 1
+            : clampUploadLimit(request.maxConcurrentUploads, session.max_concurrent_uploads, "maxConcurrentUploads"),
           async (batchFiles) => {
             if (uploadStop.signal.aborted) throw new DOMException("Upload stopped", "AbortError");
             if (batchFiles.some((file) => file.descriptor.size > session.max_batch_bytes)) {
@@ -1814,6 +1824,34 @@ function buildUploadBatches(
     batches.push(currentBatch);
   }
   return batches;
+}
+
+async function withUploadAdmissionBudget<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  callerSignal: AbortSignal | undefined,
+  timeoutError: () => Error,
+): Promise<T> {
+  if (callerSignal?.aborted) throw new DOMException("Upload aborted", "AbortError");
+  const controller = new AbortController();
+  let rejectInterruption!: (error: Error) => void;
+  const interruption = new Promise<never>((_, reject) => { rejectInterruption = reject; });
+  const interrupt = (error: Error): void => {
+    rejectInterruption(error);
+    controller.abort(error);
+  };
+  const onAbort = (): void => interrupt(new DOMException("Upload aborted", "AbortError"));
+  callerSignal?.addEventListener("abort", onAbort, { once: true });
+  // Zero retains the existing one-initial-attempt/no-queue-wait behavior.
+  const timer = timeoutMs > 0 ? setTimeout(() => interrupt(timeoutError()), timeoutMs) : undefined;
+  try {
+    // Abort alone cannot bound injected transports or stalled response bodies.
+    return await Promise.race([operation(controller.signal), interruption]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    callerSignal?.removeEventListener("abort", onAbort);
+    controller.abort();
+  }
 }
 
 function clampUploadLimit(requested: number | undefined, advertised: number, name: string): number {

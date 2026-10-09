@@ -2576,7 +2576,7 @@ test("incomplete scan, supplied hash mismatch and duplicate files cannot allocat
   assert.equal(mutations, 0);
 });
 
-test("partial upload error waits for in-flight acknowledgements and retains truthful counts", async () => {
+test("partial upload error retains acknowledgements observed before sibling cancellation", async () => {
   let attempts = 0;
   const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url, init) => {
     if (url.endsWith("/sessions")) return jsonResponse(200, {ok:true,result:{session_id:"partial",max_batch_bytes:1000,max_batch_files:1,max_concurrent_uploads:2}});
@@ -2584,8 +2584,10 @@ test("partial upload error waits for in-flight acknowledgements and retains trut
     if (url.endsWith("/files/batch")) {
       attempts += 1;
       const body = await init.body.text();
-      if (body.includes("synth_fail")) return jsonResponse(400, {detail:"synthetic rejection"});
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      if (body.includes("synth_fail")) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return jsonResponse(400, {detail:"synthetic rejection"});
+      }
       return jsonResponse(200, {ok:true,result:{files_received:1,errors:[]}});
     }
     if (url.endsWith("/abort")) return jsonResponse(200, {ok:true});
@@ -2861,6 +2863,41 @@ test("upload batches and concurrency are clamped to the server limits", async ()
   assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths.length), [1, 1, 1]);
 });
 
+test("an empty inventory commits without requiring unused upload capacity", async () => {
+  const fixture = priorityIndexFixture({ files: [], batchBytes: 0, concurrency: 0 });
+  const result = await fixture.client.indexWorkspace(fixture.request);
+  assert.equal(result.transfer.complete, true);
+  assert.equal(result.transfer.files_upload_required, 0);
+  assert.equal(result.transfer.files_transferred, 0);
+  assert.equal(fixture.calls.some((call) => call.type === "upload" || call.type === "checkpoint" || call.type === "abort"), false);
+  assert.equal(fixture.calls.at(-1).type, "commit");
+});
+
+test("all-reused code checkpoints and commits without requiring upload capacity", async () => {
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+  ], unchanged: ["main.py", "README.md"], batchBytes: 0, concurrency: 0 });
+  let codeReady = false;
+  const result = await fixture.client.indexWorkspace({ ...fixture.request,
+    onCodeReady: (status) => { codeReady = status.coverage.code_ready; },
+  });
+  assert.equal(codeReady, true);
+  assert.equal(result.transfer.complete, true);
+  assert.equal(result.transfer.files_upload_required, 0);
+  assert.equal(result.transfer.files_reused, 2);
+  assert.equal(result.transfer.files_transferred, 0);
+  assert.deepEqual(fixture.calls, [{ type: "checkpoint" }, { type: "commit" }]);
+});
+
+test("actual upload payloads still reject zero byte or concurrency capacity", async () => {
+  for (const limits of [{ batchBytes: 0 }, { concurrency: 0 }]) {
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "README.md", content: "guide" }], ...limits });
+    await assert.rejects(fixture.client.indexWorkspace(fixture.request), /positive finite limit/);
+    assert.equal(fixture.calls.some((call) => call.type === "upload" || call.type === "commit"), false);
+    assert.equal(fixture.calls.at(-1).type, "abort");
+  }
+});
+
 function queueBusy(retryAfter = "0") {
   const response = jsonResponse(429, { detail: { error_code: "index_queue_full", message: "Queue busy", retryable: true } });
   response.headers.set("Retry-After", retryAfter);
@@ -2899,6 +2936,70 @@ test("admission timeout is finite and permanent quota responses fail without ret
   }
 });
 
+test("admission budget bounds stalled fetch and response bodies even when transport ignores abort", { timeout: 1000 }, async () => {
+  for (const stalled of ["fetch", "success body", "error body"]) {
+    let transportSignal, attempts = 0;
+    const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (_, init) => {
+      transportSignal = init.signal;
+      attempts++;
+      const never = new Promise(() => {});
+      if (stalled === "fetch") return never;
+      const response = jsonResponse(stalled === "success body" ? 202 : 429, {});
+      if (stalled === "success body") response.json = () => never;
+      else response.text = () => never;
+      return response;
+    } });
+    await assert.rejects(client.uploadFileBatch("queue", { files: [QUEUE_TEST_FILE.descriptor] }, [QUEUE_TEST_FILE], undefined,
+      { queueWaitTimeoutMs: 10 }), /Upload admission timeout elapsed/);
+    assert.equal(attempts, 1, stalled);
+    assert.equal(transportSignal.aborted, true, stalled);
+  }
+});
+
+test("caller cancellation bounds an uncooperative admission fetch", { timeout: 1000 }, async () => {
+  const controller = new AbortController();
+  let transportSignal;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (_, init) => {
+    transportSignal = init.signal;
+    queueMicrotask(() => controller.abort());
+    return new Promise(() => {});
+  } });
+  await assert.rejects(client.uploadFileBatch("queue", { files: [QUEUE_TEST_FILE.descriptor] }, [QUEUE_TEST_FILE], undefined,
+    { queueWaitTimeoutMs: 500, signal: controller.signal }), { name: "AbortError" });
+  assert.equal(transportSignal.aborted, true);
+});
+
+test("generic HTTP retry backoff stays inside the admission budget", { timeout: 1000 }, async () => {
+  let attempts = 0, transportSignal;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (_, init) => {
+    transportSignal = init.signal;
+    attempts++;
+    return jsonResponse(503, { detail: "Synthetic transient gateway failure" });
+  } });
+  await assert.rejects(client.uploadFileBatch("queue", { files: [QUEUE_TEST_FILE.descriptor] }, [QUEUE_TEST_FILE], undefined,
+    { queueWaitTimeoutMs: 10 }), /Upload admission timeout elapsed/);
+  assert.equal(attempts, 1);
+  assert.equal(transportSignal.aborted, true);
+});
+
+test("zero admission budget permits one initial attempt without queue retries", async () => {
+  for (const mode of ["success", "queue", "gateway", "network"]) {
+    let attempts = 0;
+    const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async () => {
+      attempts++;
+      if (mode === "network") throw new TypeError("fetch failed");
+      if (mode === "queue") return queueBusy();
+      if (mode === "gateway") return jsonResponse(503, { detail: "Synthetic gateway failure" });
+      return jsonResponse(202, { ok: true, result: { files_received: 1, errors: [] } });
+    } });
+    const upload = client.uploadFileBatch("queue", { files: [QUEUE_TEST_FILE.descriptor] }, [QUEUE_TEST_FILE], undefined,
+      { queueWaitTimeoutMs: 0 });
+    if (mode === "success") assert.equal((await upload).files_received, 1);
+    else await assert.rejects(upload, mode === "network" ? TypeError : CorpusWireHttpError);
+    assert.equal(attempts, 1, mode);
+  }
+});
+
 test("cancellation and incomplete detach interrupt admission waits and abort unsent inventories", async () => {
   for (const detach of [false, true]) {
     const controller = new AbortController();
@@ -2925,10 +3026,10 @@ test("cancellation and incomplete detach interrupt admission waits and abort uns
 
 test("explicit detach preserves backend work after every required upload is acknowledged", async () => {
   const controller = new AbortController();
-  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }],
-    onUpload: () => controller.abort(),
-  });
-  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, detachSignal: controller.signal }), RemoteIndexDetachedError);
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, detachSignal: controller.signal,
+    onProgress: (event) => { if (event.phase === "uploading") controller.abort(); },
+  }), RemoteIndexDetachedError);
   assert.equal(fixture.calls.some((call) => call.type === "abort"), false);
 });
 
