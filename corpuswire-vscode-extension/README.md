@@ -109,7 +109,7 @@ or prefixed:
 | --- | --- | --- |
 | `corpuswire.baseUrl` | `http://127.0.0.1:8000` | Compatibility fallback URL when service URLs are unset |
 | `corpuswire.userConfigPath` | empty | Optional explicit home config file |
-| `corpuswire.auth.cliPath` | `corpuswire` | CLI executable used to resolve an OS-keyring bearer token for each service URL |
+| `corpuswire.auth.cliPath` | `corpuswire` | User or machine CLI executable used to resolve an OS-keyring bearer token in trusted workspaces |
 | `corpuswire.repoPath` | first workspace folder | Service-local path used only when remote indexing is disabled |
 | `corpuswire.topK` | `5` | Retrieval chunk count for prompt enhancement |
 | `corpuswire.outputMode` | `generic` | `generic`, `copilot`, `claude-code`, or `sequential` |
@@ -123,6 +123,10 @@ Explicit Authorization, including Basic Auth or an API key using that header,
 takes precedence. Set an absolute `corpuswire.auth.cliPath` if the VS Code
 extension host's PATH does not contain the CLI. Token lookup has a five-second
 timeout and does not initiate login.
+Configure the executable in VS Code user or machine settings. Workspace and
+folder settings, and `auth.cliPath` in the optional JSON config file, are ignored.
+The extension never executes the CLI in an untrusted workspace; explicit
+Authorization headers remain available there.
 
 `serviceDefaults` applies to `indexer`, `enhancer`, and `semanticSearch` unless a
 service-specific setting overrides it.

@@ -111,6 +111,7 @@ Build and install a local package snapshot without a source-tree entrypoint:
 
 ```bash
 cd /path/to/corpuswire-clients
+npm ci --prefix corpuswire-cli --offline --ignore-scripts --omit=dev
 npm pack ./corpuswire-sdk --pack-destination /tmp/corpuswire-snapshot
 npm pack ./corpuswire-cli --pack-destination /tmp/corpuswire-snapshot
 npm install --prefix /tmp/corpuswire-install \
@@ -298,8 +299,10 @@ remove unmentioned paths. A second identical full run is reported as
 `no_change` in the preview and avoids re-embedding unchanged files.
 
 Ctrl+C sends a real backend abort and waits for acknowledgement. A second Ctrl+C
-detaches and reports the session id and reattachment command. An explicit
-`--timeout-ms` also detaches rather than falsely marking the backend run failed.
+or `--timeout-ms` detaches after all required uploads are accepted, reporting the
+session id and reattachment command. If source uploads are still incomplete,
+the CLI requests abort and asks for a new indexing operation because following
+a session cannot resume unsent files. Tier processing waits share one deadline.
 
 The CLI helps verify those flows after they run:
 

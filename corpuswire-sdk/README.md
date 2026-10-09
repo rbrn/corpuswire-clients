@@ -349,10 +349,13 @@ caps unverified overall progress below 100, and reports 100 only after verified
 commit. It includes heartbeat/liveness, phase timing, throughput, queue, retry,
 warning, ETA-confidence, and cumulative count fields.
 
-`processingTimeoutMs` is an explicit caller wait budget, not a backend job
-timeout. Expiry raises `RemoteIndexDetachedError`; backend work continues and
-the error contains the session id. Use `followIndexSession(sessionId, ...)` to
-reattach. An `AbortSignal` sends `DELETE /v1/index/sessions/{id}` and waits for
+`processingTimeoutMs` is one caller wait budget across tier drains, starting at
+the first processing wait. Before all required source uploads are accepted,
+expiry or detach requests abort and returns a restart-required error: polling
+cannot resume unsent source. After all uploads are accepted, expiry raises
+`RemoteIndexDetachedError`; backend work continues and the error contains the
+session id. Use `followIndexSession(sessionId, ...)` to reattach. An
+`AbortSignal` sends `DELETE /v1/index/sessions/{id}` and waits for
 the terminal `aborted` status before raising `RemoteIndexCancelledError`.
 
 Use `mode: "full"` when the file list represents the complete workspace

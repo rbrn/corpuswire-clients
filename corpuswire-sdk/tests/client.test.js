@@ -2753,6 +2753,88 @@ test("final completeness still waits for missing uploads after all tiers drain",
   assert.equal(fixture.calls.some((call) => call.type === "commit" || call.type === "abort"), false);
 });
 
+test("a code-tier processing timeout aborts while documentation uploads are still unsent", async () => {
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+  ] });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (!url.endsWith("/status")) return response;
+    const payload = await response.json();
+    payload.result.active_batches = 1;
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: 20 }), (error) => {
+    assert.equal(error instanceof RemoteIndexDetachedError, false);
+    assert.match(error.message, /abort was requested for the incomplete session/);
+    assert.equal(error.transfer.files_transferred, 1);
+    assert.equal(error.transfer.complete, false);
+    return true;
+  });
+  assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
+  assert.equal(fixture.calls.at(-1).type, "abort");
+  assert.equal(fixture.calls.some((call) => call.type === "checkpoint" || call.type === "commit"), false);
+});
+
+test("tier processing waits share one deadline instead of restarting the caller budget", async (t) => {
+  let now = 0, codeReads = 0, documentationReads = 0;
+  t.mock.method(Date, "now", () => now);
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+    { relativePath: "data.json", content: "{}" },
+  ] });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (!url.endsWith("/status")) return response;
+    const payload = await response.json();
+    if (payload.result.queue_depth === 2) {
+      now = ++codeReads === 1 ? 60 : 90;
+      payload.result.active_batches = codeReads === 1 ? 1 : 0;
+    } else {
+      now = ++documentationReads === 1 ? 110 : 220;
+      payload.result.active_batches = 1;
+    }
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspace(fixture.request), /abort was requested for the incomplete session/);
+  assert.equal(codeReads, 2);
+  assert.equal(documentationReads, 1);
+  assert.equal(fixture.calls.at(-1).type, "abort");
+  assert.equal(fixture.calls.some((call) => call.type === "upload" && call.paths.includes("data.json")), false);
+});
+
+test("an incomplete detach reports an unconfirmed abort without claiming reattachment", async () => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+  ], onUpload: () => controller.abort() });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = (url, init) => {
+    if (init.method === "DELETE") throw new Error("Synthetic abort rejection");
+    return originalFetch(url, init);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, detachSignal: controller.signal }), (error) => {
+    assert.equal(error instanceof RemoteIndexDetachedError, false);
+    assert.match(error.message, /abort could not be confirmed/);
+    assert.equal(error.transfer.complete, false);
+    return true;
+  });
+  assert.equal(fixture.calls.some((call) => call.type === "upload" && call.paths.includes("README.md")), false);
+});
+
+test("expiry after code publication prevents the next tier from uploading", async (t) => {
+  let now = 0;
+  t.mock.method(Date, "now", () => now);
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+  ] });
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, onCodeReady: () => { now = 110; } }), /abort was requested for the incomplete session/);
+  assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
+  assert.equal(fixture.calls.at(-1).type, "abort");
+});
+
 test("old server capability and zero-code inventories skip code publication", async () => {
   for (const options of [
     { files: [{ relativePath: "main.py", content: "x" }], capability: false },
@@ -2817,7 +2899,7 @@ test("admission timeout is finite and permanent quota responses fail without ret
   }
 });
 
-test("cancellation and detach interrupt admission waits before another upload", async () => {
+test("cancellation and incomplete detach interrupt admission waits and abort unsent inventories", async () => {
   for (const detach of [false, true]) {
     const controller = new AbortController();
     let uploads = 0, aborts = 0;
@@ -2832,11 +2914,22 @@ test("cancellation and detach interrupt admission waits before another upload", 
     const started = Date.now();
     await assert.rejects(client.indexWorkspace({ workspace: { workspaceId: "fixture" }, files: [{ relativePath: "main.py", content: "x" }],
       signal: detach ? undefined : controller.signal, detachSignal: detach ? controller.signal : undefined,
-    }), detach ? RemoteIndexDetachedError : RemoteIndexCancelledError);
+    }), (error) => detach
+      ? !(error instanceof RemoteIndexDetachedError) && /abort was requested for the incomplete session/.test(error.message)
+      : error instanceof RemoteIndexCancelledError);
     assert.ok(Date.now() - started < 1000);
     assert.equal(uploads, 1);
-    assert.equal(aborts, detach ? 0 : 1);
+    assert.equal(aborts, 1);
   }
+});
+
+test("explicit detach preserves backend work after every required upload is acknowledged", async () => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }],
+    onUpload: () => controller.abort(),
+  });
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, detachSignal: controller.signal }), RemoteIndexDetachedError);
+  assert.equal(fixture.calls.some((call) => call.type === "abort"), false);
 });
 
 test("one failing upload stops sibling queue retries and prevents the next batch", async () => {

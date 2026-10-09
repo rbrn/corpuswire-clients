@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
+import * as path from "node:path";
 
 import { assessEnhancementQuality } from "../dist/enhancement-quality.js";
 import { hasAuthorizationHeader } from "../dist/service-auth.js";
@@ -16,10 +17,11 @@ function cliResolver(execFile) {
   return new Function("execFile", `${authSource}\nreturn resolveCliBearerToken;`)(execFile);
 }
 
-function headerResolver(resolveToken) {
-  return new Function("buildRemoteServiceHeaders", "hasAuthorizationHeader", "resolveCliBearerToken",
+function headerResolver(resolveToken, ...trust) {
+  const isTrusted = trust.length ? trust[0] : true;
+  return new Function("buildRemoteServiceHeaders", "hasAuthorizationHeader", "resolveCliBearerToken", "vscode",
     `${extensionSource.slice(authStart, authEnd)}; return buildAuthenticatedServiceHeaders;`)(
-    (service) => ({ ...service.headers }), hasAuthorizationHeader, resolveToken,
+    (service) => ({ ...service.headers }), hasAuthorizationHeader, resolveToken, { workspace: { isTrusted } },
   );
 }
 
@@ -74,7 +76,7 @@ test("reports low-confidence or uncited results as degraded", () => {
   assert.match(quality.message, /no source citations/);
 });
 
-test("CLI bearer lookup uses the resource CLI/service URL and retains installed safety bounds", async () => {
+test("CLI bearer lookup uses the trusted CLI/service URL and retains installed safety bounds", async () => {
   const calls = [];
   const resolve = cliResolver((executable, args, options, callback) => {
     calls.push({ executable, args, options });
@@ -103,7 +105,7 @@ test("explicit Authorization of any case takes precedence without invoking the C
   }
 });
 
-test("service header fallback adds CLI bearer only for the selected resource and service URL", async () => {
+test("trusted-workspace header fallback adds CLI bearer for the selected service URL", async () => {
   const calls = [];
   const build = headerResolver(async (url, cliPath) => { calls.push({ url, cliPath }); return "synthetic-fixture-token"; });
   const headers = await build({ auth: { cliPath: "/fixture/root-two-cli" } }, {
@@ -115,8 +117,47 @@ test("service header fallback adds CLI bearer only for the selected resource and
   assert.deepEqual(await unavailable({ auth: { cliPath: "/fixture/cli" } }, { url: "https://fixture.example", headers: { "X-Fixture": "safe" } }), { "X-Fixture": "safe" });
 });
 
-test("manifest retains resource-scoped CLI auth configuration from installed 0.1.7", async () => {
+test("manifest restricts CLI executable configuration to user or machine settings", async () => {
   const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   assert.equal(manifest.contributes.configuration.properties["corpuswire.auth.cliPath"].default, "corpuswire");
-  assert.equal(manifest.contributes.configuration.properties["corpuswire.auth.cliPath"].scope, "resource");
+  assert.equal(manifest.contributes.configuration.properties["corpuswire.auth.cliPath"].scope, "machine");
+});
+
+test("untrusted and unknown-trust workspaces never execute CLI fallback while explicit auth remains usable", async () => {
+  for (const isTrusted of [false, undefined]) {
+    const build = headerResolver(async () => { throw new Error("Untrusted workspace executed the CLI"); }, isTrusted);
+    const settings = { auth: { cliPath: "/fixture/hostile-workspace-executable" } };
+    assert.deepEqual(await build(settings, { url: "https://fixture.example", headers: { "X-Fixture": "safe" } }), { "X-Fixture": "safe" });
+    assert.deepEqual(await build(settings, { url: "https://fixture.example", headers: { authorization: "Bearer explicit-fixture" } }), { authorization: "Bearer explicit-fixture" });
+  }
+});
+
+test("workspace, folder and workspace-selected config files cannot choose the CLI executable", async () => {
+  const configurationSource = (await readFile(new URL("../dist/configuration.js", import.meta.url), "utf8"))
+    .replace(/^import .*;\n/gm, "").replace(/^export /gm, "");
+  const folder = { name: "hostile", uri: { scheme: "file", fsPath: "/fixture/workspace", toString: () => "file:///fixture/workspace" } };
+  let globalCliPath = " /fixture/trusted-user-cli ";
+  const fakeVscode = { workspace: {
+    workspaceFolders: [folder], getWorkspaceFolder: () => folder,
+    getConfiguration: (section) => ({ inspect: (key) => {
+      if (section !== "corpuswire") return undefined;
+      if (key === "auth.cliPath") return {
+        globalValue: globalCliPath, workspaceValue: "/fixture/evil-workspace-cli", workspaceFolderValue: "/fixture/evil-folder-cli",
+      };
+      if (key === "userConfigPath") return { workspaceValue: "/fixture/workspace/auth.json" };
+      return undefined;
+    } }),
+  } };
+  const fakeFs = {
+    existsSync: (filename) => filename === "/fixture/workspace/auth.json",
+    readFileSync: (filename) => {
+      assert.equal(filename, "/fixture/workspace/auth.json");
+      return JSON.stringify({ auth: { cliPath: "/fixture/evil-config-file-cli" } });
+    },
+  };
+  const readSettings = new Function("fs", "os", "path", "vscode", "deriveDefaultWorkspaceId",
+    `${configurationSource}\nreturn readSettings;`)(fakeFs, { homedir: () => "/fixture/home" }, path, fakeVscode, () => "test://hostile");
+  assert.equal(readSettings(folder.uri).auth.cliPath, "/fixture/trusted-user-cli");
+  globalCliPath = undefined;
+  assert.equal(readSettings(folder.uri).auth.cliPath, "corpuswire");
 });

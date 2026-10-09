@@ -34,7 +34,7 @@ type PromptRewriteResultWithCompatibilityFields = PromptRewriteResult & {
   rewritten_prompt?: unknown;
 };
 
-const INDEX_INCLUDE_GLOB = "**/*.{md,txt,csv,pdf,java,py,sh,cjs,js,jsx,mjs,ts,tsx,json,jsonl,ndjson,toml,yaml,yml}";
+const INDEX_INCLUDE_GLOB = "{**/*.{md,txt,csv,pdf,bat,scala,sh,cjs,js,jsx,mjs,cts,mts,ts,tsx,java,kt,kts,py,pyi,hcl,tf,html,htm,json,jsonl,ndjson,toml,yaml,yml},**/{mvnw,gradlew},**/*.json.example}";
 const INDEX_EXCLUDE_GLOB = "{**/.git/**,**/.vscode/**,**/node_modules/**,**/dist/**,**/build/**,**/target/**,**/__pycache__/**}";
 
 async function buildAuthenticatedServiceHeaders(
@@ -43,6 +43,9 @@ async function buildAuthenticatedServiceHeaders(
 ): Promise<Record<string, string>> {
   const headers = buildRemoteServiceHeaders(service);
   if (hasAuthorizationHeader(headers)) {
+    return headers;
+  }
+  if (vscode.workspace.isTrusted !== true) {
     return headers;
   }
   const token = await resolveCliBearerToken(service.url, settings.auth.cliPath);

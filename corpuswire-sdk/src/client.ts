@@ -1076,13 +1076,12 @@ export class CorpusWireClient {
 
   private async waitForIndexSessionProcessing(
     sessionId: string,
-    timeoutMs: number | undefined,
+    deadline: number | null,
     pollMs: number,
     request: Pick<IndexWorkspaceRequest, "signal" | "detachSignal" | "onProgress">,
     ignoreMissingUploads = false,
     remainingUploads = 0,
   ): Promise<RemoteIndexStatus> {
-    const deadline = timeoutMs === undefined ? null : Date.now() + Math.max(1, timeoutMs);
     let lastSequence = -1;
     for (;;) {
       const status = await this.getIndexSessionStatus(sessionId);
@@ -1105,9 +1104,6 @@ export class CorpusWireClient {
       const drained = ignoreMissingUploads
         ? countersAvailable || status.queue_depth <= remainingUploads
         : status.queue_depth === 0;
-      if (pendingBatches === 0 && activeBatches === 0 && drained) {
-        return status;
-      }
       if (request.signal?.aborted) {
         return status;
       }
@@ -1116,6 +1112,9 @@ export class CorpusWireClient {
       }
       if (deadline !== null && Date.now() >= deadline) {
         throw new RemoteIndexDetachedError(sessionId, status, "Caller wait timeout elapsed");
+      }
+      if (pendingBatches === 0 && activeBatches === 0 && drained) {
+        return status;
       }
       await waitForIndexInterruptDelay(Math.max(10, pollMs), request);
     }
@@ -1285,8 +1284,22 @@ export class CorpusWireClient {
       const filesToUpload = remoteFiles.filter(({ file }) => uploadRequired.has(file.relativePath));
       let queuedBackgroundWork = false;
       let uploadedFiles = 0;
+      // All tier drains share the caller's processing budget. Starting it at
+      // the first drain preserves the existing upload-versus-processing split.
+      let processingDeadline: number | null = null;
+      const processingWaitDeadline = (): number | null => {
+        if (processingDeadline === null && request.processingTimeoutMs !== undefined) {
+          processingDeadline = Date.now() + Math.max(1, request.processingTimeoutMs);
+        }
+        return processingDeadline;
+      };
       for (const priority of [1, 2, 3] as const) {
         await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
+        if (processingDeadline !== null && Date.now() >= processingDeadline
+          && uploadedFiles < filesToUpload.length) {
+          throw new RemoteIndexDetachedError(session.session_id,
+            await this.getIndexSessionStatus(session.session_id), "Caller wait timeout elapsed");
+        }
         const tierFiles = filesToUpload.filter(({ file }) => ingestionPriority(file.relativePath) === priority);
         let tierQueued = false;
         const uploadBatches = buildUploadBatches(
@@ -1341,7 +1354,7 @@ export class CorpusWireClient {
         );
         if (tierQueued) {
           const status = await this.waitForIndexSessionProcessing(
-            session.session_id, request.processingTimeoutMs, request.processingPollMs ?? 250,
+            session.session_id, processingWaitDeadline(), request.processingPollMs ?? 250,
             { ...request, onProgress: emitProgress }, true, filesToUpload.length - uploadedFiles,
           );
           if (status.phase === "aborted") throw new RemoteIndexCancelledError(session.session_id, status);
@@ -1361,7 +1374,7 @@ export class CorpusWireClient {
       if (queuedBackgroundWork) {
         const processingStatus = await this.waitForIndexSessionProcessing(
           session.session_id,
-          request.processingTimeoutMs,
+          processingWaitDeadline(),
           request.processingPollMs ?? 250,
           { ...request, onProgress: emitProgress },
         );
@@ -1391,9 +1404,22 @@ export class CorpusWireClient {
         try {
           await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
         } catch (interruption) {
-          if (interruption instanceof Error) Object.assign(interruption, { transfer });
-          throw interruption;
+          error = interruption;
         }
+      }
+      if (error instanceof RemoteIndexDetachedError
+        && (transfer.files_upload_required === null || transfer.files_transferred < transfer.files_upload_required)) {
+        // Reattachment can observe a session but cannot upload the remaining
+        // local source. Retaining it would strand an incomplete inventory.
+        let abortMessage = "an abort was requested for the incomplete session";
+        try {
+          await this.abortIndexSession(session.session_id);
+        } catch {
+          abortMessage = "the incomplete session's abort could not be confirmed";
+        }
+        const incomplete = new Error(`Indexing stopped before all required source uploads were submitted; ${abortMessage}. Start a new index operation to complete the inventory.`);
+        Object.assign(incomplete, { transfer, cause: error });
+        throw incomplete;
       }
       if (error instanceof Error) Object.assign(error, { transfer });
       if (error instanceof RemoteIndexDetachedError || error instanceof RemoteIndexCancelledError) {

@@ -4683,6 +4683,20 @@ test("MCP recognizes code readiness without certifying full inventory", async ()
   assert.equal(ready.documentationPending, true);
   assert.equal(ready.coverage.state, 'pending');
   assert.equal(ready.needsReconcile, false);
+  for (const change of [
+    {index:{...diagnosis.index,health_status:'error'}},
+    {index:{...diagnosis.index,health_warnings:['vector connection failed']}},
+    {qdrant_error:'vector connection failed'},
+    {checks:[{name:'vectors',status:'error',message:'vector connection failed'}]},
+    {checks:[{name:'vectors',status:'warning',message:'vector connection failed'}]},
+    {collection_exists:false},
+    {point_count:0},
+    {index:{...diagnosis.index,health_status:undefined}},
+  ]) {
+    const rejected = readBootstrap({...diagnosis,...change},{});
+    assert.equal(rejected.codeReady,false);
+    assert.equal(rejected.state,'needs_reconcile');
+  }
   diagnosis.index.coverage.reason_codes = ['mirror_pending'];
   assert.equal(readBootstrap(diagnosis, {}).state, 'needs_reconcile');
   diagnosis.index.coverage.reason_codes = ['background_ingestion_pending'];

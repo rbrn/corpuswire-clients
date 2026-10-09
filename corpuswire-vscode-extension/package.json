@@ -73,8 +73,8 @@
         "corpuswire.auth.cliPath": {
           "type": "string",
           "default": "corpuswire",
-          "scope": "resource",
-          "description": "CorpusWire CLI executable used to read the OS-keyring bearer token for authenticated extension requests."
+          "scope": "machine",
+          "description": "User or machine CLI executable used to read the OS-keyring bearer token in trusted workspaces. Workspace, folder, and optional config-file overrides are ignored."
         },
         "corpuswire.baseUrl": {
           "type": "string",

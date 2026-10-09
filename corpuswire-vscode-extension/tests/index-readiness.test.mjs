@@ -1,11 +1,14 @@
-import { isRetrievalExcludedPath } from "../../corpuswire-sdk/dist/index.js";
+import { ingestionPriority, isRetrievalExcludedPath } from "../../corpuswire-sdk/dist/index.js";
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
+import minimatch from 'minimatch';
 
 // Exercise the compiled production scanner with injected VS Code filesystem IO.
 const source = await readFile(new URL('../dist/extension.js', import.meta.url), 'utf8');
+const includeGlob = JSON.parse(source.match(/^const INDEX_INCLUDE_GLOB = (.+);$/m)[1]);
+const excludeGlob = JSON.parse(source.match(/^const INDEX_EXCLUDE_GLOB = (.+);$/m)[1]);
 const start = source.indexOf('async function collectUriFiles(');
 const end = source.indexOf('\nfunction relativePathForUri', start);
 assert.ok(start > 0 && end > start);
@@ -89,6 +92,7 @@ function extensionHarness(folders, overrides = new Map()) {
   const warnings = [], information = [], progress = [], requests = [], diagnoses = [], timers = new Map();
   const settings = new Map(folders.map((root) => [root.uri.toString(), rootSettings(root, overrides.get(root.name))]));
   let nextTimer = 0;
+  let watcherGlob;
   let capabilities = 0;
   let upload = async () => ({ status: { coverage: { state: 'verified' } }, transfer: { files_transferred: 1 } });
   let diagnose = async () => readyDiagnosis();
@@ -111,7 +115,8 @@ function extensionHarness(folders, overrides = new Map()) {
         const root = this.getWorkspaceFolder(uri);
         return uri.toString().slice(root.uri.toString().length + 1);
       },
-      createFileSystemWatcher() {
+      createFileSystemWatcher(glob) {
+        watcherGlob = glob;
         return { onDidCreate: (handler) => { callbacks.create = handler; },
           onDidChange: (handler) => { callbacks.change = handler; },
           onDidDelete: (handler) => { callbacks.delete = handler; }, dispose() {} };
@@ -148,12 +153,13 @@ function extensionHarness(folders, overrides = new Map()) {
     ${source.slice(statusStart, statusEnd)}
     function formatIndexingError(error) { return error.message; }
     function formatIndexProgressMessage() { return 'upload progress'; }
-    const INDEX_INCLUDE_GLOB = '**/*';
+    const INDEX_INCLUDE_GLOB = ${JSON.stringify(includeGlob)};
     return { indexCurrentWorkspace, registerRemoteIndexWatchers, relativePathForUri, runIndexStatusCheck };
   `)(vscode, readSettings, Client, () => ({}), collectWorkspaceFiles, collectUriFiles, excludedPath,
     (handler) => { const id = ++nextTimer; timers.set(id, handler); return id; }, (id) => timers.delete(id));
   return { ...functions, warnings, information, progress, requests, diagnoses, callbacks, settings, subscriptions,
     get capabilities() { return capabilities; }, setUpload(handler) { upload = handler; },
+    get watcherGlob() { return watcherGlob; },
     setDiagnosis(handler) { diagnose = handler; },
     flushTimers() { const scheduled = [...timers.values()]; timers.clear(); scheduled.forEach((handler) => handler()); },
     cancel() { token.isCancellationRequested = true; cancelHandlers.forEach((handler) => handler()); },
@@ -302,6 +308,70 @@ test('full workspace scanner partitions nested roots and keeps exclusion evidenc
   assert.deepEqual(scanned, [own]);
   assert.equal(result.inventoryScan.complete, true);
   assert.equal(result.inventoryScan.excludedFileCount, 1);
+});
+
+test('production scanner and watcher include canonical code extensions and wrappers without crossing exclusions', async () => {
+  const extensions = ['bat', 'scala', 'sh', 'cjs', 'js', 'jsx', 'mjs', 'cts', 'mts', 'ts', 'tsx', 'java', 'kt', 'kts', 'py', 'pyi', 'hcl', 'tf', 'html', 'htm'];
+  const codePaths = [...extensions.map((extension) => `src/example.${extension}`), 'mvnw', 'tools/gradlew', 'infra/main.tf.json'];
+  for (const path of codePaths) assert.equal(ingestionPriority(path), 1, path);
+  const allowedPaths = [...codePaths, 'README.md', 'config/settings.json.example'];
+  const deniedPaths = ['.env', 'credential.pem', 'infra/private.tfvars.json', 'package.json', '.github/pipeline.yml', 'build/example.scala', 'node_modules/example.kt'];
+  const parent = folder('registry');
+  const child = { name: 'child', uri: { toString: () => `${parent.uri.toString()}/child` } };
+  const candidateUris = [...allowedPaths, ...deniedPaths].map((path) => file(parent, path));
+  candidateUris.push(file(child, 'src/nested.kt'));
+  const readPaths = [];
+  const vscode = {
+    FileType: { Directory: 2, SymbolicLink: 64 },
+    RelativePattern: class { constructor(root, glob) { this.root = root; this.glob = glob; } },
+    workspace: {
+      getWorkspaceFolder: (uri) => uri.toString().startsWith(`${child.uri.toString()}/`) ? child : parent,
+      asRelativePath(uri) {
+        return uri.toString().slice(this.getWorkspaceFolder(uri).uri.toString().length + 1);
+      },
+      findFiles: async (include, exclude) => {
+        assert.equal(include.root, parent);
+        assert.equal(include.glob, includeGlob);
+        assert.equal(exclude.glob, excludeGlob);
+        return candidateUris.filter((uri) => {
+          const path = uri.toString().slice(parent.uri.toString().length + 1);
+          return minimatch(path, include.glob, { dot: true }) && !minimatch(path, exclude.glob, { dot: true });
+        });
+      },
+      fs: {
+        stat: async () => ({ type: 1, size: 3, mtime: 1 }),
+        readFile: async (uri) => {
+          readPaths.push(uri.toString().slice(parent.uri.toString().length + 1));
+          return new Uint8Array(3);
+        },
+      },
+    },
+  };
+  const collect = new Function('vscode', 'isIndexExcludedPath', 'createHash', `
+    const INDEX_INCLUDE_GLOB = ${JSON.stringify(includeGlob)};
+    const INDEX_EXCLUDE_GLOB = ${JSON.stringify(excludeGlob)};
+    function indexRootKey(root) { return root.uri.toString(); }
+    ${source.slice(workspaceScanStart, workspaceScanEnd)}
+    ${source.slice(start, end)}
+    ${source.slice(relativeStart, relativeEnd)}
+    return collectWorkspaceFiles;
+  `)(vscode, excludedPath, createHash);
+  const result = await collect(parent, 100);
+  assert.deepEqual(result.files.map((entry) => entry.relativePath).sort(), allowedPaths.toSorted());
+  assert.deepEqual(readPaths.sort(), allowedPaths.toSorted());
+  assert.equal(result.inventoryScan.complete, true);
+  assert.equal(result.inventoryScan.excludedFileCount, 4);
+
+  const harness = extensionHarness([parent], new Map([[parent.name, { maxAutoWatchFiles: 100 }]]));
+  harness.registerRemoteIndexWatchers({ subscriptions: harness.subscriptions }, { setIndexProgress() {} });
+  assert.equal(harness.watcherGlob, includeGlob);
+  for (const path of [...allowedPaths, ...deniedPaths]) {
+    if (minimatch(path, harness.watcherGlob, { dot: true })) harness.callbacks.change(file(parent, path));
+  }
+  harness.flushTimers();
+  await tick(); await tick();
+  assert.equal(harness.requests.length, 1);
+  assert.deepEqual(harness.requests[0].files.map((entry) => entry.relativePath).sort(), allowedPaths.toSorted());
 });
 
 test('watcher retains events arriving in flight, coalesces delete/recreate, and aborts on disposal', async () => {

@@ -104,7 +104,7 @@ export function readSettings(resource?: vscode.Uri): ExtensionSettings {
 
   return {
     auth: {
-      cliPath: readConfiguredString(config, homeConfiguration.values, "auth.cliPath", "corpuswire"),
+      cliPath: readTrustedCliPath(),
     },
     baseUrl,
     repoPath: resolveRepoPath(configuredRepoPath, workspaceFolderPath),
@@ -155,6 +155,12 @@ export function readSettings(resource?: vscode.Uri): ExtensionSettings {
     },
     configurationWarnings: homeConfiguration.warnings,
   };
+}
+
+function readTrustedCliPath(): string {
+  // Executable selection must never come from repository-controlled settings or config files.
+  const configured = vscode.workspace.getConfiguration(CONFIG_SECTION).inspect<unknown>("auth.cliPath")?.globalValue;
+  return typeof configured === "string" && configured.trim() ? configured.trim() : "corpuswire";
 }
 
 function readLegacyContextEngineSettings(resource?: vscode.Uri): LegacyContextEngineSettings {

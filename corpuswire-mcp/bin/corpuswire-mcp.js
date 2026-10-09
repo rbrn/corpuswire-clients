@@ -5207,7 +5207,13 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
     && Array.isArray(coverage.reason_codes)
     && coverage.reason_codes.length === 1
     && coverage.reason_codes[0] === "background_ingestion_pending"
-    && canRetrieve === true && diagnosisStatus === "ready";
+    && canRetrieve === true && diagnosisStatus === "ready"
+    && collectionExists === true && Number.isInteger(pointCount) && pointCount > 0
+    && indexHealthStatus === "ok" && healthWarnings.length === 0
+    && !optionalString(diagnosis.qdrant_error)
+    && !hasFreshnessProblem
+    && checks.every((check) => !["warning", "error", "blocked", "failed"].includes(
+      String(check.status ?? "").toLowerCase()));
   const coverageUnknown = !["verified", "not_applicable"].includes(coverage.state);
   const needsReconcile = (coverageUnknown && !codeReady) || hasFreshnessProblem
     || collectionExists === false
