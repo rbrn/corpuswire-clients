@@ -4760,7 +4760,7 @@ test("verified MCP health failures block strict reads, incremental sync and doct
   const launch = (enabled) => spawn("node", [SERVER_BIN], {stdio:["pipe","pipe","pipe"],env:{...process.env,
     CORPUSWIRE_BASE_URL:"http://127.0.0.1:8000",CORPUSWIRE_SDK_PATH:sdkPath,CORPUSWIRE_WORKSPACE_ID:"fixture",CORPUSWIRE_REPO_PATH:sourceRoot,
     CORPUSWIRE_SYNC_ENABLED:String(enabled),CORPUSWIRE_SYNC_ROOT:sourceRoot,CORPUSWIRE_SYNC_READ_STRICT:"true",
-    CORPUSWIRE_SYNC_READ_STRICT_STALE_AFTER_MS:"60000",CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK:"true",
+    CORPUSWIRE_SYNC_READ_STRICT_STALE_AFTER_MS:"0",CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK:"true",
     CORPUSWIRE_SYNC_MTIME_CACHE_ENABLED:"true",CORPUSWIRE_SYNC_STATE_DIR:path.join(root,"cache"),
     MOCK_DIAGNOSIS_PATH:diagnosisPath,MOCK_CALLS_PATH:callsPath}});
   const child = launch(true), rpc = createRpc(child);
@@ -4775,6 +4775,12 @@ test("verified MCP health failures block strict reads, incremental sync and doct
     assert.match((await invoke("corpuswire_doctor")).result.content[0].text,/verdict: blocked/);
     await writeFile(diagnosisPath,JSON.stringify(healthy));
     assert.match((await invoke("corpuswire_doctor")).result.content[0].text,/verdict: ready/);
+    for (const diagnosisStatus of ["ready","degraded"]) {
+      await writeFile(diagnosisPath,JSON.stringify({...healthy,status:diagnosisStatus,
+        checks:[{name:"explicit_target",status:"warning",message:"No repoPath or workspaceId was supplied; retrieval will use the backend default context."}]}));
+      assert.match((await invoke("corpuswire_doctor")).result.content[0].text,/verdict: attention/);
+      assert.equal((await invoke("corpuswire_search",{query:"baseline"})).result.isError,false);
+    }
     for (const change of [
       {qdrant_error:"vector unavailable"},
       {checks:[{name:"vectors",status:"error",message:"vector unavailable"}]},
@@ -4793,13 +4799,20 @@ test("verified MCP health failures block strict reads, incremental sync and doct
       assert.match(status,/needsReconcile: false/);
     }
     const calls = (await readFile(callsPath,"utf8")).trim().split("\n");
-    assert.deepEqual(calls,["index","query"]);
+    assert.deepEqual(calls,["index","query","query","query"]);
     await writeFile(diagnosisPath,JSON.stringify(healthy));
     assert.match((await invoke("corpuswire_doctor")).result.content[0].text,/verdict: attention/);
     const resumed = await invoke("corpuswire_sync_delta",{changedPaths:["a.py"],flush:true});
     assert.match(resumed.result.content[0].text,/noOp: true/);
     assert.match((await invoke("corpuswire_sync_status")).result.content[0].text,/bootstrapState: ready/);
     assert.match((await invoke("corpuswire_doctor")).result.content[0].text,/verdict: ready/);
+    await writeFile(diagnosisPath,JSON.stringify({...healthy,status:"degraded",
+      checks:[{name:"explicit_target",status:"warning",message:"No repoPath or workspaceId was supplied; retrieval will use the backend default context."}],
+      index:{...healthy.index,readiness:"code_ready",coverage:{state:"pending",code_ready:true,
+        documentation_pending:true,reason_codes:["background_ingestion_pending"]}}}));
+    assert.match((await invoke("corpuswire_doctor")).result.content[0].text,/verdict: attention/);
+    assert.equal((await invoke("corpuswire_search",{query:"baseline"})).result.isError,false);
+    await writeFile(diagnosisPath,JSON.stringify(healthy));
     await writeFile(diagnosisPath,JSON.stringify({...healthy,index:{...healthy.index,indexed:false}}));
     // Fresh doctor diagnosis must also block when sync is disabled and no bootstrap check ran.
     const disabled = launch(false), disabledRpc = createRpc(disabled);
@@ -4850,5 +4863,52 @@ test("doctor falls back to a known bootstrap health block when fresh diagnosis i
   for (const bootstrapState of ["blocked","error"]) {
     assert.equal(verdict({healthResponse:{ok:true},diagnosis:null,syncStatus:{bootstrapState,pendingTotal:0},
       sessions:[],activity:{gap_detected:false},errors:[]}),"blocked");
+  }
+});
+
+test("verified empty MCP baseline admits its first source file while genuine health faults and empty reads stay blocked", async () => {
+  for (const collectionExists of [true,false]) {
+  const root = await mkdtemp(path.join(tmpdir(),"cw-empty-write-"));
+  const sourceRoot = path.join(root,"repo"), sdkPath = path.join(root,"sdk.mjs");
+  const diagnosisPath = path.join(root,"diagnosis.json"), callsPath = path.join(root,"calls.jsonl");
+  await mkdir(sourceRoot);
+  const emptyWarning = "No indexed Qdrant points were found for this context.";
+  const coverage = {state:"verified",eligible_file_count:0,coverage_token:"empty-baseline",selection_policy_digest:"policy"};
+  const empty = {status:"blocked",can_retrieve:false,collection:"fixture",collection_exists:collectionExists,point_count:0,
+    checks:[...(collectionExists ? [] : [{name:"collection",status:"error",message:"Collection does not exist: fixture"}]),{name:"points",status:"error",message:"Collection has no indexed points."},
+      {name:"index_health",status:"warning",message:emptyWarning}],
+    index:{indexed:false,health_status:"degraded",health_warnings:[emptyWarning],coverage}};
+  await writeFile(diagnosisPath,JSON.stringify(empty));
+  await writeFile(sdkPath,`import {readFileSync,appendFileSync} from 'node:fs';
+    export class CorpusWireClient {
+      async diagnoseWorkspace(){return JSON.parse(readFileSync(process.env.MOCK_DIAGNOSIS_PATH,'utf8'));}
+      async indexWorkspace(request){appendFileSync(process.env.MOCK_CALLS_PATH,JSON.stringify({mode:request.mode,token:request.baseCoverageToken,policy:request.selectionPolicyDigest,files:request.files.map(f=>f.relativePath)})+'\\n');
+        return {ok:true,result:{collection:'fixture'},status:{collection_name:'fixture',coverage:${JSON.stringify(coverage)}},transfer:{complete:true,files_submitted:request.files.length,files_transferred:request.files.length,files_reused:0,acknowledged_files:request.files.map(f=>({relative_path:f.relativePath,sha256:f.sha256,disposition:'uploaded'}))}};}
+    }`);
+  const child = spawn('node',[SERVER_BIN],{stdio:['pipe','pipe','pipe'],env:{...process.env,
+    CORPUSWIRE_BASE_URL:'http://127.0.0.1:8000',CORPUSWIRE_SDK_PATH:sdkPath,CORPUSWIRE_WORKSPACE_ID:'fixture',
+    CORPUSWIRE_SYNC_ENABLED:'true',CORPUSWIRE_SYNC_ROOT:sourceRoot,CORPUSWIRE_SYNC_READ_STRICT:'true',
+    CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK:'true',MOCK_DIAGNOSIS_PATH:diagnosisPath,MOCK_CALLS_PATH:callsPath}});
+  const rpc = createRpc(child);let id=0;
+  const invoke=(name,args={})=>rpc({jsonrpc:'2.0',id:++id,method:'tools/call',params:{name,arguments:args}});
+  try {
+    assert.equal((await invoke('corpuswire_sync_reconcile')).result.isError,false);
+    const emptyRead=await invoke('corpuswire_search',{query:'new source'});
+    assert.equal(emptyRead.result.isError,true);
+    assert.match(emptyRead.result.content[0].text,/strict mode blocked retrieval/);
+    await writeFile(path.join(sourceRoot,'first.py'),'x=1');
+    for (const change of [{qdrant_error:'vector unavailable'},
+      {index:{...empty.index,coverage:{...coverage,eligible_file_count:1}}},
+      {checks:[...empty.checks,{name:'local_path',status:'error',message:'Source unavailable'}]}]) {
+      await writeFile(diagnosisPath,JSON.stringify({...empty,...change}));
+      const rejected=await invoke('corpuswire_sync_delta',{changedPaths:['first.py'],flush:true});
+      assert.doesNotMatch(rejected.result.content[0].text,/filesUploaded: 1/);
+    }
+    await writeFile(diagnosisPath,JSON.stringify(empty));
+    const uploaded=await invoke('corpuswire_sync_delta',{changedPaths:['first.py'],flush:true});
+    assert.match(uploaded.result.content[0].text,/filesUploaded: 1/);
+    assert.deepEqual((await readFile(callsPath,'utf8')).trim().split('\n').map(JSON.parse),[
+      {mode:'full',files:[]},{mode:'incremental',token:'empty-baseline',policy:'policy',files:['first.py']}]);
+  } finally {child.kill();await rm(root,{recursive:true,force:true});}
   }
 });

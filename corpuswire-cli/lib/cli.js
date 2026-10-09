@@ -1209,6 +1209,7 @@ async function runDoctorCommand(options, dependencies) {
     if (diagnosis.can_retrieve !== true || diagnosis.status === "blocked") reasons.push("retrieval_blocked");
     else if (diagnosis.status !== "ready") reasons.push("workspace_degraded");
     if (diagnosis.resolved_workspace_id && diagnosis.resolved_workspace_id !== options.workspaceId) reasons.push("workspace_identity_mismatch");
+    if (diagnosis.index?.indexed === false) reasons.push("index_not_indexed");
     if (diagnosis.index?.read_needs_reconcile === true || diagnosis.index?.readNeedsReconcile === true) reasons.push("needs_reconcile");
     if (diagnosis.index?.health_status && !["ok", "ready", "healthy"].includes(diagnosis.index.health_status)) reasons.push("index_health_degraded");
     if (diagnosis.index?.health_warnings?.length) reasons.push("index_health_warnings");

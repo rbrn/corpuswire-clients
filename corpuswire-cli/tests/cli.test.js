@@ -1066,12 +1066,12 @@ test("doctor requires verified inventory, reports unavailable service, and never
     const writes = [];
     const baseDiagnosis = { status: "ready", can_retrieve: true,
       resolved_workspace_id: "local-docker://verified#main", index: { health_status: "ok" } };
-    for (const [state, status, exitCode] of [["verified", "ready", 0], ["unknown", "attention", 1], ["invalidated", "attention", 1], [undefined, "attention", 1]]) {
+    for (const [state, status, exitCode, indexed] of [["verified", "attention", 1, false], ["verified", "ready", 0, true], ["verified", "ready", 0], ["unknown", "attention", 1], ["invalidated", "attention", 1], [undefined, "attention", 1]]) {
       const result = await main(["doctor", "--workspace-id", "local-docker://verified#main", "--json"], {
         cwd: fixture, env: {}, homeDirectory: fixture, write: (line) => writes.push(line),
         client: {
           health: async () => ({ ok: true }),
-          diagnoseWorkspace: async () => ({ ...baseDiagnosis, index: { health_status: "ok", coverage: state ? { state } : undefined } }),
+          diagnoseWorkspace: async () => ({ ...baseDiagnosis, index: { indexed, health_status: "ok", coverage: state ? { state } : undefined } }),
         },
       });
       assert.equal(result.status, status);
@@ -1861,4 +1861,13 @@ test("watch retries startup capabilities and stops cleanly when startup is inter
       assert.equal(closed, 1);
     } finally { await rm(root, { recursive: true, force: true }); }
   }
+});
+
+
+test("watch rejects explicitly unindexed verified diagnosis", async () => {
+  const state = await watchFixture({onDiagnosis:async (_current,request)=>({status:"ready",can_retrieve:true,
+    resolved_workspace_id:request.workspaceId,index:{indexed:false,health_status:"ok",coverage:{state:"verified"}}})});
+  assert.match(state.error?.message ?? "",/index_not_indexed/);
+  assert.equal(state.waits,0);
+  assert.equal(state.writes.some(line=>line.includes("Index verified")),false);
 });

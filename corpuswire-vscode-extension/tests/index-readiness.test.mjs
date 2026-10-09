@@ -4,10 +4,10 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import minimatch from 'minimatch';
+import { INDEX_INCLUDE_GLOB as includeGlob } from '../dist/index-discovery.js';
 
 // Exercise the compiled production scanner with injected VS Code filesystem IO.
 const source = await readFile(new URL('../dist/extension.js', import.meta.url), 'utf8');
-const includeGlob = JSON.parse(source.match(/^const INDEX_INCLUDE_GLOB = (.+);$/m)[1]);
 const excludeGlob = JSON.parse(source.match(/^const INDEX_EXCLUDE_GLOB = (.+);$/m)[1]);
 const start = source.indexOf('async function collectUriFiles(');
 const end = source.indexOf('\nfunction relativePathForUri', start);
@@ -176,7 +176,7 @@ function extensionHarness(folders, overrides = new Map()) {
 function readyDiagnosis(coverage = {}) {
   return {
     status: 'ready', can_retrieve: true, qdrant_error: null, checks: [],
-    index: { indexed: true, health_status: 'ok', health_warnings: [], coverage: { state: 'verified', reason_codes: [], ...coverage } },
+    index: { indexed: true, readiness: coverage.state === 'pending' ? 'code_ready' : 'ready', health_status: 'ok', health_warnings: [], coverage: { state: 'verified', reason_codes: [], ...coverage } },
   };
 }
 
@@ -247,6 +247,37 @@ test('duplicate root workspace identities fail before any capabilities or upload
   assert.equal(harness.capabilities, 0);
   assert.equal(harness.requests.length, 0);
   assert.match(harness.warnings[0], /distinct remoteIndexing.workspaceId/);
+});
+
+test('equivalent service URL spellings cannot bypass duplicate root protection', async () => {
+  const roots = [folder('one'), folder('two')];
+  for (const [firstUrl, secondUrl] of [
+    ['HTTPS://EXAMPLE.com:443', 'https://example.com/'],
+    ['http://EXAMPLE.com:80/api/', 'http://example.com/api'],
+  ]) {
+    const harness = extensionHarness(roots, new Map(roots.map((root) => [root.name, { workspaceId: 'test://shared' }])));
+    harness.settings.get(roots[0].uri.toString()).services.indexer.url = firstUrl;
+    harness.settings.get(roots[1].uri.toString()).services.indexer.url = secondUrl;
+    await harness.indexCurrentWorkspace();
+    assert.equal(harness.capabilities, 0);
+    assert.equal(harness.requests.length, 0);
+    assert.match(harness.warnings[0], /distinct remoteIndexing.workspaceId/);
+
+    harness.registerRemoteIndexWatchers({ subscriptions: harness.subscriptions });
+    harness.callbacks.delete(file(roots[1], 'src/shared.ts'));
+    harness.flushTimers();
+    await tick();
+    assert.equal(harness.requests.length, 0);
+  }
+
+  // Distinct path prefixes and nondefault ports remain separate services.
+  for (const secondUrl of ['https://example.com/Other', 'https://example.com:8443/api']) {
+    const harness = extensionHarness(roots, new Map(roots.map((root) => [root.name, { workspaceId: 'test://shared' }])));
+    harness.settings.get(roots[0].uri.toString()).services.indexer.url = 'https://example.com/api';
+    harness.settings.get(roots[1].uri.toString()).services.indexer.url = secondUrl;
+    await harness.indexCurrentWorkspace();
+    assert.equal(harness.requests.length, 2);
+  }
 });
 
 test('watcher keeps same-path changes and deletion-only events isolated by root', async () => {
@@ -343,9 +374,9 @@ test('full workspace scanner partitions nested roots and keeps exclusion evidenc
 
 test('production scanner and watcher include canonical code extensions and wrappers without crossing exclusions', async () => {
   const extensions = ['bat', 'scala', 'sh', 'cjs', 'js', 'jsx', 'mjs', 'cts', 'mts', 'ts', 'tsx', 'java', 'kt', 'kts', 'py', 'pyi', 'hcl', 'tf', 'html', 'htm'];
-  const codePaths = [...extensions.map((extension) => `src/example.${extension}`), 'mvnw', 'tools/gradlew', 'infra/main.tf.json'];
+  const codePaths = [...extensions.flatMap((extension) => [`src/example.${extension}`, `src/Main.${extension.toUpperCase()}`]), 'mvnw', 'tools/gradlew', 'tools/MvNw', 'tools/GradleW', 'infra/main.tf.json', 'infra/main.TF.JSON'];
   for (const path of codePaths) assert.equal(ingestionPriority(path), 1, path);
-  const allowedPaths = [...codePaths, 'README.md', 'config/settings.json.example'];
+  const allowedPaths = [...codePaths, 'README.md', 'README.Md', 'config/settings.json.example', 'config/settings.JSON.ExAmPlE'];
   const deniedPaths = ['.env', 'credential.pem', 'infra/private.tfvars.json', 'package.json', '.github/pipeline.yml', 'build/example.scala', 'node_modules/example.kt'];
   const parent = folder('registry');
   const child = { name: 'child', uri: { toString: () => `${parent.uri.toString()}/child` } };
@@ -567,6 +598,24 @@ test('per-root readiness rejects unhealthy index metadata and diagnosis warnings
   assert.equal(warning.state, 'stale');
   assert.equal(warning.code_ready, false);
   assert.match(warning.message, /Synthetic diagnosis warning/);
+});
+
+test('partial code readiness requires explicit checkpoint readiness while verified coverage remains compatible', () => {
+  const root = folder('checkpoint');
+  const harness = extensionHarness([root]);
+  const pending = { state: 'pending', reason_codes: ['background_ingestion_pending'], code_ready: true, documentation_pending: true };
+  for (const readiness of [undefined, null, 'ready', 'indexing', 'stale']) {
+    const diagnosis = readyDiagnosis(pending);
+    diagnosis.index.readiness = readiness;
+    const result = harness.indexRootStatus(root.name, 'test://checkpoint', diagnosis);
+    assert.equal(result.state, 'stale');
+    assert.equal(result.code_ready, false);
+    assert.equal(result.documentation_pending, true);
+  }
+  assert.equal(harness.indexRootStatus(root.name, 'test://checkpoint', readyDiagnosis(pending)).code_ready, true);
+  const verified = readyDiagnosis({ code_ready: true });
+  delete verified.index.readiness;
+  assert.equal(harness.indexRootStatus(root.name, 'test://checkpoint', verified).state, 'indexed');
 });
 
 test('degraded top-level diagnosis blocks healthy pending and verified code coverage and aggregate readiness', async () => {

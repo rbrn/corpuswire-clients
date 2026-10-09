@@ -24,6 +24,7 @@ import {
   assessEnhancementQuality,
 } from "./enhancement-quality.js";
 import { hasAuthorizationHeader, resolveCliBearerToken } from "./service-auth.js";
+import { INDEX_INCLUDE_GLOB } from "./index-discovery.js";
 import type {
   EnhancementQuality,
   EnhancementQualityStatus,
@@ -34,7 +35,6 @@ type PromptRewriteResultWithCompatibilityFields = PromptRewriteResult & {
   rewritten_prompt?: unknown;
 };
 
-const INDEX_INCLUDE_GLOB = "{**/*.{md,txt,csv,pdf,bat,scala,sh,cjs,js,jsx,mjs,cts,mts,ts,tsx,java,kt,kts,py,pyi,hcl,tf,html,htm,json,jsonl,ndjson,toml,yaml,yml},**/{mvnw,gradlew},**/*.json.example}";
 const INDEX_EXCLUDE_GLOB = "{**/.git/**,**/.vscode/**,**/node_modules/**,**/dist/**,**/build/**,**/target/**,**/__pycache__/**}";
 
 async function buildAuthenticatedServiceHeaders(
@@ -458,7 +458,7 @@ function indexRootStatus(name: string, workspaceId: string, diagnosis: Workspace
   const blocked = diagnosis.status === "blocked" || !diagnosis.can_retrieve || Boolean(diagnosis.qdrant_error)
     || errors.length > 0 || index.health_status === "error";
   const codeReady = index.health_status === "ok" && healthClear && coverage?.code_ready === true && diagnosis.index.indexed
-    && (coverage.state === "verified" || (coverage.state === "pending"
+    && (coverage.state === "verified" || (coverage.state === "pending" && index.readiness === "code_ready"
       && coverage.reason_codes.length === 1 && coverage.reason_codes[0] === "background_ingestion_pending"));
   // Legacy servers may omit health fields; explicit degraded health must still block full readiness.
   const fullReady = (index.health_status == null || index.health_status === "ok") && healthClear && diagnosis.index.indexed && (coverage
@@ -647,6 +647,10 @@ function indexRootKey(folder: vscode.WorkspaceFolder): string {
   return folder.uri.toString();
 }
 
+function indexServiceIdentity(baseUrl: string): string {
+  return new URL(baseUrl).href.replace(/\/+$/, "");
+}
+
 function assertDistinctIndexRoots(roots: IndexWorkspaceRoot[]): void {
   const identities = new Map<string, string>();
   for (const { folder, settings } of roots) {
@@ -654,7 +658,7 @@ function assertDistinctIndexRoots(roots: IndexWorkspaceRoot[]): void {
     if (!workspaceId) {
       throw new Error(`Configure a stable remote indexing workspace ID for ${folder.name} before indexing.`);
     }
-    const identity = JSON.stringify([settings.services.indexer.url.replace(/\/+$/, ""), workspaceId]);
+    const identity = JSON.stringify([indexServiceIdentity(settings.services.indexer.url), workspaceId]);
     const previousRoot = identities.get(identity);
     if (previousRoot && previousRoot !== indexRootKey(folder)) {
       throw new Error(`Multiple workspace folders use CorpusWire workspace ID ${workspaceId}. Configure a distinct remoteIndexing.workspaceId for each folder before indexing.`);

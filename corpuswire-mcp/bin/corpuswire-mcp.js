@@ -1166,7 +1166,7 @@ class SyncManager {
       try { await this.refreshBootstrapStatus(batch); }
       catch { this.observationGap = true; }
     }
-    if (isBootstrapHealthBlocked(this.bootstrapStatus)) {
+    if (isBootstrapHealthBlocked(this.bootstrapStatus) && this.bootstrapStatus.emptyWriteReady !== true) {
       this.requeueBatch(batch);
       const result = { ok: false, blocked: true, requeued: true,
         error: this.bootstrapStatus.reason ?? "Index health blocks incremental sync.",
@@ -1240,7 +1240,8 @@ class SyncManager {
     }
 
     const coverage = this.bootstrapStatus.coverage;
-    if (this.observationGap !== false || this.bootstrapStatus.needsReconcile === true
+    if (this.observationGap !== false
+      || (this.bootstrapStatus.needsReconcile === true && this.bootstrapStatus.emptyWriteReady !== true)
       || coverage?.state !== "verified" || !coverage.coverage_token
       || !coverage.selection_policy_digest
       || this.coverageContextKey !== syncContextKey(batch)) {
@@ -5202,8 +5203,22 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
     .filter(Boolean);
   const diagnosisStatus = optionalString(diagnosis.status);
   const indexHealthStatus = optionalString(index.health_status);
+  const collectionExists = typeof diagnosis.collection_exists === "boolean" ? diagnosis.collection_exists : null;
+  const canRetrieve = typeof diagnosis.can_retrieve === "boolean" ? diagnosis.can_retrieve : null;
+  const pointCount = Number.isInteger(diagnosis.point_count) ? diagnosis.point_count : null;
+  const statusLooksBlocked = ["blocked", "error", "missing"].includes((diagnosisStatus ?? "").toLowerCase());
+  const isHealthWarning = (check) => String(check.status ?? "").toLowerCase() === "warning"
+    && ["index_health", "qdrant", "vectors", "vector_store", "collection", "points"].includes(
+      String(check.name ?? "").toLowerCase());
+  const hasAdvisoryWarning = checks.some((check) => String(check.status ?? "").toLowerCase() === "warning"
+    && !isHealthWarning(check));
+  const hasHealthProblem = index.indexed === false || Boolean(optionalString(diagnosis.qdrant_error))
+    || healthWarnings.length > 0
+    || (indexHealthStatus != null && !["ok", "ready", "healthy"].includes(indexHealthStatus.toLowerCase()))
+    || checks.some((check) => isHealthWarning(check) || ["error", "blocked", "failed"].includes(
+      String(check.status ?? "").toLowerCase()));
   const textSignals = [
-    diagnosisStatus,
+    diagnosisStatus === "degraded" && hasAdvisoryWarning && !hasHealthProblem ? null : diagnosisStatus,
     indexHealthStatus,
     optionalString(diagnosis.qdrant_error),
     ...healthWarnings,
@@ -5211,22 +5226,32 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
     ...recoveryActions,
   ].filter(Boolean);
   const hasFreshnessProblem = textSignals.some(hasBootstrapFreshnessSignal);
-  const collectionExists = typeof diagnosis.collection_exists === "boolean" ? diagnosis.collection_exists : null;
-  const canRetrieve = typeof diagnosis.can_retrieve === "boolean" ? diagnosis.can_retrieve : null;
-  const pointCount = Number.isInteger(diagnosis.point_count) ? diagnosis.point_count : null;
-  const statusLooksBlocked = ["blocked", "error", "missing"].includes((diagnosisStatus ?? "").toLowerCase());
-  const hasHealthProblem = index.indexed === false || Boolean(optionalString(diagnosis.qdrant_error))
-    || healthWarnings.length > 0
-    || (indexHealthStatus != null && !["ok", "ready", "healthy"].includes(indexHealthStatus.toLowerCase()))
-    || checks.some((check) => ["warning", "error", "blocked", "failed"].includes(
-      String(check.status ?? "").toLowerCase()));
   const coverage = asRecord(index.coverage);
+  // A verified empty inventory can receive its first file despite the expected
+  // no-points diagnosis. This exception applies only to incremental admission.
+  const emptyWarning = "No indexed Qdrant points were found for this context.";
+  const emptyWriteReady = coverage.state === "verified" && coverage.eligible_file_count === 0
+    && collectionExists !== null && pointCount === 0 && canRetrieve === false
+    && !optionalString(diagnosis.qdrant_error)
+    && ["ok", "ready", "healthy", "degraded"].includes(indexHealthStatus)
+    && healthWarnings.every((warning) => warning === emptyWarning)
+    && checks.every((check) => {
+      const status = String(check.status ?? "").toLowerCase();
+      if (status === "ok") return true;
+      if (status === "warning") return !isHealthWarning(check)
+        || (check.name === "index_health" && check.message === emptyWarning);
+      return status === "error" && ((check.name === "points"
+        && check.message === "Collection has no indexed points.")
+        || (collectionExists === false && check.name === "collection"
+          && check.message === `Collection does not exist: ${diagnosis.collection ?? index.collection}`));
+    });
   const codeReady = index.indexed === true && index.readiness === "code_ready" && coverage.code_ready === true
     && coverage.state === "pending"
     && Array.isArray(coverage.reason_codes)
     && coverage.reason_codes.length === 1
     && coverage.reason_codes[0] === "background_ingestion_pending"
-    && canRetrieve === true && diagnosisStatus === "ready"
+    && canRetrieve === true && (diagnosisStatus === "ready"
+      || (diagnosisStatus === "degraded" && hasAdvisoryWarning && !hasHealthProblem))
     && collectionExists === true && Number.isInteger(pointCount) && pointCount > 0
     && indexHealthStatus === "ok" && healthWarnings.length === 0
     && !hasHealthProblem && !hasFreshnessProblem;
@@ -5241,6 +5266,7 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
     ? "needs_reconcile"
     : statusLooksBlocked || hasHealthProblem || canRetrieve === false
       ? "blocked"
+      : hasAdvisoryWarning ? "attention"
       : (diagnosisStatus == null || diagnosisStatus === "ready")
         && (canRetrieve === true || diagnosisStatus === "ready")
         ? "ready"
@@ -5249,6 +5275,7 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
   return {
     coverage,
     healthBlocked: statusLooksBlocked || hasHealthProblem || canRetrieve === false,
+    emptyWriteReady,
     codeReady,
     documentationPending: codeReady && coverage.documentation_pending === true,
     otherPending: codeReady && coverage.other_pending === true,
@@ -5427,6 +5454,7 @@ function determineDoctorVerdict({ healthResponse, diagnosis, syncStatus, session
   if (
     syncStatus?.needsReconcile === true
     || freshDiagnosisStatus?.needsReconcile === true
+    || freshDiagnosisStatus?.state === "attention"
     || pendingTotal > 0
     || hasActiveSessions
     || hasActivityGap

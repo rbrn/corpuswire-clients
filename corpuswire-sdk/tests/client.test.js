@@ -2728,12 +2728,17 @@ test("cancel and detach interrupt a stalled code checkpoint and preserve transfe
       ...(mode === "cancel" ? { signal: controller.signal } : { detachSignal: controller.signal }),
     }), (error) => {
       if (mode === "cancel") assert.ok(error instanceof RemoteIndexCancelledError);
-      else if (mode === "complete detach") assert.ok(error instanceof RemoteIndexDetachedError);
-      else assert.match(error.message, /Start a new index operation/);
+      else {
+        assert.equal(error instanceof RemoteIndexDetachedError,false);
+        assert.match(error.message,/Start a new index operation/);
+        assert.equal(error.transfer.files_transferred,1);
+        assert.equal(error.transfer.complete,false);
+        if (mode === "complete detach") assert.match(error.message,/client-owned code checkpoint/);
+      }
       return true;
     });
     assert.equal(checkpointSignal.aborted, true, mode);
-    assert.equal(fixture.calls.some((call) => call.type === "abort"), mode !== "complete detach", mode);
+    assert.equal(fixture.calls.some((call) => call.type === "abort"), true, mode);
     assert.equal(fixture.calls.some((call) => call.type === "upload" && call.paths.includes("README.md")), false);
     assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
   }
@@ -3087,4 +3092,21 @@ test("one failing upload stops sibling queue retries and prevents the next batch
   await assert.rejects(client.indexWorkspace({ workspace: { workspaceId: "fixture" }, files: ["a.py", "b.py", "c.py"].map((relativePath) => ({ relativePath, content: "x" })) }), (error) => error instanceof CorpusWireHttpError && error.status === 400);
   assert.equal(uploads, 2);
   assert.equal(aborts, 1);
+});
+
+
+test("detach in and after the code-ready callback aborts a fully uploaded checkpoint awaiting client commit", async () => {
+  for (const deferred of [false,true]) {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({files:[{relativePath:"main.py",content:"x"}]});
+  await assert.rejects(fixture.client.indexWorkspace({...fixture.request,detachSignal:controller.signal,
+    onCodeReady:()=>deferred ? queueMicrotask(()=>controller.abort()) : controller.abort()}),(error)=>{
+    assert.equal(error instanceof RemoteIndexDetachedError,false);
+    assert.match(error.message,/client-owned code checkpoint/);
+    assert.equal(error.transfer.files_transferred,1);
+    return true;
+  });
+  assert.equal(fixture.calls.some(call=>call.type==="abort"),true);
+  assert.equal(fixture.calls.some(call=>call.type==="commit"),false);
+  }
 });

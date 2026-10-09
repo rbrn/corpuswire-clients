@@ -988,6 +988,7 @@ export class CorpusWireClient {
         };
         const session = await this.startIndexSession(request);
         const uploadStop = new AbortController();
+        let clientOwnedCheckpoint = false;
         const stopUploads = () => uploadStop.abort();
         request.signal?.addEventListener("abort", stopUploads, { once: true });
         request.detachSignal?.addEventListener("abort", stopUploads, { once: true });
@@ -1071,6 +1072,7 @@ export class CorpusWireClient {
                     }
                 });
                 if (tierQueued) {
+                    clientOwnedCheckpoint = false;
                     const status = await this.waitForIndexSessionProcessing(session.session_id, processingWaitDeadline(), request.processingPollMs ?? 250, { ...request, onProgress: emitProgress }, true, filesToUpload.length - uploadedFiles);
                     if (status.phase === "aborted")
                         throw new RemoteIndexCancelledError(session.session_id, status);
@@ -1079,6 +1081,7 @@ export class CorpusWireClient {
                 if (priority === 1 && session.code_checkpoint === true && request.inventory
                     && session.mode === "full" && !request.snapshotScope && !request.evaluationInventoryAttestation
                     && remoteFiles.some(({ file }) => ingestionPriority(file.relativePath) === 1)) {
+                    clientOwnedCheckpoint = true;
                     const status = await this.checkpointIndexSessionCode(session.session_id, { signal: uploadStop.signal });
                     if (status.coverage?.code_ready !== true) {
                         throw new Error("Code checkpoint did not confirm code readiness");
@@ -1086,6 +1089,7 @@ export class CorpusWireClient {
                     if (status.progress)
                         emitProgress(status.progress);
                     request.onCodeReady?.(status);
+                    await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
                 }
             }
             if (queuedBackgroundWork) {
@@ -1116,18 +1120,23 @@ export class CorpusWireClient {
                     error = interruption;
                 }
             }
-            if (error instanceof RemoteIndexDetachedError
-                && (transfer.files_upload_required === null || transfer.files_transferred < transfer.files_upload_required)) {
-                // Reattachment can observe a session but cannot upload the remaining
-                // local source. Retaining it would strand an incomplete inventory.
-                let abortMessage = "an abort was requested for the incomplete session";
+            const incompleteUploads = transfer.files_upload_required === null
+                || transfer.files_transferred < transfer.files_upload_required;
+            if (error instanceof RemoteIndexDetachedError && (incompleteUploads || clientOwnedCheckpoint)) {
+                // Polling cannot submit remaining source or finish a client-owned code
+                // checkpoint/commit, so retaining either session would strand it.
+                const stoppedPhase = incompleteUploads ? "incomplete session" : "interrupted code checkpoint session";
+                let abortMessage = `an abort was requested for the ${stoppedPhase}`;
                 try {
                     await this.abortIndexSession(session.session_id);
                 }
                 catch {
-                    abortMessage = "the incomplete session's abort could not be confirmed";
+                    abortMessage = `the ${stoppedPhase}'s abort could not be confirmed`;
                 }
-                const incomplete = new Error(`Indexing stopped before all required source uploads were submitted; ${abortMessage}. Start a new index operation to complete the inventory.`);
+                const reason = incompleteUploads
+                    ? "Indexing stopped before all required source uploads were submitted"
+                    : "Indexing stopped during the client-owned code checkpoint";
+                const incomplete = new Error(`${reason}; ${abortMessage}. Start a new index operation to complete the inventory.`);
                 Object.assign(incomplete, { transfer, cause: error });
                 throw incomplete;
             }

@@ -232,7 +232,9 @@ The command:
 3. Creates `CorpusWireClient` for the configured indexer service with
    `endpointMode: "v1-only"`.
 4. Finds workspace files with:
-   `{**/*.{md,txt,csv,pdf,bat,scala,sh,cjs,js,jsx,mjs,cts,mts,ts,tsx,java,kt,kts,py,pyi,hcl,tf,html,htm,json,jsonl,ndjson,toml,yaml,yml},**/{mvnw,gradlew},**/*.json.example}`.
+   `{**/*.{md,txt,csv,pdf,bat,scala,sh,cjs,js,jsx,mjs,cts,mts,ts,tsx,java,kt,kts,py,pyi,hcl,tf,html,htm,json,jsonl,ndjson,toml,yaml,yml},**/{mvnw,gradlew},**/*.json.example}`,
+   expanded into character classes to match uppercase and mixed-case filename
+   extensions and wrappers on case-sensitive filesystems. Watchers use the same pattern.
 5. Excludes:
    `.git`, `.vscode`, `node_modules`, `dist`, `build`, `target`, and
    `__pycache__`.
@@ -242,7 +244,8 @@ The command:
 8. Calls `client.indexWorkspace({ mode: "full", recreateCollection: false, files, ... })`.
 
 Roots must have distinct workspace IDs on the same service; duplicate IDs are
-rejected before uploading. Nested roots are excluded from their parent root's
+rejected before uploading, including equivalent URL spellings with different
+host or scheme casing, default ports, or trailing slashes. Nested roots are excluded from their parent root's
 inventory. Each root uploads code before documentation and other supported
 files. When the server publishes code, progress and the panel show code ready
 with documentation/other ingestion pending. The workspace panel reports ready
