@@ -93,7 +93,9 @@ export declare class CorpusWireClient {
         signal?: AbortSignal;
     }): Promise<RemoteIndexStatus>;
     commitIndexSession(sessionId: string): Promise<RemoteIndexCommitResponse>;
-    getIndexSessionStatus(sessionId: string): Promise<RemoteIndexStatus>;
+    getIndexSessionStatus(sessionId: string, options?: {
+        signal?: AbortSignal;
+    }): Promise<RemoteIndexStatus>;
     followIndexSession(sessionId: string, options?: {
         timeoutMs?: number;
         pollMs?: number;
@@ -101,16 +103,23 @@ export declare class CorpusWireClient {
         detachSignal?: AbortSignal;
         onProgress?: (event: RemoteIndexProgressEvent) => void;
     }): Promise<RemoteIndexStatus>;
-    abortIndexSession(sessionId: string): Promise<{
+    abortIndexSession(sessionId: string, options?: {
+        signal?: AbortSignal;
+    }): Promise<{
         ok: true;
         session_id: string;
         phase: string;
     }>;
     private abortIndexSessionQuietly;
+    private releaseCodeStageSession;
     private waitForIndexSessionProcessing;
     private checkIndexWorkspaceInterrupt;
     indexWorkspace(request: IndexWorkspaceRequest): Promise<RemoteIndexCommitResponse>;
-    /** Publish code from a complete scan and release the drained owned session. */
+    /**
+     * Publish code from a complete scan and release the drained owned session.
+     * Release uses the remaining processing budget, or 5 seconds when unspecified.
+     * Interruption allows up to 1 extra second for best-effort abort confirmation.
+     */
     indexWorkspaceCodeStage(request: IndexWorkspaceRequest): Promise<RemoteIndexCodeStageResult>;
     private runIndexWorkspace;
     private waitForIndexSessionTerminal;

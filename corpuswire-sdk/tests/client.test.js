@@ -3155,6 +3155,63 @@ test("detach in and after the code-ready callback aborts a fully uploaded checkp
   }
 });
 
+for (const interruption of ["processing timeout", "detach during drain", "cancel during drain", "detach after drained callback", "timeout after drained callback"]) {
+  test(`queued documentation retains owned checkpoint through ${interruption}`, async (t) => {
+    let now = 0;
+    t.mock.method(Date, "now", () => now);
+    const controller = new AbortController();
+    const fixture = priorityIndexFixture({ files: [
+      { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+    ] });
+    const originalFetch = fixture.client.fetchFn;
+    const afterDrainedCallback = interruption.includes("after drained callback");
+    let drainedCallbacks = 0, readyCallbacks = 0;
+    fixture.client.fetchFn = async (url, init) => {
+      const response = await originalFetch(url, init);
+      const documentationUploaded = fixture.calls.some((call) => call.type === "upload" && call.paths.includes("README.md"));
+      if (!url.endsWith("/status") || !documentationUploaded || fixture.calls.some((call) => call.type === "abort")) return response;
+      const payload = await response.json();
+      payload.result.phase = afterDrainedCallback ? "ready_to_commit" : "indexing";
+      payload.result.pending_batches = afterDrainedCallback ? 0 : 1;
+      if (afterDrainedCallback) {
+        payload.result.progress = { ...progressEvent(700, 80, "queued"), session_id: "priority", workspace_id: "fixture" };
+      } else if (interruption === "processing timeout") {
+        now = 101;
+      } else {
+        controller.abort();
+      }
+      return jsonResponse(200, payload);
+    };
+    await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+      signal: interruption === "cancel during drain" ? controller.signal : undefined,
+      detachSignal: interruption.includes("detach") ? controller.signal : undefined,
+      onCodeReady: () => { readyCallbacks += 1; },
+      onProgress: (event) => {
+        if (!afterDrainedCallback || event.sequence !== 700 || drainedCallbacks++) return;
+        queueMicrotask(() => {
+          if (interruption.includes("detach")) controller.abort();
+          else now = 101;
+        });
+      },
+    }), (error) => {
+      assert.equal(error instanceof RemoteIndexDetachedError, false, "Client-owned commit cannot be resumed by status polling");
+      if (interruption === "cancel during drain") assert.ok(error instanceof RemoteIndexCancelledError);
+      else {
+        assert.match(error.message, /client-owned code checkpoint/);
+        assert.match(error.message, /Start a new index operation/);
+      }
+      assert.equal(error.transfer.files_transferred, 2);
+      assert.equal(error.transfer.complete, false);
+      return true;
+    });
+    assert.equal(readyCallbacks, 1);
+    if (afterDrainedCallback) assert.ok(drainedCallbacks > 0);
+    assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"], ["README.md"]]);
+    assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  });
+}
+
 test("upload counters separate eleven queue cooldown retries from transport retries", { timeout: 4000 }, async () => {
   let attempts = 0;
   const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url) => {
@@ -3387,6 +3444,204 @@ test("code-stage cancellation preserves published code without uploading documen
   assert.equal(fixture.calls.filter((call) => call.type === "checkpoint").length, 1);
   assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
   assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+});
+
+for (const stall of ["headers", "body"]) {
+  for (const interruption of ["deadline", "cancel", "detach"]) {
+    test(`code-stage release bounds stalled ${stall} on ${interruption} and confirms cleanup separately`, { timeout: 2000 }, async (t) => {
+      let now = 0;
+      t.mock.method(Date, "now", () => now);
+      const delays = [], signals = [];
+      const nativeSetTimeout = globalThis.setTimeout;
+      t.mock.method(globalThis, "setTimeout", (callback, delay, ...args) => {
+        delays.push(delay); return nativeSetTimeout(callback, delay, ...args);
+      });
+      const controller = new AbortController();
+      const fixture = priorityIndexFixture({ files: [
+        { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+      ] });
+      const originalFetch = fixture.client.fetchFn;
+      let deletes = 0, ready;
+      fixture.client.fetchFn = async (url, init) => {
+        if (init.method !== "DELETE") return originalFetch(url, init);
+        signals.push(init.signal);
+        if (++deletes > 1) return originalFetch(url, init);
+        const stallForever = () => {
+          if (interruption !== "deadline") queueMicrotask(() => controller.abort());
+          return new Promise(() => {}); // Deliberately ignore transport abort.
+        };
+        if (stall === "headers") return stallForever();
+        const response = await originalFetch(url, init);
+        response.json = stallForever;
+        return response;
+      };
+      await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request,
+        signal: interruption === "cancel" ? controller.signal : undefined,
+        detachSignal: interruption === "detach" ? controller.signal : undefined,
+        onCodeReady: (status) => { ready = status; now = 80; },
+      }), (error) => {
+        assert.equal(error instanceof RemoteIndexDetachedError, false);
+        if (interruption === "cancel") {
+          assert.ok(error instanceof RemoteIndexCancelledError);
+          assert.equal(error.status.phase, "aborted");
+          assert.equal(error.status.pending_batches, 0);
+          assert.equal(error.status.active_batches, 0);
+        } else {
+          assert.match(error.message, /owned session abort was confirmed/);
+          if (interruption === "deadline") assert.match(error.cause.message, /release timed out/);
+        }
+        assert.equal(error.transfer.complete, false);
+        assert.equal(error.transfer.files_transferred, 1);
+        return true;
+      });
+      assert.equal(ready.coverage.code_ready, true);
+      assert.equal(deletes, 2, "Cleanup uses a new request after the stalled request is bounded");
+      assert.ok(signals.every((signal) => signal instanceof AbortSignal && signal.aborted));
+      assert.ok(delays.includes(20), "Release retains only the unspent processing budget");
+      assert.ok(delays.includes(1000), "Best-effort cleanup has an independent capped reserve");
+      assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+      assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
+    });
+  }
+}
+
+test("code-stage cancellation bounds uncooperative release and cleanup without claiming slot release", { timeout: 2500 }, async () => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  const originalFetch = fixture.client.fetchFn;
+  const signals = [];
+  fixture.client.fetchFn = (url, init) => {
+    if (init.method !== "DELETE") return originalFetch(url, init);
+    signals.push(init.signal);
+    if (signals.length === 1) queueMicrotask(() => controller.abort());
+    return new Promise(() => {});
+  };
+  await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request,
+    processingTimeoutMs: undefined, signal: controller.signal,
+  }), (error) => {
+    assert.equal(error instanceof RemoteIndexCancelledError, false);
+    assert.equal(error instanceof RemoteIndexDetachedError, false);
+    assert.match(error.message, /release could not be confirmed/);
+    assert.equal(error.transfer.complete, false);
+    return true;
+  });
+  assert.equal(signals.length, 2);
+  assert.ok(signals.every((signal) => signal.aborted));
+  assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+});
+
+for (const stall of ["headers", "body"]) {
+  for (const interruption of ["deadline", "cancel"]) {
+    test(`terminal release ${stall} receives transport signal and bounds ignored abort on ${interruption}`, { timeout: 2000 }, async (t) => {
+      let now = 0;
+      t.mock.method(Date, "now", () => now);
+      const controller = new AbortController();
+      const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+      const originalFetch = fixture.client.fetchFn;
+      const statusSignals = [], deleteSignals = [];
+      fixture.client.fetchFn = async (url, init) => {
+        if (init.method === "DELETE") deleteSignals.push(init.signal);
+        const response = await originalFetch(url, init);
+        if (!url.endsWith("/status") || deleteSignals.length === 0) return response;
+        statusSignals.push(init.signal);
+        if (deleteSignals.length > 1) return response;
+        const stallForever = () => {
+          if (interruption === "cancel") queueMicrotask(() => controller.abort());
+          return new Promise(() => {});
+        };
+        if (stall === "headers") return stallForever();
+        response.json = stallForever;
+        return response;
+      };
+      await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request,
+        signal: interruption === "cancel" ? controller.signal : undefined,
+        onCodeReady: () => { now = 80; },
+      }), (error) => {
+        if (interruption === "cancel") assert.ok(error instanceof RemoteIndexCancelledError);
+        else assert.match(error.message, /owned session abort was confirmed/);
+        assert.equal(error.transfer.complete, false);
+        return true;
+      });
+      assert.equal(statusSignals.length, 2);
+      assert.equal(statusSignals[0], deleteSignals[0]);
+      assert.equal(statusSignals[1], deleteSignals[1]);
+      assert.ok(statusSignals.every((signal) => signal instanceof AbortSignal && signal.aborted));
+    });
+  }
+}
+
+test("cooperative terminal GET is aborted on caller cancellation before cleanup uses a fresh signal", async () => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  const originalFetch = fixture.client.fetchFn;
+  let deletes = 0, abortedReads = 0;
+  fixture.client.fetchFn = async (url, init) => {
+    if (init.method === "DELETE") deletes += 1;
+    if (!url.endsWith("/status") || deletes !== 1) return originalFetch(url, init);
+    assert.ok(init.signal instanceof AbortSignal);
+    return new Promise((_, reject) => {
+      init.signal.addEventListener("abort", () => { abortedReads += 1; reject(new DOMException("Stopped", "AbortError")); }, { once: true });
+      queueMicrotask(() => controller.abort());
+    });
+  };
+  await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request, signal: controller.signal }), RemoteIndexCancelledError);
+  assert.equal(abortedReads, 1);
+  assert.equal(deletes, 2);
+});
+
+test("terminal polling cancellation removes its pending delay without another abandoned GET", async (t) => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  const originalFetch = fixture.client.fetchFn;
+  const nativeSetTimeout = globalThis.setTimeout, nativeClearTimeout = globalThis.clearTimeout;
+  const timers = new Map(), clearedDelays = [];
+  t.mock.method(globalThis, "setTimeout", (callback, delay, ...args) => {
+    const timer = nativeSetTimeout(callback, delay, ...args); timers.set(timer, delay); return timer;
+  });
+  t.mock.method(globalThis, "clearTimeout", (timer) => {
+    clearedDelays.push(timers.get(timer)); return nativeClearTimeout(timer);
+  });
+  let deletes = 0, terminalReads = 0;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (init.method === "DELETE") deletes += 1;
+    if (!url.endsWith("/status") || deletes === 0) return response;
+    terminalReads += 1;
+    if (deletes > 1) return response;
+    const payload = await response.json();
+    payload.result.phase = "indexing";
+    payload.result.progress = { ...progressEvent(991, 80, "queued"), session_id: "priority" };
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request,
+    processingTimeoutMs: 2000, processingPollMs: 500, signal: controller.signal,
+    onProgress: (event) => { if (event.sequence === 991) queueMicrotask(() => controller.abort()); },
+  }), RemoteIndexCancelledError);
+  assert.ok(clearedDelays.includes(500), "Transport cancellation removes the pending terminal poll delay");
+  assert.equal(terminalReads, 2, "Only the original attempt and independent cleanup read status");
+});
+
+test("late terminal response cannot extend the absolute release deadline after DELETE", async (t) => {
+  let now = 0;
+  t.mock.method(Date, "now", () => now);
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  const originalFetch = fixture.client.fetchFn;
+  let deletes = 0;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (init.method === "DELETE") { if (++deletes === 1) now = 90; }
+    if (url.endsWith("/status") && deletes === 1) now = 101;
+    return response;
+  };
+  await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request,
+    onCodeReady: () => { now = 80; },
+  }), (error) => {
+    assert.match(error.message, /release was interrupted/);
+    assert.match(error.cause.message, /timed out/);
+    assert.equal(error.transfer.complete, false);
+    return true;
+  });
+  assert.equal(deletes, 2, "Late terminal evidence enters independently bounded cleanup instead of stage success");
 });
 
 test("code-stage failed checkpoint, release or incomplete scan cannot masquerade as full success", async () => {

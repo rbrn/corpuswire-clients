@@ -1039,14 +1039,17 @@ export class CorpusWireClient {
     });
   }
 
-  async getIndexSessionStatus(sessionId: string): Promise<RemoteIndexStatus> {
+  async getIndexSessionStatus(
+    sessionId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<RemoteIndexStatus> {
     const response = await requestJson<{ ok: true; result: RemoteIndexStatus }>({
       baseUrl: this.baseUrl,
       paths: [`/v1/index/sessions/${encodeURIComponent(sessionId)}/status`],
       fetchFn: this.fetchFn,
       defaultHeaders: this.defaultHeaders,
       basicAuth: this.basicAuth,
-      init: { method: "GET" },
+      init: { method: "GET", signal: options.signal },
     });
     return response.result;
   }
@@ -1087,14 +1090,17 @@ export class CorpusWireClient {
     }
   }
 
-  async abortIndexSession(sessionId: string): Promise<{ ok: true; session_id: string; phase: string }> {
+  async abortIndexSession(
+    sessionId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<{ ok: true; session_id: string; phase: string }> {
     return requestJson<{ ok: true; session_id: string; phase: string }>({
       baseUrl: this.baseUrl,
       paths: [`/v1/index/sessions/${encodeURIComponent(sessionId)}`],
       fetchFn: this.fetchFn,
       defaultHeaders: this.defaultHeaders,
       basicAuth: this.basicAuth,
-      init: { method: "DELETE" },
+      init: { method: "DELETE", signal: options.signal },
     });
   }
 
@@ -1103,6 +1109,43 @@ export class CorpusWireClient {
       await this.abortIndexSession(sessionId);
     } catch {
       // Best effort: preserve the original indexing failure for callers.
+    }
+  }
+
+  private async releaseCodeStageSession(
+    session: RemoteIndexSession,
+    workspaceId: string,
+    deadline: number | null,
+    pollMs: number,
+    callerSignal: AbortSignal,
+    cancellationSignal: AbortSignal | undefined,
+    onProgress: (event: RemoteIndexProgressEvent) => void,
+  ): Promise<RemoteIndexStatus> {
+    const release = (attemptDeadline: number, signal?: AbortSignal): Promise<RemoteIndexStatus> => {
+      const budgetMs = attemptDeadline - Date.now();
+      if (budgetMs <= 0) return Promise.reject(new Error("Code stage session release timed out"));
+      return withRequestBudget(async (transportSignal) => {
+        await this.abortIndexSession(session.session_id, { signal: transportSignal });
+        const status = await this.waitForIndexSessionTerminal(session.session_id, pollMs, onProgress,
+          undefined, attemptDeadline, transportSignal);
+        if (Date.now() >= attemptDeadline) throw new Error("Code stage session release timed out");
+        return status;
+      }, budgetMs, signal, () => new Error("Code stage session release timed out"));
+    };
+    try {
+      return await release(deadline ?? Date.now() + 5_000, callerSignal);
+    } catch (cause) {
+      // A cancelled transport may already have delivered DELETE. Retry cleanup
+      // with an independent finite reserve; never strand callers on its IO.
+      let cleanupStatus: RemoteIndexStatus | undefined;
+      try { cleanupStatus = await release(Date.now() + 1_000); } catch { /* Best effort only. */ }
+      const confirmed = cleanupStatus !== undefined
+        && isOwnedCodeStageStatus(cleanupStatus, session, workspaceId)
+        && cleanupStatus.phase === "aborted" && cleanupStatus.pending_batches === 0
+        && cleanupStatus.active_batches === 0;
+      if (cancellationSignal?.aborted && confirmed) return cleanupStatus!;
+      throw new Error(`Code stage session release was interrupted; ${confirmed
+        ? "the owned session abort was confirmed" : "an abort was requested but release could not be confirmed"}. Start a new index operation.`, { cause });
     }
   }
 
@@ -1168,7 +1211,11 @@ export class CorpusWireClient {
     return this.runIndexWorkspace(request, false) as Promise<RemoteIndexCommitResponse>;
   }
 
-  /** Publish code from a complete scan and release the drained owned session. */
+  /**
+   * Publish code from a complete scan and release the drained owned session.
+   * Release uses the remaining processing budget, or 5 seconds when unspecified.
+   * Interruption allows up to 1 extra second for best-effort abort confirmation.
+   */
   async indexWorkspaceCodeStage(request: IndexWorkspaceRequest): Promise<RemoteIndexCodeStageResult> {
     if (request.mode !== "full" || request.snapshotScope || request.evaluationInventoryAttestation
       || request.inventoryScan?.complete !== true) {
@@ -1286,6 +1333,7 @@ export class CorpusWireClient {
     const session = await this.startIndexSession(request);
     const uploadStop = new AbortController();
     let clientOwnedCheckpoint = false;
+    let codeStageReleaseStarted = false;
     const stopUploads = (): void => uploadStop.abort();
     request.signal?.addEventListener("abort", stopUploads, { once: true });
     request.detachSignal?.addEventListener("abort", stopUploads, { once: true });
@@ -1438,7 +1486,7 @@ export class CorpusWireClient {
         );
         phaseClock.pause();
         if (tierQueued) {
-          clientOwnedCheckpoint = false;
+          // Later queued tiers still need this client's commit after they drain.
           const status = await this.waitForIndexSessionProcessing(
             session.session_id, processingWaitDeadline(), request.processingPollMs ?? 250,
             { ...request, onProgress: emitProgress }, true, filesToUpload.length - uploadedFiles,
@@ -1462,11 +1510,10 @@ export class CorpusWireClient {
           }
           if (status.progress) emitProgress(status.progress);
           request.onCodeReady?.(status);
-          await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
           if (codeStage) {
-            await this.abortIndexSession(session.session_id);
-            const releaseStatus = await this.waitForIndexSessionTerminal(session.session_id,
-              request.processingPollMs ?? 250, emitProgress, request.detachSignal, processingWaitDeadline());
+            codeStageReleaseStarted = true;
+            const releaseStatus = await this.releaseCodeStageSession(session, request.workspace.workspaceId,
+              processingWaitDeadline(), request.processingPollMs ?? 250, uploadStop.signal, request.signal, emitProgress);
             if (!isOwnedCodeStageStatus(releaseStatus, session, request.workspace.workspaceId)
               || releaseStatus.phase !== "aborted" || releaseStatus.pending_batches !== 0
               || releaseStatus.active_batches !== 0) {
@@ -1477,6 +1524,7 @@ export class CorpusWireClient {
             return { outcome: "code_ready", full_inventory_complete: false, checkpoint: status,
               release_status: releaseStatus, transfer };
           }
+          await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
         }
       }
       if (queuedBackgroundWork) {
@@ -1503,6 +1551,7 @@ export class CorpusWireClient {
       await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
       emitClientProgress("committing", 0, null, "items", "Waiting for verified commit", session.session_id);
       const committed = await this.commitIndexSession(session.session_id);
+      clientOwnedCheckpoint = false;
       phaseClock.pause();
       transfer.client_phase_timings_ms = phaseClock.snapshot();
       if (committed.status.progress) {
@@ -1518,6 +1567,10 @@ export class CorpusWireClient {
         committed: fullResult } : fullResult;
     } catch (error) {
       phaseClock.pause();
+      if (codeStageReleaseStarted) {
+        if (error instanceof Error) Object.assign(error, { transfer });
+        throw error;
+      }
       if (!(error instanceof RemoteIndexDetachedError) && !(error instanceof RemoteIndexCancelledError)
         && (request.signal?.aborted || request.detachSignal?.aborted)) {
         try {
@@ -1565,10 +1618,17 @@ export class CorpusWireClient {
     onProgress?: (event: RemoteIndexProgressEvent) => void,
     detachSignal?: AbortSignal,
     deadline: number | null = null,
+    transportSignal?: AbortSignal,
   ): Promise<RemoteIndexStatus> {
     const observeStatus = createIndexStatusObserver(pollMs, onProgress);
     for (;;) {
-      const status = await this.getIndexSessionStatus(sessionId);
+      if (transportSignal?.aborted) throw new DOMException("Session release aborted", "AbortError");
+      if (deadline !== null && Date.now() >= deadline) throw new Error("Session release confirmation timed out");
+      const status = await this.getIndexSessionStatus(sessionId, { signal: transportSignal });
+      if (transportSignal?.aborted) throw new DOMException("Session release aborted", "AbortError");
+      if (deadline !== null && Date.now() >= deadline) {
+        throw new RemoteIndexDetachedError(sessionId, status, "Session release confirmation timed out");
+      }
       const pollDelay = observeStatus(status);
       if (["aborted", "failed", "expired", "completed"].includes(status.phase)) {
         return status;
@@ -1579,7 +1639,7 @@ export class CorpusWireClient {
       if (deadline !== null && Date.now() >= deadline) {
         throw new RemoteIndexDetachedError(sessionId, status, "Session release confirmation timed out");
       }
-      await waitForIndexInterruptDelay(remainingIndexPollDelay(pollDelay, deadline), { detachSignal });
+      await waitForIndexInterruptDelay(remainingIndexPollDelay(pollDelay, deadline), { signal: transportSignal, detachSignal });
     }
   }
 }
