@@ -154,7 +154,7 @@ function extensionHarness(folders, overrides = new Map()) {
     function formatIndexingError(error) { return error.message; }
     function formatIndexProgressMessage() { return 'upload progress'; }
     const INDEX_INCLUDE_GLOB = ${JSON.stringify(includeGlob)};
-    return { indexCurrentWorkspace, registerRemoteIndexWatchers, relativePathForUri, runIndexStatusCheck };
+    return { indexCurrentWorkspace, registerRemoteIndexWatchers, relativePathForUri, runIndexStatusCheck, indexRootStatus };
   `)(vscode, readSettings, Client, () => ({}), collectWorkspaceFiles, collectUriFiles, excludedPath,
     (handler) => { const id = ++nextTimer; timers.set(id, handler); return id; }, (id) => timers.delete(id));
   return { ...functions, warnings, information, progress, requests, diagnoses, callbacks, settings, subscriptions,
@@ -169,7 +169,7 @@ function extensionHarness(folders, overrides = new Map()) {
 function readyDiagnosis(coverage = {}) {
   return {
     status: 'ready', can_retrieve: true, qdrant_error: null, checks: [],
-    index: { indexed: true, coverage: { state: 'verified', reason_codes: [], ...coverage } },
+    index: { indexed: true, health_status: 'ok', health_warnings: [], coverage: { state: 'verified', reason_codes: [], ...coverage } },
   };
 }
 
@@ -512,6 +512,50 @@ test('status preserves diagnosis warnings and supports explicitly ready legacy d
   assert.equal(messages.at(-1).state, 'stale');
   assert.equal(messages.at(-1).code_ready, false);
   assert.match(messages.at(-1).message, /Synthetic stale source warning/);
+});
+
+test('per-root readiness rejects unhealthy index metadata and diagnosis warnings even when top-level status is ready', () => {
+  const harness = extensionHarness([folder('one')]);
+  const pending = { state: 'pending', reason_codes: ['background_ingestion_pending'], code_ready: true, documentation_pending: true };
+  for (const coverage of [pending, { state: 'verified', code_ready: true }]) {
+    for (const unhealthy of [{ health_status: 'degraded' }, { health_status: 'error' }, { health_warnings: ['Synthetic index health warning'] }]) {
+      const diagnosis = readyDiagnosis(coverage);
+      Object.assign(diagnosis.index, unhealthy);
+      const result = harness.indexRootStatus('one', 'test://one', diagnosis);
+      assert.notEqual(result.state, 'indexed');
+      assert.equal(result.code_ready, false);
+    }
+  }
+  const partialWithoutHealth = readyDiagnosis(pending);
+  delete partialWithoutHealth.index.health_status;
+  assert.equal(harness.indexRootStatus('one', 'test://one', partialWithoutHealth).code_ready, false);
+  const healthyPartial = readyDiagnosis(pending);
+  assert.equal(harness.indexRootStatus('one', 'test://one', healthyPartial).state, 'indexed');
+  healthyPartial.checks = [{ name: 'source_health', status: 'warning', message: 'Synthetic diagnosis warning' }];
+  const warning = harness.indexRootStatus('one', 'test://one', healthyPartial);
+  assert.equal(warning.state, 'stale');
+  assert.equal(warning.code_ready, false);
+  assert.match(warning.message, /Synthetic diagnosis warning/);
+});
+
+test('aggregate readiness cannot mask degraded, warning or error roots behind healthy code-ready roots', async () => {
+  const roots = ['healthy', 'degraded', 'warning', 'error'].map(folder);
+  const harness = extensionHarness(roots);
+  harness.setDiagnosis(async ({ workspaceId }) => {
+    const diagnosis = readyDiagnosis({ state: 'pending', reason_codes: ['background_ingestion_pending'], code_ready: true, documentation_pending: true });
+    if (workspaceId === 'test://degraded') diagnosis.index.health_status = 'degraded';
+    if (workspaceId === 'test://warning') diagnosis.index.health_warnings = ['Synthetic warning from index metadata'];
+    if (workspaceId === 'test://error') diagnosis.index.health_status = 'error';
+    return diagnosis;
+  });
+  const messages = [];
+  await harness.runIndexStatusCheck((message) => messages.push(message));
+  const result = messages.at(-1);
+  assert.equal(result.state, 'error');
+  assert.equal(result.code_ready, false);
+  assert.equal(result.roots.find((root) => root.name === 'healthy').code_ready, true);
+  assert.ok(result.roots.filter((root) => root.name !== 'healthy').every((root) => root.code_ready === false));
+  assert.match(result.message, /Synthetic warning from index metadata/);
 });
 
 test('webview labels verified conditional readiness and retains aggregate errors', () => {

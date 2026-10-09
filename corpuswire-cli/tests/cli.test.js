@@ -1027,22 +1027,32 @@ test("doctor accepts healthy published code and keeps incomplete or degraded cov
     { name: "real warning", coverage, health_warnings: ["vector_store_error"], status: "attention" },
     { name: "reconcile needed", coverage, read_needs_reconcile: true, status: "attention" },
     { name: "missing diagnosis readiness", coverage, readiness: "incomplete", status: "attention" },
+    { name: "unhealthy service", coverage, healthOk: false, status: "blocked" },
+    { name: "wrong identity", coverage, workspaceId: "local-docker://other#main", status: "blocked" },
   ];
   try {
     for (const entry of cases) {
       const writes = [];
-      const result = await main(["doctor", "--workspace-id", "local-docker://code#main", "--json"], {
+      const dependencies = {
         cwd: fixture, env: {}, homeDirectory: fixture, write: (line) => writes.push(line),
-        client: { health: async () => ({ ok: true }), diagnoseWorkspace: async () => ({
-          status: "ready", can_retrieve: true, resolved_workspace_id: "local-docker://code#main",
+        client: { health: async () => ({ ok: entry.healthOk ?? true }), diagnoseWorkspace: async () => ({
+          status: "ready", can_retrieve: true, resolved_workspace_id: entry.workspaceId ?? "local-docker://code#main",
           index: { health_status: entry.health_status ?? "ok", readiness: entry.readiness ?? "code_ready",
             coverage: entry.coverage, health_warnings: entry.health_warnings ?? [],
             read_needs_reconcile: entry.read_needs_reconcile ?? false },
         }) },
-      });
+      };
+      const result = await main(["doctor", "--workspace-id", "local-docker://code#main", "--json"], dependencies);
       assert.equal(result.status, entry.status, entry.name);
-      assert.equal(result.exitCode, entry.status === "ready" ? 0 : 1, entry.name);
-      assert.equal(JSON.parse(writes.at(-1)).coverage.documentationPending, true);
+      assert.equal(result.exitCode, entry.status === "ready" ? 0 : entry.status === "blocked" ? 2 : 1, entry.name);
+      assert.equal(result.coverage.codeReady, entry.status === "ready", entry.name);
+      const serialized = JSON.parse(writes.at(-1));
+      assert.equal(serialized.coverage.codeReady, entry.status === "ready", entry.name);
+      assert.equal(serialized.coverage.documentationPending, true);
+      assert.equal(serialized.coverage.otherPending, false);
+      writes.length = 0;
+      await main(["doctor", "--workspace-id", "local-docker://code#main"], dependencies);
+      assert.equal(writes.join("\n").includes("\ncode ready: true"), entry.status === "ready", entry.name);
     }
   } finally { await rm(fixture, { recursive: true, force: true }); }
 });
@@ -1088,6 +1098,44 @@ test("doctor requires verified inventory, reports unavailable service, and never
     assert.equal(rejectedWrites.join("\n").includes("private"), false);
     assert.deepEqual(await readdir(fixture), initialEntries);
     assert.equal(process.exitCode, priorExitCode);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
+test("doctor rejects explicit vector errors and diagnosis checks even with ready coverage", async () => {
+  const fixture = await syntheticWorkspace();
+  try {
+    for (const state of ["pending", "verified"]) {
+      for (const entry of [
+        { name: "vector error", qdrant_error: "Synthetic vector outage", checks: [], reason: "vector_store_error", status: "blocked", exitCode: 2 },
+        { name: "check warning", checks: [{ name: "publication", status: "warning", message: "Synthetic publication warning" }], reason: "diagnosis_check_warning", status: "attention", exitCode: 1 },
+        { name: "check error", checks: [{ name: "vector_probe", status: "error", message: "Synthetic probe error" }], reason: "diagnosis_check_error", status: "blocked", exitCode: 2 },
+      ]) {
+        const writes = [];
+        const result = await main(["doctor", "--workspace-id", "local-docker://signals#main", "--json"], {
+          cwd: fixture, env: {}, homeDirectory: fixture, write: (line) => writes.push(line),
+          client: {
+            health: async () => ({ ok: true }),
+            diagnoseWorkspace: async () => ({
+              status: "ready", can_retrieve: true, resolved_workspace_id: "local-docker://signals#main",
+              qdrant_error: entry.qdrant_error ?? null, checks: entry.checks,
+              index: { health_status: "ok", health_warnings: [], readiness: state === "pending" ? "code_ready" : "ready",
+                coverage: { state, reason_codes: state === "pending" ? ["background_ingestion_pending"] : [],
+                  code_ready: true, documentation_pending: state === "pending", other_pending: false } },
+            }),
+          },
+        });
+        const label = `${state}: ${entry.name}`;
+        assert.equal(result.ok, false, label);
+        assert.equal(result.status, entry.status, label);
+        assert.equal(result.exitCode, entry.exitCode, label);
+        assert.ok(result.reasons.includes(entry.reason), label);
+        assert.equal(result.coverage.codeReady, false, label);
+        const serialized = JSON.parse(writes.at(-1));
+        assert.equal(serialized.status, entry.status, label);
+        assert.equal(serialized.coverage.codeReady, false, label);
+        assert.equal(serialized.coverage.documentationPending, state === "pending", label);
+      }
+    }
   } finally { await rm(fixture, { recursive: true, force: true }); }
 });
 

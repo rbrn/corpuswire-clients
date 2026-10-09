@@ -453,11 +453,15 @@ function indexRootStatus(name: string, workspaceId: string, diagnosis: Workspace
   const coverage = diagnosis.index.coverage;
   const index = diagnosis.index as WorkspaceDiagnosis["index"] & { readiness?: string };
   const errors = diagnosis.checks.filter((check) => check.status === "error");
-  const blocked = diagnosis.status === "blocked" || !diagnosis.can_retrieve || Boolean(diagnosis.qdrant_error) || errors.length > 0;
-  const codeReady = coverage?.code_ready === true && diagnosis.index.indexed
+  const healthWarnings = index.health_warnings ?? [];
+  const healthClear = healthWarnings.length === 0;
+  const blocked = diagnosis.status === "blocked" || !diagnosis.can_retrieve || Boolean(diagnosis.qdrant_error)
+    || errors.length > 0 || index.health_status === "error";
+  const codeReady = index.health_status === "ok" && healthClear && coverage?.code_ready === true && diagnosis.index.indexed
     && (coverage.state === "verified" || (coverage.state === "pending"
       && coverage.reason_codes.length === 1 && coverage.reason_codes[0] === "background_ingestion_pending"));
-  const fullReady = diagnosis.index.indexed && (coverage
+  // Legacy servers may omit health fields; explicit degraded health must still block full readiness.
+  const fullReady = (index.health_status == null || index.health_status === "ok") && healthClear && diagnosis.index.indexed && (coverage
     ? coverage.state === "verified" || coverage.state === "not_applicable"
     : index.readiness === "ready" || diagnosis.status === "ready");
   const warnings = diagnosis.checks.filter((check) => check.status === "warning");
@@ -467,8 +471,8 @@ function indexRootStatus(name: string, workspaceId: string, diagnosis: Workspace
   return {
     name, workspaceId, state,
     message: ready ? codeReady && coverage?.state !== "verified" ? formatCodeReadyMessage({ coverage }) : "Fully indexed"
-      : errors[0]?.message ?? diagnosis.qdrant_error ?? warnings[0]?.message ?? "Index readiness is not verified.",
-    code_ready: !blocked && codeReady,
+      : errors[0]?.message ?? diagnosis.qdrant_error ?? warnings[0]?.message ?? healthWarnings[0] ?? "Index readiness is not verified.",
+    code_ready: ready && codeReady,
     documentation_pending: coverage?.documentation_pending === true,
     other_pending: coverage?.other_pending === true,
   };

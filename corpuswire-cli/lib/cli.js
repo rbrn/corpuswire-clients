@@ -1198,6 +1198,9 @@ async function runDoctorCommand(options, dependencies) {
   });
   dependencies.onDiagnosis?.({ health, diagnosis });
   const coverage = diagnosis?.index?.coverage ?? health?.index?.coverage;
+  const diagnosisChecks = Array.isArray(diagnosis?.checks) ? diagnosis.checks : [];
+  const diagnosisCheckWarning = diagnosisChecks.some((check) => check?.status === "warning");
+  const diagnosisCheckError = diagnosisChecks.some((check) => check?.status === "error");
   const reasons = [];
   if (!health) reasons.push("health_unavailable");
   else if (health.ok !== true) reasons.push("service_unhealthy");
@@ -1209,16 +1212,20 @@ async function runDoctorCommand(options, dependencies) {
     if (diagnosis.index?.read_needs_reconcile === true || diagnosis.index?.readNeedsReconcile === true) reasons.push("needs_reconcile");
     if (diagnosis.index?.health_status && !["ok", "ready", "healthy"].includes(diagnosis.index.health_status)) reasons.push("index_health_degraded");
     if (diagnosis.index?.health_warnings?.length) reasons.push("index_health_warnings");
+    if (diagnosis.qdrant_error) reasons.push("vector_store_error");
+    if (diagnosisCheckWarning) reasons.push("diagnosis_check_warning");
+    if (diagnosisCheckError) reasons.push("diagnosis_check_error");
   }
   const partialCodeReady = coverage?.state === "pending" && coverage.code_ready === true
     && coverage.reason_codes?.length === 1 && coverage.reason_codes[0] === "background_ingestion_pending"
     && diagnosis?.status === "ready" && diagnosis.can_retrieve === true
     && diagnosis.index?.readiness === "code_ready"
     && ["ok", "ready", "healthy"].includes(diagnosis.index?.health_status)
-    && !diagnosis.index?.health_warnings?.length;
+    && !diagnosis.index?.health_warnings?.length
+    && !diagnosis.qdrant_error && !diagnosisCheckWarning && !diagnosisCheckError;
   if (coverage?.state !== "verified" && !partialCodeReady) reasons.push("inventory_not_verified");
   if (checks.some((check) => check.code === "authentication_rejected")) reasons.push("authentication_rejected");
-  const blocked = reasons.some((reason) => ["health_unavailable", "service_unhealthy", "diagnosis_unavailable", "retrieval_blocked", "workspace_identity_mismatch"].includes(reason));
+  const blocked = reasons.some((reason) => ["health_unavailable", "service_unhealthy", "diagnosis_unavailable", "retrieval_blocked", "workspace_identity_mismatch", "vector_store_error", "diagnosis_check_error"].includes(reason));
   const status = blocked ? "blocked" : reasons.length ? "attention" : "ready";
   const result = {
     schema_version: "workspace-doctor/v1", ok: status === "ready", status,
@@ -1226,7 +1233,7 @@ async function runDoctorCommand(options, dependencies) {
     workspaceId: options.workspaceId, serviceUrl: displayServiceUrl(options.apiBaseUrl),
     coverage: {
       state: coverage?.state ?? "unavailable", reasonCodes: coverage?.reason_codes ?? [],
-      codeReady: coverage?.code_ready === true,
+      codeReady: status === "ready" && coverage?.code_ready === true,
       documentationPending: coverage?.documentation_pending === true,
       otherPending: coverage?.other_pending === true,
     },
@@ -1234,7 +1241,7 @@ async function runDoctorCommand(options, dependencies) {
     recoveryActions: status === "ready" ? [] : ["Check service/authentication, then run cw reconcile --yes and cw doctor."],
   };
   dependencies.write(options.json ? JSON.stringify(result, null, 2)
-    : `status: ${status}\nworkspace: ${sanitizeTerminalText(result.workspaceId)}\nservice: ${result.serviceUrl}\ninventory coverage: ${result.coverage.state}${partialCodeReady ? `\ncode ready: true\ndocumentation pending: ${result.coverage.documentationPending}\nother files pending: ${result.coverage.otherPending}` : ""}${reasons.length ? `\nchecks: ${reasons.join(", ")}` : ""}${checks.filter((check) => check.status === "error").map((check) => `\n${check.name}: ${check.code}${check.httpStatus === undefined ? "" : ` (HTTP ${check.httpStatus})`}`).join("")}`);
+    : `status: ${status}\nworkspace: ${sanitizeTerminalText(result.workspaceId)}\nservice: ${result.serviceUrl}\ninventory coverage: ${result.coverage.state}${partialCodeReady && result.coverage.codeReady ? `\ncode ready: true\ndocumentation pending: ${result.coverage.documentationPending}\nother files pending: ${result.coverage.otherPending}` : ""}${reasons.length ? `\nchecks: ${reasons.join(", ")}` : ""}${checks.filter((check) => check.status === "error").map((check) => `\n${check.name}: ${check.code}${check.httpStatus === undefined ? "" : ` (HTTP ${check.httpStatus})`}`).join("")}`);
   return result;
 }
 

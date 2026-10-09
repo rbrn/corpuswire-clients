@@ -351,8 +351,9 @@ warning, ETA-confidence, and cumulative count fields.
 
 `processingTimeoutMs` is one caller wait budget across tier drains, starting at
 the first processing wait. Before all required source uploads are accepted,
-expiry or detach requests abort and returns a restart-required error: polling
-cannot resume unsent source. After all uploads are accepted, expiry raises
+if the wait budget expires or the caller requests detach, the SDK requests an
+abort and raises a restart-required error because polling cannot resume unsent
+source. After all uploads are accepted, expiry raises
 `RemoteIndexDetachedError`; backend work continues and the error contains the
 session id. Use `followIndexSession(sessionId, ...)` to reattach. An
 `AbortSignal` sends `DELETE /v1/index/sessions/{id}` and waits for
