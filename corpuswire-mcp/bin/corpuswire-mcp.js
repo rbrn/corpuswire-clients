@@ -417,7 +417,8 @@ class SyncManager {
     return this.isCacheEnabled() && this.observationGap === false
       && !this.activeBootstrapCheck && this.bootstrapStatus.coverage?.state === "verified"
       && Boolean(this.bootstrapStatus.coverage.coverage_token)
-      && this.bootstrapStatus.needsReconcile !== true;
+      && this.bootstrapStatus.needsReconcile !== true
+      && !isBootstrapHealthBlocked(this.bootstrapStatus);
   }
 
   async probePaths(args = {}) {
@@ -751,7 +752,7 @@ class SyncManager {
       reason: this.bootstrapStatus.reason,
       strict,
       strictStaleAfterMs: staleAfterMs,
-      strictBlocked: strict && isStaleForStrict,
+      strictBlocked: strict && (isBootstrapHealthBlocked(this.bootstrapStatus) || isStaleForStrict),
     };
   }
 
@@ -1165,6 +1166,15 @@ class SyncManager {
       try { await this.refreshBootstrapStatus(batch); }
       catch { this.observationGap = true; }
     }
+    if (isBootstrapHealthBlocked(this.bootstrapStatus)) {
+      this.requeueBatch(batch);
+      const result = { ok: false, blocked: true, requeued: true,
+        error: this.bootstrapStatus.reason ?? "Index health blocks incremental sync.",
+        filesQueued: batch.changedPaths.length, filesUploaded: 0,
+        filesDeleted: batch.deletedPaths.length, filesSkipped: 0 };
+      this.recordResult(result, "flush");
+      return result;
+    }
     const files = [];
     const cacheEntries = [];
     const deletedPaths = new Set(batch.deletedPaths);
@@ -1577,7 +1587,7 @@ class SyncManager {
       this.coverageContextKey = syncContextKey(context);
       this.bootstrapStatus = { ...this.bootstrapStatus, coverage: evidence,
         checkedAt: new Date().toISOString(), collection: response.status.collection_name,
-        state: "ready", needsReconcile: false };
+        state: isBootstrapHealthBlocked(this.bootstrapStatus) ? "blocked" : "ready", needsReconcile: false };
     } else {
       this.observationGap = true;
     }
@@ -1598,7 +1608,7 @@ class SyncManager {
       }
       this.coverageContextKey = syncContextKey(context);
       this.bootstrapStatus = { ...this.bootstrapStatus, coverage, checkedAt: new Date().toISOString(),
-        collection: response.status.collection_name, state: "ready", needsReconcile: false };
+        collection: response.status.collection_name, state: isBootstrapHealthBlocked(this.bootstrapStatus) ? "blocked" : "ready", needsReconcile: false };
       const manifestRevision = asRecord(asRecord(response).status).manifest_revision;
       const uploadedAt = new Date().toISOString();
       for (const entry of cacheEntries) {
@@ -5178,6 +5188,10 @@ function bootstrapStatusFromError(error) {
   };
 }
 
+function isBootstrapHealthBlocked(status) {
+  return status?.healthBlocked === true || ["blocked", "error"].includes(status?.state);
+}
+
 function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
   const index = asRecord(diagnosis.index);
   const checks = Array.isArray(diagnosis.checks) ? diagnosis.checks.filter(isRecord) : [];
@@ -5201,13 +5215,13 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
   const canRetrieve = typeof diagnosis.can_retrieve === "boolean" ? diagnosis.can_retrieve : null;
   const pointCount = Number.isInteger(diagnosis.point_count) ? diagnosis.point_count : null;
   const statusLooksBlocked = ["blocked", "error", "missing"].includes((diagnosisStatus ?? "").toLowerCase());
-  const hasHealthProblem = Boolean(optionalString(diagnosis.qdrant_error))
+  const hasHealthProblem = index.indexed === false || Boolean(optionalString(diagnosis.qdrant_error))
     || healthWarnings.length > 0
     || (indexHealthStatus != null && !["ok", "ready", "healthy"].includes(indexHealthStatus.toLowerCase()))
     || checks.some((check) => ["warning", "error", "blocked", "failed"].includes(
       String(check.status ?? "").toLowerCase()));
   const coverage = asRecord(index.coverage);
-  const codeReady = index.readiness === "code_ready" && coverage.code_ready === true
+  const codeReady = index.indexed === true && index.readiness === "code_ready" && coverage.code_ready === true
     && coverage.state === "pending"
     && Array.isArray(coverage.reason_codes)
     && coverage.reason_codes.length === 1
@@ -5234,6 +5248,7 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
 
   return {
     coverage,
+    healthBlocked: statusLooksBlocked || hasHealthProblem || canRetrieve === false,
     codeReady,
     documentationPending: codeReady && coverage.documentation_pending === true,
     otherPending: codeReady && coverage.other_pending === true,
@@ -5242,6 +5257,8 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
     checkedAt: new Date().toISOString(),
     reason: firstNonEmptyString(
       firstActionableSignal,
+      optionalString(diagnosis.qdrant_error),
+      index.indexed === false ? "Index is not indexed." : null,
       recoveryActions[0],
       healthWarnings[0],
       checkMessages[0],
@@ -5397,7 +5414,10 @@ function determineDoctorVerdict({ healthResponse, diagnosis, syncStatus, session
   }
   const canRetrieve = diagnosis?.can_retrieve;
   const diagnosisStatus = optionalString(diagnosis?.status);
-  if (healthResponse?.ok === false || canRetrieve === false || diagnosisStatus === "blocked") {
+  const freshDiagnosisStatus = diagnosis ? bootstrapStatusFromDiagnosis(diagnosis, {}) : null;
+  if (healthResponse?.ok === false || canRetrieve === false || diagnosisStatus === "blocked"
+    || (freshDiagnosisStatus ? isBootstrapHealthBlocked(freshDiagnosisStatus)
+      : ["blocked", "error"].includes(syncStatus?.bootstrapState))) {
     return "blocked";
   }
   const pendingTotal = Number(syncStatus?.pendingTotal ?? 0);
@@ -5406,6 +5426,7 @@ function determineDoctorVerdict({ healthResponse, diagnosis, syncStatus, session
   const consecutiveFailures = Number(activity?.consecutive_failures ?? 0);
   if (
     syncStatus?.needsReconcile === true
+    || freshDiagnosisStatus?.needsReconcile === true
     || pendingTotal > 0
     || hasActiveSessions
     || hasActivityGap
@@ -5733,7 +5754,7 @@ function formatReadPreparation(readPreparation) {
     `- readFreshnessAgeMs: ${freshness.ageMs ?? "unknown"}`,
     `- readFreshnessStrict: ${freshness.strict ?? false}`,
   ];
-  if (freshness.needsReconcile) {
+  if (freshness.needsReconcile || isBootstrapHealthBlocked(freshness)) {
     lines.push(`- readFreshnessWarning: ${freshness.reason ?? "Index needs reconciliation before it should be trusted."}`);
   }
   if (readPreparation.gitDelta?.git) {
@@ -6363,6 +6384,9 @@ function searchFailureMode({ result, hits, readPreparation }) {
   // successful backend response is known to be stale. Reporting it as a
   // failure would make offline renderers non-deterministic and create a
   // diagnostic on every search.
+  if (readPreparation?.enabled === true && isBootstrapHealthBlocked(readPreparation.freshness)) {
+    return "index_health_blocked";
+  }
   if (readPreparation?.enabled === true && readPreparation.freshness?.needsReconcile === true) {
     return "index_needs_reconcile";
   }
@@ -6373,6 +6397,9 @@ function searchFailureMode({ result, hits, readPreparation }) {
 }
 
 function enhancementFailureMode({ result, enhancedPrompt, usedLocalFallback, readPreparation }) {
+  if (readPreparation?.enabled === true && isBootstrapHealthBlocked(readPreparation.freshness)) {
+    return "index_health_blocked";
+  }
   if (readPreparation?.enabled === true && readPreparation.freshness?.needsReconcile === true) {
     return "index_needs_reconcile";
   }

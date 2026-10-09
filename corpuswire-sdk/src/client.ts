@@ -948,7 +948,7 @@ export class CorpusWireClient {
     const timeoutMs = validateNonNegativeNumber(options.queueWaitTimeoutMs ?? DEFAULT_QUEUE_WAIT_TIMEOUT_MS, "queueWaitTimeoutMs");
     const deadline = Date.now() + timeoutMs;
     let lastQueueError: CorpusWireHttpError | undefined;
-    return withUploadAdmissionBudget(async (signal) => {
+    return withRequestBudget(async (signal) => {
       for (;;) {
         if (signal.aborted) throw new DOMException("Upload aborted", "AbortError");
         try {
@@ -991,16 +991,21 @@ export class CorpusWireClient {
     }, timeoutMs, options.signal, () => lastQueueError ?? new Error("Upload admission timeout elapsed"));
   }
 
-  async checkpointIndexSessionCode(sessionId: string): Promise<RemoteIndexStatus> {
-    const response = await requestJson<{ ok: true; result: RemoteIndexStatus }>({
-      baseUrl: this.baseUrl,
-      paths: [`/v1/index/sessions/${encodeURIComponent(sessionId)}/checkpoint/code`],
-      fetchFn: this.fetchFn,
-      defaultHeaders: this.defaultHeaders,
-      basicAuth: this.basicAuth,
-      init: { method: "POST" },
-    });
-    return response.result;
+  async checkpointIndexSessionCode(
+    sessionId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<RemoteIndexStatus> {
+    return withRequestBudget(async (signal) => {
+      const response = await requestJson<{ ok: true; result: RemoteIndexStatus }>({
+        baseUrl: this.baseUrl,
+        paths: [`/v1/index/sessions/${encodeURIComponent(sessionId)}/checkpoint/code`],
+        fetchFn: this.fetchFn,
+        defaultHeaders: this.defaultHeaders,
+        basicAuth: this.basicAuth,
+        init: { method: "POST", signal },
+      });
+      return response.result;
+    }, 0, options.signal, () => new Error("Code checkpoint timeout elapsed"));
   }
 
   async commitIndexSession(sessionId: string): Promise<RemoteIndexCommitResponse> {
@@ -1373,7 +1378,7 @@ export class CorpusWireClient {
         if (priority === 1 && session.code_checkpoint === true && request.inventory
           && session.mode === "full" && !request.snapshotScope && !request.evaluationInventoryAttestation
           && remoteFiles.some(({ file }) => ingestionPriority(file.relativePath) === 1)) {
-          const status = await this.checkpointIndexSessionCode(session.session_id);
+          const status = await this.checkpointIndexSessionCode(session.session_id, { signal: uploadStop.signal });
           if (status.coverage?.code_ready !== true) {
             throw new Error("Code checkpoint did not confirm code readiness");
           }
@@ -1826,7 +1831,7 @@ function buildUploadBatches(
   return batches;
 }
 
-async function withUploadAdmissionBudget<T>(
+async function withRequestBudget<T>(
   operation: (signal: AbortSignal) => Promise<T>,
   timeoutMs: number,
   callerSignal: AbortSignal | undefined,

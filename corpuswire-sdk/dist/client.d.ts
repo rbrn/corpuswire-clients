@@ -84,7 +84,9 @@ export declare class CorpusWireClient {
         signal?: AbortSignal;
         queueWaitTimeoutMs?: number;
     }): Promise<RemoteFileBatchResult>;
-    checkpointIndexSessionCode(sessionId: string): Promise<RemoteIndexStatus>;
+    checkpointIndexSessionCode(sessionId: string, options?: {
+        signal?: AbortSignal;
+    }): Promise<RemoteIndexStatus>;
     commitIndexSession(sessionId: string): Promise<RemoteIndexCommitResponse>;
     getIndexSessionStatus(sessionId: string): Promise<RemoteIndexStatus>;
     followIndexSession(sessionId: string, options?: {

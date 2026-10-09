@@ -1020,6 +1020,7 @@ test("doctor accepts healthy published code and keeps incomplete or degraded cov
     code_ready: true, documentation_pending: true, other_pending: false };
   const cases = [
     { name: "code-ready", coverage, status: "ready" },
+    { name: "explicitly unindexed", coverage, indexed: false, status: "attention" },
     { name: "still publishing", coverage: { ...coverage, code_ready: false }, status: "attention" },
     { name: "mirror pending", coverage: { ...coverage, reason_codes: ["mirror_pending"] }, status: "attention" },
     { name: "invalidated", coverage: { ...coverage, state: "invalidated" }, status: "attention" },
@@ -1037,7 +1038,7 @@ test("doctor accepts healthy published code and keeps incomplete or degraded cov
         cwd: fixture, env: {}, homeDirectory: fixture, write: (line) => writes.push(line),
         client: { health: async () => ({ ok: entry.healthOk ?? true }), diagnoseWorkspace: async () => ({
           status: "ready", can_retrieve: true, resolved_workspace_id: entry.workspaceId ?? "local-docker://code#main",
-          index: { health_status: entry.health_status ?? "ok", readiness: entry.readiness ?? "code_ready",
+          index: { indexed: entry.indexed ?? true, health_status: entry.health_status ?? "ok", readiness: entry.readiness ?? "code_ready",
             coverage: entry.coverage, health_warnings: entry.health_warnings ?? [],
             read_needs_reconcile: entry.read_needs_reconcile ?? false },
         }) },
@@ -1426,7 +1427,7 @@ test("watch cannot establish a full baseline from a code-ready partial diagnosis
   const state = await watchFixture({
     onDiagnosis: async (_current, request) => ({
       status: "ready", can_retrieve: true, resolved_workspace_id: request.workspaceId,
-      index: { health_status: "ok", readiness: "code_ready", coverage: {
+      index: { indexed: true, health_status: "ok", readiness: "code_ready", coverage: {
         state: "pending", code_ready: true, documentation_pending: true,
         reason_codes: ["background_ingestion_pending"],
       } },

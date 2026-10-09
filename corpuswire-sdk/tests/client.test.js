@@ -2702,6 +2702,43 @@ test("unchanged code still checkpoints before documentation uploads", async () =
   assert.deepEqual(fixture.calls.find((call) => call.type === "upload").paths, ["README.md"]);
 });
 
+test("cancel and detach interrupt a stalled code checkpoint and preserve transfer semantics", { timeout: 1000 }, async () => {
+  for (const mode of ["cancel", "incomplete detach", "complete detach"]) {
+    const controller = new AbortController();
+    const files = [{ relativePath: "main.py", content: "x" }];
+    if (mode !== "complete detach") files.push({ relativePath: "README.md", content: "guide" });
+    const fixture = priorityIndexFixture({ files });
+    const originalFetch = fixture.client.fetchFn;
+    let checkpointSignal;
+    fixture.client.fetchFn = async (url, init) => {
+      if (url.endsWith("/checkpoint/code")) {
+        checkpointSignal = init.signal;
+        queueMicrotask(() => controller.abort());
+        return new Promise(() => {});
+      }
+      const response = await originalFetch(url, init);
+      if (url.endsWith("/status") && fixture.calls.some((call) => call.type === "abort")) {
+        const payload = await response.json();
+        payload.result.phase = "aborted";
+        return jsonResponse(200, payload);
+      }
+      return response;
+    };
+    await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+      ...(mode === "cancel" ? { signal: controller.signal } : { detachSignal: controller.signal }),
+    }), (error) => {
+      if (mode === "cancel") assert.ok(error instanceof RemoteIndexCancelledError);
+      else if (mode === "complete detach") assert.ok(error instanceof RemoteIndexDetachedError);
+      else assert.match(error.message, /Start a new index operation/);
+      return true;
+    });
+    assert.equal(checkpointSignal.aborted, true, mode);
+    assert.equal(fixture.calls.some((call) => call.type === "abort"), mode !== "complete detach", mode);
+    assert.equal(fixture.calls.some((call) => call.type === "upload" && call.paths.includes("README.md")), false);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  }
+});
+
 test("a checkpoint without confirmed code readiness cannot call the ready callback", async () => {
   const fixture = priorityIndexFixture({ files: [
     { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },

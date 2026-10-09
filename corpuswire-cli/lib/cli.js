@@ -1219,6 +1219,7 @@ async function runDoctorCommand(options, dependencies) {
   const partialCodeReady = coverage?.state === "pending" && coverage.code_ready === true
     && coverage.reason_codes?.length === 1 && coverage.reason_codes[0] === "background_ingestion_pending"
     && diagnosis?.status === "ready" && diagnosis.can_retrieve === true
+    && diagnosis.index?.indexed === true
     && diagnosis.index?.readiness === "code_ready"
     && ["ok", "ready", "healthy"].includes(diagnosis.index?.health_status)
     && !diagnosis.index?.health_warnings?.length

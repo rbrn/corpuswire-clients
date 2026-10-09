@@ -4685,7 +4685,7 @@ test("MCP recognizes code readiness without certifying full inventory", async ()
       optionalString, freshnessSignal,
       (...values) => values.find(Boolean));
   const diagnosis = {status:'ready',can_retrieve:true,collection_exists:true,point_count:2,
-    checks:[],recovery_actions:[],index:{health_status:'ok',readiness:'code_ready',
+    checks:[],recovery_actions:[],index:{indexed:true,health_status:'ok',readiness:'code_ready',
       coverage:{state:'pending',code_ready:true,documentation_pending:true,
         other_pending:true,reason_codes:['background_ingestion_pending']}}};
   const ready = readBootstrap(diagnosis, {workspaceId:'fixture'});
@@ -4694,6 +4694,8 @@ test("MCP recognizes code readiness without certifying full inventory", async ()
   assert.equal(ready.coverage.state, 'pending');
   assert.equal(ready.needsReconcile, false);
   for (const change of [
+    {index:{...diagnosis.index,indexed:false}},
+    {index:{...diagnosis.index,indexed:undefined}},
     {index:{...diagnosis.index,health_status:'error'}},
     {index:{...diagnosis.index,health_warnings:['vector connection failed']}},
     {qdrant_error:'vector connection failed'},
@@ -4718,6 +4720,7 @@ test("MCP recognizes code readiness without certifying full inventory", async ()
     assert.equal(readBootstrap(healthy, {}).state, 'ready');
     for (const change of [
       {status:'blocked'}, {status:'degraded'}, {can_retrieve:false},
+      {index:{...healthy.index, indexed:false}},
       {index:{...healthy.index, health_status:'error'}},
       {index:{...healthy.index, health_warnings:['vector connection failed']}},
       {qdrant_error:'vector connection failed'},
@@ -4734,4 +4737,118 @@ test("MCP recognizes code readiness without certifying full inventory", async ()
   const legacy = {can_retrieve:true, index:{coverage:{state:'verified'}}};
   assert.equal(readBootstrap(legacy, {}).state, 'ready');
   assert.equal(readBootstrap({...legacy, status:'ready'}, {}).state, 'ready');
+});
+
+test("verified MCP health failures block strict reads, incremental sync and doctor without forcing reconcile", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cw-health-consumers-"));
+  const sourceRoot = path.join(root, "repo"), sdkPath = path.join(root, "sdk.mjs");
+  const diagnosisPath = path.join(root, "diagnosis.json"), callsPath = path.join(root, "calls.jsonl");
+  await mkdir(sourceRoot);
+  await writeFile(path.join(sourceRoot, "a.py"), "baseline");
+  const healthy = {status:"ready",can_retrieve:true,collection:"fixture",collection_exists:true,point_count:1,
+    checks:[],index:{indexed:true,health_status:"ok",coverage:{state:"verified",coverage_token:"baseline",selection_policy_digest:"policy"}}};
+  await writeFile(diagnosisPath, JSON.stringify(healthy));
+  await writeFile(sdkPath, `import {readFileSync,appendFileSync} from 'node:fs';
+    export class CorpusWireClient {
+      async diagnoseWorkspace(){return JSON.parse(readFileSync(process.env.MOCK_DIAGNOSIS_PATH,'utf8'));}
+      async health(){return {ok:true};}
+      async listIndexSessions(){return [];}
+      async getIndexActivity(){return {gap_detected:false,consecutive_failures:0};}
+      async queryRaw(){appendFileSync(process.env.MOCK_CALLS_PATH,'query\\n');return {result:{retrieved_chunks:[],agent_context_packets:[]}};}
+      async indexWorkspace(request){appendFileSync(process.env.MOCK_CALLS_PATH,'index\\n');return {ok:true,result:{collection:'fixture'},status:{collection_name:'fixture',coverage:{state:'verified',coverage_token:'baseline',selection_policy_digest:'policy'}},transfer:{complete:true,files_submitted:request.files.length,files_transferred:request.files.length,files_reused:0,acknowledged_files:request.files.map(f=>({relative_path:f.relativePath,sha256:f.sha256,disposition:'uploaded'}))}};}
+    }`);
+  const launch = (enabled) => spawn("node", [SERVER_BIN], {stdio:["pipe","pipe","pipe"],env:{...process.env,
+    CORPUSWIRE_BASE_URL:"http://127.0.0.1:8000",CORPUSWIRE_SDK_PATH:sdkPath,CORPUSWIRE_WORKSPACE_ID:"fixture",
+    CORPUSWIRE_SYNC_ENABLED:String(enabled),CORPUSWIRE_SYNC_ROOT:sourceRoot,CORPUSWIRE_SYNC_READ_STRICT:"true",
+    CORPUSWIRE_SYNC_READ_STRICT_STALE_AFTER_MS:"60000",CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK:"true",
+    CORPUSWIRE_SYNC_MTIME_CACHE_ENABLED:"true",CORPUSWIRE_SYNC_STATE_DIR:path.join(root,"cache"),
+    MOCK_DIAGNOSIS_PATH:diagnosisPath,MOCK_CALLS_PATH:callsPath}});
+  const child = launch(true), rpc = createRpc(child);
+  let id = 0;
+  const invoke = (name,args={}) => rpc({jsonrpc:"2.0",id:++id,method:"tools/call",params:{name,arguments:args}});
+  try {
+    assert.equal((await invoke("corpuswire_sync_reconcile")).result.isError,false);
+    assert.match((await invoke("corpuswire_doctor")).result.content[0].text,/verdict: ready/);
+    assert.equal((await invoke("corpuswire_search",{query:"baseline"})).result.isError,false);
+    await writeFile(diagnosisPath,JSON.stringify({...healthy,qdrant_error:"vector unavailable"}));
+    assert.equal((await invoke("corpuswire_search",{query:"baseline"})).result.isError,true);
+    assert.match((await invoke("corpuswire_doctor")).result.content[0].text,/verdict: blocked/);
+    await writeFile(diagnosisPath,JSON.stringify(healthy));
+    assert.match((await invoke("corpuswire_doctor")).result.content[0].text,/verdict: ready/);
+    for (const change of [
+      {qdrant_error:"vector unavailable"},
+      {checks:[{name:"vectors",status:"error",message:"vector unavailable"}]},
+      {checks:[{name:"vectors",status:"warning",message:"vector unavailable"}]},
+      {index:{...healthy.index,indexed:false}},
+    ]) {
+      await writeFile(diagnosisPath,JSON.stringify({...healthy,...change}));
+      const read = await invoke("corpuswire_search",{query:"baseline"});
+      assert.equal(read.result.isError,true);
+      assert.match(read.result.content[0].text,/strict mode blocked retrieval/);
+      assert.match((await invoke("corpuswire_doctor")).result.content[0].text,/verdict: blocked/);
+      const delta = await invoke("corpuswire_sync_delta",{changedPaths:["a.py"],flush:true});
+      assert.doesNotMatch(delta.result.content[0].text,/noOp: true/);
+      const status = (await invoke("corpuswire_sync_status")).result.content[0].text;
+      assert.match(status,/bootstrapState: blocked/);
+      assert.match(status,/needsReconcile: false/);
+    }
+    const calls = (await readFile(callsPath,"utf8")).trim().split("\n");
+    assert.deepEqual(calls,["index","query"]);
+    await writeFile(diagnosisPath,JSON.stringify(healthy));
+    assert.match((await invoke("corpuswire_doctor")).result.content[0].text,/verdict: attention/);
+    const resumed = await invoke("corpuswire_sync_delta",{changedPaths:["a.py"],flush:true});
+    assert.match(resumed.result.content[0].text,/noOp: true/);
+    assert.match((await invoke("corpuswire_sync_status")).result.content[0].text,/bootstrapState: ready/);
+    assert.match((await invoke("corpuswire_doctor")).result.content[0].text,/verdict: ready/);
+    await writeFile(diagnosisPath,JSON.stringify({...healthy,index:{...healthy.index,indexed:false}}));
+    // Fresh doctor diagnosis must also block when sync is disabled and no bootstrap check ran.
+    const disabled = launch(false), disabledRpc = createRpc(disabled);
+    try {
+      const result = await disabledRpc({jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"corpuswire_doctor",arguments:{}}});
+      assert.match(result.result.content[0].text,/verdict: blocked/);
+      await writeFile(diagnosisPath,JSON.stringify({can_retrieve:true,index:{coverage:{state:"verified"}}}));
+      const legacy = await disabledRpc({jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"corpuswire_doctor",arguments:{}}});
+      assert.match(legacy.result.content[0].text,/verdict: ready/);
+      await writeFile(diagnosisPath,JSON.stringify({...healthy,index:{health_status:"ok",readiness:"code_ready",
+        coverage:{state:"pending",code_ready:true,reason_codes:["background_ingestion_pending"]}}}));
+      const missingIndexed = await disabledRpc({jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"corpuswire_doctor",arguments:{}}});
+      assert.match(missingIndexed.result.content[0].text,/verdict: attention/);
+    } finally {disabled.kill();}
+  } finally {child.kill();await rm(root,{recursive:true,force:true});}
+});
+
+test("MCP cache and upload completion preserve an explicit health block", async () => {
+  const source = await readFile(SERVER_BIN,"utf8");
+  const method = (start,end) => source.slice(source.indexOf(start),source.indexOf(end,source.indexOf(start)));
+  const helper = new Function(method("function isBootstrapHealthBlocked(","function bootstrapStatusFromDiagnosis(")+";return isBootstrapHealthBlocked;")();
+  const cache = new Function("isBootstrapHealthBlocked","return ({"+method("  isCacheUsable() {","  async probePaths(")+"}).isCacheUsable;")(helper);
+  const apply = new Function("isBootstrapHealthBlocked","syncContextKey","return ({"+method("  async applySyncCacheUploadResult(","  async updateSyncCacheEntry(")+"}).applySyncCacheUploadResult;")(helper,()=>"fixture");
+  // Cache usability is tested with matching verified lineage, rather than an observation gap.
+  const context = {isCacheEnabled:()=>true,observationGap:false,activeBootstrapCheck:null,
+    bootstrapStatus:{state:"blocked",needsReconcile:false,coverage:{state:"verified",coverage_token:"baseline"}}};
+  assert.equal(cache.call(context),false);
+  context.isCacheEnabled=()=>false;
+  await apply.call(context,{},[],[],{status:{collection_name:"fixture",coverage:{state:"verified",coverage_token:"new"}},transfer:{complete:true}});
+  assert.equal(context.bootstrapStatus.state,"blocked");
+  assert.equal(context.bootstrapStatus.needsReconcile,false);
+  context.isCacheEnabled=()=>true;
+  context.bootstrapStatus.state="ready";
+  assert.equal(cache.call(context),true);
+});
+
+
+test("doctor falls back to a known bootstrap health block when fresh diagnosis is absent", async () => {
+  const source = await readFile(SERVER_BIN,"utf8");
+  const start = source.indexOf("function determineDoctorVerdict(");
+  const end = source.indexOf("\nfunction formatDoctor(",start);
+  const stringStart = source.indexOf("function optionalString(");
+  const stringEnd = source.indexOf("\nfunction readOutputMode",stringStart);
+  const optionalString = new Function(source.slice(stringStart,stringEnd)+";return optionalString;")();
+  const verdict = new Function("optionalString","bootstrapStatusFromDiagnosis","isBootstrapHealthBlocked",
+    source.slice(start,end)+";return determineDoctorVerdict;")(optionalString,
+      ()=>{throw new Error("No absent diagnosis should be normalized");},()=>false);
+  for (const bootstrapState of ["blocked","error"]) {
+    assert.equal(verdict({healthResponse:{ok:true},diagnosis:null,syncStatus:{bootstrapState,pendingTotal:0},
+      sessions:[],activity:{gap_detected:false},errors:[]}),"blocked");
+  }
 });

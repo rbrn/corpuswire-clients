@@ -324,6 +324,10 @@ subscribe with
 until final commit. Legacy servers and snapshot/evaluation sessions retain the
 final-commit contract.
 
+Cancellation and detach also interrupt a stalled code-checkpoint request.
+Cancellation aborts the session; detach preserves backend work only after all
+required source uploads have been acknowledged.
+
 Temporary queue saturation is retried within `queueWaitTimeoutMs` (default
 600000), preserving the original payload and honoring the request's
 `AbortSignal`. A positive budget bounds HTTP admission, response reading,
