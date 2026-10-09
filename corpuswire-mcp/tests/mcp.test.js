@@ -21,6 +21,60 @@ const VENDORED_SDK_INDEX = new URL(
   import.meta.url,
 );
 
+test("both MCP entrypoints report safe initialization spans and disabled tracing", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cw-initialization-trace-"));
+  let traceEnabled = true;
+  const requestId = "123456789abc4def8123456789abcdef";
+  const server = createServer((_request, response) => {
+    response.writeHead(200, traceEnabled ? {
+      "content-type": "application/json",
+      "x-corpuswire-index-trace": "index-observability/v1",
+      "x-corpuswire-index-trace-availability": "available",
+      "x-request-id": requestId,
+      "server-timing": "cw_session_lock_wait;dur=7, cw_writer_creation;dur=11, cw_session_lock_hold;dur=19, cw_private_source;dur=999",
+    } : { "x-corpuswire-index-trace-availability": "disabled", "x-request-id": "caller-private-path" });
+    response.end("{}");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await writeFile(path.join(root, "README.md"), "# synthetic initialization fixture\n");
+    const { sdkPath, requestsPath } = await writeMockSdk(root);
+    for (const entrypoint of [SERVER_BIN, WRAPPER_BIN]) {
+      for (const enabled of [true, false]) {
+        traceEnabled = enabled;
+        const child = spawn("node", [entrypoint], {
+          stdio: ["pipe", "pipe", "pipe"],
+          env: { ...process.env, CORPUSWIRE_SDK_PATH: sdkPath, MOCK_REQUESTS_PATH: requestsPath,
+            CORPUSWIRE_BASE_URL: `http://127.0.0.1:${server.address().port}`, CORPUSWIRE_REPO_PATH: root,
+            CORPUSWIRE_WORKSPACE_ID: "workspace-trace-fixture", CORPUSWIRE_SYNC_ENABLED: "true",
+            CORPUSWIRE_INDEX_OBSERVABILITY_ENABLED: "true", CORPUSWIRE_RETRIEVAL_LOG_DIR: "",
+            MOCK_INDEX_TRACE_URL: `http://127.0.0.1:${server.address().port}/v1/index/sessions` },
+        });
+        try {
+          const rpc = createRpc(child);
+          const result = await rpc({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+            name: "corpuswire_sync_reconcile", arguments: { includeGlobs: ["README.md"], maxFiles: 2, maxWaitMs: 1000 },
+          } });
+          assert.equal(result.result.isError, false);
+          const output = result.result.content[0].text;
+          assert.match(output, enabled ? /server trace responses: available=1/ : /server trace responses: disabled=1/);
+          if (enabled) {
+            assert.match(output, /session_lock_wait=7ms/);
+            assert.match(output, /writer_creation=11ms/);
+            assert.match(output, new RegExp(`trace request IDs: ${requestId}`));
+          } else {
+            assert.doesNotMatch(output, /writer_creation=|trace request IDs:/);
+          }
+          assert.doesNotMatch(output, /private_source|caller-private-path|synthetic initialization fixture/);
+        } finally { child.kill(); }
+      }
+    }
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("MCP version flags work offline before SDK loading through both entrypoints", async () => {
   const expected = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).version;
   for (const entrypoint of [SERVER_BIN, WRAPPER_BIN]) {
@@ -3692,6 +3746,7 @@ export function assertReviewContextV2Result(value) {
 export class CorpusWireClient {
   constructor(options = {}) {
     this.baseUrl = options.baseUrl ?? "http://mock-corpuswire";
+    this.fetchFn = options.fetchFn;
     if (process.env.MOCK_MISSING_VALUE_ROLLUP === "true") {
       this.valueRollup = undefined;
     }
@@ -4366,6 +4421,9 @@ export class CorpusWireClient {
   }
 
   async indexWorkspace(request) {
+    if (process.env.MOCK_INDEX_TRACE_URL) {
+      await this.fetchFn(process.env.MOCK_INDEX_TRACE_URL);
+    }
     appendFileSync(process.env.MOCK_REQUESTS_PATH, JSON.stringify({
       kind: "indexWorkspace",
       workspaceId: request.workspace.workspaceId,

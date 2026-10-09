@@ -57,6 +57,8 @@ const INDEX_OBSERVABILITY_STAGES = new Set([
   "mcp_receipt", "server_receipt", "queue_wait", "file_discovery", "file_read",
   "filtering_hashing", "parsing_chunking", "model_wait", "embedding_batch",
   "vector_writes", "cleanup",
+  "session_lock_wait", "session_lock_hold", "session_catalog",
+  "writer_creation", "schema_preflight", "session_persistence",
 ]);
 const REVIEW_V2_JOB_STATES = new Set([
   "queued", "running", "succeeded", "partial", "failed", "cancelled", "superseded",
@@ -6804,12 +6806,22 @@ function buildClient() {
 
 function createMcpServerTraceCollector() {
   const stageTimingsMs = {};
+  const serverTraceRequests = { available: 0, disabled: 0, unavailable: 0 };
+  const requestIds = new Set();
   let modelState = "unknown";
   let errorState = "none";
   return {
     observe(response) {
-      if (response?.headers?.get?.("x-corpuswire-index-trace") !== INDEX_OBSERVABILITY_SCHEMA_VERSION) {
+      const availability = response?.headers?.get?.("x-corpuswire-index-trace-availability");
+      const traced = response?.headers?.get?.("x-corpuswire-index-trace") === INDEX_OBSERVABILITY_SCHEMA_VERSION;
+      if (availability === "disabled" || !traced) {
+        serverTraceRequests[availability === "disabled" ? "disabled" : "unavailable"] += 1;
         return;
+      }
+      serverTraceRequests.available += 1;
+      const requestId = response.headers.get("x-request-id") ?? "";
+      if (/^[a-f0-9]{12}4[a-f0-9]{3}[89ab][a-f0-9]{15}$/i.test(requestId) && requestIds.size < 32) {
+        requestIds.add(requestId.toLowerCase());
       }
       for (const item of (response.headers.get("server-timing") ?? "").split(",")) {
         const match = item.match(/^\s*cw_([a-z_]+)\s*;\s*dur=([0-9]+(?:\.[0-9]+)?)/i);
@@ -6838,7 +6850,10 @@ function createMcpServerTraceCollector() {
       }
     },
     snapshot() {
-      return { stageTimingsMs: { ...stageTimingsMs }, modelState, errorState };
+      return {
+        stageTimingsMs: { ...stageTimingsMs }, modelState, errorState,
+        serverTraceRequests: { ...serverTraceRequests }, requestIds: [...requestIds],
+      };
     },
   };
 }
@@ -6872,6 +6887,8 @@ function buildMcpIndexTrace({
     stageTimingsMs: {},
     modelState: "unknown",
     errorState: "none",
+    serverTraceRequests: { available: 0, disabled: 0, unavailable: 0 },
+    requestIds: [],
   };
   addTimings(collected.stageTimingsMs);
   addTimings(response?.status?.progress?.phase_timings_ms);
@@ -6888,6 +6905,8 @@ function buildMcpIndexTrace({
     total_duration_ms: Math.max(0, Math.round(totalDurationMs)),
     error_state: collected.errorState,
     model_state: collected.modelState,
+    server_trace_requests: collected.serverTraceRequests,
+    request_ids: collected.requestIds,
     sensitive_payloads_captured: false,
   };
 }
@@ -7723,6 +7742,10 @@ function formatSyncSummary(summary, ordinal) {
       ? [
         `   observability: ${observability.schema_version} model=${observability.model_state ?? "unknown"} error=${observability.error_state ?? "unknown"} total=${observability.total_duration_ms ?? 0}ms`,
         `   stages: ${measuredStages.length > 0 ? measuredStages.join(", ") : "none"}`,
+        `   server trace responses: ${formatSyncCountMap(observability.server_trace_requests, ["available", "disabled", "unavailable"])}`,
+        ...(observability.request_ids?.length > 0
+          ? [`   trace request IDs: ${observability.request_ids.join(", ")}`]
+          : []),
       ]
       : []),
   ].join("\n");

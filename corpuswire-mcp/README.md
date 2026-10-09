@@ -307,7 +307,11 @@ Polling session status remains the reliable fallback and reattachment contract.
 When both observability gates are enabled, reconciliation summaries also show
 MCP receipt, discovery/read, server/model wait, queue, chunking, embedding,
 vector-write, cleanup, total, model state, and bounded error state. The trace
-contains no file content, prompt text, credentials, or request headers.
+adds session lock wait/hold, catalog, writer/schema setup and persistence spans.
+Disabled or unavailable server traces are counted explicitly and missing spans
+remain unknown. Up to 32 server-generated UUID request identities support
+correlation. Parent and child spans overlap and must not be summed. The trace
+contains no file content, prompt text, credentials or caller headers.
 
 When `CORPUSWIRE_SYNC_MTIME_CACHE_ENABLED=true`, the versioned cache stores acknowledged path/hash metadata without source contents. Cache skips require the same service, workspace, collection, selection policy and coverage token, plus uninterrupted local observation since a verified full reconcile. Every candidate is hashed; matching size and mtime alone cannot suppress an upload. A restart, watcher error, foreign token or missing diagnosis requires reconciliation before cache reuse. Full reconciliation always reads and hashes every eligible file.
 

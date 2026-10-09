@@ -14,6 +14,7 @@ import {
   main,
   parseCliArgs,
   runCliCommand,
+  runIndexCommand,
   sanitizeTerminalText,
 } from "../lib/cli.js";
 
@@ -837,6 +838,62 @@ test("index trace collector accepts only the fixed safe server timing contract",
   assert.equal(snapshot.modelState, "cold");
   assert.equal(snapshot.errorState, "none");
   assert.equal("secret_prompt" in snapshot.stageTimingsMs, false);
+});
+
+test("index trace distinguishes disabled and missing spans and bounds safe request identities", async () => {
+  const collector = createIndexTraceCollector();
+  const traceId = "123456789abc4def8123456789abcdef";
+  const responses = [
+    new Response("{}", { headers: { "x-corpuswire-index-trace-availability": "disabled", "x-request-id": "private-path" } }),
+    new Response("{}"),
+    new Response("{}", { headers: {
+      "x-corpuswire-index-trace": "index-observability/v1",
+      "x-corpuswire-index-trace-availability": "available",
+      "x-request-id": traceId,
+      "server-timing": "cw_session_lock_wait;dur=12, cw_session_lock_hold;dur=30, cw_writer_creation;dur=20, cw_schema_preflight;dur=4, cw_session_catalog;dur=2, cw_session_persistence;dur=3, cw_private_path;dur=999",
+    } }),
+    new Response("{}", { headers: { "x-corpuswire-index-trace": "index-observability/v1", "x-request-id": "caller-supplied-secret" } }),
+  ];
+  const fetchWithTrace = collector.wrapFetch(async () => responses.shift());
+  for (let index = 0; index < 4; index += 1) await fetchWithTrace("http://127.0.0.1/v1/index/sessions");
+  const snapshot = collector.snapshot();
+  assert.deepEqual(snapshot.serverTraceRequests, { available: 2, disabled: 1, unavailable: 1 });
+  assert.deepEqual(snapshot.requestIds, [traceId]);
+  assert.equal(snapshot.stageTimingsMs.session_lock_wait, 12);
+  assert.equal(snapshot.stageTimingsMs.writer_creation, 20);
+  assert.equal(snapshot.stageTimingsMs.session_lock_hold, 30); // Nested spans are retained, never summed here.
+  assert.doesNotMatch(JSON.stringify(snapshot), /private-path|caller-supplied-secret|private_path/);
+
+  const bounded = createIndexTraceCollector();
+  let counter = 0;
+  const boundedFetch = bounded.wrapFetch(async () => new Response("{}", { headers: {
+    "x-corpuswire-index-trace": "index-observability/v1",
+    "x-request-id": `123456789abc4def8123${String(counter++).padStart(12, "0")}`,
+  } }));
+  for (let index = 0; index < 40; index += 1) await boundedFetch("http://127.0.0.1/v1/index/capabilities");
+  assert.equal(bounded.snapshot().requestIds.length, 32);
+  assert.equal(bounded.snapshot().serverTraceRequests.available, 40);
+});
+
+test("terminal index trace distinguishes disabled and unavailable server measurement", async () => {
+  const fixture = await syntheticWorkspace();
+  try {
+    for (const disabled of [true, false]) {
+      const collector = createIndexTraceCollector();
+      const tracedFetch = collector.wrapFetch(async () => new Response("{}", {
+        headers: disabled ? { "x-corpuswire-index-trace-availability": "disabled" } : {},
+      }));
+      await tracedFetch("http://127.0.0.1/v1/index/capabilities");
+      const writes = [];
+      await runIndexCommand({ ...indexOptions(fixture), trace: true, yes: true }, {
+        client: fakeIndexClient(), traceCollector: collector,
+        write: (line) => writes.push(line), writeRaw: () => {}, isTTY: false,
+      });
+      assert.match(writes.join("\n"), disabled
+        ? /Server trace responses: available=0, disabled=1, unavailable=0/
+        : /Server trace responses: available=0, disabled=0, unavailable=1/);
+    }
+  } finally { await rm(fixture, { recursive: true, force: true }); }
 });
 
 test("progress formatting preserves unknown denominators, ETA confidence, heartbeat, and redaction", () => {

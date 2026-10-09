@@ -23,6 +23,8 @@ const INDEX_TRACE_STAGES = new Set([
   "mcp_receipt", "server_receipt", "queue_wait", "file_discovery", "file_read",
   "filtering_hashing", "parsing_chunking", "model_wait", "embedding_batch",
   "vector_writes", "cleanup", "total",
+  "session_lock_wait", "session_lock_hold", "session_catalog",
+  "writer_creation", "schema_preflight", "session_persistence",
 ]);
 const CLI_VERSION = "0.1.4-beta.5";
 
@@ -1454,12 +1456,22 @@ async function scanWorkspaceComplete(sourceRoot, options) {
 
 export function createIndexTraceCollector() {
   const stageTimingsMs = {};
+  const serverTraceRequests = { available: 0, disabled: 0, unavailable: 0 };
+  const requestIds = new Set();
   let modelState = "unknown";
   let errorState = "none";
 
   const observe = (response) => {
-    if (response?.headers?.get?.("x-corpuswire-index-trace") !== INDEX_OBSERVABILITY_SCHEMA_VERSION) {
+    const availability = response?.headers?.get?.("x-corpuswire-index-trace-availability");
+    const traced = response?.headers?.get?.("x-corpuswire-index-trace") === INDEX_OBSERVABILITY_SCHEMA_VERSION;
+    if (availability === "disabled" || !traced) {
+      serverTraceRequests[availability === "disabled" ? "disabled" : "unavailable"] += 1;
       return;
+    }
+    serverTraceRequests.available += 1;
+    const requestId = response.headers.get("x-request-id") ?? "";
+    if (/^[a-f0-9]{12}4[a-f0-9]{3}[89ab][a-f0-9]{15}$/i.test(requestId) && requestIds.size < 32) {
+      requestIds.add(requestId.toLowerCase());
     }
     const serverTiming = response.headers.get("server-timing") ?? "";
     for (const item of serverTiming.split(",")) {
@@ -1510,6 +1522,8 @@ export function createIndexTraceCollector() {
         stageTimingsMs: { ...stageTimingsMs },
         modelState,
         errorState,
+        serverTraceRequests: { ...serverTraceRequests },
+        requestIds: [...requestIds],
       };
     },
   };
@@ -1549,6 +1563,8 @@ function buildIndexTrace({
     total_duration_ms: Math.max(0, Math.round(totalDurationMs)),
     error_state: errorState ?? collected.errorState,
     model_state: collected.modelState,
+    server_trace_requests: collected.serverTraceRequests,
+    request_ids: collected.requestIds,
     sensitive_payloads_captured: false,
   };
 }
@@ -1566,6 +1582,8 @@ function printIndexTrace(write, options) {
     `Index observability (${trace.schema_version})`,
     `  Model/error: ${trace.model_state}/${trace.error_state}`,
     `  Stages: ${measuredStages.length > 0 ? measuredStages.join(", ") : "no server stages reported"}`,
+    `  Server trace responses: available=${trace.server_trace_requests.available}, disabled=${trace.server_trace_requests.disabled}, unavailable=${trace.server_trace_requests.unavailable}`,
+    ...(trace.request_ids.length > 0 ? [`  Trace request IDs: ${trace.request_ids.join(", ")}`] : []),
     `  Total: ${formatDuration(trace.total_duration_ms)}`,
     "  Sensitive payloads captured: no",
   ].join("\n"));

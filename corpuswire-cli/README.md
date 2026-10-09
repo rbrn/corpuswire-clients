@@ -172,7 +172,12 @@ and upload-concurrency limits automatically.
 discovery/read/hash time, server receipt and model-wait time when the backend
 enables `INDEX_OBSERVABILITY_ENABLED=true`, durable queue/chunk/embed/write/
 cleanup timings, warm/cold model state, total time, and a bounded error state.
-It never records file contents, prompts, credentials, or request headers.
+Initialization traces also measure session lock wait/hold, catalog checks,
+writer creation, schema preflight and persistence. `server_trace_requests`
+counts available, disabled and unavailable responses; unmeasured spans remain
+`null`. At most 32 server-generated UUID request identities allow correlation.
+Parent spans overlap their child stages, so their sum is not elapsed time.
+The trace never records file contents, prompts, credentials or caller headers.
 
 Example environment:
 
