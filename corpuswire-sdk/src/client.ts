@@ -1013,8 +1013,10 @@ export class CorpusWireClient {
 
   async checkpointIndexSessionCode(
     sessionId: string,
-    options: { signal?: AbortSignal } = {},
+    options: { signal?: AbortSignal; deadline?: number } = {},
   ): Promise<RemoteIndexStatus> {
+    const remainingMs = options.deadline === undefined ? 0 : options.deadline - Date.now();
+    if (options.deadline !== undefined && remainingMs <= 0) throw new Error("Code checkpoint timeout elapsed");
     return withRequestBudget(async (signal) => {
       const response = await requestJson<{ ok: true; result: RemoteIndexStatus }>({
         baseUrl: this.baseUrl,
@@ -1024,8 +1026,10 @@ export class CorpusWireClient {
         basicAuth: this.basicAuth,
         init: { method: "POST", signal },
       });
+      if (signal.aborted) throw new DOMException("Code checkpoint aborted", "AbortError");
+      if (options.deadline !== undefined && Date.now() >= options.deadline) throw new Error("Code checkpoint timeout elapsed");
       return response.result;
-    }, 0, options.signal, () => new Error("Code checkpoint timeout elapsed"));
+    }, remainingMs, options.signal, () => new Error("Code checkpoint timeout elapsed"));
   }
 
   async commitIndexSession(sessionId: string): Promise<RemoteIndexCommitResponse> {
@@ -1121,17 +1125,8 @@ export class CorpusWireClient {
     cancellationSignal: AbortSignal | undefined,
     onProgress: (event: RemoteIndexProgressEvent) => void,
   ): Promise<RemoteIndexStatus> {
-    const release = (attemptDeadline: number, signal?: AbortSignal): Promise<RemoteIndexStatus> => {
-      const budgetMs = attemptDeadline - Date.now();
-      if (budgetMs <= 0) return Promise.reject(new Error("Code stage session release timed out"));
-      return withRequestBudget(async (transportSignal) => {
-        await this.abortIndexSession(session.session_id, { signal: transportSignal });
-        const status = await this.waitForIndexSessionTerminal(session.session_id, pollMs, onProgress,
-          undefined, attemptDeadline, transportSignal);
-        if (Date.now() >= attemptDeadline) throw new Error("Code stage session release timed out");
-        return status;
-      }, budgetMs, signal, () => new Error("Code stage session release timed out"));
-    };
+    const release = (attemptDeadline: number, signal?: AbortSignal): Promise<RemoteIndexStatus> =>
+      this.abortIndexSessionByDeadline(session.session_id, attemptDeadline, pollMs, onProgress, signal);
     try {
       return await release(deadline ?? Date.now() + 5_000, callerSignal);
     } catch (cause) {
@@ -1147,6 +1142,21 @@ export class CorpusWireClient {
       throw new Error(`Code stage session release was interrupted; ${confirmed
         ? "the owned session abort was confirmed" : "an abort was requested but release could not be confirmed"}. Start a new index operation.`, { cause });
     }
+  }
+
+  private abortIndexSessionByDeadline(
+    sessionId: string, deadline: number, pollMs: number,
+    onProgress: (event: RemoteIndexProgressEvent) => void, callerSignal?: AbortSignal,
+  ): Promise<RemoteIndexStatus> {
+    const budgetMs = deadline - Date.now();
+    if (budgetMs <= 0) return Promise.reject(new Error("Code stage session release timed out"));
+    return withRequestBudget(async (transportSignal) => {
+      await this.abortIndexSession(sessionId, { signal: transportSignal });
+      const status = await this.waitForIndexSessionTerminal(sessionId, pollMs, onProgress,
+        undefined, deadline, transportSignal);
+      if (Date.now() >= deadline) throw new Error("Code stage session release timed out");
+      return status;
+    }, budgetMs, callerSignal, () => new Error("Code stage session release timed out"));
   }
 
   private async waitForIndexSessionProcessing(
@@ -1213,7 +1223,7 @@ export class CorpusWireClient {
 
   /**
    * Publish code from a complete scan and release the drained owned session.
-   * Release uses the remaining processing budget, or 5 seconds when unspecified.
+   * Checkpoint and release share the processing budget, or 5 seconds when unspecified.
    * Interruption allows up to 1 extra second for best-effort abort confirmation.
    */
   async indexWorkspaceCodeStage(request: IndexWorkspaceRequest): Promise<RemoteIndexCodeStageResult> {
@@ -1333,12 +1343,21 @@ export class CorpusWireClient {
     const session = await this.startIndexSession(request);
     const uploadStop = new AbortController();
     let clientOwnedCheckpoint = false;
+    let checkpointRequestPending = false;
     let codeStageReleaseStarted = false;
     const stopUploads = (): void => uploadStop.abort();
     request.signal?.addEventListener("abort", stopUploads, { once: true });
     request.detachSignal?.addEventListener("abort", stopUploads, { once: true });
-    try {
+    const checkInterrupt = async (): Promise<void> => {
+      // Include interrupts queued by a just-delivered progress callback.
+      await Promise.resolve();
+      if (clientOwnedCheckpoint && (request.signal?.aborted || request.detachSignal?.aborted)) {
+        throw new DOMException("Client-owned checkpoint interrupted", "AbortError");
+      }
       await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
+    };
+    try {
+      await checkInterrupt();
       const manifestEntries = buildWorkspaceManifest(remoteFiles, request.deletedPaths ?? []);
       emitClientProgress(
         "manifest_comparison",
@@ -1393,18 +1412,20 @@ export class CorpusWireClient {
       let queuedBackgroundWork = false;
       let uploadedFiles = 0;
       // All tier drains share the caller's processing budget. Starting it at
-      // the first drain preserves the existing upload-versus-processing split.
+      // the first drain or checkpoint preserves the upload-versus-processing split.
       let processingDeadline: number | null = null;
       const processingWaitDeadline = (): number | null => {
-        if (processingDeadline === null && request.processingTimeoutMs !== undefined) {
-          processingDeadline = Date.now() + Math.max(1, request.processingTimeoutMs);
+        const timeoutMs = request.processingTimeoutMs ?? (codeStage ? 5_000 : undefined);
+        if (processingDeadline === null && timeoutMs !== undefined) {
+          processingDeadline = Date.now() + Math.max(1, timeoutMs);
         }
         return processingDeadline;
       };
       for (const priority of [1, 2, 3] as const) {
-        await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
+        await checkInterrupt();
         if (processingDeadline !== null && Date.now() >= processingDeadline
           && uploadedFiles < filesToUpload.length) {
+          if (clientOwnedCheckpoint) throw new DOMException("Caller wait timeout elapsed", "TimeoutError");
           throw new RemoteIndexDetachedError(session.session_id,
             await this.getIndexSessionStatus(session.session_id), "Caller wait timeout elapsed");
         }
@@ -1493,12 +1514,16 @@ export class CorpusWireClient {
           );
           if (status.phase === "aborted") throw new RemoteIndexCancelledError(session.session_id, status);
         }
-        await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
+        await checkInterrupt();
         if (priority === 1 && session.code_checkpoint === true && request.inventory
           && session.mode === "full" && !request.snapshotScope && !request.evaluationInventoryAttestation
           && remoteFiles.some(({ file }) => ingestionPriority(file.relativePath) === 1)) {
           clientOwnedCheckpoint = true;
-          const status = await this.checkpointIndexSessionCode(session.session_id, { signal: uploadStop.signal });
+          checkpointRequestPending = true;
+          const status = await this.checkpointIndexSessionCode(session.session_id, {
+            signal: uploadStop.signal, deadline: processingWaitDeadline() ?? undefined,
+          });
+          checkpointRequestPending = false;
           if (status.coverage?.code_ready !== true) {
             throw new Error("Code checkpoint did not confirm code readiness");
           }
@@ -1524,7 +1549,7 @@ export class CorpusWireClient {
             return { outcome: "code_ready", full_inventory_complete: false, checkpoint: status,
               release_status: releaseStatus, transfer };
           }
-          await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
+          await checkInterrupt();
         }
       }
       if (queuedBackgroundWork) {
@@ -1536,6 +1561,7 @@ export class CorpusWireClient {
           { ...request, onProgress: emitProgress },
         );
         if (request.signal?.aborted || processingStatus.phase === "aborted") {
+          if (clientOwnedCheckpoint) throw new DOMException("Client-owned checkpoint interrupted", "AbortError");
           if (processingStatus.phase !== "aborted") {
             await this.abortIndexSession(session.session_id);
           }
@@ -1548,8 +1574,9 @@ export class CorpusWireClient {
           throw new RemoteIndexCancelledError(session.session_id, terminal);
         }
       }
-      await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
+      await checkInterrupt();
       emitClientProgress("committing", 0, null, "items", "Waiting for verified commit", session.session_id);
+      if (clientOwnedCheckpoint) await checkInterrupt();
       const committed = await this.commitIndexSession(session.session_id);
       clientOwnedCheckpoint = false;
       phaseClock.pause();
@@ -1570,6 +1597,32 @@ export class CorpusWireClient {
       if (codeStageReleaseStarted) {
         if (error instanceof Error) Object.assign(error, { transfer });
         throw error;
+      }
+      if (clientOwnedCheckpoint) {
+        let terminal: RemoteIndexStatus | undefined;
+        try {
+          terminal = await this.abortIndexSessionByDeadline(session.session_id, Date.now() + 1_000,
+            request.processingPollMs ?? 250, emitProgress);
+        } catch { /* The owned abort has only a finite best-effort reserve. */ }
+        const confirmed = terminal !== undefined && isOwnedCodeStageStatus(terminal, session, request.workspace.workspaceId)
+          && terminal.phase === "aborted" && terminal.pending_batches === 0 && terminal.active_batches === 0;
+        if ((request.signal?.aborted || error instanceof RemoteIndexCancelledError) && confirmed) {
+          const cancelled = new RemoteIndexCancelledError(session.session_id, terminal!);
+          Object.assign(cancelled, { transfer, cause: error });
+          throw cancelled;
+        }
+        if (!checkpointRequestPending && !request.signal?.aborted && !request.detachSignal?.aborted
+          && !(error instanceof RemoteIndexDetachedError) && !(error instanceof RemoteIndexCancelledError)
+          && !(error instanceof Error && error.name === "TimeoutError")) {
+          if (error instanceof Error) Object.assign(error, { transfer });
+          throw error;
+        }
+        const incompleteUploads = transfer.files_upload_required === null || transfer.files_transferred < transfer.files_upload_required;
+        const interrupted = new Error(`Indexing stopped during the client-owned code checkpoint; ${confirmed
+          ? `${incompleteUploads ? "an abort was requested for the incomplete session; " : ""}the owned session abort was confirmed`
+          : `an abort was requested${incompleteUploads ? " for the incomplete session" : ""} but release could not be confirmed`}. Start a new index operation to complete the inventory.`, { cause: error });
+        Object.assign(interrupted, { transfer });
+        throw interrupted;
       }
       if (!(error instanceof RemoteIndexDetachedError) && !(error instanceof RemoteIndexCancelledError)
         && (request.signal?.aborted || request.detachSignal?.aborted)) {

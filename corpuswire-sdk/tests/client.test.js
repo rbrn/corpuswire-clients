@@ -2788,6 +2788,130 @@ test("cancel and detach interrupt a stalled code checkpoint and preserve transfe
   }
 });
 
+for (const codeStage of [false, true]) {
+  for (const stall of ["headers", "body"]) {
+    for (const interruption of ["deadline", "cancel", "detach"]) {
+      test(`${codeStage ? "code stage" : "ordinary indexing"} bounds synchronous checkpoint ${stall} on ${interruption}`, { timeout: 2000 }, async (t) => {
+        let now = 0;
+        t.mock.method(Date, "now", () => now);
+        const controller = new AbortController();
+        const fixture = priorityIndexFixture({ files: [
+          { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+        ] });
+        const originalUpload = fixture.client.uploadFileBatch.bind(fixture.client);
+        fixture.client.uploadFileBatch = async (...args) => ({ ...await originalUpload(...args), queued: false });
+        const originalFetch = fixture.client.fetchFn;
+        let checkpointSignal, readyCallbacks = 0;
+        fixture.client.fetchFn = async (url, init) => {
+          if (!url.endsWith("/checkpoint/code")) return originalFetch(url, init);
+          checkpointSignal = init.signal;
+          const stallForever = () => {
+            if (interruption !== "deadline") queueMicrotask(() => controller.abort());
+            return new Promise(() => {});
+          };
+          if (stall === "headers") return stallForever();
+          const response = await originalFetch(url, init);
+          response.json = stallForever;
+          return response;
+        };
+        const request = { ...fixture.request, processingTimeoutMs: 20,
+          signal: interruption === "cancel" ? controller.signal : undefined,
+          detachSignal: interruption === "detach" ? controller.signal : undefined,
+          onCodeReady: () => { readyCallbacks += 1; },
+        };
+        await assert.rejects(codeStage ? fixture.client.indexWorkspaceCodeStage(request) : fixture.client.indexWorkspace(request), (error) => {
+          assert.equal(error instanceof RemoteIndexDetachedError, false);
+          if (interruption === "cancel") assert.ok(error instanceof RemoteIndexCancelledError);
+          else {
+            assert.match(error.message, /client-owned code checkpoint.*owned session abort was confirmed/);
+            assert.match(error.message, /Start a new index operation/);
+            if (interruption === "deadline") assert.match(error.cause.message, /checkpoint timeout elapsed/);
+          }
+          assert.equal(error.transfer.complete, false);
+          assert.equal(error.transfer.files_transferred, 1);
+          return true;
+        });
+        assert.equal(checkpointSignal.aborted, true);
+        assert.equal(readyCallbacks, 0);
+        assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+        assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+        assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
+      });
+    }
+  }
+}
+
+test("checkpoint rejects late synchronous response and starts its absolute budget before request IO", async (t) => {
+  let now = 0;
+  t.mock.method(Date, "now", () => now);
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  const originalUpload = fixture.client.uploadFileBatch.bind(fixture.client);
+  fixture.client.uploadFileBatch = async (...args) => ({ ...await originalUpload(...args), queued: false });
+  const originalFetch = fixture.client.fetchFn;
+  let readyCallbacks = 0;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (url.endsWith("/checkpoint/code")) now = 21;
+    return response;
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: 20,
+    onCodeReady: () => { readyCallbacks += 1; },
+  }), (error) => /checkpoint timeout elapsed/.test(error.cause.message));
+  assert.equal(readyCallbacks, 0);
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+  assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+});
+
+test("code-stage omitted budget is finite before checkpoint while ordinary omitted budget remains compatible", async (t) => {
+  let now = 0;
+  t.mock.method(Date, "now", () => now);
+  for (const codeStage of [false, true]) {
+    now = 0;
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+    const originalUpload = fixture.client.uploadFileBatch.bind(fixture.client);
+    fixture.client.uploadFileBatch = async (...args) => ({ ...await originalUpload(...args), queued: false });
+    const originalFetch = fixture.client.fetchFn;
+    fixture.client.fetchFn = async (url, init) => {
+      const response = await originalFetch(url, init);
+      if (url.endsWith("/checkpoint/code")) now = 5001;
+      return response;
+    };
+    const request = { ...fixture.request, processingTimeoutMs: undefined };
+    if (codeStage) await assert.rejects(fixture.client.indexWorkspaceCodeStage(request), (error) => /checkpoint timeout elapsed/.test(error.cause.message));
+    else assert.equal((await fixture.client.indexWorkspace(request)).transfer.complete, true);
+  }
+});
+
+for (const stall of ["abort headers", "terminal body"]) {
+  test(`checkpoint deadline bounds ${stall} cleanup without claiming release`, { timeout: 2500 }, async (t) => {
+    t.mock.method(Date, "now", () => 0);
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+    const originalFetch = fixture.client.fetchFn;
+    const signals = [];
+    let cleanupStarted = false;
+    fixture.client.fetchFn = async (url, init) => {
+      if (url.endsWith("/checkpoint/code")) { signals.push(init.signal); return new Promise(() => {}); }
+      if (init.method === "DELETE") {
+        cleanupStarted = true; signals.push(init.signal);
+        if (stall === "abort headers") return new Promise(() => {});
+      }
+      const response = await originalFetch(url, init);
+      if (cleanupStarted && url.endsWith("/status")) {
+        signals.push(init.signal); response.json = () => new Promise(() => {});
+      }
+      return response;
+    };
+    await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request, processingTimeoutMs: 20 }), (error) => {
+      assert.equal(error instanceof RemoteIndexDetachedError, false);
+      assert.match(error.message, /release could not be confirmed/);
+      assert.equal(error.transfer.complete, false);
+      return true;
+    });
+    assert.ok(signals.every((signal) => signal instanceof AbortSignal && signal.aborted));
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  });
+}
+
 test("a checkpoint without confirmed code readiness cannot call the ready callback", async () => {
   const fixture = priorityIndexFixture({ files: [
     { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
@@ -2804,7 +2928,8 @@ test("a checkpoint without confirmed code readiness cannot call the ready callba
   await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, onCodeReady: () => callbacks++ }), /did not confirm code readiness/);
   assert.equal(callbacks, 0);
   assert.equal(fixture.calls.filter((call) => call.type === "upload").length, 1);
-  assert.equal(fixture.calls.at(-1).type, "abort");
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+  assert.equal(fixture.calls.at(-1).type, "status", "Owned cleanup confirms terminal status after requesting abort");
 });
 
 test("tier draining waits for legacy background work without optional batch counters", async () => {
@@ -2877,6 +3002,7 @@ test("tier processing waits share one deadline instead of restarting the caller 
     const response = await originalFetch(url, init);
     if (!url.endsWith("/status")) return response;
     const payload = await response.json();
+    if (payload.result.phase === "aborted") return jsonResponse(200, payload);
     if (payload.result.queue_depth === 2) {
       now = ++codeReads === 1 ? 60 : 90;
       payload.result.active_batches = codeReads === 1 ? 1 : 0;
@@ -2889,7 +3015,8 @@ test("tier processing waits share one deadline instead of restarting the caller 
   await assert.rejects(fixture.client.indexWorkspace(fixture.request), /abort was requested for the incomplete session/);
   assert.equal(codeReads, 2);
   assert.equal(documentationReads, 1);
-  assert.equal(fixture.calls.at(-1).type, "abort");
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+  assert.equal(fixture.calls.at(-1).type, "status");
   assert.equal(fixture.calls.some((call) => call.type === "upload" && call.paths.includes("data.json")), false);
 });
 
@@ -2920,7 +3047,8 @@ test("expiry after code publication prevents the next tier from uploading", asyn
   ] });
   await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, onCodeReady: () => { now = 110; } }), /abort was requested for the incomplete session/);
   assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
-  assert.equal(fixture.calls.at(-1).type, "abort");
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+  assert.equal(fixture.calls.at(-1).type, "status");
 });
 
 test("old server capability and zero-code inventories skip code publication", async () => {
@@ -3207,6 +3335,131 @@ for (const interruption of ["processing timeout", "detach during drain", "cancel
     assert.equal(readyCallbacks, 1);
     if (afterDrainedCallback) assert.ok(drainedCallbacks > 0);
     assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"], ["README.md"]]);
+    assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  });
+}
+
+for (const stall of ["DELETE headers", "DELETE body", "GET headers", "GET body"]) {
+  for (const interruption of ["timeout", "detach", "cancel"]) {
+    test(`published checkpoint plus queued documentation bounds ${stall} cleanup after ${interruption}`, { timeout: 2500 }, async (t) => {
+      let now = 0;
+      t.mock.method(Date, "now", () => now);
+      const controller = new AbortController();
+      const fixture = priorityIndexFixture({ files: [
+        { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+      ] });
+      const originalFetch = fixture.client.fetchFn;
+      let cleanupStarted = false, readyCallbacks = 0;
+      const signals = [];
+      fixture.client.fetchFn = async (url, init) => {
+        if (init.method === "DELETE") {
+          cleanupStarted = true; signals.push(init.signal);
+          if (stall === "DELETE headers") return new Promise(() => {});
+        }
+        const response = await originalFetch(url, init);
+        if (cleanupStarted && init.method === "DELETE" && stall === "DELETE body") response.json = () => new Promise(() => {});
+        if (!url.endsWith("/status")) return response;
+        if (cleanupStarted) {
+          signals.push(init.signal);
+          if (stall === "GET headers") return new Promise(() => {});
+          if (stall === "GET body") response.json = () => new Promise(() => {});
+          return response;
+        }
+        if (!fixture.calls.some((call) => call.type === "upload" && call.paths.includes("README.md"))) return response;
+        const payload = await response.json();
+        payload.result.pending_batches = 1;
+        if (interruption === "timeout") now = 101;
+        else controller.abort();
+        return jsonResponse(200, payload);
+      };
+      await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+        signal: interruption === "cancel" ? controller.signal : undefined,
+        detachSignal: interruption === "detach" ? controller.signal : undefined,
+        onCodeReady: () => { readyCallbacks += 1; },
+      }), (error) => {
+        assert.equal(error instanceof RemoteIndexDetachedError, false);
+        assert.equal(error instanceof RemoteIndexCancelledError, false, "Unconfirmed cleanup cannot advertise terminal cancellation");
+        assert.match(error.message, /release could not be confirmed.*Start a new index operation/);
+        assert.equal(error.transfer.files_transferred, 2);
+        assert.equal(error.transfer.complete, false);
+        return true;
+      });
+      assert.equal(readyCallbacks, 1);
+      assert.ok(signals.length > 0 && signals.every((signal) => signal instanceof AbortSignal && signal.aborted));
+      assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+    });
+  }
+}
+
+for (const counter of ["active_batches", "pending_batches"]) {
+  for (const cleanup of ["unconfirmed", "stalled body", "confirmed"]) {
+    test(`backend abort after code publication requires drained ${counter} cleanup proof (${cleanup})`, { timeout: 2500 }, async () => {
+      const fixture = priorityIndexFixture({ files: [
+        { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+      ] });
+      const originalFetch = fixture.client.fetchFn;
+      let cleanupStarted = false, readyCallbacks = 0;
+      let cleanupSignal;
+      fixture.client.fetchFn = async (url, init) => {
+        if (init.method === "DELETE") cleanupStarted = true;
+        const response = await originalFetch(url, init);
+        if (!url.endsWith("/status") || !fixture.calls.some((call) => call.type === "upload" && call.paths.includes("README.md"))) return response;
+        if (cleanupStarted && cleanup === "stalled body") {
+          cleanupSignal = init.signal;
+          response.json = () => new Promise(() => {});
+          return response;
+        }
+        const payload = await response.json();
+        payload.result.phase = "aborted";
+        payload.result[counter] = cleanupStarted && cleanup === "confirmed" ? 0 : 1;
+        return jsonResponse(200, payload);
+      };
+      await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+        onCodeReady: () => { readyCallbacks += 1; },
+      }), (error) => {
+        assert.equal(error instanceof RemoteIndexDetachedError, false);
+        assert.equal(error.transfer.files_transferred, 2);
+        assert.equal(error.transfer.complete, false);
+        assert.ok(error.cause instanceof RemoteIndexCancelledError);
+        assert.equal(error.cause.status[counter], 1, "Original backend abort was not drained");
+        if (cleanup === "confirmed") {
+          assert.ok(error instanceof RemoteIndexCancelledError);
+          assert.equal(error.status.active_batches, 0);
+          assert.equal(error.status.pending_batches, 0);
+        } else {
+          assert.equal(error instanceof RemoteIndexCancelledError, false);
+          assert.match(error.message, /release could not be confirmed.*Start a new index operation/);
+        }
+        return true;
+      });
+      assert.equal(readyCallbacks, 1);
+      assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+      assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+      if (cleanup === "stalled body") assert.ok(cleanupSignal instanceof AbortSignal && cleanupSignal.aborted);
+    });
+  }
+}
+
+for (const interruption of ["cancel", "detach"]) {
+  test(`owned commit progress callback ${interruption} cannot bypass bounded cleanup`, async () => {
+    const controller = new AbortController();
+    const fixture = priorityIndexFixture({ files: [
+      { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+    ] });
+    let committing = 0;
+    await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+      signal: interruption === "cancel" ? controller.signal : undefined,
+      detachSignal: interruption === "detach" ? controller.signal : undefined,
+      onProgress: (event) => { if (event.phase === "committing") { committing += 1; queueMicrotask(() => controller.abort()); } },
+    }), (error) => {
+      assert.equal(error instanceof RemoteIndexDetachedError, false);
+      if (interruption === "cancel") assert.ok(error instanceof RemoteIndexCancelledError);
+      else assert.match(error.message, /owned session abort was confirmed/);
+      assert.equal(error.transfer.complete, false);
+      return true;
+    });
+    assert.equal(committing, 1);
     assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
     assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
   });

@@ -91,6 +91,7 @@ export declare class CorpusWireClient {
     }): Promise<RemoteFileBatchResult>;
     checkpointIndexSessionCode(sessionId: string, options?: {
         signal?: AbortSignal;
+        deadline?: number;
     }): Promise<RemoteIndexStatus>;
     commitIndexSession(sessionId: string): Promise<RemoteIndexCommitResponse>;
     getIndexSessionStatus(sessionId: string, options?: {
@@ -112,12 +113,13 @@ export declare class CorpusWireClient {
     }>;
     private abortIndexSessionQuietly;
     private releaseCodeStageSession;
+    private abortIndexSessionByDeadline;
     private waitForIndexSessionProcessing;
     private checkIndexWorkspaceInterrupt;
     indexWorkspace(request: IndexWorkspaceRequest): Promise<RemoteIndexCommitResponse>;
     /**
      * Publish code from a complete scan and release the drained owned session.
-     * Release uses the remaining processing budget, or 5 seconds when unspecified.
+     * Checkpoint and release share the processing budget, or 5 seconds when unspecified.
      * Interruption allows up to 1 extra second for best-effort abort confirmation.
      */
     indexWorkspaceCodeStage(request: IndexWorkspaceRequest): Promise<RemoteIndexCodeStageResult>;

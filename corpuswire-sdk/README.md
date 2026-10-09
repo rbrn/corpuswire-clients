@@ -513,6 +513,14 @@ uses the existing abort route to release its drained owned session. A
 `full_inventory_complete` and `transfer.complete` are both false. Aborting this
 released stage preserves already-published code and its pending coverage.
 
+`processingTimeoutMs` covers the checkpoint response and session release using
+one remaining budget. Code-stage calls default to five seconds when it is omitted.
+An interrupted client-owned checkpoint, including later documentation processing,
+allows at most one extra second for abort confirmation. Cancellation requires
+an owned terminal session with no active or pending batches; an unconfirmed
+release reports that a new indexing operation is needed. Ordinary indexing keeps
+its existing omitted-timeout behavior.
+
 After all roots finish their code pass, scan each root again and call ordinary
 `indexWorkspace` with `recreateCollection: false` for roots that published code.
 Fresh full manifests account for edits, additions, and code deletions between

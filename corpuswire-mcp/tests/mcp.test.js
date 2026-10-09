@@ -4926,6 +4926,7 @@ test("doctor falls back to a known bootstrap health block when fresh diagnosis i
 
 test("verified empty MCP baseline admits its first source file while genuine health faults and empty reads stay blocked", async () => {
   for (const collectionExists of [true,false]) {
+  for (const postHealth of ['healthy','vector_failure','unavailable','wrong_collection','stale_coverage','missing_health']) {
   const root = await mkdtemp(path.join(tmpdir(),"cw-empty-write-"));
   const sourceRoot = path.join(root,"repo"), sdkPath = path.join(root,"sdk.mjs");
   const diagnosisPath = path.join(root,"diagnosis.json"), callsPath = path.join(root,"calls.jsonl");
@@ -4937,20 +4938,24 @@ test("verified empty MCP baseline admits its first source file while genuine hea
       {name:"index_health",status:"warning",message:emptyWarning}],
     index:{indexed:false,health_status:"degraded",health_warnings:[emptyWarning],coverage}};
   await writeFile(diagnosisPath,JSON.stringify(empty));
-  await writeFile(sdkPath,`import {readFileSync,appendFileSync} from 'node:fs';
+  await writeFile(sdkPath,`import {readFileSync,appendFileSync,writeFileSync} from 'node:fs';
     export class CorpusWireClient {
-      async diagnoseWorkspace(){return JSON.parse(readFileSync(process.env.MOCK_DIAGNOSIS_PATH,'utf8'));}
+      async diagnoseWorkspace(){const diagnosis=JSON.parse(readFileSync(process.env.MOCK_DIAGNOSIS_PATH,'utf8'));if(diagnosis.unavailable)throw new Error('diagnosis unavailable');return diagnosis;}
       async indexWorkspace(request){appendFileSync(process.env.MOCK_CALLS_PATH,JSON.stringify({mode:request.mode,token:request.baseCoverageToken,policy:request.selectionPolicyDigest,files:request.files.map(f=>f.relativePath)})+'\\n');
-        return {ok:true,result:{collection:'fixture'},status:{collection_name:'fixture',coverage:${JSON.stringify(coverage)}},transfer:{complete:true,files_submitted:request.files.length,files_transferred:request.files.length,files_reused:0,acknowledged_files:request.files.map(f=>({relative_path:f.relativePath,sha256:f.sha256,disposition:'uploaded'}))}};}
+        const coverage={...${JSON.stringify(coverage)},...(request.mode==='incremental'?{eligible_file_count:1,coverage_token:'nonempty-published'}:{})};
+        if(request.mode==='incremental')writeFileSync(process.env.MOCK_DIAGNOSIS_PATH,JSON.stringify({status:'ready',can_retrieve:true,collection:'fixture',collection_exists:true,point_count:1,checks:[],index:{indexed:true,health_status:'ok',health_warnings:[],coverage},...(process.env.MOCK_POST_HEALTH==='vector_failure'?{qdrant_error:'vector unavailable'}:{}),...(process.env.MOCK_POST_HEALTH==='unavailable'?{unavailable:true}:{}),...(process.env.MOCK_POST_HEALTH==='wrong_collection'?{collection:'other'}:{}),...(process.env.MOCK_POST_HEALTH==='stale_coverage'?{index:{indexed:true,health_status:'ok',health_warnings:[],coverage:{...coverage,coverage_token:'stale-token'}}}:{}),...(process.env.MOCK_POST_HEALTH==='missing_health'?{status:undefined,can_retrieve:undefined,index:{indexed:true,coverage}}:{})}));
+        return {ok:true,result:{collection:'fixture'},status:{collection_name:'fixture',coverage},transfer:{complete:true,files_submitted:request.files.length,files_transferred:request.files.length,files_reused:0,acknowledged_files:request.files.map(f=>({relative_path:f.relativePath,sha256:f.sha256,disposition:'uploaded'}))}};}
+      async queryRaw(){appendFileSync(process.env.MOCK_CALLS_PATH,'query\\n');return {result:{retrieved_chunks:[]}};}
     }`);
   const child = spawn('node',[SERVER_BIN],{stdio:['pipe','pipe','pipe'],env:{...process.env,
     CORPUSWIRE_BASE_URL:'http://127.0.0.1:8000',CORPUSWIRE_SDK_PATH:sdkPath,CORPUSWIRE_WORKSPACE_ID:'fixture',
-    CORPUSWIRE_SYNC_ENABLED:'true',CORPUSWIRE_SYNC_ROOT:sourceRoot,CORPUSWIRE_SYNC_READ_STRICT:'true',
-    CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK:'true',MOCK_DIAGNOSIS_PATH:diagnosisPath,MOCK_CALLS_PATH:callsPath}});
+    CORPUSWIRE_SYNC_ENABLED:'true',CORPUSWIRE_SYNC_ROOT:sourceRoot,CORPUSWIRE_SYNC_READ_STRICT:'true',CORPUSWIRE_SYNC_CACHE_ENABLED:'true',CORPUSWIRE_SYNC_STATE_DIR:path.join(root,'cache'),
+    CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK:'false',MOCK_DIAGNOSIS_PATH:diagnosisPath,MOCK_CALLS_PATH:callsPath,MOCK_POST_HEALTH:postHealth}});
   const rpc = createRpc(child);let id=0;
   const invoke=(name,args={})=>rpc({jsonrpc:'2.0',id:++id,method:'tools/call',params:{name,arguments:args}});
   try {
     assert.equal((await invoke('corpuswire_sync_reconcile')).result.isError,false);
+    await invoke('corpuswire_sync_bootstrap');
     const emptyRead=await invoke('corpuswire_search',{query:'new source'});
     assert.equal(emptyRead.result.isError,true);
     assert.match(emptyRead.result.content[0].text,/strict mode blocked retrieval/);
@@ -4965,8 +4970,22 @@ test("verified empty MCP baseline admits its first source file while genuine hea
     await writeFile(diagnosisPath,JSON.stringify(empty));
     const uploaded=await invoke('corpuswire_sync_delta',{changedPaths:['first.py'],flush:true});
     assert.match(uploaded.result.content[0].text,/filesUploaded: 1/);
-    assert.deepEqual((await readFile(callsPath,'utf8')).trim().split('\n').map(JSON.parse),[
-      {mode:'full',files:[]},{mode:'incremental',token:'empty-baseline',policy:'policy',files:['first.py']}]);
+    const status=await invoke('corpuswire_sync_status');
+    const immediate=await invoke('corpuswire_search',{query:'new source',flush:false});
+    if(postHealth==='healthy') {
+      assert.match(status.result.content[0].text,/bootstrapState: ready/);
+      assert.match(status.result.content[0].text,/bootstrapCanRetrieve: true/);
+      assert.match(status.result.content[0].text,/cacheUsable: true/);
+      assert.equal(immediate.result.isError,false);
+    } else {
+      assert.match(status.result.content[0].text,/cacheUsable: false/);
+      assert.match(status.result.content[0].text,/needsReconcile: true/);
+      assert.equal(immediate.result.isError,true);
+      assert.match(immediate.result.content[0].text,/strict mode blocked retrieval/);
+    }
+    assert.deepEqual((await readFile(callsPath,'utf8')).trim().split('\n').map(line=>line==='query'?line:JSON.parse(line)),[
+      {mode:'full',files:[]},{mode:'incremental',token:'empty-baseline',policy:'policy',files:['first.py']},...(postHealth==='healthy'?['query']:[])]);
   } finally {child.kill();await rm(root,{recursive:true,force:true});}
+  }
   }
 });

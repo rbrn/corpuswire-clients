@@ -1587,10 +1587,35 @@ class SyncManager {
   async applySyncCacheUploadResult(context, cacheEntries, deletedPaths, response, fullBaseline = false) {
     const evidence = response.status?.coverage;
     if (evidence?.state === "verified" && response.transfer?.complete) {
+      const firstNonemptyPublication = this.bootstrapStatus.emptyWriteReady === true
+        && evidence.eligible_file_count > 0;
       this.coverageContextKey = syncContextKey(context);
       this.bootstrapStatus = { ...this.bootstrapStatus, coverage: evidence,
         checkedAt: new Date().toISOString(), collection: response.status.collection_name,
         state: isBootstrapHealthBlocked(this.bootstrapStatus) ? "blocked" : "ready", needsReconcile: false };
+      if (firstNonemptyPublication) {
+        try {
+          const fresh = await this.refreshBootstrapStatus(context);
+          if (fresh.canRetrieve !== true || !["ready", "attention"].includes(fresh.state)
+            || fresh.healthBlocked === true || !["ok", "ready", "healthy"].includes(fresh.indexHealthStatus)
+            || fresh.collectionExists !== true || !(fresh.pointCount > 0)
+            || !response.status.collection_name || fresh.collection !== response.status.collection_name
+            || fresh.coverage?.state !== "verified" || !evidence.coverage_token || !evidence.selection_policy_digest
+            || fresh.coverage.coverage_token !== evidence.coverage_token
+            || fresh.coverage.selection_policy_digest !== evidence.selection_policy_digest) {
+            this.observationGap = true;
+            this.bootstrapStatus = { ...fresh, state: "blocked", healthBlocked: true,
+              emptyWriteReady: false, canRetrieve: false, needsReconcile: true,
+              reason: "The fresh health diagnosis does not match the completed publication." };
+          }
+        } catch (error) {
+          this.observationGap = true;
+          this.bootstrapStatus = { ...this.bootstrapStatus, state: "blocked", healthBlocked: true,
+            emptyWriteReady: false, canRetrieve: null, needsReconcile: true,
+            reason: "The first nonempty publication needs a fresh health diagnosis." };
+          this.recordError(error, "bootstrap");
+        }
+      }
     } else {
       this.observationGap = true;
     }
@@ -1609,9 +1634,6 @@ class SyncManager {
         await this.saveSyncCache(cacheState);
         return;
       }
-      this.coverageContextKey = syncContextKey(context);
-      this.bootstrapStatus = { ...this.bootstrapStatus, coverage, checkedAt: new Date().toISOString(),
-        collection: response.status.collection_name, state: isBootstrapHealthBlocked(this.bootstrapStatus) ? "blocked" : "ready", needsReconcile: false };
       const manifestRevision = asRecord(asRecord(response).status).manifest_revision;
       const uploadedAt = new Date().toISOString();
       for (const entry of cacheEntries) {
