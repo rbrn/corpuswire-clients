@@ -33,7 +33,9 @@ export declare class CorpusWireClient {
         repoPath?: string;
         workspaceId?: string;
     }): Promise<HealthResponse>;
-    diagnoseWorkspace(request?: WorkspaceDiagnosisRequest): Promise<WorkspaceDiagnosis>;
+    diagnoseWorkspace(request?: WorkspaceDiagnosisRequest, options?: {
+        signal?: AbortSignal;
+    }): Promise<WorkspaceDiagnosis>;
     enhance(request: string | EnhancePromptRequest): Promise<PromptRewriteResult>;
     enhanceRaw(request: string | EnhancePromptRequest): Promise<EnhanceResponseEnvelope>;
     query(request: string | QueryPromptRequest): Promise<PromptEnhancementResult>;

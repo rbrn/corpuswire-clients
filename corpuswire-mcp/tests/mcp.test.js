@@ -4926,7 +4926,7 @@ test("doctor falls back to a known bootstrap health block when fresh diagnosis i
 
 test("verified empty MCP baseline admits its first source file while genuine health faults and empty reads stay blocked", async () => {
   for (const collectionExists of [true,false]) {
-  for (const postHealth of ['healthy','vector_failure','unavailable','wrong_collection','stale_coverage','missing_health']) {
+  for (const postHealth of ['healthy','vector_failure','unavailable','wrong_collection','stale_coverage','missing_health','stalled_health','late_health']) {
   const root = await mkdtemp(path.join(tmpdir(),"cw-empty-write-"));
   const sourceRoot = path.join(root,"repo"), sdkPath = path.join(root,"sdk.mjs");
   const diagnosisPath = path.join(root,"diagnosis.json"), callsPath = path.join(root,"calls.jsonl");
@@ -4940,17 +4940,17 @@ test("verified empty MCP baseline admits its first source file while genuine hea
   await writeFile(diagnosisPath,JSON.stringify(empty));
   await writeFile(sdkPath,`import {readFileSync,appendFileSync,writeFileSync} from 'node:fs';
     export class CorpusWireClient {
-      async diagnoseWorkspace(){const diagnosis=JSON.parse(readFileSync(process.env.MOCK_DIAGNOSIS_PATH,'utf8'));if(diagnosis.unavailable)throw new Error('diagnosis unavailable');return diagnosis;}
+      async diagnoseWorkspace(){const diagnosis=JSON.parse(readFileSync(process.env.MOCK_DIAGNOSIS_PATH,'utf8'));if(diagnosis.unavailable)throw new Error('diagnosis unavailable');if(diagnosis.stalled)await new Promise(()=>{});if(diagnosis.late)await new Promise(resolve=>setTimeout(resolve,120));return diagnosis;}
       async indexWorkspace(request){appendFileSync(process.env.MOCK_CALLS_PATH,JSON.stringify({mode:request.mode,token:request.baseCoverageToken,policy:request.selectionPolicyDigest,files:request.files.map(f=>f.relativePath)})+'\\n');
         const coverage={...${JSON.stringify(coverage)},...(request.mode==='incremental'?{eligible_file_count:1,coverage_token:'nonempty-published'}:{})};
-        if(request.mode==='incremental')writeFileSync(process.env.MOCK_DIAGNOSIS_PATH,JSON.stringify({status:'ready',can_retrieve:true,collection:'fixture',collection_exists:true,point_count:1,checks:[],index:{indexed:true,health_status:'ok',health_warnings:[],coverage},...(process.env.MOCK_POST_HEALTH==='vector_failure'?{qdrant_error:'vector unavailable'}:{}),...(process.env.MOCK_POST_HEALTH==='unavailable'?{unavailable:true}:{}),...(process.env.MOCK_POST_HEALTH==='wrong_collection'?{collection:'other'}:{}),...(process.env.MOCK_POST_HEALTH==='stale_coverage'?{index:{indexed:true,health_status:'ok',health_warnings:[],coverage:{...coverage,coverage_token:'stale-token'}}}:{}),...(process.env.MOCK_POST_HEALTH==='missing_health'?{status:undefined,can_retrieve:undefined,index:{indexed:true,coverage}}:{})}));
+        if(request.mode==='incremental')writeFileSync(process.env.MOCK_DIAGNOSIS_PATH,JSON.stringify({status:'ready',can_retrieve:true,collection:'fixture',collection_exists:true,point_count:1,checks:[],index:{indexed:true,health_status:'ok',health_warnings:[],coverage},...(process.env.MOCK_POST_HEALTH==='vector_failure'?{qdrant_error:'vector unavailable'}:{}),...(process.env.MOCK_POST_HEALTH==='unavailable'?{unavailable:true}:{}),...(process.env.MOCK_POST_HEALTH==='wrong_collection'?{collection:'other'}:{}),...(process.env.MOCK_POST_HEALTH==='stale_coverage'?{index:{indexed:true,health_status:'ok',health_warnings:[],coverage:{...coverage,coverage_token:'stale-token'}}}:{}),...(process.env.MOCK_POST_HEALTH==='missing_health'?{status:undefined,can_retrieve:undefined,index:{indexed:true,coverage}}:{}),...(process.env.MOCK_POST_HEALTH==='stalled_health'?{stalled:true}:{}),...(process.env.MOCK_POST_HEALTH==='late_health'?{late:true}:{})}));
         return {ok:true,result:{collection:'fixture'},status:{collection_name:'fixture',coverage},transfer:{complete:true,files_submitted:request.files.length,files_transferred:request.files.length,files_reused:0,acknowledged_files:request.files.map(f=>({relative_path:f.relativePath,sha256:f.sha256,disposition:'uploaded'}))}};}
       async queryRaw(){appendFileSync(process.env.MOCK_CALLS_PATH,'query\\n');return {result:{retrieved_chunks:[]}};}
     }`);
   const child = spawn('node',[SERVER_BIN],{stdio:['pipe','pipe','pipe'],env:{...process.env,
     CORPUSWIRE_BASE_URL:'http://127.0.0.1:8000',CORPUSWIRE_SDK_PATH:sdkPath,CORPUSWIRE_WORKSPACE_ID:'fixture',
     CORPUSWIRE_SYNC_ENABLED:'true',CORPUSWIRE_SYNC_ROOT:sourceRoot,CORPUSWIRE_SYNC_READ_STRICT:'true',CORPUSWIRE_SYNC_CACHE_ENABLED:'true',CORPUSWIRE_SYNC_STATE_DIR:path.join(root,'cache'),
-    CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK:'false',MOCK_DIAGNOSIS_PATH:diagnosisPath,MOCK_CALLS_PATH:callsPath,MOCK_POST_HEALTH:postHealth}});
+    CORPUSWIRE_SYNC_BOOTSTRAP_TIMEOUT_MS:'50',CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK:'false',MOCK_DIAGNOSIS_PATH:diagnosisPath,MOCK_CALLS_PATH:callsPath,MOCK_POST_HEALTH:postHealth}});
   const rpc = createRpc(child);let id=0;
   const invoke=(name,args={})=>rpc({jsonrpc:'2.0',id:++id,method:'tools/call',params:{name,arguments:args}});
   try {
@@ -4968,9 +4968,13 @@ test("verified empty MCP baseline admits its first source file while genuine hea
       assert.doesNotMatch(rejected.result.content[0].text,/filesUploaded: 1/);
     }
     await writeFile(diagnosisPath,JSON.stringify(empty));
+    const started=Date.now();
     const uploaded=await invoke('corpuswire_sync_delta',{changedPaths:['first.py'],flush:true});
     assert.match(uploaded.result.content[0].text,/filesUploaded: 1/);
+    assert(Date.now()-started<1000,'Health diagnosis must not strand the completed upload');
+    if(postHealth==='late_health')await new Promise(resolve=>setTimeout(resolve,150));
     const status=await invoke('corpuswire_sync_status');
+    assert.match(status.result.content[0].text,/flushActive: false/);
     const immediate=await invoke('corpuswire_search',{query:'new source',flush:false});
     if(postHealth==='healthy') {
       assert.match(status.result.content[0].text,/bootstrapState: ready/);
@@ -4987,5 +4991,64 @@ test("verified empty MCP baseline admits its first source file while genuine hea
       {mode:'full',files:[]},{mode:'incremental',token:'empty-baseline',policy:'policy',files:['first.py']},...(postHealth==='healthy'?['query']:[])]);
   } finally {child.kill();await rm(root,{recursive:true,force:true});}
   }
+  }
+});
+
+test("bootstrap and read freshness preserve timeout receipts and reject late health state", async () => {
+  for (const surface of ["bootstrap", "read"]) {
+    for (const response of ["late", "stalled"]) {
+      const root = await mkdtemp(path.join(tmpdir(), "cw-health-deadline-"));
+      const sourceRoot = path.join(root, "repo");
+      const sdkPath = path.join(root, "sdk.mjs");
+      const markerPath = path.join(root, "slow");
+      await mkdir(sourceRoot);
+      await writeFile(sdkPath, `import {existsSync} from 'node:fs';
+        export class CorpusWireClient {
+          async diagnoseWorkspace() {
+            if (existsSync(process.env.MOCK_SLOW_MARKER)) {
+              if (process.env.MOCK_RESPONSE === 'stalled') await new Promise(() => {});
+              else await new Promise(resolve => setTimeout(resolve, 60));
+            }
+            return {status:'ready',can_retrieve:true,collection:'fixture',collection_exists:true,point_count:1,
+              checks:[],index:{indexed:true,health_status:'ok',health_warnings:[],
+                coverage:{state:'verified',coverage_token:'fixture',selection_policy_digest:'policy'}}};
+          }
+          async queryRaw() { throw new Error('Timed-out health must block this query'); }
+        }`);
+      const child = spawn("node", [SERVER_BIN], {stdio:["pipe", "pipe", "pipe"], env:{
+        ...process.env, CORPUSWIRE_BASE_URL:"http://127.0.0.1:8000", CORPUSWIRE_SDK_PATH:sdkPath,
+        CORPUSWIRE_WORKSPACE_ID:"fixture", CORPUSWIRE_SYNC_ENABLED:"true", CORPUSWIRE_SYNC_ROOT:sourceRoot,
+        CORPUSWIRE_SYNC_STATE_DIR:path.join(root, "cache"), CORPUSWIRE_SYNC_READ_STRICT:"true",
+        CORPUSWIRE_SYNC_BOOTSTRAP_TIMEOUT_MS:"100", CORPUSWIRE_SYNC_READ_FRESHNESS_TIMEOUT_MS:"20",
+        CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK:surface === "read" ? "true" : "false",
+        MOCK_SLOW_MARKER:markerPath, MOCK_RESPONSE:response,
+      }});
+      const rpc = createRpc(child);
+      let id = 0;
+      const invoke = (name, args={}) => rpc({jsonrpc:"2.0", id:++id, method:"tools/call", params:{name, arguments:args}});
+      try {
+        assert.match((await invoke("corpuswire_sync_bootstrap")).result.content[0].text, /bootstrapState: ready/);
+        await writeFile(markerPath, "1");
+        const started = Date.now();
+        const result = surface === "bootstrap"
+          ? await invoke("corpuswire_sync_bootstrap", {maxWaitMs:20})
+          : await invoke("corpuswire_search", {query:"fixture"});
+        assert(Date.now() - started < 1000, "Health timeout must release the caller");
+        if (surface === "bootstrap") {
+          assert.equal(result.result.isError, false);
+          assert.match(result.result.content[0].text, /reconcileTimedOut: true/);
+        } else {
+          assert.equal(result.result.isError, true);
+          assert.match(result.result.content[0].text, /strict mode blocked retrieval/);
+        }
+        if (response === "late") await new Promise(resolve => setTimeout(resolve, 100));
+        const status = (await invoke("corpuswire_sync_status")).result.content[0].text;
+        assert.doesNotMatch(status, /bootstrapState: ready/);
+        assert.match(status, /cacheUsable: false/);
+      } finally {
+        child.kill();
+        await rm(root, {recursive:true, force:true});
+      }
+    }
   }
 });

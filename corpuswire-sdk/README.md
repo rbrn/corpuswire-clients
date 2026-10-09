@@ -494,6 +494,11 @@ or less retain the fast test cadence. Cancellation, detach, and processing deadl
 interrupt the wait. Unchanged active status produces a heartbeat at most once per
 second with the original server sequence and an updated `last_heartbeat_at`.
 Client events include optional `event_origin` to distinguish their sequence space.
+Tier-drain status headers and bodies share the remaining processing deadline and
+are interrupted by cancellation or detach; late responses cannot update progress.
+For fully submitted ordinary sessions detached before polling, a separate status
+receipt attempt takes at most one second. If no receipt is available, bounded
+abort confirmation takes at most one further second; no status is fabricated.
 
 Transfer results also report `queue_full_responses`, `queue_retries`,
 `queue_wait_ms`, and `transport_retries`. A queue rejection followed by cancellation

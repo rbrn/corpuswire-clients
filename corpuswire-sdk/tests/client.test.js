@@ -678,6 +678,24 @@ test("diagnoseWorkspace calls versioned diagnosis endpoint with workspace scope"
   assert.match(diagnosis.recovery_actions[0], /Index or sync workspace/);
 });
 
+test("diagnoseWorkspace forwards caller cancellation through a cooperative response body", async () => {
+  const controller = new AbortController();
+  let observedSignal, bodyStarted = false;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (_url, init) => {
+    observedSignal = init.signal;
+    const response = jsonResponse(200, { ok: true, diagnosis: {} });
+    response.json = () => new Promise((_resolve, reject) => {
+      bodyStarted = true;
+      init.signal.addEventListener("abort", () => reject(new DOMException("Diagnosis aborted", "AbortError")), { once: true });
+      queueMicrotask(() => controller.abort());
+    });
+    return response;
+  } });
+  await assert.rejects(client.diagnoseWorkspace({ workspaceId: "fixture" }, { signal: controller.signal }), { name: "AbortError" });
+  assert.equal(observedSignal, controller.signal);
+  assert.equal(bodyStarted, true);
+});
+
 test("query posts workspace_id to semantic retrieval endpoint", async () => {
   const calls = [];
   const client = new CorpusWireClient({
@@ -2788,6 +2806,232 @@ test("cancel and detach interrupt a stalled code checkpoint and preserve transfe
   }
 });
 
+for (const tier of ["code", "documentation", "other", "code stage"]) {
+  for (const stall of ["headers", "body"]) {
+    for (const interruption of ["deadline", "cancel", "detach"]) {
+      test(`${tier} tier drain bounds stalled status ${stall} on ${interruption}`, { timeout: 2000 }, async (t) => {
+        t.mock.method(Date, "now", () => 0);
+        const controller = new AbortController();
+        const files = [{ relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" }];
+        if (tier === "other") files.push({ relativePath: "data.json", content: "{}" });
+        const fixture = priorityIndexFixture({ files });
+        const originalFetch = fixture.client.fetchFn;
+        const targetPath = tier === "documentation" ? "README.md" : tier === "other" ? "data.json" : "main.py";
+        let cleanupStarted = false, readyCallbacks = 0, drainSignal;
+        fixture.client.fetchFn = async (url, init) => {
+          if (init.method === "DELETE") cleanupStarted = true;
+          if (!url.endsWith("/status") || cleanupStarted
+            || !fixture.calls.some((call) => call.type === "upload" && call.paths.includes(targetPath))) return originalFetch(url, init);
+          drainSignal = init.signal;
+          const stallForever = () => {
+            if (interruption !== "deadline") queueMicrotask(() => controller.abort());
+            return new Promise(() => {});
+          };
+          if (stall === "headers") return stallForever();
+          const response = await originalFetch(url, init);
+          response.json = stallForever;
+          return response;
+        };
+        const request = { ...fixture.request, processingTimeoutMs: 20,
+          signal: interruption === "cancel" ? controller.signal : undefined,
+          detachSignal: interruption === "detach" ? controller.signal : undefined,
+          onCodeReady: () => { readyCallbacks += 1; },
+        };
+        await assert.rejects(tier === "code stage" ? fixture.client.indexWorkspaceCodeStage(request) : fixture.client.indexWorkspace(request), (error) => {
+          assert.equal(error instanceof RemoteIndexDetachedError, false);
+          if (interruption === "cancel") {
+            assert.ok(error instanceof RemoteIndexCancelledError);
+            assert.equal(error.status.active_batches, 0);
+            assert.equal(error.status.pending_batches, 0);
+          } else assert.match(error.message, /owned session abort was confirmed.*Start a new index operation/);
+          assert.equal(error.transfer.complete, false);
+          assert.equal(error.transfer.files_transferred, tier === "documentation" ? 2 : tier === "other" ? 3 : 1);
+          return true;
+        });
+        assert.equal(drainSignal instanceof AbortSignal && drainSignal.aborted, true);
+        assert.equal(readyCallbacks, tier === "documentation" || tier === "other" ? 1 : 0);
+        assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+        assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+      });
+    }
+  }
+}
+
+for (const tier of ["code", "documentation"]) {
+  test(`late ${tier} drain response cannot extend the original deadline or report progress`, async (t) => {
+    let now = 0, lateProgress = 0, readyCallbacks = 0, cleanupStarted = false;
+    t.mock.method(Date, "now", () => now);
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" }] });
+    const originalFetch = fixture.client.fetchFn;
+    fixture.client.fetchFn = async (url, init) => {
+      if (init.method === "DELETE") cleanupStarted = true;
+      const response = await originalFetch(url, init);
+      const targetUploaded = fixture.calls.some((call) => call.type === "upload" && call.paths.includes(tier === "code" ? "main.py" : "README.md"));
+      if (!url.endsWith("/status") || cleanupStarted || !targetUploaded) return response;
+      const payload = await response.json();
+      now = 21;
+      payload.result.progress = { ...progressEvent(999, 80, "queued"), session_id: "priority", workspace_id: "fixture" };
+      return jsonResponse(200, payload);
+    };
+    await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: 20,
+      onCodeReady: () => { readyCallbacks += 1; },
+      onProgress: (event) => { if (event.sequence === 999) lateProgress += 1; },
+    }), /Start a new index operation/);
+    assert.equal(lateProgress, 0);
+    assert.equal(readyCallbacks, tier === "code" ? 0 : 1);
+    assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  });
+}
+
+test("ordinary tier drains retain omitted processing timeout compatibility", async (t) => {
+  let now = 0;
+  t.mock.method(Date, "now", () => now);
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" }] });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (url.endsWith("/status")) now += 5001;
+    return response;
+  };
+  const result = await fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: undefined });
+  assert.equal(result.transfer.complete, true);
+  assert.equal(fixture.calls.some((call) => call.type === "abort"), false);
+});
+
+test("legacy fully submitted drain keeps observed status on later stalled transport timeout", { timeout: 500 }, async () => {
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "README.md", content: "guide" }], capability: false });
+  const originalFetch = fixture.client.fetchFn;
+  let statusRequests = 0, stalledSignal;
+  fixture.client.fetchFn = async (url, init) => {
+    if (!url.endsWith("/status")) return originalFetch(url, init);
+    if (++statusRequests === 2) { stalledSignal = init.signal; return new Promise(() => {}); }
+    const payload = await (await originalFetch(url, init)).json();
+    payload.result.active_batches = 1;
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: 30 }), (error) => {
+    assert.ok(error instanceof RemoteIndexDetachedError);
+    assert.equal(error.status.active_batches, 1);
+    assert.equal(error.transfer.complete, false);
+    return true;
+  });
+  assert.equal(statusRequests, 2);
+  assert.equal(stalledSignal instanceof AbortSignal && stalledSignal.aborted, true);
+  assert.equal(fixture.calls.some((call) => call.type === "abort" || call.type === "commit"), false);
+});
+
+test("tier drain caps polling sleep at its deadline without another status request", { timeout: 500 }, async (t) => {
+  let now = 0;
+  t.mock.method(Date, "now", () => now);
+  const originalSetTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, "setTimeout", (callback, delay, ...args) => originalSetTimeout(() => {
+    now = 20;
+    callback(...args);
+  }, delay));
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "README.md", content: "guide" }], capability: false });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (!url.endsWith("/status")) return response;
+    const payload = await response.json();
+    payload.result.active_batches = 1;
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: 20, processingPollMs: 5000 }), RemoteIndexDetachedError);
+  assert.equal(fixture.calls.filter((call) => call.type === "status").length, 1);
+  assert.equal(fixture.calls.some((call) => call.type === "abort" || call.type === "commit"), false);
+});
+
+test("legacy deadline expiry between tiers skips an unbounded status read and unsent documentation", { timeout: 500 }, async (t) => {
+  let now = 0, cleanupStarted = false, drainReads = 0;
+  t.mock.method(Date, "now", () => now);
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" }], capability: false });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = async (url, init) => {
+    if (init.method === "DELETE") cleanupStarted = true;
+    if (!url.endsWith("/status") || cleanupStarted) return originalFetch(url, init);
+    if (++drainReads > 1) return new Promise(() => {});
+    const payload = await (await originalFetch(url, init)).json();
+    payload.result.progress = { ...progressEvent(998, 50, "queued"), session_id: "priority", workspace_id: "fixture" };
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: 20,
+    onProgress: (event) => { if (event.sequence === 998) queueMicrotask(() => { now = 21; }); },
+  }), /before all required source uploads were submitted.*Start a new index operation/);
+  assert.equal(drainReads, 1);
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+  assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
+  assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+});
+
+for (const interruption of ["cancel", "detach"]) {
+  test(`legacy drained callback ${interruption} routes into bounded cleanup before unsent docs`, { timeout: 2500 }, async (t) => {
+    t.mock.method(Date, "now", () => 0);
+    const controller = new AbortController();
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" }], capability: false });
+    const originalFetch = fixture.client.fetchFn;
+    let statusReads = 0, callbackCount = 0, stalledSignal;
+    fixture.client.fetchFn = async (url, init) => {
+      if (!url.endsWith("/status")) return originalFetch(url, init);
+      if (++statusReads > 1) { stalledSignal = init.signal; return new Promise(() => {}); }
+      const payload = await (await originalFetch(url, init)).json();
+      payload.result.progress = { ...progressEvent(997, 50, "queued"), session_id: "priority", workspace_id: "fixture" };
+      return jsonResponse(200, payload);
+    };
+    await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+      signal: interruption === "cancel" ? controller.signal : undefined,
+      detachSignal: interruption === "detach" ? controller.signal : undefined,
+      onProgress: (event) => {
+        if (event.sequence === 997) { callbackCount += 1; queueMicrotask(() => controller.abort()); }
+      },
+    }), (error) => {
+      assert.equal(error instanceof RemoteIndexDetachedError, false);
+      assert.equal(error instanceof RemoteIndexCancelledError, false, "Stalled cleanup did not confirm a terminal receipt");
+      assert.match(error.message, /release could not be confirmed.*Start a new index operation/);
+      assert.equal(error.transfer.files_transferred, 1);
+      assert.equal(error.transfer.complete, false);
+      return true;
+    });
+    assert.equal(callbackCount, 1);
+    assert.equal(statusReads, 2);
+    assert.equal(stalledSignal instanceof AbortSignal && stalledSignal.aborted, true);
+    assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+    assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  });
+}
+
+for (const stall of ["headers", "body"]) {
+  test(`legacy detach before first poll bounds unknown ${stall} receipt and cleans up`, { timeout: 2500 }, async () => {
+    const controller = new AbortController();
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "README.md", content: "guide" }], capability: false });
+    const originalFetch = fixture.client.fetchFn;
+    let cleanupStarted = false, receiptSignal;
+    fixture.client.fetchFn = async (url, init) => {
+      if (init.method === "DELETE") cleanupStarted = true;
+      if (!url.endsWith("/status") || cleanupStarted) return originalFetch(url, init);
+      receiptSignal = init.signal;
+      if (stall === "headers") return new Promise(() => {});
+      const response = await originalFetch(url, init);
+      response.json = () => new Promise(() => {});
+      return response;
+    };
+    await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, detachSignal: controller.signal,
+      onProgress: (event) => { if (event.phase === "uploading") controller.abort(); },
+    }), (error) => {
+      assert.equal(error instanceof RemoteIndexDetachedError, false);
+      assert.match(error.message, /owned session abort was confirmed.*Start a new index operation/);
+      assert.equal(error.transfer.files_transferred, 1);
+      assert.equal(error.transfer.complete, false);
+      return true;
+    });
+    assert.equal(receiptSignal instanceof AbortSignal && receiptSignal.aborted, true);
+    assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  });
+}
+
 for (const codeStage of [false, true]) {
   for (const stall of ["headers", "body"]) {
     for (const interruption of ["deadline", "cancel", "detach"]) {
@@ -2986,7 +3230,8 @@ test("a code-tier processing timeout aborts while documentation uploads are stil
     return true;
   });
   assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
-  assert.equal(fixture.calls.at(-1).type, "abort");
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+  assert.equal(fixture.calls.at(-1).type, "status");
   assert.equal(fixture.calls.some((call) => call.type === "checkpoint" || call.type === "commit"), false);
 });
 

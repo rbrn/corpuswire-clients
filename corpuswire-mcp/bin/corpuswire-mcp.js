@@ -714,7 +714,7 @@ class SyncManager {
         this.env.CORPUSWIRE_SYNC_READ_FRESHNESS_TIMEOUT_MS ?? this.env.CORPUSWIRE_SYNC_BOOTSTRAP_TIMEOUT_MS,
         DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS,
       );
-      const checked = await awaitWithTimeout(this.refreshBootstrapStatus(args), maxWaitMs);
+      const checked = await this.checkBootstrapStatus(args, maxWaitMs);
       if (checked.timedOut) {
         this.recordBootstrapStatus(bootstrapStatusForTimeout(maxWaitMs));
       }
@@ -922,7 +922,7 @@ class SyncManager {
       args.maxWaitMs ?? args.max_wait_ms ?? this.env.CORPUSWIRE_SYNC_BOOTSTRAP_TIMEOUT_MS,
       DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS,
     );
-    const checked = await awaitWithTimeout(this.refreshBootstrapStatus(args), maxWaitMs);
+    const checked = await this.checkBootstrapStatus(args, maxWaitMs);
     if (checked.timedOut) {
       this.recordBootstrapStatus(bootstrapStatusForTimeout(maxWaitMs));
       return {
@@ -938,7 +938,7 @@ class SyncManager {
     let reconcileResult = null;
     if (optionalBoolean(args.reconcile ?? args.runReconcile ?? args.run_reconcile, false)) {
       reconcileResult = await this.reconcileExplicit(args);
-      const refreshed = await awaitWithTimeout(this.refreshBootstrapStatus(args), maxWaitMs);
+      const refreshed = await this.checkBootstrapStatus(args, maxWaitMs);
       if (refreshed.timedOut) {
         this.recordBootstrapStatus(bootstrapStatusForTimeout(maxWaitMs));
       }
@@ -955,7 +955,37 @@ class SyncManager {
     };
   }
 
-  async refreshBootstrapStatus(args = {}) {
+  async checkBootstrapStatus(args, maxWaitMs) {
+    try {
+      const value = await this.refreshBootstrapStatus(args, Date.now() + maxWaitMs);
+      return { timedOut: false, value };
+    } catch (error) {
+      if (error?.code === "CORPUSWIRE_HEALTH_TIMEOUT") return { timedOut: true };
+      throw error;
+    }
+  }
+
+  async refreshBootstrapStatus(args = {}, callerDeadline = Infinity) {
+    const healthStop = new AbortController();
+    const budgetMs = optionalPositiveInteger(this.env.CORPUSWIRE_SYNC_BOOTSTRAP_TIMEOUT_MS, DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS);
+    const deadline = Math.min(Date.now() + budgetMs, callerDeadline);
+    try {
+      const remainingMs = deadline - Date.now();
+      const checked = remainingMs > 0
+        ? await awaitWithTimeout(this.readBootstrapStatus(args, healthStop.signal), remainingMs)
+        : { timedOut: true };
+      if (checked.timedOut || Date.now() >= deadline) {
+        const error = new Error("Workspace health diagnosis timed out");
+        error.code = "CORPUSWIRE_HEALTH_TIMEOUT";
+        throw error;
+      }
+      return this.applyBootstrapStatus(checked.value);
+    } finally {
+      healthStop.abort();
+    }
+  }
+
+  async readBootstrapStatus(args = {}, signal = undefined) {
     const context = this.resolveContext(args);
     const repoPath = firstNonEmptyString(
       args.repoPath,
@@ -966,9 +996,13 @@ class SyncManager {
     const workspaceId = firstNonEmptyString(args.workspaceId, args.workspace_id, context.workspaceId);
     const client = buildClient();
     const diagnosis = typeof client.diagnoseWorkspace === "function"
-      ? await client.diagnoseWorkspace({ repoPath, workspaceId })
+      ? await client.diagnoseWorkspace({ repoPath, workspaceId }, { signal })
       : diagnosisFromHealth(await client.health({ repoPath, workspaceId }), { repoPath, workspaceId });
-    const bootstrapStatus = bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId });
+    if (signal?.aborted) throw new Error("Workspace health diagnosis was interrupted");
+    return bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId });
+  }
+
+  applyBootstrapStatus(bootstrapStatus) {
     if (this.observationGap === false && (
       this.bootstrapStatus.coverage?.coverage_token !== bootstrapStatus.coverage?.coverage_token
       || this.bootstrapStatus.coverage?.selection_policy_digest
@@ -5197,6 +5231,8 @@ function bootstrapStatusForTimeout(maxWaitMs) {
   return {
     ...initialBootstrapStatus(),
     state: "unknown",
+    healthBlocked: true,
+    canRetrieve: false,
     checkedAt: new Date().toISOString(),
     reason: `Bootstrap freshness check timed out after ${maxWaitMs}ms.`,
   };
