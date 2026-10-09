@@ -12,6 +12,7 @@ import type {
   RemoteWorkspaceFile,
   InventoryScan,
   RemoteIndexCommitResponse,
+  RemoteIndexCodeStageResult,
   RemoteIndexStatus,
   WorkspaceDiagnosis,
 } from "@corpuswire/sdk";
@@ -715,6 +716,8 @@ async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}, confir
     // Validate every participating identity before capabilities, scans, or uploads begin.
     assertDistinctIndexRoots(roots);
     const outcomes: { root: IndexWorkspaceRoot; committed?: RemoteIndexCommitResponse; skippedLargeFiles?: number; error?: unknown }[] = [];
+    const codeStages = new Map<string, RemoteIndexCodeStageResult>();
+    const pendingCodeRoots = new Set<string>();
     let cancelled = false;
     await vscode.window.withProgress(
       {
@@ -730,70 +733,97 @@ async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}, confir
         if (token.isCancellationRequested) controller.abort();
         const rootPercent = new Map<string, number>();
         let reportedPercent = 0;
-        let nextRoot = 0;
         try {
-          const work = async (): Promise<void> => {
-            while (!controller.signal.aborted && nextRoot < roots.length) {
-              const root = roots[nextRoot++];
-              const { folder, settings } = root;
-              const indexerService = settings.services.indexer;
-              try {
-                const client = new CorpusWireClient({
-                  baseUrl: indexerService.url,
-                  endpointMode: "v1-only",
-                  defaultHeaders: await buildAuthenticatedServiceHeaders(settings, indexerService),
-                });
-                const capabilities = await client.getIndexCapabilities();
-                if (controller.signal.aborted) throw new Error("Indexing cancelled before scan started.");
-                const maxFileSizeBytes = Math.min(settings.remoteIndexing.maxFileSizeBytes, capabilities.max_file_size_bytes);
-                progress.report({ message: `${folder.name} · scanning workspace` });
-                const collected = await collectWorkspaceFiles(folder, maxFileSizeBytes, controller.signal);
-                if (controller.signal.aborted) throw new Error("Indexing cancelled before upload started.");
-                let codeReadyMessage = "";
-                const committed = await client.indexWorkspace({
-                  workspace: {
-                    workspaceId: settings.remoteIndexing.workspaceId!,
-                    displayRoot: folder.uri.toString(),
-                    name: folder.name,
-                  },
-                  mode: "full",
-                  client: {
-                    name: "corpuswire-vscode-extension",
-                    transport: "vscode.workspace.fs",
+          const runPass = async (codePass: boolean): Promise<void> => {
+            let nextRoot = 0;
+            const work = async (): Promise<void> => {
+              while (!controller.signal.aborted && nextRoot < roots.length) {
+                const root = roots[nextRoot++];
+                const previousStage = codeStages.get(indexRootKey(root.folder));
+                if (outcomes.some((outcome) => outcome.root === root)) continue;
+                if (codePass && !root.settings.remoteIndexing.codeFirstPass) continue;
+                const { folder, settings } = root;
+                const indexerService = settings.services.indexer;
+                try {
+                  const client = new CorpusWireClient({
+                    baseUrl: indexerService.url,
+                    endpointMode: "v1-only",
+                    defaultHeaders: await buildAuthenticatedServiceHeaders(settings, indexerService),
+                  });
+                  const capabilities = await client.getIndexCapabilities();
+                  if (controller.signal.aborted) throw new Error("Indexing cancelled before scan started.");
+                  const maxFileSizeBytes = Math.min(settings.remoteIndexing.maxFileSizeBytes, capabilities.max_file_size_bytes);
+                  progress.report({ message: `${folder.name} · scanning workspace` });
+                  const collected = await collectWorkspaceFiles(folder, maxFileSizeBytes, controller.signal);
+                  if (controller.signal.aborted) throw new Error("Indexing cancelled before upload started.");
+                  let codeReadyMessage = "";
+                  const request = {
+                    workspace: {
+                      workspaceId: settings.remoteIndexing.workspaceId!,
+                      displayRoot: folder.uri.toString(),
+                      name: folder.name,
+                    },
+                    mode: "full",
+                    client: {
+                      name: "corpuswire-vscode-extension",
+                      transport: "vscode.workspace.fs",
+                      maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
+                      batchBytes: settings.remoteIndexing.batchBytes,
+                      maxFileSizeBytes,
+                    },
                     maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
                     batchBytes: settings.remoteIndexing.batchBytes,
                     maxFileSizeBytes,
-                  },
-                  maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
-                  batchBytes: settings.remoteIndexing.batchBytes,
-                  maxFileSizeBytes,
-                  recreateCollection: options.recreateCollection === true,
-                  files: collected.files,
-                  inventoryScan: collected.inventoryScan,
-                  signal: controller.signal,
-                  onCodeReady: (status) => {
-                    codeReadyMessage = formatCodeReadyMessage(status);
-                    progress.report({ message: `${folder.name} · ${codeReadyMessage}` });
-                  },
-                  onProgress: (event) => {
-                    if (event.phase === "completed") codeReadyMessage = "";
-                    if (event.overall_percent !== null) {
-                      const key = indexRootKey(folder);
-                      rootPercent.set(key, Math.max(rootPercent.get(key) ?? 0, event.overall_percent));
+                    recreateCollection: options.recreateCollection === true && previousStage?.outcome !== "code_ready",
+                    files: collected.files,
+                    inventoryScan: collected.inventoryScan,
+                    signal: controller.signal,
+                    onCodeReady: (status) => {
+                      codeReadyMessage = formatCodeReadyMessage(status);
+                      if (status.coverage?.code_ready) pendingCodeRoots.add(indexRootKey(folder));
+                      progress.report({ message: `${folder.name} · ${codeReadyMessage}` });
+                    },
+                    onProgress: (event) => {
+                      if (event.phase === "completed") codeReadyMessage = "";
+                      if (event.overall_percent !== null) {
+                        const key = indexRootKey(folder);
+                        const weightedPercent = codePass && event.phase !== "completed" ? event.overall_percent / 2
+                          : previousStage?.outcome === "code_ready" ? 50 + event.overall_percent / 2 : event.overall_percent;
+                        rootPercent.set(key, Math.max(rootPercent.get(key) ?? 0, weightedPercent));
+                      }
+                      const percent = [...rootPercent.values()].reduce((sum, value) => sum + value, 0) / roots.length;
+                      const increment = Math.max(0, percent - reportedPercent);
+                      reportedPercent = Math.max(reportedPercent, percent);
+                      progress.report({ increment, message: `${folder.name} · ${formatIndexProgressMessage(event)}${codeReadyMessage ? ` · ${codeReadyMessage}` : ""}` });
+                    },
+                  } satisfies IndexWorkspaceRequest;
+                  if (codePass && typeof client.indexWorkspaceCodeStage === "function") {
+                    const staged = await client.indexWorkspaceCodeStage(request);
+                    codeStages.set(indexRootKey(folder), staged);
+                    if (staged.outcome === "full") {
+                      progress.report({ message: `${folder.name} · ${staged.reason === "empty_inventory" ? "Empty folder indexing completed" : "Code checkpoint unavailable; completed ordinary full indexing"}${staged.full_inventory_complete ? "" : " · full inventory verification unavailable"}` });
+                      pendingCodeRoots.delete(indexRootKey(folder));
+                      outcomes.push({ root, committed: staged.committed, skippedLargeFiles: collected.skippedLargeFiles });
+                    } else if (staged.outcome === "code_ready") {
+                      progress.report({ message: `${folder.name} · ${formatCodeReadyMessage(staged.checkpoint)} · indexing slot released` });
+                    } else {
+                      progress.report({ message: `${folder.name} · No code files; full indexing deferred until the code pass finishes` });
                     }
-                    const percent = [...rootPercent.values()].reduce((sum, value) => sum + value, 0) / roots.length;
-                    const increment = Math.max(0, percent - reportedPercent);
-                    reportedPercent = Math.max(reportedPercent, percent);
-                    progress.report({ increment, message: `${folder.name} · ${formatIndexProgressMessage(event)}${codeReadyMessage ? ` · ${codeReadyMessage}` : ""}` });
-                  },
-                } satisfies IndexWorkspaceRequest);
-                outcomes.push({ root, committed, skippedLargeFiles: collected.skippedLargeFiles });
-              } catch (error) {
-                outcomes.push({ root, error });
+                  } else {
+                    if (codePass) progress.report({ message: `${folder.name} · Code-stage client unavailable; using ordinary full indexing` });
+                    const committed = await client.indexWorkspace(request);
+                    pendingCodeRoots.delete(indexRootKey(folder));
+                    outcomes.push({ root, committed, skippedLargeFiles: collected.skippedLargeFiles });
+                  }
+                } catch (error) {
+                  outcomes.push({ root, error });
+                }
               }
-            }
+            };
+            await Promise.all(Array.from({ length: Math.min(MAX_CONCURRENT_INDEX_ROOTS, roots.length) }, work));
           };
-          await Promise.all(Array.from({ length: Math.min(MAX_CONCURRENT_INDEX_ROOTS, roots.length) }, work));
+          if (roots.some((root) => root.settings.remoteIndexing.codeFirstPass)) await runPass(true);
+          if (!controller.signal.aborted) await runPass(false);
           cancelled = controller.signal.aborted;
         } finally {
           cancellation.dispose();
@@ -811,7 +841,10 @@ async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}, confir
       const evidenceSuffix = ` Inventory coverage: ${outcome.committed?.status.coverage?.state ?? "unknown"}; transferred files: ${outcome.committed?.transfer?.files_transferred ?? "unknown"}.`;
       void vscode.window.showInformationMessage(`${folder.name}: Workspace ${options.recreateCollection ? "index rebuilt" : "indexed"} with CorpusWire.${skippedSuffix}${evidenceSuffix}`);
     }
-    if (cancelled) void vscode.window.showWarningMessage(`CorpusWire indexing cancelled. Completed ${outcomes.filter((outcome) => outcome.committed).length}/${roots.length} workspace folders.`);
+    if (cancelled) {
+      const pendingCode = pendingCodeRoots.size;
+      void vscode.window.showWarningMessage(`CorpusWire indexing cancelled. Completed ${outcomes.filter((outcome) => outcome.committed).length}/${roots.length} workspace folders.${pendingCode ? ` Published code is preserved for ${pendingCode} folder(s); full inventory remains pending.` : ""}`);
+    }
   } catch (error) {
     void vscode.window.showWarningMessage(error instanceof Error ? error.message : String(error));
   }

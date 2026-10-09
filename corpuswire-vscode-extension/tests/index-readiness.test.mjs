@@ -75,7 +75,7 @@ function rootSettings(root, overrides = {}) {
   return {
     services: { indexer: { url: 'http://synthetic-indexer', headers: {} } },
     remoteIndexing: {
-      enabled: true, autoWatch: true, workspaceId: `test://${root.name}`,
+      enabled: true, autoWatch: true, codeFirstPass: false, workspaceId: `test://${root.name}`,
       maxConcurrentUploads: 1, batchBytes: 1024, maxFileSizeBytes: 100,
       autoWatchDebounceMs: 1, maxAutoWatchFiles: 20, ...overrides,
     },
@@ -89,7 +89,7 @@ function deferred() {
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 function extensionHarness(folders, overrides = new Map()) {
-  const warnings = [], information = [], progress = [], requests = [], diagnoses = [], timers = new Map();
+  const warnings = [], information = [], progress = [], requests = [], stageRequests = [], scans = [], diagnoses = [], timers = new Map();
   const confirmations = [];
   let confirmationSelection;
   const settings = new Map(folders.map((root) => [root.uri.toString(), rootSettings(root, overrides.get(root.name))]));
@@ -98,6 +98,14 @@ function extensionHarness(folders, overrides = new Map()) {
   let capabilities = 0;
   let upload = async () => ({ status: { coverage: { state: 'verified' } }, transfer: { files_transferred: 1 } });
   let diagnose = async () => readyDiagnosis();
+  let codeStage = async (request) => {
+    const checkpoint = { coverage: { code_ready: true, state: 'pending', documentation_pending: true } };
+    request.onCodeReady(checkpoint);
+    return { outcome: 'code_ready', full_inventory_complete: false, checkpoint,
+      release_status: { phase: 'aborted', pending_batches: 0, active_batches: 0 }, transfer: { complete: false } };
+  };
+  let scan = async (root) => ({ files: [{ relativePath: 'src/shared.ts', content: root.name }],
+    skippedLargeFiles: 0, inventoryScan: { complete: true } });
   const callbacks = {};
   const subscriptions = [];
   const cancelHandlers = [];
@@ -137,6 +145,7 @@ function extensionHarness(folders, overrides = new Map()) {
     constructor(options) { this.options = options; }
     async getIndexCapabilities() { capabilities += 1; return { max_file_size_bytes: 100 }; }
     async indexWorkspace(request) { requests.push(request); return upload(request); }
+    async indexWorkspaceCodeStage(request) { stageRequests.push(request); return codeStage(request); }
     async diagnoseWorkspace(request) { diagnoses.push(request); return diagnose(request); }
   }
   const readSettings = (uri) => settings.get(vscode.workspace.getWorkspaceFolder(uri).uri.toString());
@@ -145,8 +154,8 @@ function extensionHarness(folders, overrides = new Map()) {
   })), skippedLargeFiles: 0, skippedPolicyFiles: 0 });
   const collectWorkspaceFiles = async (root, _limit, signal) => {
     if (signal?.aborted) throw new Error('scan cancelled');
-    return { files: [{ relativePath: 'src/shared.ts', content: root.name }],
-      skippedLargeFiles: 0, inventoryScan: { complete: true } };
+    scans.push(root.name);
+    return scan(root);
   };
   const functions = new Function('vscode', 'readSettings', 'CorpusWireClient', 'buildAuthenticatedServiceHeaders',
     'collectWorkspaceFiles', 'collectUriFiles', 'isIndexExcludedPath', 'setTimeout', 'clearTimeout', `
@@ -163,9 +172,10 @@ function extensionHarness(folders, overrides = new Map()) {
     return { indexCurrentWorkspace, rebuildCurrentWorkspaceIndex, registerRemoteIndexWatchers, relativePathForUri, runIndexStatusCheck, indexRootStatus };
   `)(vscode, readSettings, Client, () => ({}), collectWorkspaceFiles, collectUriFiles, excludedPath,
     (handler) => { const id = ++nextTimer; timers.set(id, handler); return id; }, (id) => timers.delete(id));
-  return { ...functions, warnings, information, progress, requests, diagnoses, callbacks, settings, subscriptions, confirmations,
+  return { ...functions, warnings, information, progress, requests, stageRequests, scans, diagnoses, callbacks, settings, subscriptions, confirmations,
     setConfirmation(selection) { confirmationSelection = selection; },
     get capabilities() { return capabilities; }, setUpload(handler) { upload = handler; },
+    setCodeStage(handler) { codeStage = handler; }, setScan(handler) { scan = handler; },
     get watcherGlob() { return watcherGlob; },
     setDiagnosis(handler) { diagnose = handler; },
     flushTimers() { const scheduled = [...timers.values()]; timers.clear(); scheduled.forEach((handler) => handler()); },
@@ -676,4 +686,151 @@ test('webview labels verified conditional readiness and retains aggregate errors
   assert.equal(label.textContent, 'Index status error');
   assert.equal(banner.className, 'state-error');
   assert.equal(message.textContent, 'One root is unavailable.');
+});
+
+
+test('opt-in code pass releases slots for twelve roots before any fresh full continuation', async () => {
+  const roots = Array.from({ length: 12 }, (_, index) => folder(`quantum-${index}`));
+  const harness = extensionHarness(roots, new Map(roots.map((root) => [root.name, { codeFirstPass: true }])));
+  const published = new Set(), events = [];
+  let active = 0, maximumActive = 0;
+  harness.setCodeStage(async (request) => {
+    active += 1; maximumActive = Math.max(maximumActive, active);
+    assert.ok(active <= 2, 'Synthetic tenant permits only two session slots');
+    events.push(`code:${request.workspace.name}`);
+    await tick();
+    published.add(request.workspace.name);
+    const checkpoint = { coverage: { state: 'pending', code_ready: true, documentation_pending: true } };
+    request.onCodeReady(checkpoint);
+    active -= 1;
+    return { outcome: 'code_ready', checkpoint, release_status: { phase: 'aborted', pending_batches: 0, active_batches: 0 }, transfer: { complete: false }, full_inventory_complete: false };
+  });
+  harness.setUpload(async (request) => {
+    assert.equal(published.size, 12, 'Every root code pass precedes documentation continuation');
+    active += 1; maximumActive = Math.max(maximumActive, active);
+    assert.ok(active <= 2);
+    events.push(`full:${request.workspace.name}`);
+    await tick(); active -= 1;
+    return { status: { phase: 'completed', coverage: { state: 'verified' } }, transfer: { complete: true } };
+  });
+  await harness.indexCurrentWorkspace({ recreateCollection: true });
+  assert.equal(maximumActive, 2);
+  assert.equal(harness.stageRequests.length, 12);
+  assert.equal(harness.requests.length, 12);
+  assert.ok(harness.stageRequests.every((request) => request.recreateCollection === true));
+  assert.ok(harness.requests.every((request) => request.recreateCollection === false));
+  assert.equal(harness.scans.length, 24);
+  assert.ok(events.slice(0, 12).every((event) => event.startsWith('code:')));
+  assert.equal(harness.information.length, 12);
+});
+
+test('full continuation rescans changed code, added files and code deletion after publication', async () => {
+  const root = folder('fresh');
+  const harness = extensionHarness([root], new Map([['fresh', { codeFirstPass: true }]]));
+  let scanCount = 0;
+  harness.setScan(async () => ({ files: ++scanCount === 1
+    ? [{ relativePath: 'deleted.py', content: 'old' }, { relativePath: 'changed.py', content: 'old' }]
+    : [{ relativePath: 'changed.py', content: 'new' }, { relativePath: 'added.py', content: 'new' }, { relativePath: 'README.md', content: 'guide' }],
+    skippedLargeFiles: 0, inventoryScan: { complete: true, producer: `scan-${scanCount}` } }));
+  await harness.indexCurrentWorkspace();
+  assert.deepEqual(harness.stageRequests[0].files.map((file) => file.relativePath), ['deleted.py', 'changed.py']);
+  assert.deepEqual(harness.requests[0].files.map((file) => file.relativePath), ['changed.py', 'added.py', 'README.md']);
+  assert.equal(harness.requests[0].files[0].content, 'new');
+  assert.equal(harness.requests[0].inventoryScan.producer, 'scan-2');
+  assert.equal(harness.requests[0].mode, 'full');
+});
+
+test('cancellation after the code pass preserves pending code and prevents every full continuation', async () => {
+  const roots = [folder('one'), folder('two')];
+  const harness = extensionHarness(roots, new Map(roots.map((root) => [root.name, { codeFirstPass: true }])));
+  let finished = 0;
+  harness.setCodeStage(async (request) => {
+    const checkpoint = { coverage: { state: 'pending', code_ready: true, documentation_pending: true } };
+    request.onCodeReady(checkpoint);
+    if (++finished === 2) harness.cancel();
+    return { outcome: 'code_ready', checkpoint, release_status: { phase: 'aborted', active_batches: 0, pending_batches: 0 }, transfer: { complete: false }, full_inventory_complete: false };
+  });
+  await harness.indexCurrentWorkspace();
+  assert.equal(harness.requests.length, 0);
+  assert.equal(harness.information.length, 0);
+  assert.ok(harness.warnings.some((message) => /full inventory remains pending/.test(message)));
+});
+
+test('documentation-only stages defer while empty and legacy full fallbacks run once', async () => {
+  const roots = ['docs', 'empty', 'legacy'].map(folder);
+  const harness = extensionHarness(roots, new Map(roots.map((root) => [root.name, { codeFirstPass: true }])));
+  harness.setCodeStage(async (request) => request.workspace.name === 'docs'
+    ? { outcome: 'deferred', reason: 'no_code', full_inventory_complete: false, files_submitted: 1 }
+    : { outcome: 'full', reason: request.workspace.name === 'empty' ? 'empty_inventory' : 'checkpoint_unsupported', full_inventory_complete: true,
+      committed: { status: { phase: 'completed', coverage: { state: 'verified' } }, transfer: { complete: true } } });
+  await harness.indexCurrentWorkspace({ recreateCollection: true });
+  assert.deepEqual(harness.requests.map((request) => request.workspace.name), ['docs']);
+  assert.equal(harness.requests[0].recreateCollection, true, 'Deferred stage has not recreated anything yet');
+  assert.equal(harness.scans.filter((name) => name === 'empty').length, 1);
+  assert.equal(harness.scans.filter((name) => name === 'legacy').length, 1);
+  assert.ok(harness.progress.some((event) => /Code checkpoint unavailable/.test(event.message)));
+  assert.ok(harness.progress.some((event) => /full indexing deferred/.test(event.message)));
+});
+
+test('failed code stage never aliases success and does not start its full continuation', async () => {
+  const root = folder('failed');
+  const harness = extensionHarness([root], new Map([['failed', { codeFirstPass: true }]]));
+  harness.setCodeStage(async () => { throw new Error('Synthetic release confirmation failure'); });
+  await harness.indexCurrentWorkspace();
+  assert.equal(harness.requests.length, 0);
+  assert.equal(harness.information.length, 0);
+  assert.ok(harness.warnings.some((message) => /release confirmation failure/.test(message)));
+});
+
+
+test('legacy full fallback displays its missing inventory verification explicitly', async () => {
+  const root = folder('legacy-unverified');
+  const harness = extensionHarness([root], new Map([[root.name, { codeFirstPass: true }]]));
+  harness.setCodeStage(async () => ({ outcome: 'full', reason: 'checkpoint_unsupported', full_inventory_complete: false,
+    committed: { status: { phase: 'completed' }, transfer: { complete: true } } }));
+  await harness.indexCurrentWorkspace();
+  assert.equal(harness.requests.length, 0);
+  assert.ok(harness.progress.some((event) => /full inventory verification unavailable/.test(event.message)));
+  assert.ok(harness.information.some((message) => /Inventory coverage: unknown/.test(message)));
+});
+
+test('incremental watchers ignore the experimental full indexing treatment', async () => {
+  const root = folder('watch-opt-in');
+  const harness = extensionHarness([root], new Map([[root.name, { codeFirstPass: true }]]));
+  harness.registerRemoteIndexWatchers({ subscriptions: harness.subscriptions });
+  harness.callbacks.change(file(root, 'main.py'));
+  harness.flushTimers();
+  await tick(); await tick();
+  assert.equal(harness.stageRequests.length, 0);
+  assert.equal(harness.requests.length, 1);
+  assert.equal(harness.requests[0].mode, 'incremental');
+});
+
+test('cancelled continuation counts only roots whose published code is still pending', async () => {
+  const roots = [folder('complete'), folder('pending')];
+  const harness = extensionHarness(roots, new Map(roots.map((root) => [root.name, { codeFirstPass: true }])));
+  harness.setUpload(async (request) => {
+    if (request.workspace.name === 'complete') return { status: { phase: 'completed', coverage: { state: 'verified' } }, transfer: { complete: true } };
+    await tick();
+    harness.cancel();
+    throw new Error('Synthetic cancelled continuation');
+  });
+  await harness.indexCurrentWorkspace();
+  assert.equal(harness.information.length, 1);
+  assert.ok(harness.warnings.some((message) => /Published code is preserved for 1 folder\(s\); full inventory remains pending/.test(message)));
+  assert.ok(harness.warnings.every((message) => !/preserved for 2/.test(message)));
+});
+
+test('a callback publication remains visible when cancellation prevents a code-stage result', async () => {
+  const root = folder('cancelled-checkpoint');
+  const harness = extensionHarness([root], new Map([[root.name, { codeFirstPass: true }]]));
+  harness.setCodeStage(async (request) => {
+    request.onCodeReady({ coverage: { state: 'pending', code_ready: true, documentation_pending: true } });
+    harness.cancel();
+    throw new Error('Synthetic cancellation after publication');
+  });
+  await harness.indexCurrentWorkspace();
+  assert.equal(harness.requests.length, 0);
+  assert.equal(harness.information.length, 0);
+  assert.ok(harness.warnings.some((message) => /Published code is preserved for 1 folder/.test(message)));
 });

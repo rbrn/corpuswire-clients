@@ -48,6 +48,7 @@ export interface AuthSettings {
 export interface RemoteIndexingSettings {
   enabled: boolean;
   autoWatch: boolean;
+  codeFirstPass: boolean;
   workspaceId?: string;
   maxConcurrentUploads: number;
   batchBytes: number;
@@ -126,6 +127,7 @@ export function readSettings(resource?: vscode.Uri): ExtensionSettings {
         false,
       ),
       autoWatch: readConfiguredBoolean(config, homeConfiguration.values, "remoteIndexing.autoWatch", false),
+      codeFirstPass: readConfiguredBoolean(config, homeConfiguration.values, "remoteIndexing.codeFirstPass", false),
       workspaceId,
       maxConcurrentUploads: normalizePositiveInteger(
         readConfiguredNumber(config, homeConfiguration.values, "remoteIndexing.maxConcurrentUploads", 4),

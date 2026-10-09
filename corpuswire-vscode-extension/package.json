@@ -297,6 +297,12 @@
           "scope": "resource",
           "description": "Debounce delay before the remote indexing file watcher flushes incremental changes."
         },
+        "corpuswire.remoteIndexing.codeFirstPass": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Experimental: publish each folder's code and release its indexing slot before starting fresh full scans for documentation and other files. Disable to use ordinary full indexing."
+        },
         "corpuswire.remoteIndexing.maxAutoWatchFiles": {
           "type": "number",
           "default": 50,

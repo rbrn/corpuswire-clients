@@ -932,6 +932,17 @@ export class CorpusWireClient {
         }
     }
     async indexWorkspace(request) {
+        return this.runIndexWorkspace(request, false);
+    }
+    /** Publish code from a complete scan and release the drained owned session. */
+    async indexWorkspaceCodeStage(request) {
+        if (request.mode !== "full" || request.snapshotScope || request.evaluationInventoryAttestation
+            || request.inventoryScan?.complete !== true) {
+            throw new WorkspaceScanIncompleteError("Code stage requires a complete canonical v1 full scan");
+        }
+        return this.runIndexWorkspace(request, true);
+    }
+    async runIndexWorkspace(request, codeStage) {
         const clientStartedAt = Date.now();
         let clientSequence = 0;
         const phaseClock = createClientPhaseClock();
@@ -999,6 +1010,11 @@ export class CorpusWireClient {
             if (request.evaluationInventoryAttestation && !request.inventory) {
                 throw new WorkspaceScanIncompleteError("Evaluation inventory attestation requires workspace inventory coverage");
             }
+        }
+        if (codeStage && remoteFiles.length > 0
+            && !remoteFiles.some(({ file }) => ingestionPriority(file.relativePath) === 1)) {
+            return { outcome: "deferred", reason: "no_code", full_inventory_complete: false,
+                files_submitted: remoteFiles.length };
         }
         const transfer = {
             files_submitted: remoteFiles.length, files_upload_required: null, files_reused: null,
@@ -1136,10 +1152,30 @@ export class CorpusWireClient {
                     if (status.coverage?.code_ready !== true) {
                         throw new Error("Code checkpoint did not confirm code readiness");
                     }
+                    if (codeStage && (!isOwnedCodeStageStatus(status, session, request.workspace.workspaceId)
+                        || status.coverage.state !== "pending" || status.coverage.session_id !== session.session_id
+                        || status.pending_batches !== 0 || status.active_batches !== 0
+                        || status.phase !== "ready_to_commit")) {
+                        throw new Error("Code stage checkpoint did not confirm drained pending code publication");
+                    }
                     if (status.progress)
                         emitProgress(status.progress);
                     request.onCodeReady?.(status);
                     await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
+                    if (codeStage) {
+                        await this.abortIndexSession(session.session_id);
+                        const releaseStatus = await this.waitForIndexSessionTerminal(session.session_id, request.processingPollMs ?? 250, emitProgress, request.detachSignal, processingWaitDeadline());
+                        if (!isOwnedCodeStageStatus(releaseStatus, session, request.workspace.workspaceId)
+                            || releaseStatus.phase !== "aborted" || releaseStatus.pending_batches !== 0
+                            || releaseStatus.active_batches !== 0) {
+                            throw new Error("Code stage session release was not confirmed");
+                        }
+                        if (request.signal?.aborted)
+                            throw new RemoteIndexCancelledError(session.session_id, releaseStatus);
+                        transfer.client_phase_timings_ms = phaseClock.snapshot();
+                        return { outcome: "code_ready", full_inventory_complete: false, checkpoint: status,
+                            release_status: releaseStatus, transfer };
+                    }
                 }
             }
             if (queuedBackgroundWork) {
@@ -1161,8 +1197,14 @@ export class CorpusWireClient {
             if (committed.status.progress) {
                 emitProgress(committed.status.progress);
             }
+            if (codeStage && committed.status.phase !== "completed") {
+                throw new WorkspaceScanIncompleteError("Code-stage full fallback did not confirm completed indexing");
+            }
             transfer.complete = true;
-            return { ...committed, transfer };
+            const fullResult = { ...committed, transfer };
+            return codeStage ? { outcome: "full", reason: remoteFiles.length === 0 ? "empty_inventory"
+                    : "checkpoint_unsupported", full_inventory_complete: committed.status.coverage?.state === "verified",
+                committed: fullResult } : fullResult;
         }
         catch (error) {
             phaseClock.pause();
@@ -1210,7 +1252,7 @@ export class CorpusWireClient {
             request.detachSignal?.removeEventListener("abort", stopUploads);
         }
     }
-    async waitForIndexSessionTerminal(sessionId, pollMs, onProgress, detachSignal) {
+    async waitForIndexSessionTerminal(sessionId, pollMs, onProgress, detachSignal, deadline = null) {
         const observeStatus = createIndexStatusObserver(pollMs, onProgress);
         for (;;) {
             const status = await this.getIndexSessionStatus(sessionId);
@@ -1221,9 +1263,23 @@ export class CorpusWireClient {
             if (detachSignal?.aborted) {
                 throw new RemoteIndexDetachedError(sessionId, status, "Detached while cancellation was pending");
             }
-            await waitForIndexInterruptDelay(pollDelay, { detachSignal });
+            if (deadline !== null && Date.now() >= deadline) {
+                throw new RemoteIndexDetachedError(sessionId, status, "Session release confirmation timed out");
+            }
+            await waitForIndexInterruptDelay(remainingIndexPollDelay(pollDelay, deadline), { detachSignal });
         }
     }
+}
+/** A code publication/release receipt must identify the owned canonical session. */
+function isOwnedCodeStageStatus(status, session, workspaceId) {
+    return typeof session.session_id === "string" && session.session_id.length > 0
+        && session.workspace_id === workspaceId && session.mode === "full"
+        && typeof session.collection_name === "string" && session.collection_name.length > 0
+        && status.session_id === session.session_id && status.workspace_id === session.workspace_id
+        && status.mode === session.mode && status.collection_name === session.collection_name
+        && (status.coverage?.session_id === undefined || status.coverage.session_id === session.session_id)
+        && Array.isArray(status.errors) && status.errors.length === 0
+        && (status.failed_batches === undefined || status.failed_batches === 0);
 }
 function sanitizeManifestErrors(errors) {
     return errors

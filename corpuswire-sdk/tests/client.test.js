@@ -2668,9 +2668,10 @@ test("ingestion priority matches canonical code, documentation and other categor
 
 function priorityIndexFixture({ files, unchanged = [], capability = true, batchBytes = 1024, concurrency = 1, onUpload } = {}) {
   const calls = [], uploaded = new Set(), uploadRequired = files.map((file) => file.relativePath).filter((path) => !unchanged.includes(path));
+  let released = false;
   const status = (coverage) => ({
     session_id: "priority", workspace_id: "fixture", collection_name: "fixture", mode: "full",
-    phase: "indexing", files_manifested: files.length, files_indexed: uploaded.size,
+    phase: released ? "aborted" : "indexing", files_manifested: files.length, files_indexed: uploaded.size,
     files_deleted: 0, files_unchanged: unchanged.length, files_skipped: 0, bytes_uploaded: 0,
     bytes_skipped: 0, queue_depth: uploadRequired.length - uploaded.size,
     pending_batches: 0, active_batches: 0, errors: [], coverage,
@@ -2681,7 +2682,8 @@ function priorityIndexFixture({ files, unchanged = [], capability = true, batchB
       supported_file_registry_version: "fixture/v1", max_file_size_bytes: 1024,
     });
     if (url.endsWith("/sessions")) return jsonResponse(200, { ok: true, result: {
-      session_id: "priority", mode: "full", max_batch_bytes: batchBytes,
+      session_id: "priority", workspace_id: "fixture", collection_name: "fixture", manifest_revision: 1,
+      mode: "full", max_batch_bytes: batchBytes,
       max_concurrent_uploads: concurrency, code_checkpoint: capability,
     } });
     if (url.endsWith("/manifest/batch")) return jsonResponse(200, { ok: true, result: {
@@ -2699,14 +2701,14 @@ function priorityIndexFixture({ files, unchanged = [], capability = true, batchB
     if (url.endsWith("/status")) { calls.push({ type: "status" }); return jsonResponse(200, { ok: true, result: status() }); }
     if (url.endsWith("/checkpoint/code")) {
       calls.push({ type: "checkpoint" });
-      return jsonResponse(200, { ok: true, result: status({
-        schema_version: "workspace-coverage/v1", state: "pending", reason_codes: [],
+      return jsonResponse(200, { ok: true, result: { ...status({
+        schema_version: "workspace-coverage/v1", state: "pending", reason_codes: [], session_id: "priority",
         code_ready: true, documentation_pending: files.some((file) => ingestionPriority(file.relativePath) === 2),
         other_pending: files.some((file) => ingestionPriority(file.relativePath) === 3),
-      }) });
+      }), phase: "ready_to_commit" } });
     }
     if (url.endsWith("/commit")) { calls.push({ type: "commit" }); return jsonResponse(200, { ok: true, result: {}, status: { ...status(), phase: "completed" } }); }
-    if (init.method === "DELETE") { calls.push({ type: "abort" }); return jsonResponse(200, { ok: true }); }
+    if (init.method === "DELETE") { released = true; calls.push({ type: "abort" }); return jsonResponse(200, { ok: true }); }
     throw new Error(`Unexpected request ${url}`);
   } });
   const request = {
@@ -3323,4 +3325,180 @@ test("failed upload timing stops before delayed abort response cleanup", { timeo
     return true;
   });
   assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+});
+
+
+test("explicit code stage submits the complete manifest, publishes only code and confirms drained release", async () => {
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+    { relativePath: "settings.json", content: "{}" },
+  ] });
+  let manifestPaths, checkpoint;
+  const originalManifest = fixture.client.sendManifestBatch.bind(fixture.client);
+  fixture.client.sendManifestBatch = async (session, entries) => { manifestPaths = entries.map((entry) => entry.relativePath); return originalManifest(session, entries); };
+  const result = await fixture.client.indexWorkspaceCodeStage({ ...fixture.request, onCodeReady: (status) => { checkpoint = status; } });
+  assert.equal(result.outcome, "code_ready");
+  assert.equal(result.full_inventory_complete, false);
+  assert.equal(result.transfer.complete, false);
+  assert.equal(result.transfer.files_submitted, 3);
+  assert.equal(result.transfer.files_transferred, 1);
+  assert.equal(result.checkpoint, checkpoint);
+  assert.equal(result.checkpoint.coverage.code_ready, true);
+  assert.equal(result.checkpoint.coverage.documentation_pending, true);
+  assert.equal(result.release_status.phase, "aborted");
+  assert.equal(result.release_status.pending_batches, 0);
+  assert.equal(result.release_status.active_batches, 0);
+  assert.deepEqual(manifestPaths.sort(), ["README.md", "main.py", "settings.json"]);
+  assert.deepEqual(fixture.calls.filter((call) => call.type !== "status"), [
+    { type: "upload", paths: ["main.py"] }, { type: "checkpoint" }, { type: "abort" },
+  ]);
+});
+
+test("code stage defers documentation-only roots and fully commits empty or unsupported roots", async () => {
+  const docs = priorityIndexFixture({ files: [{ relativePath: "README.md", content: "guide" }] });
+  assert.deepEqual(await docs.client.indexWorkspaceCodeStage(docs.request), {
+    outcome: "deferred", reason: "no_code", full_inventory_complete: false, files_submitted: 1,
+  });
+  assert.deepEqual(docs.calls, []);
+  for (const empty of [true, false]) {
+    const fixture = priorityIndexFixture({ files: empty ? [] : [{ relativePath: "main.py", content: "x" }], capability: false });
+    const result = await fixture.client.indexWorkspaceCodeStage(fixture.request);
+    assert.equal(result.outcome, "full");
+    assert.equal(result.reason, empty ? "empty_inventory" : "checkpoint_unsupported");
+    assert.equal(result.committed.transfer.complete, true);
+    assert.equal(fixture.calls.filter((call) => call.type === "commit").length, 1);
+    assert.equal(fixture.calls.some((call) => call.type === "abort"), false);
+  }
+});
+
+test("code-stage cancellation preserves published code without uploading documentation or claiming completion", async () => {
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" }] });
+  const controller = new AbortController();
+  let ready;
+  await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request, signal: controller.signal,
+    onCodeReady: (status) => { ready = status; controller.abort(); },
+  }), (error) => {
+    assert.ok(error instanceof RemoteIndexCancelledError);
+    assert.equal(error.transfer.complete, false);
+    assert.equal(error.transfer.files_transferred, 1);
+    return true;
+  });
+  assert.equal(ready.coverage.code_ready, true);
+  assert.equal(fixture.calls.filter((call) => call.type === "checkpoint").length, 1);
+  assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
+  assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+});
+
+test("code-stage failed checkpoint, release or incomplete scan cannot masquerade as full success", async () => {
+  for (const failure of ["checkpoint", "release", "active release", "unknown release"]) {
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+    if (failure === "checkpoint") fixture.client.checkpointIndexSessionCode = async () => ({ coverage: { code_ready: false } });
+    else if (failure === "release") fixture.client.abortIndexSession = async () => { throw new Error("Synthetic abort outage"); };
+    else fixture.client.getIndexSessionStatus = async () => ({ phase: fixture.calls.some((call) => call.type === "abort") ? "aborted" : "indexing",
+      pending_batches: failure === "unknown release" && fixture.calls.some((call) => call.type === "abort") ? undefined : 0,
+      active_batches: failure === "active release" && fixture.calls.some((call) => call.type === "abort") ? 1 : 0, queue_depth: 0, errors: [] });
+    await assert.rejects(fixture.client.indexWorkspaceCodeStage(fixture.request));
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  }
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request, inventoryScan: undefined }), { code: "scan_incomplete" });
+  assert.deepEqual(fixture.calls, []);
+});
+
+test("public capability and health declarations retain additive code-readiness fields", () => {
+  const declarations = readFileSync(new URL("../dist/types.d.ts", import.meta.url), "utf8");
+  assert.match(declarations, /file_batch_priorities\?:\s*\{\s*code: number;\s*documentation: number;\s*other: number;/);
+  const indexHealth = declarations.slice(declarations.indexOf("interface IndexHealth"), declarations.indexOf("interface IndexHealth") + 1600);
+  for (const flag of ["code_ready", "documentation_pending", "other_pending"]) assert.match(indexHealth, new RegExp(`${flag}\\?: boolean`));
+});
+
+
+test("health and indexing capabilities preserve server code readiness and processing quantum metadata", async () => {
+  const metadata = { file_batch_priorities: { code: 1, documentation: 2, other: 3 },
+    max_processing_files: 4, max_processing_source_bytes: 1000,
+    processing_quantum_boundary: "complete_files", chunk_stream_preemption: false };
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url) =>
+    jsonResponse(200, url.endsWith("/capabilities") ? { ok: true, ...metadata }
+      : { ok: true, index: { code_ready: true, documentation_pending: true, other_pending: false } }) });
+  const capabilities = await client.getIndexCapabilities();
+  for (const [key, value] of Object.entries(metadata)) assert.deepEqual(capabilities[key], value);
+  assert.deepEqual((await client.health()).index, { code_ready: true, documentation_pending: true, other_pending: false });
+});
+
+
+test("code stage rejects malformed pending checkpoint evidence before release success", async () => {
+  for (const change of [
+    { coverage: { code_ready: true, state: "verified" } },
+    { pending_batches: 1 }, { active_batches: 1 }, { pending_batches: undefined },
+    { phase: "failed" }, { errors: ["synthetic worker failure"] },
+  ]) {
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+    const checkpoint = fixture.client.checkpointIndexSessionCode.bind(fixture.client);
+    fixture.client.checkpointIndexSessionCode = async (...args) => ({ ...await checkpoint(...args), ...change });
+    let readyCallbacks = 0;
+    await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request, onCodeReady: () => readyCallbacks++ }), /drained pending code publication/);
+    assert.equal(readyCallbacks, 0);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  }
+});
+
+test("code-stage full fallback distinguishes verified coverage from legacy unknown and rejects pending commit", async () => {
+  for (const state of ["verified", "pending", undefined]) {
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }], capability: false });
+    const commit = fixture.client.commitIndexSession.bind(fixture.client);
+    fixture.client.commitIndexSession = async (...args) => {
+      const result = await commit(...args);
+      return { ...result, status: { ...result.status, coverage: state ? { state } : undefined } };
+    };
+    const result = await fixture.client.indexWorkspaceCodeStage(fixture.request);
+    assert.equal(result.outcome, "full");
+    assert.equal(result.full_inventory_complete, state === "verified");
+    assert.equal(result.committed.transfer.complete, true);
+  }
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }], capability: false });
+  fixture.client.commitIndexSession = async () => ({ ok: true, result: {}, status: { phase: "indexing", coverage: { state: "pending" } } });
+  await assert.rejects(fixture.client.indexWorkspaceCodeStage(fixture.request), (error) => {
+    assert.equal(error.code, "scan_incomplete");
+    assert.equal(error.transfer.complete, false);
+    return true;
+  });
+});
+
+
+test("code-stage checkpoint proof is bound to owned identity before readiness callback", async () => {
+  for (const change of [
+    { session_id: "another-session" }, { workspace_id: "another-workspace" },
+    { mode: "incremental" }, { collection_name: "another-collection" }, { phase: undefined },
+    { phase: "indexing" }, { errors: undefined }, { errors: "synthetic failure" }, { failed_batches: 1 },
+    { coverage: { state: "pending", code_ready: true, session_id: "another-session" } },
+    { coverage: { state: "pending", code_ready: true } },
+  ]) {
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+    const checkpoint = fixture.client.checkpointIndexSessionCode.bind(fixture.client);
+    fixture.client.checkpointIndexSessionCode = async (...args) => ({ ...await checkpoint(...args), ...change });
+    let callbacks = 0;
+    await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request, onCodeReady: () => callbacks++ }), /drained pending code publication/);
+    assert.equal(callbacks, 0, `Malformed checkpoint must not publish callback: ${JSON.stringify(change)}`);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  }
+});
+
+test("code-stage release proof cannot confirm another session or conflicting scope", async () => {
+  for (const change of [
+    { session_id: "another-session" }, { workspace_id: "another-workspace" },
+    { mode: "incremental" }, { collection_name: "another-collection" },
+    { errors: undefined }, { errors: ["synthetic abort error"] }, { failed_batches: 1 },
+    { coverage: { state: "pending", code_ready: true, session_id: "another-session" } },
+  ]) {
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+    const getStatus = fixture.client.getIndexSessionStatus.bind(fixture.client);
+    fixture.client.getIndexSessionStatus = async (...args) => {
+      const status = await getStatus(...args);
+      return status.phase === "aborted" ? { ...status, ...change } : status;
+    };
+    let callbacks = 0;
+    await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request, onCodeReady: () => callbacks++ }), /session release was not confirmed/);
+    assert.equal(callbacks, 1, "Owned publication may precede failed release proof; it never becomes stage success");
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  }
 });

@@ -149,6 +149,7 @@ no Authorization header has already been provided.
 | --- | --- | --- |
 | `corpuswire.remoteIndexing.enabled` | `false` | Enables remote-first indexing and sends `workspace_id` in enhancement requests |
 | `corpuswire.remoteIndexing.autoWatch` | `false` | Watches file create/change/delete events and sends incremental updates |
+| `corpuswire.remoteIndexing.codeFirstPass` | `false` | Experimental: publish code across roots before fresh full indexing of documentation and other files |
 | `corpuswire.remoteIndexing.workspaceId` | `local-docker://<folder-slug>#main` for local folders; folder URI otherwise | Stable workspace identity for remote indexing |
 | `corpuswire.remoteIndexing.maxConcurrentUploads` | `4` | Client concurrency hint for SDK upload batches |
 | `corpuswire.remoteIndexing.batchBytes` | `4194304` | Target maximum bytes per upload batch |
@@ -407,3 +408,18 @@ valid for hosted services that cannot mount the local path.
 ## Full-scan readiness
 
 Full indexing now fails if an eligible file cannot be read or changes during its read. It supplies a declared inventory for the selected include/exclude policy and skips symlinks. Watcher batches retain incremental semantics and cannot establish a full baseline by themselves. Completion notifications display inventory coverage and acknowledged transferred files separately; unsupported older services display unknown coverage.
+
+The experimental `corpuswire.remoteIndexing.codeFirstPass` setting applies to
+manual full indexing and rebuild commands. Keep it disabled for ordinary full
+indexing; no performance gain has yet been measured. When enabled, at most two
+root workers publish code and release their drained session slots before the
+full pass starts. Every continuation scans the folder again, reuses published
+code, and accounts for files changed, added or deleted between passes. Rebuild
+recreates each collection only in its first actual session.
+
+Documentation-only folders wait for the full pass. Empty folders complete an
+ordinary empty full inventory; older servers visibly fall back to ordinary full
+indexing. Published code remains marked pending until full verification. Cancel
+stops later roots/passes and retains already-published code; a released code
+stage never triggers a full-completion notification. Automatic incremental
+watcher updates keep their existing behavior.

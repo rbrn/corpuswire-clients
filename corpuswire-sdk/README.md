@@ -504,3 +504,23 @@ wall time. Backend `progress.retries` retains its separate server meaning.
 upload tiers; upload intervals include admission/transport waits. Server phase
 timings remain authoritative for server work and must not be summed with client
 intervals to infer wall time.
+
+For opt-in scheduling across many roots, `indexWorkspaceCodeStage(request)` accepts
+a complete canonical `mode: "full"` scan and declares the entire manifest. It
+uploads/drains code, publishes the code checkpoint, calls `onCodeReady`, then
+uses the existing abort route to release its drained owned session. A
+`code_ready` result contains distinct `checkpoint` and `release_status` fields;
+`full_inventory_complete` and `transfer.complete` are both false. Aborting this
+released stage preserves already-published code and its pending coverage.
+
+After all roots finish their code pass, scan each root again and call ordinary
+`indexWorkspace` with `recreateCollection: false` for roots that published code.
+Fresh full manifests account for edits, additions, and code deletions between
+passes. Documentation-only roots return `deferred` without allocating a session.
+An empty inventory or a server without checkpoint support returns `full` with
+a real `committed` response and an explicit fallback reason. Its
+`full_inventory_complete` flag requires verified inventory coverage; legacy
+completed services without that evidence report false. Such roots already
+finished and need no second pass. A deferred rebuild root still needs its first
+full session to recreate. Cancellation/errors never turn a code stage into full
+inventory completion. The SDK does not start a background continuation.

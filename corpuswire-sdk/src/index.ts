@@ -98,6 +98,7 @@ export type {
   RemoteFileDescriptor,
   RemoteIndexCapabilities,
   RemoteIndexCommitResponse,
+  RemoteIndexCodeStageResult,
   RemoteIndexLayer,
   RemoteIndexMode,
   RemoteIndexEtaConfidence,

@@ -166,6 +166,9 @@ export interface QdrantHealth {
     error?: string | null;
 }
 export interface IndexHealth {
+    code_ready?: boolean;
+    documentation_pending?: boolean;
+    other_pending?: boolean;
     coverage?: WorkspaceCoverage;
     workspace_id?: string | null;
     path: string;
@@ -1540,6 +1543,15 @@ export interface RemoteIndexCapabilities {
     max_queued_bytes?: number;
     protocol_versions?: string[];
     snapshot_scoping?: boolean;
+    file_batch_priorities?: {
+        code: number;
+        documentation: number;
+        other: number;
+    };
+    max_processing_files?: number;
+    max_processing_source_bytes?: number;
+    processing_quantum_boundary?: "complete_files";
+    chunk_stream_preemption?: boolean;
 }
 export interface RemoteIndexCommitResponse {
     transfer?: IndexTransferSummary;
@@ -1547,6 +1559,25 @@ export interface RemoteIndexCommitResponse {
     result: Record<string, unknown>;
     status: RemoteIndexStatus;
 }
+/** A released code publication is distinct from a verified full commit. */
+export type RemoteIndexCodeStageResult = {
+    outcome: "code_ready";
+    full_inventory_complete: false;
+    checkpoint: RemoteIndexStatus;
+    release_status: RemoteIndexStatus;
+    transfer: IndexTransferSummary;
+} | {
+    outcome: "deferred";
+    reason: "no_code";
+    full_inventory_complete: false;
+    files_submitted: number;
+} | {
+    outcome: "full";
+    reason: "checkpoint_unsupported" | "empty_inventory";
+    /** False when an older service cannot certify inventory coverage. */
+    full_inventory_complete: boolean;
+    committed: RemoteIndexCommitResponse;
+};
 export interface RemoteWorkspaceFile {
     relativePath: string;
     content: string | Uint8Array;
