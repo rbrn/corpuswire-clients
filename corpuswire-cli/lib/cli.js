@@ -729,10 +729,11 @@ export async function runWatchCommand(options, dependencies) {
             && diagnosedIndex.coverage.session_id !== result.status.coverage.session_id) {
             throw watchFailure("The verified publication changed before the readiness check. Restart cw to reconcile again.");
           }
-          const verifiedEmpty = scan.files.length === 0 && doctor.coverage.state === "verified"
-            && diagnosedIndex?.coverage?.eligible_file_count === 0
-            && (diagnosedIndex.health_warnings ?? []).every((warning) => warning === "No indexed Qdrant points were found for this context.")
-            && doctor.reasons.every((reason) => ["retrieval_blocked", "index_health_degraded", "index_health_warnings"].includes(reason));
+          const verifiedEmpty = scan.files.length === 0
+            && verifiedEmptyDiagnosisForWatch(diagnosisEvidence?.diagnosis)
+            && doctor.reasons.every((reason) => ["retrieval_blocked", "index_not_indexed",
+              "index_health_degraded", "index_health_warnings", "diagnosis_check_warning",
+              "diagnosis_check_error"].includes(reason));
           if (!(doctor.ok && doctor.coverage.state === "verified") && !verifiedEmpty) {
             const authFailure = doctor.reasons.includes("authentication_rejected");
             const unavailable = doctor.checks.some((check) => check.code === "unavailable");
@@ -1179,6 +1180,28 @@ async function initializeWorkspace(options, dependencies) {
   write(options.json ? JSON.stringify(result, null, 2)
     : `${changed ? "Configured" : "Already configured"}: ${sanitizeTerminalText(options.workspaceId)}\nSettings: ${settingsPath}`);
   return result;
+}
+
+function verifiedEmptyDiagnosisForWatch(diagnosis) {
+  const index = diagnosis?.index;
+  const emptyWarning = "No indexed Qdrant points were found for this context.";
+  if (index?.coverage?.state !== "verified" || index.coverage.eligible_file_count !== 0
+    || diagnosis.can_retrieve !== false || diagnosis.point_count !== 0
+    || typeof diagnosis.collection_exists !== "boolean" || diagnosis.qdrant_error
+    || !["ok", "ready", "healthy", "degraded"].includes(index.health_status)) return false;
+  if (!Array.isArray(index.health_warnings ?? [])
+    || !(index.health_warnings ?? []).every((warning) => warning === emptyWarning)) return false;
+  if (!Array.isArray(diagnosis.checks ?? [])) return false;
+  return (diagnosis.checks ?? []).every((check) => {
+    if (check?.status === "ok") return true;
+    if (check?.status === "warning") return (check.name === "index_health" && check.message === emptyWarning)
+      || (check.name === "explicit_target" && check.message === "No repoPath or workspaceId was supplied; retrieval will use the backend default context.");
+    return check?.status === "error" && ((check.name === "points"
+      && check.message === "Collection has no indexed points.")
+      || (diagnosis.collection_exists === false && check.name === "collection"
+        && typeof (diagnosis.collection ?? index.collection) === "string"
+        && check.message === `Collection does not exist: ${diagnosis.collection ?? index.collection}`));
+  });
 }
 
 async function runDoctorCommand(options, dependencies) {

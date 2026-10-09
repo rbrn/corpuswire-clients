@@ -1794,35 +1794,48 @@ test("a hanging mutation response body survives first stop but settles on detach
 });
 
 test("verified empty backend diagnosis permits watching and a later source addition", { timeout: 5000 }, async () => {
-  let added = false;
-  const state = await watchFixture({
-    onSetup: async (current) => { await rm(path.join(current.root, "README.md")); await rm(path.join(current.root, "src", "index.js")); },
-    onDiagnosis: (current, request) => current.requests.at(-1).files.length === 0 ? {
-      status: "blocked", can_retrieve: false, resolved_workspace_id: request.workspaceId,
-      index: { health_status: "degraded", health_warnings: ["No indexed Qdrant points were found for this context."], coverage: { state: "verified", eligible_file_count: 0 } },
-    } : undefined,
-    onWait: async (current) => {
-      if (!added) { added = true; await writeFile(path.join(current.root, "README.md"), "# Added after verified empty inventory\n"); current.notify("README.md"); }
-      if (current.requests.length === 2) current.controller.abort();
-    },
-  });
-  assert.ifError(state.error);
-  assert.equal(state.requests.length, 2);
-  assert.deepEqual(state.requests[0].files, []);
-  assert.deepEqual(state.requests[1].files.map((file) => file.path), ["README.md"]);
-  assert.equal(state.result.publications, 2);
+  for (const collectionExists of [true,false]) {
+    let added = false;
+    const state = await watchFixture({
+      onSetup: async (current) => { await rm(path.join(current.root, "README.md")); await rm(path.join(current.root, "src", "index.js")); },
+      onIndex: (current) => ({ok:true,result:{},status:{phase:"completed",coverage:{state:"verified",session_id:`synthetic-${current.requests.length}`}},transfer:{complete:true}}),
+      onDiagnosis: (current, request) => current.requests.at(-1).files.length === 0 ? {
+        status: "blocked", can_retrieve: false, resolved_workspace_id: request.workspaceId,
+        collection:"synthetic-watch",collection_exists:collectionExists,point_count:0,
+        checks:[{name:"points",status:"error",message:"Collection has no indexed points."},
+          ...(collectionExists ? [] : [{name:"collection",status:"error",message:"Collection does not exist: synthetic-watch"}]),
+          {name:"index_health",status:"warning",message:"No indexed Qdrant points were found for this context."}],
+        index: { indexed:false,health_status: "degraded", health_warnings: ["No indexed Qdrant points were found for this context."],
+          coverage: { state: "verified", eligible_file_count: 0,session_id:"synthetic-1" } },
+      } : undefined,
+      onWait: async (current) => {
+        if (!added) { added = true; await writeFile(path.join(current.root, "README.md"), "# Added after verified empty inventory\n"); current.notify("README.md"); }
+        if (current.requests.length === 2) current.controller.abort();
+      },
+    });
+    assert.ifError(state.error);
+    assert.equal(state.requests.length, 2);
+    assert.deepEqual(state.requests[0].files, []);
+    assert.deepEqual(state.requests[1].files.map((file) => file.path), ["README.md"]);
+    assert.equal(state.result.publications, 2);
+  }
 });
 
 test("empty inventory never excuses divergent warnings, authorization failure, or another session", { timeout: 5000 }, async () => {
-  for (const failure of ["warning", "authentication", "session"]) {
+  for (const failure of ["warning", "authentication", "session", "qdrant", "check", "positive_eligible", "unconfirmed_collection", "reconcile"]) {
     const state = await watchFixture({
       onSetup: async (current) => { await rm(path.join(current.root, "README.md")); await rm(path.join(current.root, "src", "index.js")); },
       onIndex: () => ({ ok: true, result: {}, status: { phase: "completed", coverage: { state: "verified", session_id: "synthetic-current" } }, transfer: { complete: true } }),
       onDiagnosis: (_current, request) => {
         if (failure === "authentication") throw Object.assign(new Error("Synthetic rejected auth"), { status: 403 });
         return { status: "blocked", can_retrieve: false, resolved_workspace_id: request.workspaceId,
-          index: { health_status: "degraded", health_warnings: [failure === "warning" ? "Unexpected synthetic index failure" : "No indexed Qdrant points were found for this context."],
-            coverage: { state: "verified", eligible_file_count: 0, session_id: failure === "session" ? "synthetic-previous" : "synthetic-current" } },
+          collection:"synthetic-watch",collection_exists:failure === "unconfirmed_collection" ? undefined : false,point_count:0,
+          qdrant_error:failure === "qdrant" ? "Synthetic vector outage" : null,
+          checks:[{name:"points",status:"error",message:"Collection has no indexed points."},
+            {name:"collection",status:"error",message:"Collection does not exist: synthetic-watch"},
+            ...(failure === "check" ? [{name:"local_path",status:"error",message:"Synthetic source unreadable"}] : [])],
+          index: { indexed:false,read_needs_reconcile:failure === "reconcile",health_status: "degraded", health_warnings: [failure === "warning" ? "Unexpected synthetic index failure" : "No indexed Qdrant points were found for this context."],
+            coverage: { state: "verified", eligible_file_count: failure === "positive_eligible" ? 1 : 0, session_id: failure === "session" ? "synthetic-previous" : "synthetic-current" } },
         };
       },
     });
