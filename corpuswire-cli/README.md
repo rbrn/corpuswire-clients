@@ -303,11 +303,13 @@ Incremental mode updates only files included in that invocation; it does not
 remove unmentioned paths. A second identical full run is reported as
 `no_change` in the preview and avoids re-embedding unchanged files.
 
-Ctrl+C sends a real backend abort and waits for acknowledgement. A second Ctrl+C
-or `--timeout-ms` detaches after all required uploads are accepted, reporting the
-session id and reattachment command. If source uploads are still incomplete,
-the CLI requests abort and asks for a new indexing operation because following
-a session cannot resume unsent files. Tier processing waits share one deadline.
+Ctrl+C requests a real backend abort. A timeout or second interrupt before commit
+also requests bounded abort and asks for a new indexing operation, even if every
+source body was uploaded: attachment cannot upload missing files or send the
+missing commit. Cancellation is confirmed only after terminal acknowledgement;
+an unconfirmed release never advertises a freed slot. Tier processing waits share
+one deadline. `--attach` can follow an existing server-owned operation without
+resuming client-side work.
 
 The CLI helps verify those flows after they run:
 

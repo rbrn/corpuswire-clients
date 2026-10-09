@@ -328,7 +328,7 @@ Cancellation and detach also interrupt a stalled code-checkpoint request.
 Cancellation aborts the session. Detach during the client-owned code checkpoint
 also requests abort and requires a new indexing operation, even when every
 source upload was acknowledged: polling cannot finish checkpoint or commit.
-Detach from server processing after all uploads are accepted preserves backend work.
+Before commit, every timeout or detach requests a bounded abort and requires a new indexing operation, including documentation-only, incremental and checkpoint-disabled sessions.
 
 Temporary queue saturation is retried within `queueWaitTimeoutMs` (default
 600000), preserving the original payload and honoring the request's
@@ -359,14 +359,14 @@ commit. It includes heartbeat/liveness, phase timing, throughput, queue, retry,
 warning, ETA-confidence, and cumulative count fields.
 
 `processingTimeoutMs` is one caller wait budget across tier drains, starting at
-the first processing wait. Before all required source uploads are accepted,
-if the wait budget expires or the caller requests detach, the SDK requests an
-abort and raises a restart-required error because polling cannot resume unsent
-source. After all uploads are accepted, expiry raises
-`RemoteIndexDetachedError`; backend work continues and the error contains the
-session id. Use `followIndexSession(sessionId, ...)` to reattach. An
-`AbortSignal` sends `DELETE /v1/index/sessions/{id}` and waits for
-the terminal `aborted` status before raising `RemoteIndexCancelledError`.
+first processing wait or code checkpoint. Every interruption before commit
+requests abort within a separate one-second cleanup budget. Timeout and detach
+raise a restart-required error even after all uploads are acknowledged: polling
+cannot perform the client-owned commit. Caller cancellation raises
+`RemoteIndexCancelledError` only when the owned aborted session has explicitly
+zero pending and active batches; unknown release requires a restart.
+`followIndexSession(sessionId, ...)` remains available for observing work that is
+already owned by the server; its detach behavior does not finish a client commit.
 
 Use `mode: "full"` when the file list represents the complete workspace
 snapshot. The backend stores a new manifest generation and, during commit,
@@ -496,9 +496,11 @@ second with the original server sequence and an updated `last_heartbeat_at`.
 Client events include optional `event_origin` to distinguish their sequence space.
 Tier-drain status headers and bodies share the remaining processing deadline and
 are interrupted by cancellation or detach; late responses cannot update progress.
-For fully submitted ordinary sessions detached before polling, a separate status
-receipt attempt takes at most one second. If no receipt is available, bounded
-abort confirmation takes at most one further second; no status is fabricated.
+Cancellation and detach before the first poll, including synchronous upload
+callbacks and before manifest submission, use the same bounded abort cleanup.
+No precommit session is advertised as resumable through status polling.
+Fatal errors keep their original cause while a best-effort abort is limited to
+one second; a failed cleanup attempt does not confirm session release.
 
 Transfer results also report `queue_full_responses`, `queue_retries`,
 `queue_wait_ms`, and `transport_retries`. A queue rejection followed by cancellation

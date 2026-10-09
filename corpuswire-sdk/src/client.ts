@@ -1121,14 +1121,6 @@ export class CorpusWireClient {
     });
   }
 
-  private async abortIndexSessionQuietly(sessionId: string): Promise<void> {
-    try {
-      await this.abortIndexSession(sessionId);
-    } catch {
-      // Best effort: preserve the original indexing failure for callers.
-    }
-  }
-
   private async releaseCodeStageSession(
     session: RemoteIndexSession,
     workspaceId: string,
@@ -1226,21 +1218,6 @@ export class CorpusWireClient {
         return status;
       }
       await waitForIndexInterruptDelay(remainingIndexPollDelay(pollDelay, deadline), request);
-    }
-  }
-
-  private async checkIndexWorkspaceInterrupt(
-    sessionId: string,
-    request: Pick<IndexWorkspaceRequest, "signal" | "detachSignal">,
-    onProgress: (event: RemoteIndexProgressEvent) => void,
-  ): Promise<void> {
-    if (request.signal?.aborted) {
-      await this.abortIndexSession(sessionId);
-      const status = await this.waitForIndexSessionTerminal(sessionId, 250, onProgress, request.detachSignal);
-      throw new RemoteIndexCancelledError(sessionId, status);
-    }
-    if (request.detachSignal?.aborted) {
-      throw new RemoteIndexDetachedError(sessionId, await this.getIndexSessionStatus(sessionId), "Detached by caller");
     }
   }
 
@@ -1379,13 +1356,9 @@ export class CorpusWireClient {
     const checkInterrupt = async (): Promise<void> => {
       // Include interrupts queued by a just-delivered progress callback.
       await Promise.resolve();
-      if (clientOwnedCheckpoint && (request.signal?.aborted || request.detachSignal?.aborted)) {
-        throw new DOMException("Client-owned checkpoint interrupted", "AbortError");
-      }
-      if (lastProcessingStatus !== undefined && (request.signal?.aborted || request.detachSignal?.aborted)) {
+      if (request.signal?.aborted || request.detachSignal?.aborted) {
         throw new IndexProcessingInterruptedError(request.signal?.aborted ? "cancel" : "detach", lastProcessingStatus);
       }
-      await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
     };
     try {
       await checkInterrupt();
@@ -1595,22 +1568,12 @@ export class CorpusWireClient {
         );
         lastProcessingStatus = processingStatus;
         if (request.signal?.aborted || processingStatus.phase === "aborted") {
-          if (clientOwnedCheckpoint) throw new DOMException("Client-owned checkpoint interrupted", "AbortError");
-          if (processingStatus.phase !== "aborted") {
-            await this.abortIndexSession(session.session_id);
-          }
-          const terminal = await this.waitForIndexSessionTerminal(
-            session.session_id,
-            request.processingPollMs ?? 250,
-            emitProgress,
-            request.detachSignal,
-          );
-          throw new RemoteIndexCancelledError(session.session_id, terminal);
+          throw new IndexProcessingInterruptedError("cancel", processingStatus);
         }
       }
       await checkInterrupt();
       emitClientProgress("committing", 0, null, "items", "Waiting for verified commit", session.session_id);
-      if (clientOwnedCheckpoint) await checkInterrupt();
+      await checkInterrupt();
       const committed = await this.commitIndexSession(session.session_id);
       clientOwnedCheckpoint = false;
       phaseClock.pause();
@@ -1632,32 +1595,11 @@ export class CorpusWireClient {
         if (error instanceof Error) Object.assign(error, { transfer });
         throw error;
       }
-      if (!clientOwnedCheckpoint && error instanceof IndexProcessingInterruptedError
-        && error.reason !== "cancel"
-        && transfer.files_upload_required !== null && transfer.files_transferred >= transfer.files_upload_required) {
-        let observed = error.status;
-        // A detach immediately after the final acknowledgement can precede the
-        // first poll. Obtain its receipt without leaving an unbounded GET.
-        if (observed === undefined && error.reason === "detach" && error.cause === undefined) {
-          const receiptDeadline = Date.now() + 1_000;
-          try {
-            const receiptBudget = receiptDeadline - Date.now();
-            if (receiptBudget <= 0) throw new Error("Detach status receipt timed out");
-            observed = await withRequestBudget(async (signal) => {
-              const status = await this.getIndexSessionStatus(session.session_id, { signal });
-              if (signal.aborted || Date.now() >= receiptDeadline) throw new Error("Detach status receipt timed out");
-              return status;
-            }, receiptBudget, undefined, () => new Error("Detach status receipt timed out"));
-          } catch { /* Unknown status requires finite abort cleanup below. */ }
-        }
-        if (observed !== undefined) {
-          const detached = new RemoteIndexDetachedError(session.session_id, observed,
-            error.reason === "timeout" ? "Caller wait timeout elapsed" : "Detached by caller");
-          Object.assign(detached, { transfer, cause: error });
-          throw detached;
-        }
+      if (!(error instanceof IndexProcessingInterruptedError) && (request.signal?.aborted || request.detachSignal?.aborted
+        || error instanceof RemoteIndexDetachedError)) {
+        error = new IndexProcessingInterruptedError(request.signal?.aborted ? "cancel" : "detach", lastProcessingStatus, error);
       }
-      if (clientOwnedCheckpoint || error instanceof IndexProcessingInterruptedError) {
+      if (clientOwnedCheckpoint || error instanceof IndexProcessingInterruptedError || error instanceof RemoteIndexCancelledError) {
         let terminal: RemoteIndexStatus | undefined;
         try {
           terminal = await this.abortIndexSessionByDeadline(session.session_id, Date.now() + 1_000,
@@ -1668,7 +1610,11 @@ export class CorpusWireClient {
             ? isOwnedCodeStageStatus(terminal, session, request.workspace.workspaceId)
               && terminal.pending_batches === 0 && terminal.active_batches === 0
             : terminal.session_id === session.session_id && Array.isArray(terminal.errors) && terminal.errors.length === 0
-              && (terminal.pending_batches ?? 0) === 0 && (terminal.active_batches ?? 0) === 0);
+              && (session.workspace_id === undefined || terminal.workspace_id === session.workspace_id)
+              && (session.collection_name === undefined || terminal.collection_name === session.collection_name)
+              && (session.mode === undefined || terminal.mode === session.mode)
+              && (terminal.failed_batches === undefined || terminal.failed_batches === 0)
+              && terminal.pending_batches === 0 && terminal.active_batches === 0);
         if ((request.signal?.aborted || error instanceof RemoteIndexCancelledError
           || (error instanceof IndexProcessingInterruptedError && error.reason === "cancel")) && confirmed) {
           const cancelled = new RemoteIndexCancelledError(session.session_id, terminal!);
@@ -1692,38 +1638,11 @@ export class CorpusWireClient {
         Object.assign(interrupted, { transfer });
         throw interrupted;
       }
-      if (!(error instanceof RemoteIndexDetachedError) && !(error instanceof RemoteIndexCancelledError)
-        && (request.signal?.aborted || request.detachSignal?.aborted)) {
-        try {
-          await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
-        } catch (interruption) {
-          error = interruption;
-        }
-      }
-      const incompleteUploads = transfer.files_upload_required === null
-        || transfer.files_transferred < transfer.files_upload_required;
-      if (error instanceof RemoteIndexDetachedError && (incompleteUploads || clientOwnedCheckpoint)) {
-        // Polling cannot submit remaining source or finish a client-owned code
-        // checkpoint/commit, so retaining either session would strand it.
-        const stoppedPhase = incompleteUploads ? "incomplete session" : "interrupted code checkpoint session";
-        let abortMessage = `an abort was requested for the ${stoppedPhase}`;
-        try {
-          await this.abortIndexSession(session.session_id);
-        } catch {
-          abortMessage = `the ${stoppedPhase}'s abort could not be confirmed`;
-        }
-        const reason = incompleteUploads
-          ? "Indexing stopped before all required source uploads were submitted"
-          : "Indexing stopped during the client-owned code checkpoint";
-        const incomplete = new Error(`${reason}; ${abortMessage}. Start a new index operation to complete the inventory.`);
-        Object.assign(incomplete, { transfer, cause: error });
-        throw incomplete;
-      }
       if (error instanceof Error) Object.assign(error, { transfer });
-      if (error instanceof RemoteIndexDetachedError || error instanceof RemoteIndexCancelledError) {
-        throw error;
-      }
-      await this.abortIndexSessionQuietly(session.session_id);
+      try {
+        await withRequestBudget((signal) => this.abortIndexSession(session.session_id, { signal }),
+          1_000, undefined, () => new Error("Index failure cleanup timed out"));
+      } catch { /* Preserve the original failure; release remains unconfirmed. */ }
       throw error;
     } finally {
       phaseClock.pause();

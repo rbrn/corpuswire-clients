@@ -113,11 +113,9 @@ export declare class CorpusWireClient {
         session_id: string;
         phase: string;
     }>;
-    private abortIndexSessionQuietly;
     private releaseCodeStageSession;
     private abortIndexSessionByDeadline;
     private waitForIndexSessionProcessing;
-    private checkIndexWorkspaceInterrupt;
     indexWorkspace(request: IndexWorkspaceRequest): Promise<RemoteIndexCommitResponse>;
     /**
      * Publish code from a complete scan and release the drained owned session.
