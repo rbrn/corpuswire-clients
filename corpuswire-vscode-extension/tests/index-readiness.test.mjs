@@ -64,6 +64,36 @@ const statusStart = source.indexOf('async function runIndexStatusCheck(');
 const statusEnd = source.indexOf('\nasync function runFetchModel', statusStart);
 assert.ok(rootsStart > 0 && commandEnd > commandStart && watcherEnd > watcherStart);
 
+const directoryStat = (overrides = {}) => ({ type: 2, ctime: 1, mtime: 2, size: 0, ...overrides });
+function workspaceScanner(root, hooks = {}) {
+  let rootStats = 0;
+  const vscode = {
+    FileType: { Directory: 2, SymbolicLink: 64 },
+    RelativePattern: class { constructor(folder, glob) { this.root = folder; this.glob = glob; } },
+    workspace: {
+      fs: {
+        stat: async (uri) => uri.toString() === root.uri.toString()
+          ? hooks.rootStat?.(++rootStats) ?? directoryStat()
+          : { type: 1, ctime: 1, mtime: 1, size: 3 },
+        readFile: async (uri) => hooks.readFile?.(uri) ?? new Uint8Array(3),
+        readDirectory: async () => hooks.readDirectory?.() ?? [],
+      },
+      findFiles: async () => hooks.findFiles?.() ?? [],
+      getWorkspaceFolder: () => root,
+      asRelativePath: (uri) => uri.toString().slice(root.uri.toString().length + 1),
+    },
+  };
+  return new Function('vscode', 'isIndexExcludedPath', 'createHash', `
+    const INDEX_INCLUDE_GLOB = ${JSON.stringify(includeGlob)};
+    const INDEX_EXCLUDE_GLOB = ${JSON.stringify(excludeGlob)};
+    function indexRootKey(root) { return root.uri.toString(); }
+    ${source.slice(workspaceScanStart, workspaceScanEnd)}
+    ${source.slice(start, end)}
+    ${source.slice(relativeStart, relativeEnd)}
+    return collectWorkspaceFiles;
+  `)(vscode, excludedPath, createHash);
+}
+
 function folder(name) {
   const root = `file:///workspace/${name}`;
   return { name, uri: { toString: () => root } };
@@ -155,7 +185,7 @@ function extensionHarness(folders, overrides = new Map()) {
   const collectWorkspaceFiles = async (root, _limit, signal) => {
     if (signal?.aborted) throw new Error('scan cancelled');
     scans.push(root.name);
-    return scan(root);
+    return scan(root, signal);
   };
   const functions = new Function('vscode', 'readSettings', 'CorpusWireClient', 'buildAuthenticatedServiceHeaders',
     'collectWorkspaceFiles', 'collectUriFiles', 'isIndexExcludedPath', 'setTimeout', 'clearTimeout', `
@@ -360,8 +390,10 @@ test('full workspace scanner partitions nested roots and keeps exclusion evidenc
   const own = file(parent, 'src/shared.ts');
   const nested = file(child, 'src/shared.ts');
   const vscode = {
+    FileType: { Directory: 2, SymbolicLink: 64 },
     RelativePattern: class { constructor(root, glob) { this.root = root; this.glob = glob; } },
     workspace: {
+      fs: { stat: async () => directoryStat(), readDirectory: async () => [] },
       findFiles: async () => [own, nested],
       getWorkspaceFolder: (uri) => uri.toString().startsWith(`${child.uri.toString()}/`) ? child : parent,
     },
@@ -411,7 +443,9 @@ test('production scanner and watcher include canonical code extensions and wrapp
         });
       },
       fs: {
-        stat: async () => ({ type: 1, size: 3, mtime: 1 }),
+        readDirectory: async () => [],
+        stat: async (uri) => uri.toString() === parent.uri.toString()
+          ? directoryStat() : { type: 1, size: 3, mtime: 1 },
         readFile: async (uri) => {
           readPaths.push(uri.toString().slice(parent.uri.toString().length + 1));
           return new Uint8Array(3);
@@ -833,4 +867,168 @@ test('a callback publication remains visible when cancellation prevents a code-s
   assert.equal(harness.requests.length, 0);
   assert.equal(harness.information.length, 0);
   assert.ok(harness.warnings.some((message) => /Published code is preserved for 1 folder/.test(message)));
+});
+
+test('production full scanner accepts an intact empty directory and checks it across discovery and reads', async () => {
+  const root = folder('intact-empty');
+  let checks = 0, discoveries = 0;
+  const collect = workspaceScanner(root, {
+    rootStat: () => { checks += 1; return directoryStat(); },
+    findFiles: () => { discoveries += 1; return []; },
+    readFile: () => { assert.fail('Empty roots have no files to read'); },
+  });
+  const result = await collect(root, 100);
+  assert.deepEqual(result.files, []);
+  assert.equal(result.inventoryScan.complete, true);
+  assert.equal(checks, 3);
+  assert.equal(discoveries, 1);
+});
+
+test('production full scanner rejects missing inaccessible non-directory and symlink roots before discovery', async () => {
+  const root = folder('unavailable');
+  for (const rootStat of [
+    () => { throw new Error('Synthetic missing root'); },
+    () => { throw new Error('Synthetic permission denial'); },
+    () => directoryStat({ type: 1 }),
+    () => directoryStat({ type: 2 | 64 }),
+    () => directoryStat({ ctime: undefined }),
+  ]) {
+    const collect = workspaceScanner(root, {
+      rootStat, findFiles: () => { assert.fail('Invalid root must not discover files'); },
+    });
+    await assert.rejects(collect(root, 100), { code: 'scan_incomplete' });
+  }
+});
+
+test('production full scanner rejects empty discovery after root loss replacement or metadata change', async () => {
+  const root = folder('discovery-race');
+  for (const changed of [{ type: 1 }, { type: 2 | 64 }, { ctime: 3 }, { mtime: 3 }, { size: 1 }]) {
+    const collect = workspaceScanner(root, {
+      rootStat: (check) => directoryStat(check === 1 ? {} : changed),
+      findFiles: () => [],
+    });
+    await assert.rejects(collect(root, 100), { code: 'scan_incomplete' });
+  }
+  const disappeared = workspaceScanner(root, {
+    rootStat: (check) => { if (check > 1) throw new Error('Synthetic disappeared root'); return directoryStat(); },
+    findFiles: () => [],
+  });
+  await assert.rejects(disappeared(root, 100), { code: 'scan_incomplete' });
+  const failedDiscovery = workspaceScanner(root, { findFiles: () => { throw new Error('Synthetic discovery outage'); } });
+  await assert.rejects(failedDiscovery(root, 100), { code: 'scan_incomplete' });
+});
+
+test('production full scanner snapshots root metadata and rechecks root after the last read', async () => {
+  const root = folder('read-race');
+  const sharedStat = directoryStat();
+  const mutated = workspaceScanner(root, {
+    rootStat: () => sharedStat,
+    findFiles: () => { sharedStat.ctime += 1; return []; },
+  });
+  await assert.rejects(mutated(root, 100), { code: 'scan_incomplete' });
+  let read = false;
+  const replaced = workspaceScanner(root, {
+    rootStat: () => directoryStat(read ? { ctime: 99 } : {}),
+    findFiles: () => [file(root, 'main.py')],
+    readFile: () => { read = true; return new Uint8Array(3); },
+  });
+  await assert.rejects(replaced(root, 100), { code: 'scan_incomplete' });
+  assert.equal(read, true);
+});
+
+test('production full scanner rejects cancellation before scan during empty discovery and during final read', async () => {
+  const root = folder('cancelled-root');
+  const before = new AbortController(); before.abort();
+  await assert.rejects(workspaceScanner(root, {
+    rootStat: () => { assert.fail('Cancelled scan must not stat the root'); },
+  })(root, 100, before.signal), { code: 'scan_incomplete' });
+  const discovery = new AbortController();
+  await assert.rejects(workspaceScanner(root, {
+    findFiles: () => { discovery.abort(); return []; },
+  })(root, 100, discovery.signal), { code: 'scan_incomplete' });
+  const read = new AbortController();
+  await assert.rejects(workspaceScanner(root, {
+    findFiles: () => [file(root, 'main.py')],
+    readFile: () => { read.abort(); return new Uint8Array(3); },
+  })(root, 100, read.signal), { code: 'scan_incomplete' });
+});
+
+test('full command creates no session for unavailable root but accepts a genuine intact empty root', async () => {
+  const missing = folder('missing-command');
+  const failed = extensionHarness([missing]);
+  failed.setScan(workspaceScanner(missing, { rootStat: () => { throw new Error('Synthetic missing root'); } }));
+  await failed.indexCurrentWorkspace();
+  assert.equal(failed.stageRequests.length, 0);
+  assert.equal(failed.requests.length, 0);
+  assert.equal(failed.information.length, 0);
+  assert.ok(failed.warnings.some((message) => /Workspace scan incomplete/.test(message)));
+  const empty = folder('empty-command');
+  const intact = extensionHarness([empty]);
+  intact.setScan((root, signal) => workspaceScanner(empty)(root, 100, signal));
+  await intact.indexCurrentWorkspace();
+  assert.equal(intact.requests.length, 1);
+  assert.deepEqual(intact.requests[0].files, []);
+  assert.equal(intact.requests[0].inventoryScan.complete, true);
+  assert.equal(intact.information.length, 1);
+});
+
+test('healthy root stat with denied listing cannot certify an empty inventory or start a session', async () => {
+  const root = folder('denied-root-listing');
+  let discoveries = 0;
+  const collect = workspaceScanner(root, {
+    rootStat: () => directoryStat(),
+    readDirectory: () => { throw new Error('Synthetic listing denial'); },
+    findFiles: () => { discoveries += 1; return []; },
+  });
+  await assert.rejects(collect(root, 100), { code: 'scan_incomplete' });
+  assert.equal(discoveries, 0);
+  const harness = extensionHarness([root]);
+  harness.setScan((folder, signal) => collect(folder, 100, signal));
+  await harness.indexCurrentWorkspace();
+  assert.equal(harness.requests.length, 0);
+  assert.equal(harness.stageRequests.length, 0);
+  assert.equal(harness.information.length, 0);
+  assert.ok(harness.warnings.some((message) => /Workspace scan incomplete/.test(message)));
+});
+
+test('failed fresh production scan preserves published code and starts no full continuation session', async () => {
+  for (const reason of ['missing', 'inaccessible', 'replaced']) {
+    const root = folder(`failed-continuation-${reason}`);
+    const harness = extensionHarness([root], new Map([[root.name, { codeFirstPass: true }]]));
+    let published = false;
+    const collect = workspaceScanner(root, {
+      rootStat: () => {
+        if (published && reason !== 'replaced') throw new Error(`Synthetic ${reason} root`);
+        return directoryStat(published ? { type: 1 } : {});
+      },
+      findFiles: () => [file(root, 'main.py')],
+    });
+    harness.setScan((folder, signal) => collect(folder, 100, signal));
+    harness.setCodeStage(async (request) => {
+      const checkpoint = { coverage: { state: 'pending', code_ready: true, documentation_pending: true } };
+      request.onCodeReady(checkpoint);
+      published = true;
+      return { outcome: 'code_ready', checkpoint, release_status: { phase: 'aborted' }, full_inventory_complete: false };
+    });
+    await harness.indexCurrentWorkspace({ recreateCollection: true });
+    assert.equal(harness.stageRequests.length, 1);
+    assert.equal(harness.requests.length, 0);
+    assert.equal(harness.information.length, 0);
+    assert.ok(harness.warnings.some((message) => /Workspace scan incomplete.*Published code is preserved; full inventory remains pending/.test(message)));
+  }
+});
+
+test('cancelled empty discovery on fresh continuation preserves code without starting another session', async () => {
+  const root = folder('cancelled-empty-continuation');
+  const harness = extensionHarness([root], new Map([[root.name, { codeFirstPass: true }]]));
+  let discoveries = 0;
+  const collect = workspaceScanner(root, {
+    findFiles: () => { if (++discoveries === 1) return [file(root, 'main.py')]; harness.cancel(); return []; },
+  });
+  harness.setScan((folder, signal) => collect(folder, 100, signal));
+  await harness.indexCurrentWorkspace();
+  assert.equal(harness.stageRequests.length, 1);
+  assert.equal(harness.requests.length, 0);
+  assert.equal(harness.information.length, 0);
+  assert.ok(harness.warnings.some((message) => /Workspace scan incomplete.*Published code is preserved/.test(message)));
 });

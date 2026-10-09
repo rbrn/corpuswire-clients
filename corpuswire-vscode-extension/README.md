@@ -409,6 +409,14 @@ valid for hosted services that cannot mount the local path.
 
 Full indexing now fails if an eligible file cannot be read or changes during its read. It supplies a declared inventory for the selected include/exclude policy and skips symlinks. Watcher batches retain incremental semantics and cannot establish a full baseline by themselves. Completion notifications display inventory coverage and acknowledged transferred files separately; unsupported older services display unknown coverage.
 
+The source root must remain a directory that can be listed, with unchanged creation
+time, modification time and size before discovery, after discovery and after file reads.
+A missing, changed, symlink or cancelled root fails the scan before a session can
+publish an empty inventory. An intact empty directory remains valid. VS Code's
+filesystem API exposes no inode or generation identity, so replacement that
+preserves all those metadata values cannot be detected by these checks. Discovery
+and file reads do not provide an atomic snapshot of the whole directory tree.
+
 The experimental `corpuswire.remoteIndexing.codeFirstPass` setting applies to
 manual full indexing and rebuild commands. Keep it disabled for ordinary full
 indexing; no performance gain has yet been measured. When enabled, at most two
@@ -423,3 +431,5 @@ indexing. Published code remains marked pending until full verification. Cancel
 stops later roots/passes and retains already-published code; a released code
 stage never triggers a full-completion notification. Automatic incremental
 watcher updates keep their existing behavior.
+If the fresh continuation scan fails, its error also reports that published code
+is preserved and full inventory remains pending; no continuation session starts.

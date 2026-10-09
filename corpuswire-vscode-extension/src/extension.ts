@@ -833,7 +833,9 @@ async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}, confir
     for (const outcome of outcomes) {
       const { folder, settings } = outcome.root;
       if (outcome.error) {
-        void vscode.window.showWarningMessage(`${folder.name}: ${formatIndexingError(outcome.error, settings.services.indexer.url)}`);
+        const pendingSuffix = pendingCodeRoots.has(indexRootKey(folder))
+          ? " Published code is preserved; full inventory remains pending." : "";
+        void vscode.window.showWarningMessage(`${folder.name}: ${formatIndexingError(outcome.error, settings.services.indexer.url)}${pendingSuffix}`);
         continue;
       }
       const skippedSuffix = outcome.skippedLargeFiles
@@ -1028,22 +1030,46 @@ async function collectWorkspaceFiles(
   signal?: AbortSignal,
 ): Promise<CollectedWorkspaceFiles> {
   const startedAt = new Date().toISOString();
-  const uris = await vscode.workspace.findFiles(
-    new vscode.RelativePattern(workspaceFolder, INDEX_INCLUDE_GLOB),
-    new vscode.RelativePattern(workspaceFolder, INDEX_EXCLUDE_GLOB),
-  );
-  // Nested workspace folders have independent identities and must never appear in this root's inventory.
-  const rootUris = uris.filter((uri) => {
-    const actualRoot = vscode.workspace.getWorkspaceFolder(uri);
-    if (!actualRoot) throw Object.assign(new Error("Workspace scan incomplete"), { code: "scan_incomplete" });
-    return indexRootKey(actualRoot) === indexRootKey(workspaceFolder);
-  });
-  const collected = await collectUriFiles(rootUris, maxFileSizeBytes, true, signal);
-  return { ...collected, inventoryScan: {
-    complete: true, startedAt, completedAt: new Date().toISOString(),
-    excludedFileCount: collected.skippedLargeFiles + collected.skippedPolicyFiles + uris.length - rootUris.length, producer: "corpuswire-vscode-scan/v1",
-    ignoreDigest: createHash("sha256").update(JSON.stringify({ include: INDEX_INCLUDE_GLOB, exclude: INDEX_EXCLUDE_GLOB, hiddenPaths: "exclude", retrievalExclusions: "discovery-and-terraform/v1", workspaceRootIsolation: "v1" })).digest("hex"),
-  } };
+  const checkRoot = async (before?: vscode.FileStat): Promise<vscode.FileStat> => {
+    if (signal?.aborted) throw new Error("Indexing cancelled during scan");
+    const stat = await vscode.workspace.fs.stat(workspaceFolder.uri);
+    if (signal?.aborted) throw new Error("Indexing cancelled during scan");
+    if (stat.type !== vscode.FileType.Directory
+      || ![stat.ctime, stat.mtime, stat.size].every(Number.isFinite)
+      || (before && (stat.ctime !== before.ctime || stat.mtime !== before.mtime || stat.size !== before.size))) {
+      throw new Error("Source root unavailable or changed during scan");
+    }
+    // FileStat exposes no inode/generation identity; snapshot all available directory metadata.
+    const snapshot = { type: stat.type, ctime: stat.ctime, mtime: stat.mtime, size: stat.size };
+    // Discovery can return an empty list when listing fails even if directory stat succeeds.
+    await vscode.workspace.fs.readDirectory(workspaceFolder.uri);
+    if (signal?.aborted) throw new Error("Indexing cancelled during scan");
+    return snapshot;
+  };
+  try {
+    const rootStat = await checkRoot();
+    const uris = await vscode.workspace.findFiles(
+      new vscode.RelativePattern(workspaceFolder, INDEX_INCLUDE_GLOB),
+      new vscode.RelativePattern(workspaceFolder, INDEX_EXCLUDE_GLOB),
+    );
+    await checkRoot(rootStat);
+    // Nested workspace folders have independent identities and must never appear in this root's inventory.
+    const rootUris = uris.filter((uri) => {
+      const actualRoot = vscode.workspace.getWorkspaceFolder(uri);
+      if (!actualRoot) throw new Error("File left workspace during scan");
+      return indexRootKey(actualRoot) === indexRootKey(workspaceFolder);
+    });
+    const collected = await collectUriFiles(rootUris, maxFileSizeBytes, true, signal);
+    await checkRoot(rootStat);
+    return { ...collected, inventoryScan: {
+      complete: true, startedAt, completedAt: new Date().toISOString(),
+      excludedFileCount: collected.skippedLargeFiles + collected.skippedPolicyFiles + uris.length - rootUris.length, producer: "corpuswire-vscode-scan/v1",
+      ignoreDigest: createHash("sha256").update(JSON.stringify({ include: INDEX_INCLUDE_GLOB, exclude: INDEX_EXCLUDE_GLOB, hiddenPaths: "exclude", retrievalExclusions: "discovery-and-terraform/v1", workspaceRootIsolation: "v1" })).digest("hex"),
+    } };
+  } catch (cause) {
+    throw Object.assign(new Error(signal?.aborted ? "Workspace scan incomplete: indexing cancelled during scan."
+      : "Workspace scan incomplete: source root or files unavailable or changed.", { cause }), { code: "scan_incomplete" });
+  }
 }
 
 async function collectUriFiles(uris: vscode.Uri[], maxFileSizeBytes: number, strict = false, signal?: AbortSignal): Promise<CollectedWorkspaceFiles> {
