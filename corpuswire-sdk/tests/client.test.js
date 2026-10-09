@@ -2349,6 +2349,48 @@ test("review telemetry summary uses the operator endpoint and returns typed aggr
   }]);
 });
 
+test("requestJson honors explicit nonretryable errors before generic transient retries", { timeout: 1000 }, async () => {
+  for (const status of [429, 503]) {
+    let attempts = 0;
+    await assert.rejects(requestJson({
+      baseUrl: "http://fixture.test", paths: ["/v1/index/sessions"], retryAttempts: 2,
+      init: { signal: AbortSignal.timeout(500) },
+      fetchFn: async () => {
+        attempts++;
+        return jsonResponse(status, { detail: {
+          code: "index_quota_exceeded", message: "Active session limit reached", retryable: false,
+        } }, { "Retry-After": "60" });
+      },
+    }), (error) => error instanceof CorpusWireHttpError
+      && error.status === status && error.errorCode === "index_quota_exceeded"
+      && error.retryable === false && error.errorMessage === "Active session limit reached");
+    assert.equal(attempts, 1);
+  }
+});
+
+test("requestJson preserves legacy transient retries when retryability is omitted", async () => {
+  const cases = [
+    [429, { detail: "Tenant session limit reached" }],
+    [503, { detail: { code: "embedding_not_ready", message: "Warming up" } }],
+    [503, { ok: false, request_id: "legacy", duration_ms: 1, error: { code: "unavailable", message: "Try later" } }],
+    [503, { schema_version: "review-context/v2", error_code: "unavailable", message: "Try later", request_id: "legacy" }],
+  ];
+  for (const [status, payload] of cases) {
+    let attempts = 0;
+    const result = await requestJson({
+      baseUrl: "http://fixture.test", paths: ["/legacy"], retryDelayMs: 0,
+      fetchFn: async () => ++attempts === 1
+        ? jsonResponse(status, payload, { "Retry-After": "0" }) : jsonResponse(200, { ok: true }),
+    });
+    assert.deepEqual(result, { ok: true });
+    assert.equal(attempts, 2);
+    await assert.rejects(requestJson({
+      baseUrl: "http://fixture.test", paths: ["/legacy"], retryAttempts: 0,
+      fetchFn: async () => jsonResponse(status, payload),
+    }), (error) => error instanceof CorpusWireHttpError && error.retryable === true);
+  }
+});
+
 test("requestJson exposes stable review errors and Retry-After metadata", async () => {
   await assert.rejects(
     requestJson({

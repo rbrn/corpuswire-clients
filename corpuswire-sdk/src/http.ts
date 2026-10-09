@@ -156,6 +156,7 @@ export async function requestJson<T>(options: RequestJsonOptions): Promise<T> {
         // uploader. Do not consume that budget inside generic HTTP retries.
         if (attempt < retryAttempts && TRANSIENT_HTTP_STATUSES.has(response.status)
           && (response.status !== 429 || options.retryHttp429 !== false)
+          && parsed?.retryable !== false
           && parsed?.errorCode !== "index_queue_full") {
           const retryAfterSeconds = responseRetryAfterSeconds(response);
           await waitForRetry(retryDelayMs, attempt, retryAfterSeconds, options.init?.signal);
@@ -239,7 +240,7 @@ interface ParsedApiError {
   errorMessage: string;
   errorDetail: unknown;
   errorEnvelope: EnhanceErrorEnvelope | ReviewContextErrorEnvelope | null;
-  retryable: boolean;
+  retryable: boolean | null;
   retryAfterSeconds: number | null;
   recoveryGuidance: readonly string[];
 }
@@ -285,7 +286,7 @@ function parseApiError(responseBody: string): ParsedApiError | null {
         errorMessage: candidate.message,
         errorDetail: candidate.details,
         errorEnvelope: candidate,
-        retryable: candidate.retryable === true,
+        retryable: typeof candidate.retryable === "boolean" ? candidate.retryable : null,
         retryAfterSeconds: nonNegativeIntegerOrNull(candidate.retry_after_seconds),
         recoveryGuidance: normalizeRecoveryGuidance(candidate.recovery_guidance),
       };
@@ -311,7 +312,7 @@ function parseApiError(responseBody: string): ParsedApiError | null {
         errorMessage: message,
         errorDetail: detail,
         errorEnvelope: null,
-        retryable: detailRecord?.retryable === true,
+        retryable: typeof detailRecord?.retryable === "boolean" ? detailRecord.retryable : null,
         retryAfterSeconds: nonNegativeIntegerOrNull(detailRecord?.retry_after_seconds),
         recoveryGuidance: [],
       };
@@ -335,7 +336,7 @@ function parseApiError(responseBody: string): ParsedApiError | null {
       errorMessage: envelope.error.message,
       errorDetail: envelope.error.detail,
       errorEnvelope: envelope,
-      retryable: false,
+      retryable: null,
       retryAfterSeconds: null,
       recoveryGuidance: [],
     };

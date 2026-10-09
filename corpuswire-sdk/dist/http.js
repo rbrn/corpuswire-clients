@@ -105,6 +105,7 @@ export async function requestJson(options) {
                 // uploader. Do not consume that budget inside generic HTTP retries.
                 if (attempt < retryAttempts && TRANSIENT_HTTP_STATUSES.has(response.status)
                     && (response.status !== 429 || options.retryHttp429 !== false)
+                    && parsed?.retryable !== false
                     && parsed?.errorCode !== "index_queue_full") {
                     const retryAfterSeconds = responseRetryAfterSeconds(response);
                     await waitForRetry(retryDelayMs, attempt, retryAfterSeconds, options.init?.signal);
@@ -206,7 +207,7 @@ function parseApiError(responseBody) {
                 errorMessage: candidate.message,
                 errorDetail: candidate.details,
                 errorEnvelope: candidate,
-                retryable: candidate.retryable === true,
+                retryable: typeof candidate.retryable === "boolean" ? candidate.retryable : null,
                 retryAfterSeconds: nonNegativeIntegerOrNull(candidate.retry_after_seconds),
                 recoveryGuidance: normalizeRecoveryGuidance(candidate.recovery_guidance),
             };
@@ -231,7 +232,7 @@ function parseApiError(responseBody) {
                 errorMessage: message,
                 errorDetail: detail,
                 errorEnvelope: null,
-                retryable: detailRecord?.retryable === true,
+                retryable: typeof detailRecord?.retryable === "boolean" ? detailRecord.retryable : null,
                 retryAfterSeconds: nonNegativeIntegerOrNull(detailRecord?.retry_after_seconds),
                 recoveryGuidance: [],
             };
@@ -252,7 +253,7 @@ function parseApiError(responseBody) {
             errorMessage: envelope.error.message,
             errorDetail: envelope.error.detail,
             errorEnvelope: envelope,
-            retryable: false,
+            retryable: null,
             retryAfterSeconds: null,
             recoveryGuidance: [],
         };
