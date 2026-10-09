@@ -4758,7 +4758,7 @@ test("verified MCP health failures block strict reads, incremental sync and doct
       async indexWorkspace(request){appendFileSync(process.env.MOCK_CALLS_PATH,'index\\n');return {ok:true,result:{collection:'fixture'},status:{collection_name:'fixture',coverage:{state:'verified',coverage_token:'baseline',selection_policy_digest:'policy'}},transfer:{complete:true,files_submitted:request.files.length,files_transferred:request.files.length,files_reused:0,acknowledged_files:request.files.map(f=>({relative_path:f.relativePath,sha256:f.sha256,disposition:'uploaded'}))}};}
     }`);
   const launch = (enabled) => spawn("node", [SERVER_BIN], {stdio:["pipe","pipe","pipe"],env:{...process.env,
-    CORPUSWIRE_BASE_URL:"http://127.0.0.1:8000",CORPUSWIRE_SDK_PATH:sdkPath,CORPUSWIRE_WORKSPACE_ID:"fixture",
+    CORPUSWIRE_BASE_URL:"http://127.0.0.1:8000",CORPUSWIRE_SDK_PATH:sdkPath,CORPUSWIRE_WORKSPACE_ID:"fixture",CORPUSWIRE_REPO_PATH:sourceRoot,
     CORPUSWIRE_SYNC_ENABLED:String(enabled),CORPUSWIRE_SYNC_ROOT:sourceRoot,CORPUSWIRE_SYNC_READ_STRICT:"true",
     CORPUSWIRE_SYNC_READ_STRICT_STALE_AFTER_MS:"60000",CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK:"true",
     CORPUSWIRE_SYNC_MTIME_CACHE_ENABLED:"true",CORPUSWIRE_SYNC_STATE_DIR:path.join(root,"cache"),
