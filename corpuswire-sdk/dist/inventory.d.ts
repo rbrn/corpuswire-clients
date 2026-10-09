@@ -1,5 +1,7 @@
 import type { InventoryScan, InventorySelectionPolicy, WorkspaceInventory } from "./types.js";
 export declare const INVENTORY_VERSION: "workspace-inventory/v1";
+/** Scheduling tiers match the server's canonical supported-file registry. */
+export declare function ingestionPriority(relativePath: string): 1 | 2 | 3;
 export interface WorkspaceScanIncompleteDetails {
     sessionId?: string;
     manifestErrors?: readonly string[];

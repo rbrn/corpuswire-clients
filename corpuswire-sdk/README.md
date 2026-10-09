@@ -315,6 +315,20 @@ const commit = await client.indexWorkspace({
 console.log(commit.status.files_indexed, commit.status.files_deleted);
 ```
 
+Uploads use code priority 1, documentation priority 2, and other supported files
+priority 3. Each tier drains before the next. A capable server publishes code
+after the first tier of a complete v1 inventory supplied through `inventoryScan`;
+subscribe with
+`onCodeReady: (status) => { ... }` to read `status.coverage.code_ready`,
+`documentation_pending` and `other_pending`. Full coverage remains pending
+until final commit. Legacy servers and snapshot/evaluation sessions retain the
+final-commit contract.
+
+Temporary queue saturation is retried within `queueWaitTimeoutMs` (default
+600000), preserving the original payload and honoring the request's
+`AbortSignal`. Permanent quotas fail immediately. Upload concurrency and batch
+bytes are clamped to advertised server limits.
+
 Preview the same hashed manifest without acquiring a workspace lock or starting
 a session, then subscribe to semantic progress:
 

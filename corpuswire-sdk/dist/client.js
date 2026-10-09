@@ -1,5 +1,5 @@
-import { INVENTORY_VERSION, WorkspaceScanIncompleteError, buildWorkspaceInventory, canonicalInventoryPath, inventoryDigest } from "./inventory.js";
-import { createBearerAuthHeader, requestJson } from "./http.js";
+import { INVENTORY_VERSION, WorkspaceScanIncompleteError, buildWorkspaceInventory, canonicalInventoryPath, ingestionPriority, inventoryDigest } from "./inventory.js";
+import { CorpusWireHttpError, createBearerAuthHeader, requestJson, waitForAbortableDelay } from "./http.js";
 const RUNTIME_ENV = globalThis.process?.env ?? {};
 const DEFAULT_BASE_URL = RUNTIME_ENV.CORPUSWIRE_BASE_URL ?? "http://127.0.0.1:8000";
 const DEFAULT_BASIC_AUTH = RUNTIME_ENV.CORPUSWIRE_BASIC_AUTH ?? "";
@@ -9,6 +9,7 @@ const DEFAULT_REVIEW_POLL_TIMEOUT_MS = 60_000;
 const DEFAULT_REVIEW_POLL_INTERVAL_MS = 1_000;
 const MAX_MANIFEST_ERROR_DETAILS = 20;
 const MAX_MANIFEST_ERROR_LENGTH = 256;
+const DEFAULT_QUEUE_WAIT_TIMEOUT_MS = 600_000;
 export class RemoteIndexDetachedError extends Error {
     transfer;
     sessionId;
@@ -741,22 +742,54 @@ export class CorpusWireClient {
         });
         return response.result;
     }
-    async uploadFileBatch(sessionId, metadata, files, onAttempt) {
+    async uploadFileBatch(sessionId, metadata, files, onAttempt, options = {}) {
         const multipart = buildMultipartMixed(metadata, files);
+        const timeoutMs = validateNonNegativeNumber(options.queueWaitTimeoutMs ?? DEFAULT_QUEUE_WAIT_TIMEOUT_MS, "queueWaitTimeoutMs");
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+            if (options.signal?.aborted)
+                throw new DOMException("Upload aborted", "AbortError");
+            try {
+                const response = await requestJson({
+                    retryHttp429: false,
+                    baseUrl: this.baseUrl,
+                    paths: [`/v1/index/sessions/${encodeURIComponent(sessionId)}/files/batch`],
+                    fetchFn: (input, init) => { onAttempt?.(); return (this.fetchFn ?? globalThis.fetch)(input, init); },
+                    defaultHeaders: this.defaultHeaders,
+                    basicAuth: this.basicAuth,
+                    init: {
+                        method: "POST",
+                        signal: options.signal,
+                        headers: {
+                            "Content-Type": multipart.contentType,
+                            Prefer: "respond-async",
+                        },
+                        body: new Blob([toArrayBuffer(multipart.body)]),
+                    },
+                });
+                return response.result;
+            }
+            catch (error) {
+                if (!(error instanceof CorpusWireHttpError) || error.status !== 429
+                    || error.errorCode !== "index_queue_full" || !error.retryable)
+                    throw error;
+                const remainingMs = deadline - Date.now();
+                if (remainingMs <= 0)
+                    throw error;
+                await waitForAbortableDelay(Math.min(remainingMs, Math.max(10, (error.retryAfterSeconds ?? 1) * 1_000)), options.signal);
+                if (Date.now() >= deadline)
+                    throw error;
+            }
+        }
+    }
+    async checkpointIndexSessionCode(sessionId) {
         const response = await requestJson({
             baseUrl: this.baseUrl,
-            paths: [`/v1/index/sessions/${encodeURIComponent(sessionId)}/files/batch`],
-            fetchFn: (input, init) => { onAttempt?.(); return (this.fetchFn ?? globalThis.fetch)(input, init); },
+            paths: [`/v1/index/sessions/${encodeURIComponent(sessionId)}/checkpoint/code`],
+            fetchFn: this.fetchFn,
             defaultHeaders: this.defaultHeaders,
             basicAuth: this.basicAuth,
-            init: {
-                method: "POST",
-                headers: {
-                    "Content-Type": multipart.contentType,
-                    Prefer: "respond-async",
-                },
-                body: new Blob([toArrayBuffer(multipart.body)]),
-            },
+            init: { method: "POST" },
         });
         return response.result;
     }
@@ -827,7 +860,7 @@ export class CorpusWireClient {
             // Best effort: preserve the original indexing failure for callers.
         }
     }
-    async waitForIndexSessionProcessing(sessionId, timeoutMs, pollMs, request) {
+    async waitForIndexSessionProcessing(sessionId, timeoutMs, pollMs, request, ignoreMissingUploads = false, remainingUploads = 0) {
         const deadline = timeoutMs === undefined ? null : Date.now() + Math.max(1, timeoutMs);
         let lastSequence = -1;
         for (;;) {
@@ -844,7 +877,13 @@ export class CorpusWireClient {
             }
             const pendingBatches = status.pending_batches ?? 0;
             const activeBatches = status.active_batches ?? 0;
-            if (pendingBatches === 0 && activeBatches === 0 && status.queue_depth === 0) {
+            if (status.errors.length > 0)
+                throw new Error(`Remote index session ${sessionId} failed: ${status.errors.join("; ")}`);
+            const countersAvailable = status.pending_batches !== undefined && status.active_batches !== undefined;
+            const drained = ignoreMissingUploads
+                ? countersAvailable || status.queue_depth <= remainingUploads
+                : status.queue_depth === 0;
+            if (pendingBatches === 0 && activeBatches === 0 && drained) {
                 return status;
             }
             if (request.signal?.aborted) {
@@ -856,7 +895,17 @@ export class CorpusWireClient {
             if (deadline !== null && Date.now() >= deadline) {
                 throw new RemoteIndexDetachedError(sessionId, status, "Caller wait timeout elapsed");
             }
-            await new Promise((resolve) => setTimeout(resolve, Math.max(10, pollMs)));
+            await waitForIndexInterruptDelay(Math.max(10, pollMs), request);
+        }
+    }
+    async checkIndexWorkspaceInterrupt(sessionId, request, onProgress) {
+        if (request.signal?.aborted) {
+            await this.abortIndexSession(sessionId);
+            const status = await this.waitForIndexSessionTerminal(sessionId, 250, onProgress, request.detachSignal);
+            throw new RemoteIndexCancelledError(sessionId, status);
+        }
+        if (request.detachSignal?.aborted) {
+            throw new RemoteIndexDetachedError(sessionId, await this.getIndexSessionStatus(sessionId), "Detached by caller");
         }
     }
     async indexWorkspace(request) {
@@ -927,7 +976,12 @@ export class CorpusWireClient {
             source_bytes_attempted: 0, complete: false, acknowledged_files: [],
         };
         const session = await this.startIndexSession(request);
+        const uploadStop = new AbortController();
+        const stopUploads = () => uploadStop.abort();
+        request.signal?.addEventListener("abort", stopUploads, { once: true });
+        request.detachSignal?.addEventListener("abort", stopUploads, { once: true });
         try {
+            await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
             const manifestEntries = buildWorkspaceManifest(remoteFiles, request.deletedPaths ?? []);
             emitClientProgress("manifest_comparison", 0, manifestEntries.length, "files", "Sending manifest for comparison", session.session_id);
             const manifestResult = await this.sendManifestBatch(session.session_id, manifestEntries);
@@ -957,24 +1011,57 @@ export class CorpusWireClient {
             const filesToUpload = remoteFiles.filter(({ file }) => uploadRequired.has(file.relativePath));
             let queuedBackgroundWork = false;
             let uploadedFiles = 0;
-            if (filesToUpload.length > 0) {
-                const uploadBatches = buildUploadBatches(filesToUpload, request.batchBytes ?? session.max_batch_bytes, session.max_batch_files);
-                await runWithConcurrency(uploadBatches, request.maxConcurrentUploads ?? session.max_concurrent_uploads, async (batchFiles) => {
-                    const result = await this.uploadFileBatch(session.session_id, { files: batchFiles.map((file) => file.descriptor) }, batchFiles, () => {
-                        transfer.upload_attempts += 1;
-                        transfer.source_bytes_attempted += batchFiles.reduce((sum, file) => sum + file.descriptor.size, 0);
-                    });
-                    if (result.errors.length)
-                        throw new Error("Source upload was not fully acknowledged");
-                    transfer.files_transferred += batchFiles.length;
-                    transfer.source_bytes_transferred += batchFiles.reduce((sum, file) => sum + file.descriptor.size, 0);
-                    transfer.acknowledged_files.push(...batchFiles.map((file) => ({
-                        relative_path: file.descriptor.relativePath, sha256: file.descriptor.sha256, disposition: "uploaded",
-                    })));
-                    queuedBackgroundWork ||= result.queued === true;
-                    uploadedFiles += batchFiles.length;
-                    emitClientProgress("uploading", uploadedFiles, filesToUpload.length, "files", "Uploading changed files", session.session_id, initiallyComplete, manifestEntries.length);
+            for (const priority of [1, 2, 3]) {
+                await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
+                const tierFiles = filesToUpload.filter(({ file }) => ingestionPriority(file.relativePath) === priority);
+                let tierQueued = false;
+                const uploadBatches = buildUploadBatches(tierFiles, clampUploadLimit(request.batchBytes, session.max_batch_bytes, "batchBytes"), session.max_batch_files);
+                await runWithConcurrency(uploadBatches, clampUploadLimit(request.maxConcurrentUploads, session.max_concurrent_uploads, "maxConcurrentUploads"), async (batchFiles) => {
+                    if (uploadStop.signal.aborted)
+                        throw new DOMException("Upload stopped", "AbortError");
+                    if (batchFiles.some((file) => file.descriptor.size > session.max_batch_bytes)) {
+                        uploadStop.abort();
+                        throw new Error("A source file exceeds the server's upload batch byte limit");
+                    }
+                    try {
+                        const result = await this.uploadFileBatch(session.session_id, { files: batchFiles.map((file) => file.descriptor) }, batchFiles, () => {
+                            transfer.upload_attempts += 1;
+                            transfer.source_bytes_attempted += batchFiles.reduce((sum, file) => sum + file.descriptor.size, 0);
+                        }, { signal: uploadStop.signal, queueWaitTimeoutMs: request.queueWaitTimeoutMs });
+                        if (result.errors.length)
+                            throw new Error("Source upload was not fully acknowledged");
+                        transfer.files_transferred += batchFiles.length;
+                        transfer.source_bytes_transferred += batchFiles.reduce((sum, file) => sum + file.descriptor.size, 0);
+                        transfer.acknowledged_files.push(...batchFiles.map((file) => ({
+                            relative_path: file.descriptor.relativePath, sha256: file.descriptor.sha256, disposition: "uploaded",
+                        })));
+                        queuedBackgroundWork ||= result.queued === true;
+                        tierQueued ||= result.queued === true;
+                        uploadedFiles += batchFiles.length;
+                        emitClientProgress("uploading", uploadedFiles, filesToUpload.length, "files", "Uploading changed files", session.session_id, initiallyComplete, manifestEntries.length);
+                    }
+                    catch (error) {
+                        uploadStop.abort();
+                        throw error;
+                    }
                 });
+                if (tierQueued) {
+                    const status = await this.waitForIndexSessionProcessing(session.session_id, request.processingTimeoutMs, request.processingPollMs ?? 250, { ...request, onProgress: emitProgress }, true, filesToUpload.length - uploadedFiles);
+                    if (status.phase === "aborted")
+                        throw new RemoteIndexCancelledError(session.session_id, status);
+                }
+                await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
+                if (priority === 1 && session.code_checkpoint === true && request.inventory
+                    && session.mode === "full" && !request.snapshotScope && !request.evaluationInventoryAttestation
+                    && remoteFiles.some(({ file }) => ingestionPriority(file.relativePath) === 1)) {
+                    const status = await this.checkpointIndexSessionCode(session.session_id);
+                    if (status.coverage?.code_ready !== true) {
+                        throw new Error("Code checkpoint did not confirm code readiness");
+                    }
+                    if (status.progress)
+                        emitProgress(status.progress);
+                    request.onCodeReady?.(status);
+                }
             }
             if (queuedBackgroundWork) {
                 const processingStatus = await this.waitForIndexSessionProcessing(session.session_id, request.processingTimeoutMs, request.processingPollMs ?? 250, { ...request, onProgress: emitProgress });
@@ -986,11 +1073,7 @@ export class CorpusWireClient {
                     throw new RemoteIndexCancelledError(session.session_id, terminal);
                 }
             }
-            if (request.signal?.aborted) {
-                await this.abortIndexSession(session.session_id);
-                const terminal = await this.waitForIndexSessionTerminal(session.session_id, request.processingPollMs ?? 250, emitProgress, request.detachSignal);
-                throw new RemoteIndexCancelledError(session.session_id, terminal);
-            }
+            await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
             const committed = await this.commitIndexSession(session.session_id);
             if (committed.status.progress) {
                 emitProgress(committed.status.progress);
@@ -999,6 +1082,17 @@ export class CorpusWireClient {
             return { ...committed, transfer };
         }
         catch (error) {
+            if (!(error instanceof RemoteIndexDetachedError) && !(error instanceof RemoteIndexCancelledError)
+                && (request.signal?.aborted || request.detachSignal?.aborted)) {
+                try {
+                    await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
+                }
+                catch (interruption) {
+                    if (interruption instanceof Error)
+                        Object.assign(interruption, { transfer });
+                    throw interruption;
+                }
+            }
             if (error instanceof Error)
                 Object.assign(error, { transfer });
             if (error instanceof RemoteIndexDetachedError || error instanceof RemoteIndexCancelledError) {
@@ -1006,6 +1100,10 @@ export class CorpusWireClient {
             }
             await this.abortIndexSessionQuietly(session.session_id);
             throw error;
+        }
+        finally {
+            request.signal?.removeEventListener("abort", stopUploads);
+            request.detachSignal?.removeEventListener("abort", stopUploads);
         }
     }
     async waitForIndexSessionTerminal(sessionId, pollMs, onProgress, detachSignal) {
@@ -1316,6 +1414,29 @@ function buildUploadBatches(files, batchBytes, batchFiles) {
         batches.push(currentBatch);
     }
     return batches;
+}
+function clampUploadLimit(requested, advertised, name) {
+    if (!Number.isFinite(advertised) || advertised < 1
+        || (requested !== undefined && (!Number.isFinite(requested) || requested < 1))) {
+        throw new Error(`${name} requires a positive finite limit`);
+    }
+    return Math.floor(Math.min(requested ?? advertised, advertised));
+}
+/** Wake polling immediately on either interrupt; the caller owns its semantics. */
+async function waitForIndexInterruptDelay(delayMs, request) {
+    if (request.signal?.aborted || request.detachSignal?.aborted)
+        return;
+    await new Promise((resolve) => {
+        const finish = () => {
+            clearTimeout(timer);
+            request.signal?.removeEventListener("abort", finish);
+            request.detachSignal?.removeEventListener("abort", finish);
+            resolve();
+        };
+        const timer = setTimeout(finish, delayMs);
+        request.signal?.addEventListener("abort", finish, { once: true });
+        request.detachSignal?.addEventListener("abort", finish, { once: true });
+    });
 }
 function toRemoteFileContent(preparedFile, contentId) {
     return {

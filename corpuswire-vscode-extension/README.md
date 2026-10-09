@@ -25,6 +25,7 @@ the MCP package is the tool surface Copilot discovers.
 - Service-specific configuration for indexer, enhancer, and semantic search
   endpoints.
 - API key, Basic Auth, and custom header support.
+- CLI OS-keyring bearer authentication when no Authorization header is configured.
 - Optional home config at `~/.config/corpuswire/vscode-extension.json` or
   `~/.corpuswire/vscode-extension.json`.
 - Local fallback enhancement when generation is unavailable but the backend can
@@ -108,12 +109,20 @@ or prefixed:
 | --- | --- | --- |
 | `corpuswire.baseUrl` | `http://127.0.0.1:8000` | Compatibility fallback URL when service URLs are unset |
 | `corpuswire.userConfigPath` | empty | Optional explicit home config file |
+| `corpuswire.auth.cliPath` | `corpuswire` | CLI executable used to resolve an OS-keyring bearer token for each service URL |
 | `corpuswire.repoPath` | first workspace folder | Service-local path used only when remote indexing is disabled |
 | `corpuswire.topK` | `5` | Retrieval chunk count for prompt enhancement |
 | `corpuswire.outputMode` | `generic` | `generic`, `copilot`, `claude-code`, or `sequential` |
 | `corpuswire.localOnly` | `false` | Ask backend for deterministic local rewrite instead of generation |
 
 ## Service Settings
+
+When an Authorization header is absent, the extension runs
+`corpuswire auth token --base-url <service-url>` through the configured CLI.
+Explicit Authorization, including Basic Auth or an API key using that header,
+takes precedence. Set an absolute `corpuswire.auth.cliPath` if the VS Code
+extension host's PATH does not contain the CLI. Token lookup has a five-second
+timeout and does not initiate login.
 
 `serviceDefaults` applies to `indexer`, `enhancer`, and `semanticSearch` unless a
 service-specific setting overrides it.
@@ -210,7 +219,10 @@ without deleting and recreating the target collection.
 
 The command:
 
-1. Reads settings for the first workspace folder.
+1. Selects every workspace folder with remote indexing enabled and reads its
+   own settings. At most two roots index concurrently. A single-folder
+   workspace also supports an explicit manual command when automatic indexing
+   is disabled.
 2. Uses the configured stable `remoteIndexing.workspaceId`, or the derived
    local-folder identity when no explicit value is set.
 3. Creates `CorpusWireClient` for the configured indexer service with
@@ -224,6 +236,13 @@ The command:
    file systems work.
 7. Skips files larger than `remoteIndexing.maxFileSizeBytes`.
 8. Calls `client.indexWorkspace({ mode: "full", recreateCollection: false, files, ... })`.
+
+Roots must have distinct workspace IDs on the same service; duplicate IDs are
+rejected before uploading. Nested roots are excluded from their parent root's
+inventory. Each root uploads code before documentation and other supported
+files. When the server publishes code, progress and the panel show code ready
+with documentation/other ingestion pending. The workspace panel reports ready
+only when every enabled root has a healthy complete or code-ready index.
 
 The cancellable notification renders the shared `index-progress/v1` contract:
 phase, processed/total work, elapsed time, numeric progress when a denominator
@@ -264,6 +283,9 @@ watcher for the same include glob used by full indexing. It batches events for
 - If a file is created or changed and then deleted before flush, the delete wins
   for that URI.
 - The SDK sends `mode: "incremental"`.
+- Changed and deleted events are grouped by their actual workspace root. Each
+  group uses that root's settings, identity and exclusions, including groups
+  containing only deletions.
 - Watcher flushes are serialized; a new flush waits until the active upload
   finishes.
 - Automatic watcher updates are bounded by `remoteIndexing.maxAutoWatchFiles`.

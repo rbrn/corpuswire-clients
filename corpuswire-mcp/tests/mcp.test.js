@@ -4661,3 +4661,31 @@ test("incremental sync defers when the verified selection policy digest changes"
     assert.deepEqual(calls,[{mode:"full"}]);
   } finally {child.kill();await rm(root,{recursive:true,force:true});}
 });
+
+test("MCP recognizes code readiness without certifying full inventory", async () => {
+  const source = await readFile(SERVER_BIN, 'utf8');
+  const start = source.indexOf('function bootstrapStatusFromDiagnosis(');
+  const end = source.indexOf('\nfunction compactStringArray', start);
+  assert.ok(start >= 0 && end > start);
+  const readBootstrap = new Function('asRecord', 'compactStringArray', 'isRecord',
+    'optionalString', 'hasBootstrapFreshnessSignal', 'firstNonEmptyString',
+    source.slice(start, end) + '; return bootstrapStatusFromDiagnosis;')(
+      (value) => value ?? {}, (value) => Array.isArray(value) ? value : [],
+      (value) => value && typeof value === 'object',
+      (value) => typeof value === 'string' ? value : null, () => false,
+      (...values) => values.find(Boolean));
+  const diagnosis = {status:'ready',can_retrieve:true,collection_exists:true,point_count:2,
+    checks:[],recovery_actions:[],index:{health_status:'ok',readiness:'code_ready',
+      coverage:{state:'pending',code_ready:true,documentation_pending:true,
+        other_pending:true,reason_codes:['background_ingestion_pending']}}};
+  const ready = readBootstrap(diagnosis, {workspaceId:'fixture'});
+  assert.equal(ready.state, 'ready');
+  assert.equal(ready.documentationPending, true);
+  assert.equal(ready.coverage.state, 'pending');
+  assert.equal(ready.needsReconcile, false);
+  diagnosis.index.coverage.reason_codes = ['mirror_pending'];
+  assert.equal(readBootstrap(diagnosis, {}).state, 'needs_reconcile');
+  diagnosis.index.coverage.reason_codes = ['background_ingestion_pending'];
+  diagnosis.index.health_status = 'degraded';
+  assert.equal(readBootstrap(diagnosis, {}).state, 'needs_reconcile');
+});

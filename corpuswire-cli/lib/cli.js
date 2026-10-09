@@ -24,7 +24,7 @@ const INDEX_TRACE_STAGES = new Set([
   "filtering_hashing", "parsing_chunking", "model_wait", "embedding_batch",
   "vector_writes", "cleanup", "total",
 ]);
-const CLI_VERSION = "0.1.4-beta.4";
+const CLI_VERSION = "0.1.4-beta.5";
 
 export function printHelp(write = console.log) {
   write(`cw
@@ -34,7 +34,7 @@ Usage:
   cw watch [options]         Index and keep reconciling local source changes
   cw --once                  Index once and exit
   cw init [--index] [--verify] Configure this workspace
-  cw doctor [options]        Check service and verified inventory (read-only)
+  cw doctor [options]        Check service and code/full readiness (read-only)
   cw reconcile [options]     Full workspace indexing with confirmation
   cw "<prompt>" [options]
   cw enhance "<prompt>" [options]
@@ -733,10 +733,10 @@ export async function runWatchCommand(options, dependencies) {
             && diagnosedIndex?.coverage?.eligible_file_count === 0
             && (diagnosedIndex.health_warnings ?? []).every((warning) => warning === "No indexed Qdrant points were found for this context.")
             && doctor.reasons.every((reason) => ["retrieval_blocked", "index_health_degraded", "index_health_warnings"].includes(reason));
-          if (!doctor.ok && !verifiedEmpty) {
+          if (!(doctor.ok && doctor.coverage.state === "verified") && !verifiedEmpty) {
             const authFailure = doctor.reasons.includes("authentication_rejected");
             const unavailable = doctor.checks.some((check) => check.code === "unavailable");
-            throw watchFailure(`Reconciliation could not be verified (${doctor.reasons.join(", ")}).`, authFailure ? "authentication_rejected" : unavailable ? "watch_unavailable" : "watch_fence");
+            throw watchFailure(`Reconciliation could not be verified (${doctor.reasons.join(", ") || "inventory_not_verified"}).`, authFailure ? "authentication_rejected" : unavailable ? "watch_unavailable" : "watch_fence");
           }
           publishedDigest = digest;
           publications += 1;
@@ -908,6 +908,27 @@ export async function runIndexCommand(options, dependencies) {
   request.onProgress = (event) => {
     lastProgress = event;
     renderer.render(event);
+  };
+  request.onCodeReady = (status) => {
+    const coverage = status.coverage ?? {};
+    if (coverage.code_ready !== true) return;
+    if (options.ndjson || options.json) {
+      write(JSON.stringify({
+        type: "code_ready",
+        session_id: status.session_id,
+        workspace_id: configuration.workspaceId,
+        code_ready: true,
+        documentation_pending: coverage.documentation_pending === true,
+        other_pending: coverage.other_pending === true,
+      }));
+      return;
+    }
+    renderer.finish();
+    const pending = [
+      coverage.documentation_pending === true ? "documentation pending" : null,
+      coverage.other_pending === true ? "other files pending" : null,
+    ].filter(Boolean);
+    write(`Code ready${pending.length ? `; ${pending.join("; ")}` : ""}.`);
   };
   try {
     const result = await dependencies.client.indexWorkspace(request);
@@ -1189,7 +1210,13 @@ async function runDoctorCommand(options, dependencies) {
     if (diagnosis.index?.health_status && !["ok", "ready", "healthy"].includes(diagnosis.index.health_status)) reasons.push("index_health_degraded");
     if (diagnosis.index?.health_warnings?.length) reasons.push("index_health_warnings");
   }
-  if (coverage?.state !== "verified") reasons.push("inventory_not_verified");
+  const partialCodeReady = coverage?.state === "pending" && coverage.code_ready === true
+    && coverage.reason_codes?.length === 1 && coverage.reason_codes[0] === "background_ingestion_pending"
+    && diagnosis?.status === "ready" && diagnosis.can_retrieve === true
+    && diagnosis.index?.readiness === "code_ready"
+    && ["ok", "ready", "healthy"].includes(diagnosis.index?.health_status)
+    && !diagnosis.index?.health_warnings?.length;
+  if (coverage?.state !== "verified" && !partialCodeReady) reasons.push("inventory_not_verified");
   if (checks.some((check) => check.code === "authentication_rejected")) reasons.push("authentication_rejected");
   const blocked = reasons.some((reason) => ["health_unavailable", "service_unhealthy", "diagnosis_unavailable", "retrieval_blocked", "workspace_identity_mismatch"].includes(reason));
   const status = blocked ? "blocked" : reasons.length ? "attention" : "ready";
@@ -1197,12 +1224,17 @@ async function runDoctorCommand(options, dependencies) {
     schema_version: "workspace-doctor/v1", ok: status === "ready", status,
     exitCode: status === "ready" ? 0 : blocked ? 2 : 1,
     workspaceId: options.workspaceId, serviceUrl: displayServiceUrl(options.apiBaseUrl),
-    coverage: { state: coverage?.state ?? "unavailable", reasonCodes: coverage?.reason_codes ?? [] },
+    coverage: {
+      state: coverage?.state ?? "unavailable", reasonCodes: coverage?.reason_codes ?? [],
+      codeReady: coverage?.code_ready === true,
+      documentationPending: coverage?.documentation_pending === true,
+      otherPending: coverage?.other_pending === true,
+    },
     reasons, checks,
     recoveryActions: status === "ready" ? [] : ["Check service/authentication, then run cw reconcile --yes and cw doctor."],
   };
   dependencies.write(options.json ? JSON.stringify(result, null, 2)
-    : `status: ${status}\nworkspace: ${sanitizeTerminalText(result.workspaceId)}\nservice: ${result.serviceUrl}\ninventory coverage: ${result.coverage.state}${reasons.length ? `\nchecks: ${reasons.join(", ")}` : ""}${checks.filter((check) => check.status === "error").map((check) => `\n${check.name}: ${check.code}${check.httpStatus === undefined ? "" : ` (HTTP ${check.httpStatus})`}`).join("")}`);
+    : `status: ${status}\nworkspace: ${sanitizeTerminalText(result.workspaceId)}\nservice: ${result.serviceUrl}\ninventory coverage: ${result.coverage.state}${partialCodeReady ? `\ncode ready: true\ndocumentation pending: ${result.coverage.documentationPending}\nother files pending: ${result.coverage.otherPending}` : ""}${reasons.length ? `\nchecks: ${reasons.join(", ")}` : ""}${checks.filter((check) => check.status === "error").map((check) => `\n${check.name}: ${check.code}${check.httpStatus === undefined ? "" : ` (HTTP ${check.httpStatus})`}`).join("")}`);
   return result;
 }
 

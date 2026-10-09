@@ -24,6 +24,7 @@ import {
   toReviewContextPayloadV2,
   toStartIndexSessionPayload,
   assertReviewContextV2Result,
+  ingestionPriority,
 } from "../dist/index.js";
 
 const REVIEW_CONTEXT_V2_SCHEMA = JSON.parse(readFileSync(
@@ -924,7 +925,8 @@ test("remote indexWorkspace polls queued background batches before commit", asyn
   });
 
   assert.equal(result.ok, true);
-  assert.equal(statusReads, 2);
+  // Drain the documentation tier, then verify no manifest uploads remain.
+  assert.equal(statusReads, 3);
   assert.equal(calls.at(-1).input, "http://example.test/v1/index/sessions/sess-async/commit");
 });
 
@@ -2609,4 +2611,249 @@ test("retrieval exclusions preserve source while rejecting discovery and Terrafo
   for (const path of ["src/main.py", "README.md", "settings.json", "requirements-guide.md", "main.tf", "model.tf.json"]) {
     assert.equal(isRetrievalExcludedPath(path), false, path);
   }
+});
+
+test("ingestion priority matches canonical code, documentation and other categories", () => {
+  for (const extension of ["bat", "scala", "sh", "cjs", "js", "jsx", "mjs", "cts", "mts", "ts", "tsx", "java", "kt", "kts", "py", "pyi", "hcl", "tf", "html", "htm"]) {
+    assert.equal(ingestionPriority(`src/main.${extension.toUpperCase()}`), 1);
+  }
+  for (const path of ["scripts/mvnw", "scripts/gradlew", "infra/main.tf.json"]) assert.equal(ingestionPriority(path), 1);
+  for (const path of ["README.md", "guide.txt", "manual.pdf"]) assert.equal(ingestionPriority(path), 2);
+  for (const path of ["settings.json", "data.csv", "config.yml"]) assert.equal(ingestionPriority(path), 3);
+});
+
+function priorityIndexFixture({ files, unchanged = [], capability = true, batchBytes = 1024, concurrency = 1, onUpload } = {}) {
+  const calls = [], uploaded = new Set(), uploadRequired = files.map((file) => file.relativePath).filter((path) => !unchanged.includes(path));
+  const status = (coverage) => ({
+    session_id: "priority", workspace_id: "fixture", collection_name: "fixture", mode: "full",
+    phase: "indexing", files_manifested: files.length, files_indexed: uploaded.size,
+    files_deleted: 0, files_unchanged: unchanged.length, files_skipped: 0, bytes_uploaded: 0,
+    bytes_skipped: 0, queue_depth: uploadRequired.length - uploaded.size,
+    pending_batches: 0, active_batches: 0, errors: [], coverage,
+  });
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url, init) => {
+    if (url.endsWith("/capabilities")) return jsonResponse(200, {
+      ok: true, inventory_coverage_versions: ["workspace-inventory/v1"],
+      supported_file_registry_version: "fixture/v1", max_file_size_bytes: 1024,
+    });
+    if (url.endsWith("/sessions")) return jsonResponse(200, { ok: true, result: {
+      session_id: "priority", mode: "full", max_batch_bytes: batchBytes,
+      max_concurrent_uploads: concurrency, code_checkpoint: capability,
+    } });
+    if (url.endsWith("/manifest/batch")) return jsonResponse(200, { ok: true, result: {
+      accepted: files.length, upload_required: uploadRequired, unchanged: unchanged.length,
+      deletes: 0, skipped: 0, errors: [],
+    } });
+    if (url.endsWith("/files/batch")) {
+      const body = await init.body.text();
+      const paths = files.filter((file) => body.includes(`"relative_path":"${file.relativePath}"`)).map((file) => file.relativePath);
+      calls.push({ type: "upload", paths });
+      await onUpload?.(paths, init);
+      for (const path of paths) uploaded.add(path);
+      return jsonResponse(202, { ok: true, result: { files_received: paths.length, queued: true, errors: [] } });
+    }
+    if (url.endsWith("/status")) { calls.push({ type: "status" }); return jsonResponse(200, { ok: true, result: status() }); }
+    if (url.endsWith("/checkpoint/code")) {
+      calls.push({ type: "checkpoint" });
+      return jsonResponse(200, { ok: true, result: status({
+        schema_version: "workspace-coverage/v1", state: "pending", reason_codes: [],
+        code_ready: true, documentation_pending: files.some((file) => ingestionPriority(file.relativePath) === 2),
+        other_pending: files.some((file) => ingestionPriority(file.relativePath) === 3),
+      }) });
+    }
+    if (url.endsWith("/commit")) { calls.push({ type: "commit" }); return jsonResponse(200, { ok: true, result: {}, status: { ...status(), phase: "completed" } }); }
+    if (init.method === "DELETE") { calls.push({ type: "abort" }); return jsonResponse(200, { ok: true }); }
+    throw new Error(`Unexpected request ${url}`);
+  } });
+  const request = {
+    workspace: { workspaceId: "fixture" }, mode: "full", files, processingTimeoutMs: 100, processingPollMs: 10,
+    inventoryScan: { complete: true, startedAt: "2026-10-09T00:00:00Z", completedAt: "2026-10-09T00:00:01Z",
+      excludedFileCount: 0, ignoreDigest: "0".repeat(64), producer: "fixture/v1" },
+  };
+  return { client, request, calls };
+}
+
+test("code drains and publishes while documentation remains missing, before later tiers upload", async () => {
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "data.json", content: "{}" }, { relativePath: "README.md", content: "guide" },
+    { relativePath: "src/main.py", content: "x=1" },
+  ] });
+  let ready;
+  const result = await fixture.client.indexWorkspace({ ...fixture.request, onCodeReady: (status) => { ready = status; fixture.calls.push({ type: "callback" }); } });
+  assert.deepEqual(fixture.calls.filter((call) => call.type !== "status"), [
+    { type: "upload", paths: ["src/main.py"] }, { type: "checkpoint" }, { type: "callback" },
+    { type: "upload", paths: ["README.md"] }, { type: "upload", paths: ["data.json"] }, { type: "commit" },
+  ]);
+  assert.equal(ready.queue_depth, 2);
+  assert.equal(ready.coverage.code_ready, true);
+  assert.equal(ready.coverage.documentation_pending, true);
+  assert.equal(ready.coverage.other_pending, true);
+  assert.equal(result.transfer.files_transferred, 3);
+});
+
+test("unchanged code still checkpoints before documentation uploads", async () => {
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "README.md", content: "guide" }, { relativePath: "main.ts", content: "x" },
+  ], unchanged: ["main.ts"] });
+  await fixture.client.indexWorkspace(fixture.request);
+  assert.equal(fixture.calls[0].type, "checkpoint");
+  assert.deepEqual(fixture.calls.find((call) => call.type === "upload").paths, ["README.md"]);
+});
+
+test("a checkpoint without confirmed code readiness cannot call the ready callback", async () => {
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+  ] });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (!url.endsWith("/checkpoint/code")) return response;
+    const payload = await response.json();
+    payload.result.coverage.code_ready = false;
+    return jsonResponse(200, payload);
+  };
+  let callbacks = 0;
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, onCodeReady: () => callbacks++ }), /did not confirm code readiness/);
+  assert.equal(callbacks, 0);
+  assert.equal(fixture.calls.filter((call) => call.type === "upload").length, 1);
+  assert.equal(fixture.calls.at(-1).type, "abort");
+});
+
+test("tier draining waits for legacy background work without optional batch counters", async () => {
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+  ] });
+  const originalFetch = fixture.client.fetchFn;
+  let statusReads = 0;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (!url.endsWith("/status")) return response;
+    const payload = await response.json();
+    delete payload.result.pending_batches;
+    delete payload.result.active_batches;
+    if (++statusReads === 1) payload.result.queue_depth++;
+    return jsonResponse(200, payload);
+  };
+  await fixture.client.indexWorkspace(fixture.request);
+  const beforeCheckpoint = fixture.calls.slice(0, fixture.calls.findIndex((call) => call.type === "checkpoint"));
+  assert.equal(beforeCheckpoint.filter((call) => call.type === "status").length, 2);
+});
+
+test("final completeness still waits for missing uploads after all tiers drain", async () => {
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }], capability: false });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (!url.endsWith("/status")) return response;
+    const payload = await response.json();
+    payload.result.queue_depth = 1;
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: 20 }), RemoteIndexDetachedError);
+  assert.equal(fixture.calls.some((call) => call.type === "commit" || call.type === "abort"), false);
+});
+
+test("old server capability and zero-code inventories skip code publication", async () => {
+  for (const options of [
+    { files: [{ relativePath: "main.py", content: "x" }], capability: false },
+    { files: [{ relativePath: "README.md", content: "guide" }] },
+  ]) {
+    const fixture = priorityIndexFixture(options);
+    let callbacks = 0;
+    await fixture.client.indexWorkspace({ ...fixture.request, onCodeReady: () => callbacks++ });
+    assert.equal(callbacks, 0);
+    assert.equal(fixture.calls.some((call) => call.type === "checkpoint"), false);
+  }
+});
+
+test("upload batches and concurrency are clamped to the server limits", async () => {
+  let active = 0, maximum = 0;
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "a.py", content: "abc" }, { relativePath: "b.py", content: "def" }, { relativePath: "c.py", content: "ghi" },
+  ], batchBytes: 4, concurrency: 1, onUpload: async () => {
+    active++; maximum = Math.max(maximum, active);
+    await new Promise((resolve) => setTimeout(resolve, 5)); active--;
+  } });
+  await fixture.client.indexWorkspace({ ...fixture.request, batchBytes: 1000, maxConcurrentUploads: 20 });
+  assert.equal(maximum, 1);
+  assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths.length), [1, 1, 1]);
+});
+
+function queueBusy(retryAfter = "0") {
+  const response = jsonResponse(429, { detail: { error_code: "index_queue_full", message: "Queue busy", retryable: true } });
+  response.headers.set("Retry-After", retryAfter);
+  return response;
+}
+
+const QUEUE_TEST_FILE = { descriptor: { relativePath: "main.py", contentId: "file-0", size: 1, sha256: "0".repeat(64), mtimeNs: 0 }, content: "x" };
+
+test("typed queue pressure bypasses generic retries and admission retries identical bytes losslessly", async () => {
+  let genericCalls = 0;
+  await assert.rejects(requestJson({ baseUrl: "http://fixture.test", paths: ["/busy"], retryDelayMs: 0,
+    fetchFn: async () => { genericCalls++; return queueBusy(); },
+  }), (error) => error.errorCode === "index_queue_full" && error.retryable && error.retryAfterSeconds === 0);
+  assert.equal(genericCalls, 1);
+  const bodies = [];
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (_, init) => {
+    bodies.push(await init.body.text());
+    return bodies.length < 3 ? queueBusy() : jsonResponse(202, { ok: true, result: { files_received: 1, errors: [], queued: true } });
+  } });
+  let attempts = 0;
+  const result = await client.uploadFileBatch("queue", { files: [QUEUE_TEST_FILE.descriptor] }, [QUEUE_TEST_FILE], () => attempts++, { queueWaitTimeoutMs: 200 });
+  assert.equal(result.files_received, 1);
+  assert.equal(attempts, 3);
+  assert.equal(new Set(bodies).size, 1);
+});
+
+test("admission timeout is finite and permanent quota responses fail without retries", async () => {
+  for (const busy of [true, false]) {
+    let attempts = 0;
+    const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async () => {
+      attempts++;
+      return busy ? queueBusy("1") : jsonResponse(429, { detail: "permanent workspace byte quota exceeded" });
+    } });
+    await assert.rejects(client.uploadFileBatch("queue", { files: [QUEUE_TEST_FILE.descriptor] }, [QUEUE_TEST_FILE], undefined, { queueWaitTimeoutMs: 15 }), CorpusWireHttpError);
+    assert.equal(attempts, 1);
+  }
+});
+
+test("cancellation and detach interrupt admission waits before another upload", async () => {
+  for (const detach of [false, true]) {
+    const controller = new AbortController();
+    let uploads = 0, aborts = 0;
+    const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url, init) => {
+      if (url.endsWith("/sessions")) return jsonResponse(200, { ok: true, result: { session_id: "queue", max_batch_bytes: 1000, max_concurrent_uploads: 1 } });
+      if (url.endsWith("/manifest/batch")) return jsonResponse(200, { ok: true, result: { accepted: 1, upload_required: ["main.py"], unchanged: 0, deletes: 0, skipped: 0, errors: [] } });
+      if (url.endsWith("/files/batch")) { uploads++; setTimeout(() => controller.abort(), 5); return queueBusy("60"); }
+      if (init.method === "DELETE") { aborts++; return jsonResponse(200, { ok: true }); }
+      if (url.endsWith("/status")) return jsonResponse(200, { ok: true, result: { phase: aborts ? "aborted" : "indexing" } });
+      throw new Error(`Unexpected request ${url}`);
+    } });
+    const started = Date.now();
+    await assert.rejects(client.indexWorkspace({ workspace: { workspaceId: "fixture" }, files: [{ relativePath: "main.py", content: "x" }],
+      signal: detach ? undefined : controller.signal, detachSignal: detach ? controller.signal : undefined,
+    }), detach ? RemoteIndexDetachedError : RemoteIndexCancelledError);
+    assert.ok(Date.now() - started < 1000);
+    assert.equal(uploads, 1);
+    assert.equal(aborts, detach ? 0 : 1);
+  }
+});
+
+test("one failing upload stops sibling queue retries and prevents the next batch", async () => {
+  let uploads = 0, aborts = 0;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url, init) => {
+    if (url.endsWith("/sessions")) return jsonResponse(200, { ok: true, result: { session_id: "queue", max_batch_bytes: 1000, max_batch_files: 1, max_concurrent_uploads: 2 } });
+    if (url.endsWith("/manifest/batch")) return jsonResponse(200, { ok: true, result: { accepted: 3, upload_required: ["a.py", "b.py", "c.py"], unchanged: 0, deletes: 0, skipped: 0, errors: [] } });
+    if (url.endsWith("/files/batch")) {
+      uploads++;
+      const body = await init.body.text();
+      if (body.includes("a.py")) { await new Promise((resolve) => setTimeout(resolve, 10)); return jsonResponse(400, { detail: "rejected" }); }
+      return queueBusy("60");
+    }
+    if (init.method === "DELETE") { aborts++; return jsonResponse(200, { ok: true }); }
+    throw new Error(`Unexpected request ${url}`);
+  } });
+  await assert.rejects(client.indexWorkspace({ workspace: { workspaceId: "fixture" }, files: ["a.py", "b.py", "c.py"].map((relativePath) => ({ relativePath, content: "x" })) }), (error) => error instanceof CorpusWireHttpError && error.status === 400);
+  assert.equal(uploads, 2);
+  assert.equal(aborts, 1);
 });

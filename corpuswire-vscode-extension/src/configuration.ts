@@ -30,6 +30,7 @@ export interface RemoteServiceSettings {
 }
 
 export interface ExtensionSettings {
+  auth: AuthSettings;
   baseUrl: string;
   repoPath?: string;
   topK: number;
@@ -38,6 +39,10 @@ export interface ExtensionSettings {
   remoteIndexing: RemoteIndexingSettings;
   services: Record<RemoteServiceName, RemoteServiceSettings>;
   configurationWarnings: string[];
+}
+
+export interface AuthSettings {
+  cliPath: string;
 }
 
 export interface RemoteIndexingSettings {
@@ -98,6 +103,9 @@ export function readSettings(resource?: vscode.Uri): ExtensionSettings {
     );
 
   return {
+    auth: {
+      cliPath: readConfiguredString(config, homeConfiguration.values, "auth.cliPath", "corpuswire"),
+    },
     baseUrl,
     repoPath: resolveRepoPath(configuredRepoPath, workspaceFolderPath),
     topK: normalizeTopK(readConfiguredNumber(config, homeConfiguration.values, "topK", DEFAULT_TOP_K)),

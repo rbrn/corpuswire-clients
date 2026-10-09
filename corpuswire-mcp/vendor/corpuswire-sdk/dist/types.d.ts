@@ -1414,6 +1414,8 @@ export interface StartRemoteIndexSessionRequest {
     snapshotScope?: RemoteIndexScopeV2 | null;
 }
 export interface RemoteIndexSession {
+    /** This session supports publishing verified code before lower-priority files. */
+    code_checkpoint?: boolean;
     session_id: string;
     workspace_id: string;
     collection_name: string;
@@ -1533,6 +1535,7 @@ export interface RemoteIndexCapabilities {
     background_file_batches?: boolean;
     worker_count?: number;
     max_queued_batches?: number;
+    max_queued_bytes?: number;
     protocol_versions?: string[];
     snapshot_scoping?: boolean;
 }
@@ -1557,9 +1560,12 @@ export interface IndexWorkspaceRequest extends Omit<StartRemoteIndexSessionReque
     maxConcurrentUploads?: number;
     processingTimeoutMs?: number;
     processingPollMs?: number;
+    /** Maximum admission wait per batch; defaults to 10 minutes. */
+    queueWaitTimeoutMs?: number;
     signal?: AbortSignal;
     detachSignal?: AbortSignal;
     onProgress?: (event: RemoteIndexProgressEvent) => void;
+    onCodeReady?: (status: RemoteIndexStatus) => void;
 }
 /** Evidence emitted only by a complete filesystem scan; a files array alone is insufficient. */
 export interface InventoryScan {
@@ -1617,6 +1623,9 @@ export interface WorkspaceCoverage {
     schema_version: "workspace-coverage/v1";
     state: "unknown" | "pending" | "verified" | "invalidated" | "unavailable" | "not_applicable";
     reason_codes: string[];
+    code_ready?: boolean;
+    documentation_pending?: boolean;
+    other_pending?: boolean;
     coverage_token?: string | null;
     session_id?: string | null;
     published_revision?: number | null;

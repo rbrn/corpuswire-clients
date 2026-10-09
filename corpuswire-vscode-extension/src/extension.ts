@@ -12,15 +12,18 @@ import type {
   RemoteWorkspaceFile,
   InventoryScan,
   RemoteIndexCommitResponse,
+  RemoteIndexStatus,
+  WorkspaceDiagnosis,
 } from "@corpuswire/sdk";
 import {
   buildRemoteServiceHeaders,
   readSettings,
 } from "./configuration.js";
-import type { ExtensionSettings } from "./configuration.js";
+import type { ExtensionSettings, RemoteServiceSettings } from "./configuration.js";
 import {
   assessEnhancementQuality,
 } from "./enhancement-quality.js";
+import { hasAuthorizationHeader, resolveCliBearerToken } from "./service-auth.js";
 import type {
   EnhancementQuality,
   EnhancementQualityStatus,
@@ -33,6 +36,21 @@ type PromptRewriteResultWithCompatibilityFields = PromptRewriteResult & {
 
 const INDEX_INCLUDE_GLOB = "**/*.{md,txt,csv,pdf,java,py,sh,cjs,js,jsx,mjs,ts,tsx,json,jsonl,ndjson,toml,yaml,yml}";
 const INDEX_EXCLUDE_GLOB = "{**/.git/**,**/.vscode/**,**/node_modules/**,**/dist/**,**/build/**,**/target/**,**/__pycache__/**}";
+
+async function buildAuthenticatedServiceHeaders(
+  settings: ExtensionSettings,
+  service: RemoteServiceSettings,
+): Promise<Record<string, string>> {
+  const headers = buildRemoteServiceHeaders(service);
+  if (hasAuthorizationHeader(headers)) {
+    return headers;
+  }
+  const token = await resolveCliBearerToken(service.url, settings.auth.cliPath);
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  return headers;
+}
 
 interface PromptEnhancementOutcome {
   replacement: string;
@@ -107,6 +125,20 @@ interface PanelIndexStatusMessage {
   workspaceId?: string;
   lastIndexedAt?: string | null;
   ageSeconds?: number | null;
+  code_ready?: boolean;
+  documentation_pending?: boolean;
+  other_pending?: boolean;
+  roots?: PanelIndexRootStatus[];
+}
+
+interface PanelIndexRootStatus {
+  name: string;
+  workspaceId: string;
+  state: IndexStatusState;
+  message: string;
+  code_ready: boolean;
+  documentation_pending: boolean;
+  other_pending: boolean;
 }
 
 interface PanelModelMessage {
@@ -323,7 +355,7 @@ async function runPromptEnhancement(
   const client = new CorpusWireClient({
     baseUrl: enhancerService.url,
     endpointMode: "v1-only",
-    defaultHeaders: buildRemoteServiceHeaders(enhancerService),
+    defaultHeaders: await buildAuthenticatedServiceHeaders(settings, enhancerService),
   });
   const request = buildEnhancementRequest(prompt, settings);
 
@@ -344,15 +376,6 @@ async function runPromptEnhancement(
   }
 }
 
-const STALE_AGE_THRESHOLD_SECONDS = 60 * 60 * 24; // 24h
-
-interface ReposResponseRepo {
-  path?: string;
-  collection_name?: string;
-  source_root?: string;
-  label?: string;
-}
-
 interface CollectedWorkspaceFiles {
   files: RemoteWorkspaceFile[];
   skippedLargeFiles: number;
@@ -361,129 +384,91 @@ interface CollectedWorkspaceFiles {
 }
 
 async function runIndexStatusCheck(post: (message: PanelOutboundMessage) => void): Promise<void> {
-  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-  if (!workspaceFolder) {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  if (folders.length === 0) {
     post({ type: "index-status", state: "unknown", message: "No workspace folder is open." });
     return;
   }
-
-  const settings = readSettings(workspaceFolder.uri);
-  const indexerService = settings.services.indexer;
-  const workspaceId = settings.remoteIndexing.workspaceId || workspaceFolder.uri.toString();
-  const localPath = workspaceFolder.uri.fsPath;
-
-  post({ type: "index-status", state: "checking", message: "Checking index status…", workspaceId });
-
-  const headers = buildRemoteServiceHeaders(indexerService);
-  const baseUrl = indexerService.url.replace(/\/$/, "");
-
-  // Probe /repos for a matching workspace path
-  let isRegistered = false;
   try {
-    const reposResponse = await fetch(`${baseUrl}/repos`, { headers });
-    if (reposResponse.ok) {
-      const body = (await reposResponse.json()) as { repos?: ReposResponseRepo[] };
-      const repos = body.repos ?? [];
-      isRegistered = repos.some((r) => {
-        const candidates = [r.path, r.source_root, r.label].filter(
-          (v): v is string => typeof v === "string" && v.length > 0,
-        );
-        return candidates.some((c) => c === localPath || c === workspaceId);
-      });
+    const roots = folders.map((folder) => ({ folder, settings: readSettings(folder.uri) }))
+      .filter(({ settings }) => folders.length === 1 || settings.remoteIndexing.enabled);
+    if (roots.length === 0) {
+      post({ type: "index-status", state: "unknown", message: "No workspace folders have remote indexing enabled." });
+      return;
     }
-  } catch {
-    // Ignore — fall through to activity probe
-  }
-
-  // Probe /v1/index/activity for last_success_at and gap_detected
-  const client = new CorpusWireClient({
-    baseUrl: indexerService.url,
-    endpointMode: "v1-only",
-    defaultHeaders: headers,
-  });
-
-  try {
-    const activity = await client.getIndexActivity({ workspaceId });
-    if (!activity.available) {
-      if (isRegistered) {
-        post({
-          type: "index-status",
-          state: "indexed",
-          message: "Workspace registered; activity log unavailable. Re-index to refresh.",
-          workspaceId,
-        });
-      } else {
-        post({
-          type: "index-status",
-          state: "not-indexed",
-          message: "Workspace is not indexed on the configured CorpusWire backend.",
-          workspaceId,
-        });
+    assertDistinctIndexRoots(roots);
+    post({ type: "index-status", state: "checking", message: `Checking ${roots.length} workspace folder(s)…` });
+    const rootStatuses: PanelIndexRootStatus[] = new Array(roots.length);
+    let nextRoot = 0;
+    const checkRoot = async (): Promise<void> => {
+      while (nextRoot < roots.length) {
+        const index = nextRoot++;
+        const { folder, settings } = roots[index];
+        const workspaceId = settings.remoteIndexing.workspaceId!;
+        try {
+          const client = new CorpusWireClient({
+            baseUrl: settings.services.indexer.url,
+            endpointMode: "v1-only",
+            defaultHeaders: await buildAuthenticatedServiceHeaders(settings, settings.services.indexer),
+          });
+          const diagnosis = await client.diagnoseWorkspace({ workspaceId });
+          rootStatuses[index] = indexRootStatus(folder.name, workspaceId, diagnosis);
+        } catch (error) {
+          rootStatuses[index] = {
+            name: folder.name, workspaceId, state: "error",
+            message: `Could not diagnose index: ${error instanceof Error ? error.message : String(error)}`,
+            code_ready: false, documentation_pending: false, other_pending: false,
+          };
+        }
       }
-      return;
-    }
-
-    const lastSuccess = activity.last_success_at ?? null;
-    const ageSeconds = activity.last_success_age_seconds ?? null;
-
-    if (!lastSuccess) {
-      post({
-        type: "index-status",
-        state: isRegistered ? "stale" : "not-indexed",
-        message: isRegistered
-          ? "Workspace registered but no successful indexing recorded. Run Index Workspace."
-          : "Workspace is not indexed. Run Index Workspace to populate the index.",
-        workspaceId,
-        lastIndexedAt: lastSuccess,
-        ageSeconds,
-      });
-      return;
-    }
-
-    const isStale = activity.gap_detected === true || (ageSeconds !== null && ageSeconds > STALE_AGE_THRESHOLD_SECONDS);
+    };
+    await Promise.all(Array.from({ length: Math.min(MAX_CONCURRENT_INDEX_ROOTS, roots.length) }, checkRoot));
+    const ready = rootStatuses.filter((root) => root.state === "indexed");
+    const documentationPending = rootStatuses.some((root) => root.documentation_pending);
+    const otherPending = rootStatuses.some((root) => root.other_pending);
+    const allReady = ready.length === rootStatuses.length;
+    const state = allReady ? "indexed" : rootStatuses.some((root) => root.state === "error")
+      ? "error" : rootStatuses.some((root) => root.state === "stale") ? "stale" : "not-indexed";
+    const pendingMessage = [documentationPending ? "Documentation pending" : "", otherPending ? "Other files pending" : ""]
+      .filter(Boolean).join("; ");
+    const details = rootStatuses.map((root) => `${root.name}: ${root.message}`).join("; ");
     post({
-      type: "index-status",
-      state: isStale ? "stale" : "indexed",
-      message: isStale
-        ? `Index may be stale (last successful indexing ${formatAge(ageSeconds)} ago). Re-index to refresh.`
-        : `Indexed (last success ${formatAge(ageSeconds)} ago).`,
-      workspaceId,
-      lastIndexedAt: lastSuccess,
-      ageSeconds,
+      type: "index-status", state,
+      message: `${ready.length}/${rootStatuses.length} workspace folder(s) ${allReady && (documentationPending || otherPending) ? "code ready to serve" : "ready"}.${pendingMessage ? ` ${pendingMessage}.` : ""} ${details}`,
+      workspaceId: roots.length === 1 ? roots[0].settings.remoteIndexing.workspaceId : undefined,
+      code_ready: allReady,
+      documentation_pending: documentationPending,
+      other_pending: otherPending,
+      roots: rootStatuses,
     });
   } catch (error) {
-    if (isRegistered) {
-      post({
-        type: "index-status",
-        state: "indexed",
-        message: "Workspace registered. Activity probe failed; re-index if results look stale.",
-        workspaceId,
-      });
-    } else {
-      post({
-        type: "index-status",
-        state: "error",
-        message: `Could not check index status: ${error instanceof Error ? error.message : String(error)}`,
-        workspaceId,
-      });
-    }
+    post({ type: "index-status", state: "error", message: error instanceof Error ? error.message : String(error), code_ready: false });
   }
 }
 
-function formatAge(ageSeconds: number | null | undefined): string {
-  if (ageSeconds === null || ageSeconds === undefined || !Number.isFinite(ageSeconds)) {
-    return "unknown time";
-  }
-  if (ageSeconds < 60) {
-    return `${Math.round(ageSeconds)}s`;
-  }
-  if (ageSeconds < 3600) {
-    return `${Math.round(ageSeconds / 60)}m`;
-  }
-  if (ageSeconds < 86400) {
-    return `${Math.round(ageSeconds / 3600)}h`;
-  }
-  return `${Math.round(ageSeconds / 86400)}d`;
+function indexRootStatus(name: string, workspaceId: string, diagnosis: WorkspaceDiagnosis): PanelIndexRootStatus {
+  const coverage = diagnosis.index.coverage;
+  const index = diagnosis.index as WorkspaceDiagnosis["index"] & { readiness?: string };
+  const errors = diagnosis.checks.filter((check) => check.status === "error");
+  const blocked = diagnosis.status === "blocked" || !diagnosis.can_retrieve || Boolean(diagnosis.qdrant_error) || errors.length > 0;
+  const codeReady = coverage?.code_ready === true && diagnosis.index.indexed
+    && (coverage.state === "verified" || (coverage.state === "pending"
+      && coverage.reason_codes.length === 1 && coverage.reason_codes[0] === "background_ingestion_pending"));
+  const fullReady = diagnosis.index.indexed && (coverage
+    ? coverage.state === "verified" || coverage.state === "not_applicable"
+    : index.readiness === "ready" || diagnosis.status === "ready");
+  const warnings = diagnosis.checks.filter((check) => check.status === "warning");
+  const ready = !blocked && (codeReady || fullReady) && warnings.length === 0
+    && (diagnosis.status === "ready" || codeReady);
+  const state = ready ? "indexed" : blocked ? "error" : diagnosis.index.indexed ? "stale" : "not-indexed";
+  return {
+    name, workspaceId, state,
+    message: ready ? codeReady && coverage?.state !== "verified" ? formatCodeReadyMessage({ coverage }) : "Fully indexed"
+      : errors[0]?.message ?? diagnosis.qdrant_error ?? warnings[0]?.message ?? "Index readiness is not verified.",
+    code_ready: !blocked && codeReady,
+    documentation_pending: coverage?.documentation_pending === true,
+    other_pending: coverage?.other_pending === true,
+  };
 }
 
 async function runFetchModel(post: (message: PanelOutboundMessage) => void): Promise<void> {
@@ -493,7 +478,7 @@ async function runFetchModel(post: (message: PanelOutboundMessage) => void): Pro
   const client = new CorpusWireClient({
     baseUrl: enhancerService.url,
     endpointMode: "v1-only",
-    defaultHeaders: buildRemoteServiceHeaders(enhancerService),
+    defaultHeaders: await buildAuthenticatedServiceHeaders(settings, enhancerService),
   });
   try {
     const state = await client.getLlmModel();
@@ -529,7 +514,7 @@ async function runSetModel(
   const client = new CorpusWireClient({
     baseUrl: enhancerService.url,
     endpointMode: "v1-only",
-    defaultHeaders: buildRemoteServiceHeaders(enhancerService),
+    defaultHeaders: await buildAuthenticatedServiceHeaders(settings, enhancerService),
   });
   try {
     const state = await client.setLlmModel(trimmed);
@@ -645,6 +630,40 @@ interface IndexWorkspaceOptions {
   recreateCollection?: boolean;
 }
 
+interface IndexWorkspaceRoot {
+  folder: vscode.WorkspaceFolder;
+  settings: ExtensionSettings;
+}
+
+const MAX_CONCURRENT_INDEX_ROOTS = 2;
+
+function indexRootKey(folder: vscode.WorkspaceFolder): string {
+  return folder.uri.toString();
+}
+
+function assertDistinctIndexRoots(roots: IndexWorkspaceRoot[]): void {
+  const identities = new Map<string, string>();
+  for (const { folder, settings } of roots) {
+    const workspaceId = settings.remoteIndexing.workspaceId;
+    if (!workspaceId) {
+      throw new Error(`Configure a stable remote indexing workspace ID for ${folder.name} before indexing.`);
+    }
+    const identity = JSON.stringify([settings.services.indexer.url.replace(/\/+$/, ""), workspaceId]);
+    const previousRoot = identities.get(identity);
+    if (previousRoot && previousRoot !== indexRootKey(folder)) {
+      throw new Error(`Multiple workspace folders use CorpusWire workspace ID ${workspaceId}. Configure a distinct remoteIndexing.workspaceId for each folder before indexing.`);
+    }
+    identities.set(identity, indexRootKey(folder));
+  }
+}
+
+function formatCodeReadyMessage(status: Pick<RemoteIndexStatus, "coverage">): string {
+  const pending = [];
+  if (status.coverage?.documentation_pending) pending.push("documentation pending");
+  if (status.coverage?.other_pending) pending.push("other files pending");
+  return `Code ready to serve${pending.length > 0 ? ` · ${pending.join(" · ")}` : ""}`;
+}
+
 async function rebuildCurrentWorkspaceIndex(): Promise<void> {
   const selection = await vscode.window.showWarningMessage(
     "Rebuild the CorpusWire workspace index by recreating the target collection. Use this only after an embedding-model or vector-dimension change.",
@@ -659,32 +678,24 @@ async function rebuildCurrentWorkspaceIndex(): Promise<void> {
 }
 
 async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}): Promise<void> {
-  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-  if (!workspaceFolder) {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  if (folders.length === 0) {
     void vscode.window.showWarningMessage("Open a workspace before running CorpusWire: Index Workspace.");
     return;
   }
 
-  const settings = readSettings(workspaceFolder.uri);
-  const workspaceId = settings.remoteIndexing.workspaceId;
-  if (!workspaceId) {
-    void vscode.window.showWarningMessage("Configure a stable remote indexing workspace ID before indexing.");
-    return;
-  }
-
-  const indexerService = settings.services.indexer;
-  const client = new CorpusWireClient({
-    baseUrl: indexerService.url,
-    endpointMode: "v1-only",
-    defaultHeaders: buildRemoteServiceHeaders(indexerService),
-  });
-
   try {
-    const capabilities = await client.getIndexCapabilities();
-    const maxFileSizeBytes = Math.min(settings.remoteIndexing.maxFileSizeBytes, capabilities.max_file_size_bytes);
-
-    let committed: RemoteIndexCommitResponse | undefined;
-    let skippedLargeFiles = 0;
+    // An explicit command historically works in a single folder even when automatic indexing is disabled.
+    const roots = folders.map((folder) => ({ folder, settings: readSettings(folder.uri) }))
+      .filter(({ settings }) => folders.length === 1 || settings.remoteIndexing.enabled);
+    if (roots.length === 0) {
+      void vscode.window.showWarningMessage("Enable remote indexing for at least one workspace folder before indexing this multi-folder workspace.");
+      return;
+    }
+    // Validate every participating identity before capabilities, scans, or uploads begin.
+    assertDistinctIndexRoots(roots);
+    const outcomes: { root: IndexWorkspaceRoot; committed?: RemoteIndexCommitResponse; skippedLargeFiles?: number; error?: unknown }[] = [];
+    let cancelled = false;
     await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
@@ -696,62 +707,93 @@ async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}): Promi
       async (progress, token) => {
         const controller = new AbortController();
         const cancellation = token.onCancellationRequested(() => controller.abort());
+        if (token.isCancellationRequested) controller.abort();
+        const rootPercent = new Map<string, number>();
         let reportedPercent = 0;
-        const collected = await collectWorkspaceFiles(workspaceFolder, maxFileSizeBytes);
-        skippedLargeFiles = collected.skippedLargeFiles;
-        if (token.isCancellationRequested) {
-          throw new Error("Indexing cancelled before upload started.");
-        }
+        let nextRoot = 0;
         try {
-          committed = await client.indexWorkspace({
-            workspace: {
-              workspaceId,
-              displayRoot: workspaceFolder.uri.toString(),
-              name: workspaceFolder.name,
-            },
-            mode: "full",
-            client: {
-              name: "corpuswire-vscode-extension",
-              transport: "vscode.workspace.fs",
-              maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
-              batchBytes: settings.remoteIndexing.batchBytes,
-              maxFileSizeBytes,
-            },
-            maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
-            batchBytes: settings.remoteIndexing.batchBytes,
-            maxFileSizeBytes,
-            recreateCollection: options.recreateCollection === true,
-            files: collected.files,
-            inventoryScan: collected.inventoryScan,
-            signal: controller.signal,
-            onProgress: (event) => {
-              const percent = event.overall_percent;
-              const increment = percent === null ? undefined : Math.max(0, percent - reportedPercent);
-              if (percent !== null) {
-                reportedPercent = Math.max(reportedPercent, percent);
+          const work = async (): Promise<void> => {
+            while (!controller.signal.aborted && nextRoot < roots.length) {
+              const root = roots[nextRoot++];
+              const { folder, settings } = root;
+              const indexerService = settings.services.indexer;
+              try {
+                const client = new CorpusWireClient({
+                  baseUrl: indexerService.url,
+                  endpointMode: "v1-only",
+                  defaultHeaders: await buildAuthenticatedServiceHeaders(settings, indexerService),
+                });
+                const capabilities = await client.getIndexCapabilities();
+                if (controller.signal.aborted) throw new Error("Indexing cancelled before scan started.");
+                const maxFileSizeBytes = Math.min(settings.remoteIndexing.maxFileSizeBytes, capabilities.max_file_size_bytes);
+                progress.report({ message: `${folder.name} · scanning workspace` });
+                const collected = await collectWorkspaceFiles(folder, maxFileSizeBytes, controller.signal);
+                if (controller.signal.aborted) throw new Error("Indexing cancelled before upload started.");
+                let codeReadyMessage = "";
+                const committed = await client.indexWorkspace({
+                  workspace: {
+                    workspaceId: settings.remoteIndexing.workspaceId!,
+                    displayRoot: folder.uri.toString(),
+                    name: folder.name,
+                  },
+                  mode: "full",
+                  client: {
+                    name: "corpuswire-vscode-extension",
+                    transport: "vscode.workspace.fs",
+                    maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
+                    batchBytes: settings.remoteIndexing.batchBytes,
+                    maxFileSizeBytes,
+                  },
+                  maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
+                  batchBytes: settings.remoteIndexing.batchBytes,
+                  maxFileSizeBytes,
+                  recreateCollection: options.recreateCollection === true,
+                  files: collected.files,
+                  inventoryScan: collected.inventoryScan,
+                  signal: controller.signal,
+                  onCodeReady: (status) => {
+                    codeReadyMessage = formatCodeReadyMessage(status);
+                    progress.report({ message: `${folder.name} · ${codeReadyMessage}` });
+                  },
+                  onProgress: (event) => {
+                    if (event.phase === "completed") codeReadyMessage = "";
+                    if (event.overall_percent !== null) {
+                      const key = indexRootKey(folder);
+                      rootPercent.set(key, Math.max(rootPercent.get(key) ?? 0, event.overall_percent));
+                    }
+                    const percent = [...rootPercent.values()].reduce((sum, value) => sum + value, 0) / roots.length;
+                    const increment = Math.max(0, percent - reportedPercent);
+                    reportedPercent = Math.max(reportedPercent, percent);
+                    progress.report({ increment, message: `${folder.name} · ${formatIndexProgressMessage(event)}${codeReadyMessage ? ` · ${codeReadyMessage}` : ""}` });
+                  },
+                } satisfies IndexWorkspaceRequest);
+                outcomes.push({ root, committed, skippedLargeFiles: collected.skippedLargeFiles });
+              } catch (error) {
+                outcomes.push({ root, error });
               }
-              progress.report({
-                increment,
-                message: formatIndexProgressMessage(event),
-              });
-            },
-          } satisfies IndexWorkspaceRequest);
+            }
+          };
+          await Promise.all(Array.from({ length: Math.min(MAX_CONCURRENT_INDEX_ROOTS, roots.length) }, work));
+          cancelled = controller.signal.aborted;
         } finally {
           cancellation.dispose();
         }
       },
     );
-    const skippedSuffix = skippedLargeFiles > 0
-      ? ` Skipped ${skippedLargeFiles} file(s) above the configured size limit.`
-      : "";
-    const evidenceSuffix = ` Inventory coverage: ${committed?.status.coverage?.state ?? "unknown"}; transferred files: ${committed?.transfer?.files_transferred ?? "unknown"}.`;
-    void vscode.window.showInformationMessage(
-      options.recreateCollection
-        ? `Workspace index rebuilt with CorpusWire.${skippedSuffix}${evidenceSuffix}`
-        : `Workspace indexed with CorpusWire.${skippedSuffix}${evidenceSuffix}`,
-    );
+    for (const outcome of outcomes) {
+      const { folder, settings } = outcome.root;
+      if (outcome.error) {
+        void vscode.window.showWarningMessage(`${folder.name}: ${formatIndexingError(outcome.error, settings.services.indexer.url)}`);
+        continue;
+      }
+      const skippedSuffix = outcome.skippedLargeFiles
+        ? ` Skipped ${outcome.skippedLargeFiles} file(s) above the configured size limit.` : "";
+      const evidenceSuffix = ` Inventory coverage: ${outcome.committed?.status.coverage?.state ?? "unknown"}; transferred files: ${outcome.committed?.transfer?.files_transferred ?? "unknown"}.`;
+      void vscode.window.showInformationMessage(`${folder.name}: Workspace ${options.recreateCollection ? "index rebuilt" : "indexed"} with CorpusWire.${skippedSuffix}${evidenceSuffix}`);
+    }
+    if (cancelled) void vscode.window.showWarningMessage(`CorpusWire indexing cancelled. Completed ${outcomes.filter((outcome) => outcome.committed).length}/${roots.length} workspace folders.`);
   } catch (error) {
-    void vscode.window.showWarningMessage(formatIndexingError(error, indexerService.url));
+    void vscode.window.showWarningMessage(error instanceof Error ? error.message : String(error));
   }
 }
 
@@ -772,105 +814,146 @@ function formatIndexProgressMessage(event: {
 }
 
 function registerRemoteIndexWatchers(context: vscode.ExtensionContext): void {
-  const settings = readSettings(vscode.workspace.workspaceFolders?.[0]?.uri);
-  if (!settings.remoteIndexing.enabled || !settings.remoteIndexing.autoWatch) {
-    return;
+  interface PendingRoot {
+    folder: vscode.WorkspaceFolder;
+    changed: Map<string, vscode.Uri>;
+    deleted: Set<string>;
+    timer?: ReturnType<typeof setTimeout>;
+    due: boolean;
+    running: boolean;
+    controller?: AbortController;
   }
+  const pendingRoots = new Map<string, PendingRoot>();
+  let activeRoots = 0;
+  let disposed = false;
 
-  const pendingChangedUris = new Map<string, vscode.Uri>();
-  const pendingDeletedPaths = new Set<string>();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let updateInFlight = false;
-  let flushAgain = false;
+  const schedule = (pending: PendingRoot): void => {
+    if (disposed) return;
+    if (pending.timer) clearTimeout(pending.timer);
+    const settings = readSettings(pending.folder.uri);
+    pending.timer = setTimeout(() => {
+      pending.timer = undefined;
+      pending.due = true;
+      pump();
+    }, settings.remoteIndexing.autoWatchDebounceMs);
+  };
 
-  const flush = (): void => {
-    timer = undefined;
-    if (updateInFlight) {
-      flushAgain = true;
-      return;
-    }
-
-    const changedUris = [...pendingChangedUris.values()];
-    const deletedPaths = [...pendingDeletedPaths.values()];
-    const eventCount = changedUris.length + deletedPaths.length;
-    if (eventCount === 0) {
-      return;
-    }
-
-    pendingChangedUris.clear();
-    pendingDeletedPaths.clear();
-    if (eventCount > settings.remoteIndexing.maxAutoWatchFiles) {
-      void vscode.window.showWarningMessage(
-        `CorpusWire skipped an auto-index batch with ${eventCount} file events. Run CorpusWire: Index Workspace for bounded full reconciliation.`,
-      );
-      return;
-    }
-
-    updateInFlight = true;
-    void sendIncrementalIndexUpdate(changedUris, deletedPaths)
-      .catch((error) => {
+  const pump = (): void => {
+    if (disposed) return;
+    for (const pending of pendingRoots.values()) {
+      if (activeRoots >= MAX_CONCURRENT_INDEX_ROOTS) return;
+      if (!pending.due || pending.running) continue;
+      pending.due = false;
+      const settings = readSettings(pending.folder.uri);
+      const changedUris = [...pending.changed.values()];
+      const deletedPaths = [...pending.deleted];
+      pending.changed.clear();
+      pending.deleted.clear();
+      if (!settings.remoteIndexing.enabled || !settings.remoteIndexing.autoWatch) continue;
+      const eventCount = changedUris.length + deletedPaths.length;
+      if (eventCount === 0) continue;
+      if (eventCount > settings.remoteIndexing.maxAutoWatchFiles) {
         void vscode.window.showWarningMessage(
-          `CorpusWire auto-index update failed: ${error instanceof Error ? error.message : String(error)}`,
+          `${pending.folder.name}: CorpusWire skipped an auto-index batch with ${eventCount} file events. Run CorpusWire: Index Workspace for bounded full reconciliation.`,
         );
-      })
-      .finally(() => {
-        updateInFlight = false;
-        if (flushAgain || pendingChangedUris.size > 0 || pendingDeletedPaths.size > 0) {
-          flushAgain = false;
-          schedule();
-        }
-      });
-  };
-  const schedule = (): void => {
-    if (timer) {
-      clearTimeout(timer);
+        continue;
+      }
+      pending.running = true;
+      activeRoots += 1;
+      pending.controller = new AbortController();
+      void sendIncrementalIndexUpdate(pending.folder, changedUris, deletedPaths, pending.controller.signal)
+        .catch((error) => {
+          if (!disposed) void vscode.window.showWarningMessage(
+            `${pending.folder.name}: CorpusWire auto-index update failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        })
+        .finally(() => {
+          activeRoots -= 1;
+          pending.running = false;
+          pending.controller = undefined;
+          if (pending.changed.size > 0 || pending.deleted.size > 0) schedule(pending);
+          pump();
+        });
     }
-    timer = setTimeout(flush, settings.remoteIndexing.autoWatchDebounceMs);
   };
 
-  const watcher = vscode.workspace.createFileSystemWatcher(INDEX_INCLUDE_GLOB);
-  watcher.onDidCreate((uri) => {
-    pendingChangedUris.set(uri.toString(), uri);
-    schedule();
-  });
-  watcher.onDidChange((uri) => {
-    pendingChangedUris.set(uri.toString(), uri);
-    schedule();
-  });
-  watcher.onDidDelete((uri) => {
+  const enqueue = (uri: vscode.Uri, deleted: boolean): void => {
+    if (disposed) return;
+    const folder = vscode.workspace.getWorkspaceFolder(uri);
+    if (!folder) return;
+    const settings = readSettings(folder.uri);
+    if (!settings.remoteIndexing.enabled || !settings.remoteIndexing.autoWatch) return;
     const relativePath = relativePathForUri(uri);
-    if (relativePath) {
-      pendingDeletedPaths.add(relativePath);
+    if (!relativePath || isIndexExcludedPath(relativePath)) return;
+    const key = indexRootKey(folder);
+    let pending = pendingRoots.get(key);
+    if (!pending) {
+      pending = { folder, changed: new Map(), deleted: new Set(), due: false, running: false };
+      pendingRoots.set(key, pending);
     }
-    pendingChangedUris.delete(uri.toString());
-    schedule();
-  });
+    if (deleted) {
+      pending.deleted.add(relativePath);
+      pending.changed.delete(uri.toString());
+    } else {
+      pending.changed.set(uri.toString(), uri);
+      pending.deleted.delete(relativePath);
+    }
+    schedule(pending);
+  };
+  const watcher = vscode.workspace.createFileSystemWatcher(INDEX_INCLUDE_GLOB);
+  watcher.onDidCreate((uri) => enqueue(uri, false));
+  watcher.onDidChange((uri) => enqueue(uri, false));
+  watcher.onDidDelete((uri) => enqueue(uri, true));
 
-  context.subscriptions.push(watcher);
+  context.subscriptions.push(watcher, {
+    dispose: () => {
+      disposed = true;
+      for (const pending of pendingRoots.values()) {
+        if (pending.timer) clearTimeout(pending.timer);
+        pending.controller?.abort();
+      }
+      pendingRoots.clear();
+    },
+  });
 }
 
-async function sendIncrementalIndexUpdate(changedUris: vscode.Uri[], deletedPaths: string[]): Promise<void> {
-  const resource = changedUris[0] ?? vscode.workspace.workspaceFolders?.[0]?.uri;
-  const settings = readSettings(resource);
-  if (!settings.remoteIndexing.enabled || !settings.remoteIndexing.workspaceId) {
+async function sendIncrementalIndexUpdate(
+  folder: vscode.WorkspaceFolder,
+  changedUris: vscode.Uri[],
+  deletedPaths: string[],
+  signal?: AbortSignal,
+): Promise<void> {
+  const settings = readSettings(folder.uri);
+  if (!settings.remoteIndexing.enabled || !settings.remoteIndexing.autoWatch || !settings.remoteIndexing.workspaceId) {
     return;
+  }
+  const roots = (vscode.workspace.workspaceFolders ?? []).map((root) => ({ folder: root, settings: readSettings(root.uri) }))
+    .filter(({ settings: rootSettings }) => rootSettings.remoteIndexing.enabled);
+  if (!roots.some((root) => indexRootKey(root.folder) === indexRootKey(folder))) return;
+  assertDistinctIndexRoots(roots);
+  if (changedUris.some((uri) => {
+    const actualRoot = vscode.workspace.getWorkspaceFolder(uri);
+    return !actualRoot || indexRootKey(actualRoot) !== indexRootKey(folder);
+  })) {
+    throw new Error("Incremental indexing cannot mix workspace folders.");
   }
 
   const indexerService = settings.services.indexer;
   const client = new CorpusWireClient({
     baseUrl: indexerService.url,
     endpointMode: "v1-only",
-    defaultHeaders: buildRemoteServiceHeaders(indexerService),
+    defaultHeaders: await buildAuthenticatedServiceHeaders(settings, indexerService),
   });
-  const collected = await collectUriFiles(changedUris, settings.remoteIndexing.maxFileSizeBytes);
+  const collected = await collectUriFiles(changedUris, settings.remoteIndexing.maxFileSizeBytes, false, signal);
+  if (signal?.aborted) throw new Error("Indexing cancelled before upload started.");
   if (collected.files.length === 0 && deletedPaths.length === 0) {
     return;
   }
   await client.indexWorkspace({
     workspace: {
       workspaceId: settings.remoteIndexing.workspaceId,
-      displayRoot: vscode.workspace.workspaceFolders?.[0]?.uri.toString(),
-      name: vscode.workspace.workspaceFolders?.[0]?.name,
+      displayRoot: folder.uri.toString(),
+      name: folder.name,
     },
     mode: "incremental",
     client: {
@@ -882,37 +965,46 @@ async function sendIncrementalIndexUpdate(changedUris: vscode.Uri[], deletedPath
     maxFileSizeBytes: settings.remoteIndexing.maxFileSizeBytes,
     files: collected.files,
     deletedPaths,
+    signal,
   });
 }
 
 async function collectWorkspaceFiles(
   workspaceFolder: vscode.WorkspaceFolder,
   maxFileSizeBytes: number,
+  signal?: AbortSignal,
 ): Promise<CollectedWorkspaceFiles> {
   const startedAt = new Date().toISOString();
   const uris = await vscode.workspace.findFiles(
     new vscode.RelativePattern(workspaceFolder, INDEX_INCLUDE_GLOB),
     new vscode.RelativePattern(workspaceFolder, INDEX_EXCLUDE_GLOB),
   );
-  const collected = await collectUriFiles(uris, maxFileSizeBytes, true);
+  // Nested workspace folders have independent identities and must never appear in this root's inventory.
+  const rootUris = uris.filter((uri) => {
+    const actualRoot = vscode.workspace.getWorkspaceFolder(uri);
+    if (!actualRoot) throw Object.assign(new Error("Workspace scan incomplete"), { code: "scan_incomplete" });
+    return indexRootKey(actualRoot) === indexRootKey(workspaceFolder);
+  });
+  const collected = await collectUriFiles(rootUris, maxFileSizeBytes, true, signal);
   return { ...collected, inventoryScan: {
     complete: true, startedAt, completedAt: new Date().toISOString(),
-    excludedFileCount: collected.skippedLargeFiles + collected.skippedPolicyFiles, producer: "corpuswire-vscode-scan/v1",
-    ignoreDigest: createHash("sha256").update(JSON.stringify({ include: INDEX_INCLUDE_GLOB, exclude: INDEX_EXCLUDE_GLOB, hiddenPaths: "exclude", retrievalExclusions: "discovery-and-terraform/v1" })).digest("hex"),
+    excludedFileCount: collected.skippedLargeFiles + collected.skippedPolicyFiles + uris.length - rootUris.length, producer: "corpuswire-vscode-scan/v1",
+    ignoreDigest: createHash("sha256").update(JSON.stringify({ include: INDEX_INCLUDE_GLOB, exclude: INDEX_EXCLUDE_GLOB, hiddenPaths: "exclude", retrievalExclusions: "discovery-and-terraform/v1", workspaceRootIsolation: "v1" })).digest("hex"),
   } };
 }
 
-async function collectUriFiles(uris: vscode.Uri[], maxFileSizeBytes: number, strict = false): Promise<CollectedWorkspaceFiles> {
+async function collectUriFiles(uris: vscode.Uri[], maxFileSizeBytes: number, strict = false, signal?: AbortSignal): Promise<CollectedWorkspaceFiles> {
   const files: RemoteWorkspaceFile[] = [];
   let skippedLargeFiles = 0;
   let skippedPolicyFiles = 0;
   for (const uri of uris) {
+    if (signal?.aborted) throw new Error("Indexing cancelled during scan.");
     const relativePath = relativePathForUri(uri);
     if (!relativePath) {
       if (strict) throw Object.assign(new Error("Workspace scan incomplete"), { code: "scan_incomplete" });
       continue;
     }
-    if (relativePath.split("/").some((part) => part.startsWith(".")) || isRetrievalExcludedPath(relativePath)) {
+    if (isIndexExcludedPath(relativePath)) {
       skippedPolicyFiles += 1;
       continue;
     }
@@ -943,11 +1035,17 @@ async function collectUriFiles(uris: vscode.Uri[], maxFileSizeBytes: number, str
 }
 
 function relativePathForUri(uri: vscode.Uri): string | null {
-  const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri) ?? vscode.workspace.workspaceFolders?.[0];
+  const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
   if (!workspaceFolder) {
     return null;
   }
   return vscode.workspace.asRelativePath(uri, false).replaceAll("\\", "/");
+}
+
+function isIndexExcludedPath(relativePath: string): boolean {
+  const parts = relativePath.split("/");
+  return parts.some((part) => part.startsWith(".") || ["node_modules", "dist", "build", "target", "__pycache__"].includes(part))
+    || isRetrievalExcludedPath(relativePath);
 }
 
 async function enhanceSelectedPrompt(): Promise<void> {
@@ -973,7 +1071,7 @@ async function enhanceSelectedPrompt(): Promise<void> {
   const client = new CorpusWireClient({
     baseUrl: enhancerService.url,
     endpointMode: "v1-only",
-    defaultHeaders: buildRemoteServiceHeaders(enhancerService),
+    defaultHeaders: await buildAuthenticatedServiceHeaders(settings, enhancerService),
   });
   const request = buildEnhancementRequest(selectedText, settings);
 
@@ -1394,7 +1492,8 @@ function buildPromptPanelHtml(initialSeed: string): string {
         indexing: 'Indexing…',
         error: 'Index status error'
       };
-      indexLabel.textContent = labels[message.state] || message.state;
+      indexLabel.textContent = message.state === 'indexed' && message.code_ready && (message.documentation_pending || message.other_pending)
+        ? 'Code ready' : labels[message.state] || message.state;
       indexMessage.textContent = message.message || '';
       const showIndexBtn = ['not-indexed', 'stale', 'indexed', 'error'].includes(message.state);
       indexBtn.style.display = showIndexBtn ? '' : 'none';

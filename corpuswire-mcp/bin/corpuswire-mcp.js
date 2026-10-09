@@ -2126,6 +2126,9 @@ class SyncManager {
       bootstrapReason: this.bootstrapStatus.reason,
       bootstrapStatus: this.bootstrapStatus.status,
       bootstrapCanRetrieve: this.bootstrapStatus.canRetrieve,
+      bootstrapCodeReady: this.bootstrapStatus.codeReady ?? false,
+      documentationPending: this.bootstrapStatus.documentationPending ?? false,
+      otherPending: this.bootstrapStatus.otherPending ?? false,
       bootstrapCollection: this.bootstrapStatus.collection,
       bootstrapIndexHealthStatus: this.bootstrapStatus.indexHealthStatus,
       bootstrapIndexedAt: this.bootstrapStatus.indexedAt,
@@ -5199,8 +5202,14 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
   const pointCount = Number.isInteger(diagnosis.point_count) ? diagnosis.point_count : null;
   const statusLooksBlocked = ["blocked", "error", "missing"].includes((diagnosisStatus ?? "").toLowerCase());
   const coverage = asRecord(index.coverage);
+  const codeReady = index.readiness === "code_ready" && coverage.code_ready === true
+    && coverage.state === "pending"
+    && Array.isArray(coverage.reason_codes)
+    && coverage.reason_codes.length === 1
+    && coverage.reason_codes[0] === "background_ingestion_pending"
+    && canRetrieve === true && diagnosisStatus === "ready";
   const coverageUnknown = !["verified", "not_applicable"].includes(coverage.state);
-  const needsReconcile = coverageUnknown || hasFreshnessProblem
+  const needsReconcile = (coverageUnknown && !codeReady) || hasFreshnessProblem
     || collectionExists === false
     || indexHealthStatus === "degraded"
     || indexHealthStatus === "stale"
@@ -5216,6 +5225,9 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
 
   return {
     coverage,
+    codeReady,
+    documentationPending: codeReady && coverage.documentation_pending === true,
+    otherPending: codeReady && coverage.other_pending === true,
     state,
     needsReconcile,
     checkedAt: new Date().toISOString(),
@@ -7476,6 +7488,9 @@ function formatSyncPayload(payload) {
     `- bootstrapReason: ${status.bootstrapReason ?? "none"}`,
     `- bootstrapDiagnosisStatus: ${status.bootstrapStatus ?? "unknown"}`,
     `- bootstrapCanRetrieve: ${status.bootstrapCanRetrieve ?? "unknown"}`,
+    `- codeReady: ${status.bootstrapCodeReady ?? false}`,
+    `- documentationPending: ${status.documentationPending ?? false}`,
+    `- otherPending: ${status.otherPending ?? false}`,
     `- bootstrapCollection: ${status.bootstrapCollection ?? "unknown"}`,
     `- bootstrapIndexHealthStatus: ${status.bootstrapIndexHealthStatus ?? "unknown"}`,
     `- bootstrapIndexedAt: ${status.bootstrapIndexedAt ?? "unknown"}`,

@@ -80,7 +80,11 @@ export declare class CorpusWireClient {
     startIndexSession(request: StartRemoteIndexSessionRequest): Promise<RemoteIndexSession>;
     previewIndexWorkspace(request: IndexWorkspaceRequest): Promise<RemoteIndexPreview>;
     sendManifestBatch(sessionId: string, entries: RemoteManifestEntry[]): Promise<RemoteManifestBatchResult>;
-    uploadFileBatch(sessionId: string, metadata: RemoteFileBatchMetadata, files: RemoteFileContent[], onAttempt?: () => void): Promise<RemoteFileBatchResult>;
+    uploadFileBatch(sessionId: string, metadata: RemoteFileBatchMetadata, files: RemoteFileContent[], onAttempt?: () => void, options?: {
+        signal?: AbortSignal;
+        queueWaitTimeoutMs?: number;
+    }): Promise<RemoteFileBatchResult>;
+    checkpointIndexSessionCode(sessionId: string): Promise<RemoteIndexStatus>;
     commitIndexSession(sessionId: string): Promise<RemoteIndexCommitResponse>;
     getIndexSessionStatus(sessionId: string): Promise<RemoteIndexStatus>;
     followIndexSession(sessionId: string, options?: {
@@ -97,6 +101,7 @@ export declare class CorpusWireClient {
     }>;
     private abortIndexSessionQuietly;
     private waitForIndexSessionProcessing;
+    private checkIndexWorkspaceInterrupt;
     indexWorkspace(request: IndexWorkspaceRequest): Promise<RemoteIndexCommitResponse>;
     private waitForIndexSessionTerminal;
 }

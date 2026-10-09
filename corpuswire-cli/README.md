@@ -115,7 +115,7 @@ npm pack ./corpuswire-sdk --pack-destination /tmp/corpuswire-snapshot
 npm pack ./corpuswire-cli --pack-destination /tmp/corpuswire-snapshot
 npm install --prefix /tmp/corpuswire-install \
   /tmp/corpuswire-snapshot/corpuswire-sdk-0.1.3.tgz \
-  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.4-beta.3.tgz
+  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.4-beta.5.tgz
 /tmp/corpuswire-install/node_modules/.bin/cw --version
 ```
 
@@ -147,6 +147,25 @@ repeatable `--include` and `--exclude`, `--mode full|incremental`, `--yes`,
 `--non-interactive`, `--timeout-ms`, `--attach`, `--ndjson`, and `--trace`. The local
 profile accepts only a loopback service; the hosted profile requires HTTPS.
 Credentials are never printed.
+
+The CLI bundles its SDK so an older globally installed SDK cannot override the
+indexing transport. Supported code uploads precede documentation and other
+files. After a successful code checkpoint, terminal output reports
+`Code ready; documentation pending.`; NDJSON emits a `code_ready` record with
+`documentation_pending` and `other_pending` booleans. Full completion remains a
+separate verified event.
+
+`cw doctor` accepts healthy published code while full coverage is still pending
+and reports `coverage.codeReady`, `documentationPending` and `otherPending`.
+Vector errors, publication/mirror failures, invalidation and real freshness
+warnings still require attention. Watch reconciliation continues to require its
+completed, fully verified inventory before establishing the next watch baseline.
+
+Temporary HTTP429 `index_queue_full` responses pause that batch according to
+`Retry-After` (normally one second), then retry the same payload. The bounded
+admission wait defaults to ten minutes per batch and honors cancellation.
+Permanent quotas fail immediately. The CLI uses the SDK's advertised batch
+and upload-concurrency limits automatically.
 
 `--trace` adds a content-free `index-observability/v1` record with client file
 discovery/read/hash time, server receipt and model-wait time when the backend

@@ -309,7 +309,7 @@ test("main indexes the current folder with no arguments after printing the previ
 test("main prints the installed CLI version offline for command and flags", async () => {
   const metadata = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const lock = JSON.parse(await readFile(new URL("../package-lock.json", import.meta.url), "utf8"));
-  assert.equal(metadata.version, "0.1.4-beta.4");
+  assert.equal(metadata.version, "0.1.4-beta.5");
   assert.deepEqual(metadata.bin, { cw: "bin/corpuswire.js" });
   assert.equal(lock.version, metadata.version);
   assert.equal(lock.packages[""].version, metadata.version);
@@ -322,7 +322,7 @@ test("main prints the installed CLI version offline for command and flags", asyn
       fetchFn: () => { throw new Error("Version must not contact the backend"); },
       sdk: { CorpusWireClient: class { constructor() { throw new Error("Version must not load a client"); } } },
     });
-    assert.deepEqual(writes, ["0.1.4-beta.4"]);
+    assert.deepEqual(writes, ["0.1.4-beta.5"]);
   }
   const help = [];
   await main(["--help"], { write: (line) => help.push(line) });
@@ -611,6 +611,64 @@ test("non-interactive rebuild requires an exact workspace acknowledgement", asyn
     });
     assert.equal(result.mutated, false);
     assert.equal(mutations, 0);
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+for (const ndjson of [false, true]) {
+  test(`index reports code readiness with pending flags in ${ndjson ? "NDJSON" : "terminal"} output`, async () => {
+    const fixture = await syntheticWorkspace();
+    const writes = [];
+    const client = fakeIndexClient({
+      indexWorkspace: async (request) => {
+        request.onProgress(progressEvent(1, "embedding", 40, "running"));
+        request.onCodeReady({
+          session_id: "code-session",
+          coverage: { state: "pending", code_ready: true, documentation_pending: true, other_pending: false },
+        });
+        request.onProgress(progressEvent(2, "embedding", 60, "running"));
+        request.onProgress(progressEvent(3, "completed", 100, "completed"));
+        return { ok: true, result: {}, status: {
+          phase: "completed", coverage: { state: "verified" },
+          progress: progressEvent(3, "completed", 100, "completed"),
+        } };
+      },
+    });
+    try {
+      await runCliCommand({ ...indexOptions(fixture), yes: true, ndjson }, {
+        client, write: (line) => writes.push(line), writeRaw: () => {}, isTTY: false,
+      });
+      if (ndjson) {
+        const events = writes.map((line) => JSON.parse(line));
+        assert.deepEqual(events.filter((event) => event.type === "code_ready"), [{
+          type: "code_ready", session_id: "code-session", workspace_id: "demo://cli-synthetic#main",
+          code_ready: true, documentation_pending: true, other_pending: false,
+        }]);
+        const published = events.findIndex((event) => event.type === "code_ready");
+        const completed = events.findIndex((event) => event.event?.overall_percent === 100);
+        assert.ok(published >= 0 && completed > published);
+      } else {
+        assert.equal(writes.filter((line) => line === "Code ready; documentation pending.").length, 1);
+      }
+    } finally {
+      await rm(fixture, { recursive: true, force: true });
+    }
+  });
+}
+
+test("index does not report code readiness when publication is still pending", async () => {
+  const fixture = await syntheticWorkspace();
+  const writes = [];
+  try {
+    await runCliCommand({ ...indexOptions(fixture), yes: true, ndjson: true }, {
+      client: fakeIndexClient({ indexWorkspace: async (request) => {
+        request.onCodeReady({ coverage: { code_ready: false, documentation_pending: true } });
+        return { ok: true, result: {}, status: { phase: "completed" } };
+      } }),
+      write: (line) => writes.push(line), writeRaw: () => {}, isTTY: false,
+    });
+    assert.ok(writes.map((line) => JSON.parse(line)).every((event) => event.type !== "code_ready"));
   } finally {
     await rm(fixture, { recursive: true, force: true });
   }
@@ -956,6 +1014,39 @@ test("explicit reconcile retains confirmation and hosted implicit indexing never
   } finally { await rm(fixture, { recursive: true, force: true }); }
 });
 
+test("doctor accepts healthy published code and keeps incomplete or degraded coverage unhealthy", async () => {
+  const fixture = await syntheticWorkspace();
+  const coverage = { state: "pending", reason_codes: ["background_ingestion_pending"],
+    code_ready: true, documentation_pending: true, other_pending: false };
+  const cases = [
+    { name: "code-ready", coverage, status: "ready" },
+    { name: "still publishing", coverage: { ...coverage, code_ready: false }, status: "attention" },
+    { name: "mirror pending", coverage: { ...coverage, reason_codes: ["mirror_pending"] }, status: "attention" },
+    { name: "invalidated", coverage: { ...coverage, state: "invalidated" }, status: "attention" },
+    { name: "vector error", coverage, health_status: "degraded", status: "attention" },
+    { name: "real warning", coverage, health_warnings: ["vector_store_error"], status: "attention" },
+    { name: "reconcile needed", coverage, read_needs_reconcile: true, status: "attention" },
+    { name: "missing diagnosis readiness", coverage, readiness: "incomplete", status: "attention" },
+  ];
+  try {
+    for (const entry of cases) {
+      const writes = [];
+      const result = await main(["doctor", "--workspace-id", "local-docker://code#main", "--json"], {
+        cwd: fixture, env: {}, homeDirectory: fixture, write: (line) => writes.push(line),
+        client: { health: async () => ({ ok: true }), diagnoseWorkspace: async () => ({
+          status: "ready", can_retrieve: true, resolved_workspace_id: "local-docker://code#main",
+          index: { health_status: entry.health_status ?? "ok", readiness: entry.readiness ?? "code_ready",
+            coverage: entry.coverage, health_warnings: entry.health_warnings ?? [],
+            read_needs_reconcile: entry.read_needs_reconcile ?? false },
+        }) },
+      });
+      assert.equal(result.status, entry.status, entry.name);
+      assert.equal(result.exitCode, entry.status === "ready" ? 0 : 1, entry.name);
+      assert.equal(JSON.parse(writes.at(-1)).coverage.documentationPending, true);
+    }
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
 test("doctor requires verified inventory, reports unavailable service, and never writes files", async () => {
   const fixture = await syntheticWorkspace();
   const initialEntries = await readdir(fixture);
@@ -1282,6 +1373,21 @@ async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, 
   assert.equal(state.maximumActive <= 1, true, "Index sessions must never overlap");
   return state;
 }
+
+test("watch cannot establish a full baseline from a code-ready partial diagnosis", async () => {
+  const state = await watchFixture({
+    onDiagnosis: async (_current, request) => ({
+      status: "ready", can_retrieve: true, resolved_workspace_id: request.workspaceId,
+      index: { health_status: "ok", readiness: "code_ready", coverage: {
+        state: "pending", code_ready: true, documentation_pending: true,
+        reason_codes: ["background_ingestion_pending"],
+      } },
+    }),
+  });
+  assert.match(state.error?.message ?? "", /inventory_not_verified/);
+  assert.equal(state.waits, 0);
+  assert.equal(state.requests.length, 1);
+});
 
 test("watch timing flags reject unsafe or ambiguous values", () => {
   for (const args of [["watch", "--poll-ms", "99"], ["watch", "--poll-ms", "1.5"],
