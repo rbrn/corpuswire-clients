@@ -37,6 +37,8 @@ export interface RequestJsonOptions {
     retryDelayMs?: number;
     /** Upload admission distinguishes retryable queue pressure from fatal quotas. */
     retryHttp429?: boolean;
+    /** Called only when a further transport attempt is about to start. */
+    onRetry?: () => void;
 }
 export declare function normalizeBaseUrl(baseUrl: string): string;
 export declare function createBasicAuthHeader(credentials: string): string;

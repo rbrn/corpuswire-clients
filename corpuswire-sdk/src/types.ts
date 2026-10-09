@@ -1649,6 +1649,8 @@ export type RemoteIndexVerificationStatus = "pending" | "verified" | "failed" | 
 
 export interface RemoteIndexProgressEvent {
   schema_version: "index-progress/v1";
+  /** Optional origin disambiguates client and server sequence spaces. */
+  event_origin?: "client" | "server";
   sequence: number;
   session_id: string;
   workspace_id: string;
@@ -1982,6 +1984,12 @@ export interface IndexTransferSummary {
   source_bytes_transferred: number;
   upload_attempts: number;
   source_bytes_attempted: number;
+  queue_retries?: number;
+  queue_full_responses?: number;
+  /** Cumulative measured cooldown across batches, not session wall time. */
+  queue_wait_ms?: number;
+  transport_retries?: number;
+  client_phase_timings_ms?: Record<string, number>;
   complete: boolean;
   /** Per-operation acknowledgements for authorized local cache updates; never activity telemetry. */
   acknowledged_files: Array<{ relative_path: string; sha256: string; disposition: "uploaded" | "confirmed_reused" }>;

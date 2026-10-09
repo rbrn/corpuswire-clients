@@ -487,3 +487,20 @@ incomplete index sessions.
 Full filesystem producers pass `inventoryScan` to `indexWorkspace()`. The SDK freezes and hashes uploaded buffers, computes `workspace-inventory/v1`, and negotiates `inventory_coverage_versions` before sending new fields. Supplying a `files` array alone does not certify a complete scan. Legacy servers receive the compatible request without coverage fields. Capability failures propagate before session creation.
 
 `status.coverage` describes a verified full baseline and compatible observed deltas. Session completion and 100% progress retain their existing meaning. The optional `transfer` result separates submitted, upload-required, reused and acknowledged unique transferred files; source bytes exclude multipart/TLS overhead. `upload_attempts` and `source_bytes_attempted` include HTTP retries. Error/detach objects retain partial counters with `complete: false`; do not interpret absent counters as zero. `acknowledged_files` is for authorized local cache updates and must not be copied into broad telemetry.
+
+Index progress polling backs off while status is unchanged, resets on observed work,
+and never waits more than two seconds between polls. Explicit intervals of 10ms
+or less retain the fast test cadence. Cancellation, detach, and processing deadlines
+interrupt the wait. Unchanged active status produces a heartbeat at most once per
+second with the original server sequence and an updated `last_heartbeat_at`.
+Client events include optional `event_origin` to distinguish their sequence space.
+
+Transfer results also report `queue_full_responses`, `queue_retries`,
+`queue_wait_ms`, and `transport_retries`. A queue rejection followed by cancellation
+increments the response count without claiming another attempt. Queue wait is the
+measured cumulative cooldown across batches; overlapping batch waits can exceed
+wall time. Backend `progress.retries` retains its separate server meaning.
+`client_phase_timings_ms` measures client phase intervals, including repeated
+upload tiers; upload intervals include admission/transport waits. Server phase
+timings remain authoritative for server work and must not be summed with client
+intervals to infer wall time.

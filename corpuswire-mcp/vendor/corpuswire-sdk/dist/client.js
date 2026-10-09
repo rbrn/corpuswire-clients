@@ -754,6 +754,7 @@ export class CorpusWireClient {
                 try {
                     const response = await requestJson({
                         retryHttp429: false,
+                        onRetry: options.onTransportRetry,
                         retryAttempts: timeoutMs === 0 ? 0 : undefined,
                         baseUrl: this.baseUrl,
                         paths: [`/v1/index/sessions/${encodeURIComponent(sessionId)}/files/batch`],
@@ -782,12 +783,28 @@ export class CorpusWireClient {
                         || error.errorCode !== "index_queue_full" || !error.retryable)
                         throw error;
                     lastQueueError = error;
+                    options.onQueueFull?.();
                     const remainingMs = deadline - Date.now();
                     if (remainingMs <= 0)
                         throw error;
-                    await waitForAbortableDelay(Math.min(remainingMs, Math.max(10, (error.retryAfterSeconds ?? 1) * 1_000)), signal);
+                    const waitStartedAt = Date.now();
+                    options.onQueueHeartbeat?.(0, false);
+                    const waitEndsAt = waitStartedAt
+                        + Math.min(remainingMs, Math.max(10, (error.retryAfterSeconds ?? 1) * 1_000));
+                    try {
+                        while (Date.now() < waitEndsAt) {
+                            await waitForAbortableDelay(Math.min(waitEndsAt - Date.now(), options.onQueueHeartbeat ? 1_000 : remainingMs), signal);
+                            if (Date.now() < waitEndsAt) {
+                                options.onQueueHeartbeat?.(Math.max(0, Date.now() - waitStartedAt), true);
+                            }
+                        }
+                    }
+                    finally {
+                        options.onQueueWait?.(Math.max(0, Date.now() - waitStartedAt));
+                    }
                     if (Date.now() >= deadline)
                         throw error;
+                    options.onQueueRetry?.();
                 }
             }
         }, timeoutMs, options.signal, () => lastQueueError ?? new Error("Upload admission timeout elapsed"));
@@ -831,13 +848,10 @@ export class CorpusWireClient {
             ? null
             : Date.now() + Math.max(1, options.timeoutMs);
         let abortSent = false;
-        let lastSequence = -1;
+        const observeStatus = createIndexStatusObserver(options.pollMs ?? 250, options.onProgress);
         for (;;) {
             const status = await this.getIndexSessionStatus(sessionId);
-            if (status.progress && status.progress.sequence !== lastSequence) {
-                options.onProgress?.(status.progress);
-                lastSequence = status.progress.sequence;
-            }
+            const pollDelay = observeStatus(status);
             if (["completed", "aborted", "failed", "expired"].includes(status.phase)) {
                 return status;
             }
@@ -851,7 +865,8 @@ export class CorpusWireClient {
             if (deadline !== null && Date.now() >= deadline) {
                 throw new RemoteIndexDetachedError(sessionId, status, "Caller wait timeout elapsed");
             }
-            await new Promise((resolve) => setTimeout(resolve, Math.max(10, options.pollMs ?? 250)));
+            await waitForIndexInterruptDelay(remainingIndexPollDelay(pollDelay, deadline), abortSent
+                ? { detachSignal: options.detachSignal } : options);
         }
     }
     async abortIndexSession(sessionId) {
@@ -873,13 +888,10 @@ export class CorpusWireClient {
         }
     }
     async waitForIndexSessionProcessing(sessionId, deadline, pollMs, request, ignoreMissingUploads = false, remainingUploads = 0) {
-        let lastSequence = -1;
+        const observeStatus = createIndexStatusObserver(pollMs, request.onProgress);
         for (;;) {
             const status = await this.getIndexSessionStatus(sessionId);
-            if (status.progress && status.progress.sequence !== lastSequence) {
-                request.onProgress?.(status.progress);
-                lastSequence = status.progress.sequence;
-            }
+            const pollDelay = observeStatus(status);
             if (["failed", "incomplete", "aborted", "expired"].includes(status.phase)) {
                 if (status.phase === "aborted") {
                     return status;
@@ -906,7 +918,7 @@ export class CorpusWireClient {
             if (pendingBatches === 0 && activeBatches === 0 && drained) {
                 return status;
             }
-            await waitForIndexInterruptDelay(Math.max(10, pollMs), request);
+            await waitForIndexInterruptDelay(remainingIndexPollDelay(pollDelay, deadline), request);
         }
     }
     async checkIndexWorkspaceInterrupt(sessionId, request, onProgress) {
@@ -922,6 +934,7 @@ export class CorpusWireClient {
     async indexWorkspace(request) {
         const clientStartedAt = Date.now();
         let clientSequence = 0;
+        const phaseClock = createClientPhaseClock();
         let lastOverallPercent = null;
         const emitProgress = (event) => {
             const normalized = { ...event };
@@ -944,18 +957,24 @@ export class CorpusWireClient {
                 unit,
                 message,
                 startedAt: clientStartedAt,
+                phaseStartedAt: phaseClock.enter(phase),
+                phaseTimings: phaseClock.snapshot(),
+                throughputCompleted: phaseClock.workCompleted(completed),
                 overallCompleted,
                 overallTotal,
             }));
             clientSequence += 1;
         };
         emitClientProgress("resolving_configuration", 0, null, "items", "Resolving remote indexing configuration");
+        emitClientProgress("filtering_hashing", 0, request.files.length, "files", "Preparing workspace file hashes");
         const remoteFiles = await Promise.all(request.files.map(prepareRemoteWorkspaceFile));
         emitClientProgress("filtering_hashing", remoteFiles.length, remoteFiles.length, "files", "Workspace file hashes prepared");
         if (request.inventoryScan && request.signal?.aborted)
             throw new WorkspaceScanIncompleteError("Scan cancelled before session creation");
         const triples = remoteFiles.map(({ file, sha256, content }) => [file.relativePath, sha256, content.length]);
         await inventoryDigest(triples);
+        phaseClock.pause();
+        phaseClock.enter("resolving_configuration");
         if (request.inventoryScan) {
             if (request.mode !== "full" || request.snapshotScope)
                 throw new WorkspaceScanIncompleteError("Inventory requires a v1 full scan");
@@ -984,7 +1003,8 @@ export class CorpusWireClient {
         const transfer = {
             files_submitted: remoteFiles.length, files_upload_required: null, files_reused: null,
             files_transferred: 0, source_bytes_transferred: 0, upload_attempts: 0,
-            source_bytes_attempted: 0, complete: false, acknowledged_files: [],
+            source_bytes_attempted: 0, queue_retries: 0, queue_full_responses: 0, queue_wait_ms: 0, transport_retries: 0,
+            client_phase_timings_ms: {}, complete: false, acknowledged_files: [],
         };
         const session = await this.startIndexSession(request);
         const uploadStop = new AbortController();
@@ -999,6 +1019,7 @@ export class CorpusWireClient {
             const manifestResult = await this.sendManifestBatch(session.session_id, manifestEntries);
             const initiallyComplete = manifestResult.unchanged + manifestResult.deletes + manifestResult.skipped;
             emitClientProgress("manifest_comparison", manifestEntries.length, manifestEntries.length, "files", "Manifest comparison complete", session.session_id, initiallyComplete, manifestEntries.length);
+            phaseClock.pause();
             const uploadRequired = new Set(manifestResult.upload_required);
             transfer.files_upload_required = uploadRequired.size;
             transfer.files_reused = manifestResult.unchanged;
@@ -1041,6 +1062,8 @@ export class CorpusWireClient {
                 const tierFiles = filesToUpload.filter(({ file }) => ingestionPriority(file.relativePath) === priority);
                 let tierQueued = false;
                 const uploadBatches = tierFiles.length === 0 ? [] : buildUploadBatches(tierFiles, clampUploadLimit(request.batchBytes, session.max_batch_bytes, "batchBytes"), session.max_batch_files);
+                if (uploadBatches.length)
+                    phaseClock.enter("uploading", uploadedFiles);
                 await runWithConcurrency(uploadBatches, uploadBatches.length === 0 ? 1
                     : clampUploadLimit(request.maxConcurrentUploads, session.max_concurrent_uploads, "maxConcurrentUploads"), async (batchFiles) => {
                     if (uploadStop.signal.aborted)
@@ -1050,10 +1073,36 @@ export class CorpusWireClient {
                         throw new Error("A source file exceeds the server's upload batch byte limit");
                     }
                     try {
+                        let queueSequence = clientSequence;
+                        let queueProgressAt = new Date().toISOString();
                         const result = await this.uploadFileBatch(session.session_id, { files: batchFiles.map((file) => file.descriptor) }, batchFiles, () => {
                             transfer.upload_attempts += 1;
                             transfer.source_bytes_attempted += batchFiles.reduce((sum, file) => sum + file.descriptor.size, 0);
-                        }, { signal: uploadStop.signal, queueWaitTimeoutMs: request.queueWaitTimeoutMs });
+                        }, {
+                            signal: uploadStop.signal, queueWaitTimeoutMs: request.queueWaitTimeoutMs,
+                            onQueueRetry: () => { transfer.queue_retries += 1; },
+                            onQueueFull: () => { transfer.queue_full_responses += 1; },
+                            onTransportRetry: () => { transfer.transport_retries += 1; },
+                            onQueueWait: (elapsedMs) => { transfer.queue_wait_ms += elapsedMs; },
+                            onQueueHeartbeat: (elapsedMs, heartbeat) => {
+                                const occurredAt = new Date().toISOString();
+                                if (!heartbeat) {
+                                    queueSequence = clientSequence;
+                                    clientSequence += 1;
+                                    queueProgressAt = occurredAt;
+                                }
+                                emitProgress({ ...clientIndexProgressEvent({
+                                        sequence: queueSequence, sessionId: session.session_id,
+                                        workspaceId: request.workspace.workspaceId, phase: "queued",
+                                        completed: uploadedFiles, total: filesToUpload.length, unit: "files",
+                                        message: "Waiting for upload queue capacity", startedAt: clientStartedAt,
+                                        phaseStartedAt: Date.now() - elapsedMs, phaseTimings: phaseClock.snapshot(),
+                                        throughputCompleted: 0,
+                                        overallCompleted: initiallyComplete, overallTotal: manifestEntries.length,
+                                    }), heartbeat, active_heartbeat: heartbeat, last_progress_at: queueProgressAt,
+                                    last_heartbeat_at: heartbeat ? occurredAt : null });
+                            },
+                        });
                         if (result.errors.length)
                             throw new Error("Source upload was not fully acknowledged");
                         transfer.files_transferred += batchFiles.length;
@@ -1071,6 +1120,7 @@ export class CorpusWireClient {
                         throw error;
                     }
                 });
+                phaseClock.pause();
                 if (tierQueued) {
                     clientOwnedCheckpoint = false;
                     const status = await this.waitForIndexSessionProcessing(session.session_id, processingWaitDeadline(), request.processingPollMs ?? 250, { ...request, onProgress: emitProgress }, true, filesToUpload.length - uploadedFiles);
@@ -1093,6 +1143,7 @@ export class CorpusWireClient {
                 }
             }
             if (queuedBackgroundWork) {
+                phaseClock.pause();
                 const processingStatus = await this.waitForIndexSessionProcessing(session.session_id, processingWaitDeadline(), request.processingPollMs ?? 250, { ...request, onProgress: emitProgress });
                 if (request.signal?.aborted || processingStatus.phase === "aborted") {
                     if (processingStatus.phase !== "aborted") {
@@ -1103,7 +1154,10 @@ export class CorpusWireClient {
                 }
             }
             await this.checkIndexWorkspaceInterrupt(session.session_id, request, emitProgress);
+            emitClientProgress("committing", 0, null, "items", "Waiting for verified commit", session.session_id);
             const committed = await this.commitIndexSession(session.session_id);
+            phaseClock.pause();
+            transfer.client_phase_timings_ms = phaseClock.snapshot();
             if (committed.status.progress) {
                 emitProgress(committed.status.progress);
             }
@@ -1111,6 +1165,7 @@ export class CorpusWireClient {
             return { ...committed, transfer };
         }
         catch (error) {
+            phaseClock.pause();
             if (!(error instanceof RemoteIndexDetachedError) && !(error instanceof RemoteIndexCancelledError)
                 && (request.signal?.aborted || request.detachSignal?.aborted)) {
                 try {
@@ -1149,23 +1204,24 @@ export class CorpusWireClient {
             throw error;
         }
         finally {
+            phaseClock.pause();
+            transfer.client_phase_timings_ms = phaseClock.snapshot();
             request.signal?.removeEventListener("abort", stopUploads);
             request.detachSignal?.removeEventListener("abort", stopUploads);
         }
     }
     async waitForIndexSessionTerminal(sessionId, pollMs, onProgress, detachSignal) {
+        const observeStatus = createIndexStatusObserver(pollMs, onProgress);
         for (;;) {
             const status = await this.getIndexSessionStatus(sessionId);
-            if (status.progress) {
-                onProgress?.(status.progress);
-            }
+            const pollDelay = observeStatus(status);
             if (["aborted", "failed", "expired", "completed"].includes(status.phase)) {
                 return status;
             }
             if (detachSignal?.aborted) {
                 throw new RemoteIndexDetachedError(sessionId, status, "Detached while cancellation was pending");
             }
-            await new Promise((resolve) => setTimeout(resolve, Math.max(10, pollMs)));
+            await waitForIndexInterruptDelay(pollDelay, { detachSignal });
         }
     }
 }
@@ -1397,14 +1453,17 @@ function buildWorkspaceManifest(remoteFiles, deletedPaths) {
 }
 function clientIndexProgressEvent(options) {
     const elapsedMs = Math.max(0, Date.now() - options.startedAt);
-    const throughput = elapsedMs > 0 && options.completed > 0
-        ? options.completed / (elapsedMs / 1_000)
+    const phaseElapsedMs = Math.max(0, Date.now() - (options.phaseStartedAt ?? options.startedAt));
+    const workCompleted = options.throughputCompleted ?? options.completed;
+    const throughput = phaseElapsedMs > 0 && workCompleted > 0
+        ? workCompleted / (phaseElapsedMs / 1_000)
         : null;
     const overallPercent = options.overallTotal && options.overallTotal > 0
         ? Math.min(99, (options.overallCompleted / options.overallTotal) * 99)
         : null;
     return {
         schema_version: "index-progress/v1",
+        event_origin: "client",
         sequence: options.sequence,
         session_id: options.sessionId,
         workspace_id: options.workspaceId,
@@ -1420,7 +1479,7 @@ function clientIndexProgressEvent(options) {
         phase_total: options.total,
         unit: options.unit,
         elapsed_ms: elapsedMs,
-        phase_elapsed_ms: elapsedMs,
+        phase_elapsed_ms: phaseElapsedMs,
         throughput_per_second: throughput,
         queue_depth: 0,
         retries: 0,
@@ -1432,7 +1491,7 @@ function clientIndexProgressEvent(options) {
         last_heartbeat_at: null,
         active_heartbeat: false,
         counts: {},
-        phase_timings_ms: {},
+        phase_timings_ms: options.phaseTimings ?? {},
         verification_status: "pending",
     };
 }
@@ -1493,6 +1552,75 @@ function clampUploadLimit(requested, advertised, name) {
         throw new Error(`${name} requires a positive finite limit`);
     }
     return Math.floor(Math.min(requested ?? advertised, advertised));
+}
+/** Keep client phases separate from server processing time and repeated upload tiers. */
+function createClientPhaseClock() {
+    const timings = {};
+    let phase;
+    let initialCompleted = 0;
+    let startedAt = Date.now();
+    const pause = () => {
+        if (phase)
+            timings[phase] = (timings[phase] ?? 0) + Math.max(0, Date.now() - startedAt);
+        phase = undefined;
+    };
+    return {
+        enter(next, completed = 0) {
+            if (next !== phase) {
+                pause();
+                phase = next;
+                startedAt = Date.now();
+                initialCompleted = completed;
+            }
+            return startedAt;
+        },
+        pause,
+        workCompleted(completed) { return Math.max(0, completed - initialCompleted); },
+        snapshot() {
+            return { ...timings, ...(phase ? { [phase]: (timings[phase] ?? 0) + Math.max(0, Date.now() - startedAt) } : {}) };
+        },
+    };
+}
+function remainingIndexPollDelay(delay, deadline) {
+    return deadline === null ? delay : Math.max(0, Math.min(delay, deadline - Date.now()));
+}
+/** Preserve server identity; a timestamp identifies each bounded liveness observation. */
+function createIndexStatusObserver(pollMs, onProgress) {
+    const baseDelay = Math.min(2_000, Math.max(10, pollMs));
+    let delay = baseDelay;
+    let identity = "";
+    let receivedAt = Date.now();
+    let baselineProgress;
+    let emittedAt = 0;
+    return (status) => {
+        const progress = status.progress;
+        const nextIdentity = JSON.stringify([status.phase, status.queue_depth, status.pending_batches,
+            status.active_batches, status.files_indexed, progress?.sequence, progress?.phase, progress?.state, progress?.phase_completed]);
+        const now = Date.now();
+        if (nextIdentity !== identity) {
+            identity = nextIdentity;
+            receivedAt = now;
+            baselineProgress = progress ?? undefined;
+            emittedAt = now;
+            delay = baseDelay;
+            if (progress)
+                onProgress?.({ ...progress, event_origin: progress.event_origin ?? "server" });
+        }
+        else {
+            if (baseDelay > 10)
+                delay = Math.min(2_000, Math.ceil(delay * 1.5));
+            if (progress && now - emittedAt >= 1_000 && !["completed", "failed", "aborted", "expired"].includes(status.phase)) {
+                const occurredAt = new Date(now).toISOString();
+                onProgress?.({ ...progress, event_origin: progress.event_origin ?? "server",
+                    occurred_at: occurredAt,
+                    elapsed_ms: Math.max(progress.elapsed_ms, (baselineProgress?.elapsed_ms ?? progress.elapsed_ms) + now - receivedAt),
+                    phase_elapsed_ms: Math.max(progress.phase_elapsed_ms, (baselineProgress?.phase_elapsed_ms ?? progress.phase_elapsed_ms) + now - receivedAt),
+                    heartbeat: true, active_heartbeat: true, last_heartbeat_at: occurredAt });
+                emittedAt = now;
+            }
+        }
+        return delay;
+    };
 }
 /** Wake polling immediately on either interrupt; the caller owns its semantics. */
 async function waitForIndexInterruptDelay(delayMs, request) {

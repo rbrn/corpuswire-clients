@@ -586,6 +586,16 @@ async function validateWatchFiles(root, scan) {
   }
 }
 
+const WATCH_ERROR_REASONS = {
+  ERR_FEATURE_UNAVAILABLE_ON_PLATFORM: "recursive_watch_unsupported", ENOSYS: "recursive_watch_unsupported",
+  ENOSPC: "watch_limit_reached", EMFILE: "watch_limit_reached", ENFILE: "watch_limit_reached",
+  EACCES: "watch_permission_denied", EPERM: "watch_permission_denied", ENOENT: "watch_root_unavailable",
+};
+function watcherFallbackDetails(error, stage) {
+  const code = typeof error?.code === "string" && Object.hasOwn(WATCH_ERROR_REASONS, error.code) ? error.code : null;
+  return { stage, reason: WATCH_ERROR_REASONS[code] ?? "native_watch_unavailable", error_code: code };
+}
+
 // The watcher is a wake-up hint; complete, content-hashed scans are the source of truth.
 export async function runWatchCommand(options, dependencies) {
   if (options.configuration.profile !== "local" || options.mode !== "full" || options.rebuild || options.attachSessionId) {
@@ -595,6 +605,13 @@ export async function runWatchCommand(options, dependencies) {
   const write = (message) => output(options.json || options.ndjson
     ? JSON.stringify({ schema_version: "watch-progress/v1", type: "watch_status", workspaceId: options.workspaceId, message })
     : message);
+  const reportWatcherFallback = (error, stage) => {
+    const fallback = watcherFallbackDetails(error, stage);
+    const message = "Filesystem notifications unavailable; periodic complete scans remain active.";
+    output(options.json || options.ndjson
+      ? JSON.stringify({ schema_version: "watch-progress/v1", type: "watch_status", workspaceId: options.workspaceId, message, fallback })
+      : `${message} Reason: ${fallback.reason}${fallback.error_code ? ` (${fallback.error_code})` : ""}.`);
+  };
   const signal = dependencies.signal;
   const requestedRoot = options.sourceRoot;
   const root = await realpath(requestedRoot);
@@ -664,14 +681,15 @@ export async function runWatchCommand(options, dependencies) {
     if (signal?.aborted) return { ok: true, stopped: true, publications, exitCode: 0 };
     try {
       watcher = (dependencies.watchFactory ?? watchFiles)(root, { recursive: true }, onChange);
-      watcher.on?.("error", () => {
+      watcher.on?.("error", (error) => {
         watcher?.close();
-        if (!watcherErrorReported) write("Filesystem notifications unavailable; periodic complete scans remain active.");
+        watcher = undefined;
+        if (!watcherErrorReported) reportWatcherFallback(error, "runtime");
         watcherErrorReported = true;
         onChange("change", null);
       });
-    } catch {
-      write("Filesystem notifications unavailable; using periodic complete scans.");
+    } catch (error) {
+      reportWatcherFallback(error, "startup");
     }
     let capabilities;
     for (let attempt = 0; ; attempt += 1) {
@@ -1307,7 +1325,8 @@ async function scanWorkspace(sourceRoot, options) {
 }
 
 async function scanWorkspaceComplete(sourceRoot, options) {
-  const scanStartedAt = new Date().toISOString();
+  const scanPhaseStartedAt = Date.now();
+  const scanStartedAt = new Date(scanPhaseStartedAt).toISOString();
   const scannedPaths = [];
   let scanned = 0;
   const discoveryStartedAt = performance.now();
@@ -1335,7 +1354,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
       scanned += 1;
       scannedPaths.push({ absolutePath, relativePath });
       options.onProgress(localProgressEvent({
-        phase: "scanning",
+        phase: "scanning", phaseStartedAt: scanPhaseStartedAt,
         message: "Scanning workspace files",
         workspaceId: options.workspaceId,
         startedAt: options.startedAt,
@@ -1348,6 +1367,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
   await walk(sourceRoot);
   const fileDiscoveryMs = Math.max(0, Math.round(performance.now() - discoveryStartedAt));
 
+  const filteringPhaseStartedAt = Date.now();
   const filteringStartedAt = performance.now();
   const supportedExtensions = new Set(options.capabilities.supported_extensions ?? []);
   const supportedNames = new Set(options.capabilities.supported_filenames ?? []);
@@ -1369,7 +1389,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
     selected.push({ ...candidate, fileStats });
     candidateBytes += fileStats.size;
     options.onProgress(localProgressEvent({
-      phase: "filtering_hashing",
+      phase: "filtering_hashing", phaseStartedAt: filteringPhaseStartedAt,
       message: "Filtering candidate files",
       workspaceId: options.workspaceId,
       startedAt: options.startedAt,
@@ -1403,7 +1423,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
       mtimeNs: Math.trunc(candidate.fileStats.mtimeMs * 1_000_000),
     });
     options.onProgress(localProgressEvent({
-      phase: "filtering_hashing",
+      phase: "filtering_hashing", phaseStartedAt: filteringPhaseStartedAt,
       message: "Hashing candidate files",
       workspaceId: options.workspaceId,
       startedAt: options.startedAt,
@@ -1556,14 +1576,17 @@ function localProgressEvent({
   message,
   workspaceId,
   startedAt,
+  phaseStartedAt = startedAt,
   completed = 0,
   total = null,
   unit = "items",
 }) {
   const elapsedMs = Math.max(0, Date.now() - startedAt);
+  const phaseElapsedMs = Math.max(0, Date.now() - phaseStartedAt);
   const phasePercent = total && total > 0 ? (completed / total) * 100 : null;
   return {
     schema_version: INDEX_PROGRESS_SCHEMA_VERSION,
+    event_origin: "client",
     sequence: elapsedMs,
     session_id: "pending",
     workspace_id: workspaceId,
@@ -1580,8 +1603,8 @@ function localProgressEvent({
     phase_percent: phasePercent,
     unit,
     elapsed_ms: elapsedMs,
-    phase_elapsed_ms: elapsedMs,
-    throughput_per_second: elapsedMs > 0 && completed > 0 ? completed / (elapsedMs / 1_000) : null,
+    phase_elapsed_ms: phaseElapsedMs,
+    throughput_per_second: phaseElapsedMs > 0 && completed > 0 ? completed / (phaseElapsedMs / 1_000) : null,
     queue_depth: 0,
     retries: 0,
     warnings: [],
@@ -1609,7 +1632,7 @@ export function createProgressRenderer({ write, writeRaw, isTTY, ndjson }) {
       }
       completedEmitted = true;
     }
-    const key = `${event.session_id}:${event.sequence}:${event.phase}:${event.phase_completed}:${event.heartbeat}`;
+    const key = `${event.event_origin ?? "server"}:${event.session_id}:${event.sequence}:${event.phase}:${event.phase_completed}:${event.heartbeat}:${event.last_heartbeat_at ?? ""}`;
     if (key === lastKey) {
       return;
     }
@@ -1734,10 +1757,16 @@ function printIndexTerminalSummary(write, {
     files_transferred: result?.transfer?.files_transferred ?? null,
     source_bytes_transferred: result?.transfer?.source_bytes_transferred ?? null,
     upload_attempts: result?.transfer?.upload_attempts ?? null,
+    queue_retries: result?.transfer?.queue_retries ?? null,
+    queue_full_responses: result?.transfer?.queue_full_responses ?? null,
+    queue_wait_ms: result?.transfer?.queue_wait_ms ?? null,
+    transport_retries: result?.transfer?.transport_retries ?? null,
+    client_phase_timings_ms: result?.transfer?.client_phase_timings_ms ?? {},
     session_id: status?.session_id ?? progress.session_id ?? null,
     state: progress.state ?? status?.phase ?? "unknown",
     wall_time_ms: wallTimeMs,
     phase_timings_ms: progress.phase_timings_ms ?? {},
+    scan_phase_timings_ms: scan?.stageTimingsMs ?? {},
     files_scanned: scan?.scanned ?? null,
     files_included: preview?.included ?? scan?.included ?? null,
     files_excluded: scan
@@ -1765,10 +1794,13 @@ function printIndexTerminalSummary(write, {
     `  Wall time: ${formatDuration(summary.wall_time_ms)}`,
     `  Files: scanned=${summary.files_scanned ?? "unknown"} included=${summary.files_included ?? "unknown"} excluded=${summary.files_excluded ?? "unknown"} changed=${summary.files_changed ?? "unknown"} indexed=${summary.files_indexed} unchanged=${summary.files_unchanged} skipped=${summary.files_skipped} deleted=${summary.files_deleted}`,
     `  Data: ${formatBytes(summary.bytes)}; chunks=${summary.chunks}; embedding batches=${summary.embedding_batches}; vector writes=${summary.vector_writes}`,
-    `  Retries/warnings: ${summary.retries}/${summary.warnings.length}`,
+    `  Backend retries/warnings: ${summary.retries}/${summary.warnings.length}`,
+    `  Upload retries: queue=${summary.queue_retries ?? "unknown"}; transport=${summary.transport_retries ?? "unknown"}; queue cooldown=${summary.queue_wait_ms === null ? "unknown" : formatDuration(summary.queue_wait_ms)}`,
     `  Verification: ${summary.verification}; inventory coverage: ${summary.coverage_state}`,
     `  Transfer: ${summary.files_transferred ?? "unknown"} acknowledged files; ${summary.source_bytes_transferred ?? "unknown"} source bytes; ${summary.upload_attempts ?? "unknown"} attempts`,
     `  Phase timings: ${formatPhaseTimings(summary.phase_timings_ms)}`,
+    `  Client phase timings: ${formatPhaseTimings(summary.client_phase_timings_ms)}`,
+    `  Scan timings: ${formatPhaseTimings(summary.scan_phase_timings_ms)}`,
   ].join("\n"));
 }
 

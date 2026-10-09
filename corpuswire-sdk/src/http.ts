@@ -71,6 +71,8 @@ export interface RequestJsonOptions {
   retryDelayMs?: number;
   /** Upload admission distinguishes retryable queue pressure from fatal quotas. */
   retryHttp429?: boolean;
+  /** Called only when a further transport attempt is about to start. */
+  onRetry?: () => void;
 }
 
 export function normalizeBaseUrl(baseUrl: string): string {
@@ -128,6 +130,7 @@ export async function requestJson<T>(options: RequestJsonOptions): Promise<T> {
       } catch (error) {
         if (attempt < retryAttempts && isRetryableFetchError(error)) {
           await waitForRetry(retryDelayMs, attempt, null, options.init?.signal);
+          options.onRetry?.();
           continue;
         }
         throw error;
@@ -147,6 +150,7 @@ export async function requestJson<T>(options: RequestJsonOptions): Promise<T> {
           if (attempt < retryAttempts && TRANSIENT_HTTP_STATUSES.has(response.status)
             && (response.status !== 429 || options.retryHttp429 !== false)) {
             await waitForRetry(retryDelayMs, attempt, responseRetryAfterSeconds(response), options.init?.signal);
+            options.onRetry?.();
             continue;
           }
           throw error;
@@ -160,6 +164,7 @@ export async function requestJson<T>(options: RequestJsonOptions): Promise<T> {
           && parsed?.errorCode !== "index_queue_full") {
           const retryAfterSeconds = responseRetryAfterSeconds(response);
           await waitForRetry(retryDelayMs, attempt, retryAfterSeconds, options.init?.signal);
+          options.onRetry?.();
           continue;
         }
 

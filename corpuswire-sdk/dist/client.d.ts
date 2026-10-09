@@ -83,6 +83,11 @@ export declare class CorpusWireClient {
     uploadFileBatch(sessionId: string, metadata: RemoteFileBatchMetadata, files: RemoteFileContent[], onAttempt?: () => void, options?: {
         signal?: AbortSignal;
         queueWaitTimeoutMs?: number;
+        onQueueRetry?: () => void;
+        onQueueFull?: () => void;
+        onTransportRetry?: () => void;
+        onQueueWait?: (elapsedMs: number) => void;
+        onQueueHeartbeat?: (elapsedMs: number, heartbeat: boolean) => void;
     }): Promise<RemoteFileBatchResult>;
     checkpointIndexSessionCode(sessionId: string, options?: {
         signal?: AbortSignal;

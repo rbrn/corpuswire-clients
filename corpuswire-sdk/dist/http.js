@@ -78,6 +78,7 @@ export async function requestJson(options) {
             catch (error) {
                 if (attempt < retryAttempts && isRetryableFetchError(error)) {
                     await waitForRetry(retryDelayMs, attempt, null, options.init?.signal);
+                    options.onRetry?.();
                     continue;
                 }
                 throw error;
@@ -96,6 +97,7 @@ export async function requestJson(options) {
                     if (attempt < retryAttempts && TRANSIENT_HTTP_STATUSES.has(response.status)
                         && (response.status !== 429 || options.retryHttp429 !== false)) {
                         await waitForRetry(retryDelayMs, attempt, responseRetryAfterSeconds(response), options.init?.signal);
+                        options.onRetry?.();
                         continue;
                     }
                     throw error;
@@ -109,6 +111,7 @@ export async function requestJson(options) {
                     && parsed?.errorCode !== "index_queue_full") {
                     const retryAfterSeconds = responseRetryAfterSeconds(response);
                     await waitForRetry(retryDelayMs, attempt, retryAfterSeconds, options.init?.signal);
+                    options.onRetry?.();
                     continue;
                 }
                 const headerRequestId = response.headers?.get?.("x-request-id") ?? null;

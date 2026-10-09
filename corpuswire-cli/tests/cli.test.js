@@ -1350,7 +1350,7 @@ test("CLI complete scan carries inventory evidence and cancellation cannot reach
   } finally { await rm(fixture, { recursive: true, force: true }); }
 });
 
-async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, onPreview, onDiagnosis, onSetup, watcherUnavailable = false } = {}) {
+async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, onPreview, onDiagnosis, onSetup, watcherUnavailable = false, watcherError } = {}) {
   const root = await syntheticWorkspace();
   const controller = new AbortController();
   const state = {
@@ -1398,9 +1398,10 @@ async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, 
       watchFactory: (sourceRoot, options, callback) => {
         assert.equal(sourceRoot, root);
         assert.equal(options.recursive, true);
-        if (watcherUnavailable) throw new Error("Synthetic recursive watcher unavailable");
+        if (watcherUnavailable) throw watcherError ?? new Error("Synthetic recursive watcher unavailable");
         state.opened += 1;
         const watcher = new EventEmitter();
+        state.failWatcher = (error) => watcher.emit("error", error);
         state.notify = (filename = "README.md", event = "change") => callback(event, filename);
         watcher.close = () => { state.closed += 1; watcher.removeAllListeners(); };
         return watcher;
@@ -1883,4 +1884,41 @@ test("watch rejects explicitly unindexed verified diagnosis", async () => {
   assert.match(state.error?.message ?? "",/index_not_indexed/);
   assert.equal(state.waits,0);
   assert.equal(state.writes.some(line=>line.includes("Index verified")),false);
+});
+
+test("successive same-sequence heartbeat timestamps remain visible in NDJSON", () => {
+  const writes = [];
+  const renderer = createProgressRenderer({ write: (line) => writes.push(line), writeRaw: () => {}, isTTY: false, ndjson: true });
+  const event = { ...progressEvent(3, "queued", null, "running"), heartbeat: true };
+  renderer.render({ ...event, last_heartbeat_at: "2026-10-09T00:00:01Z" });
+  renderer.render({ ...event, last_heartbeat_at: "2026-10-09T00:00:02Z" });
+  renderer.render({ ...event, last_heartbeat_at: "2026-10-09T00:00:02Z" });
+  assert.equal(writes.length, 2);
+});
+
+test("watch fallback exposes only allowlisted native reason and error code", { timeout: 5000 }, async () => {
+  for (const code of ["ENOSPC", "private/path token=secret"]) {
+    const state = await watchFixture({ argv: ["watch", "--ndjson"], watcherUnavailable: true,
+      watcherError: Object.assign(new Error("private/path token=secret"), { code }),
+      onWait: (current) => current.controller.abort(),
+    });
+    assert.ifError(state.error);
+    const fallback = state.writes.map((line) => JSON.parse(line)).find((entry) => entry.fallback)?.fallback;
+    assert.deepEqual(fallback, { stage: "startup", reason: code === "ENOSPC" ? "watch_limit_reached" : "native_watch_unavailable", error_code: code === "ENOSPC" ? "ENOSPC" : null });
+    assert.ok(state.writes.every((line) => !line.includes("secret") && !line.includes("private/path")));
+  }
+});
+
+
+test("runtime watcher failure reports safe reason and closes its handle once", { timeout: 5000 }, async () => {
+  let failed = false;
+  const state = await watchFixture({ argv: ["watch", "--ndjson"], onWait: (current) => {
+    if (!failed) { failed = true; current.failWatcher(Object.assign(new Error("token=secret /private/path"), { code: "EPERM" })); }
+    else current.controller.abort();
+  } });
+  assert.ifError(state.error);
+  const fallback = state.writes.map((line) => JSON.parse(line)).find((entry) => entry.fallback)?.fallback;
+  assert.deepEqual(fallback, { stage: "runtime", reason: "watch_permission_denied", error_code: "EPERM" });
+  assert.equal(state.closed, 1);
+  assert.ok(state.writes.every((line) => !line.includes("secret") && !line.includes("/private/path")));
 });

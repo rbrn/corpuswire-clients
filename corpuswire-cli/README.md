@@ -339,3 +339,15 @@ Use `--json` when another process needs the full backend envelope.
 A successful full scan supplies a canonical inventory after the existing preview and confirmation. Read errors, disappearing files, cancellation and detected file changes stop the scan before mutation. The effective file-size ceiling is the minimum of the configured and advertised server limits. Selection policies include default directory exclusions; excluded counts cover inspected files, not descendants of excluded directories.
 
 Terminal and NDJSON results distinguish session verification, inventory coverage, acknowledged file transfers and sender attempts. Legacy services report unknown coverage. An intentionally empty full inventory can be verified while there is no searchable content.
+
+Final indexing output separates upload attempts, queue rejection/retry counts,
+measured queue cooldown, transport retries, and backend retries. Unknown counters
+from older SDK/server versions stay unknown. Client and server phase intervals can
+overlap and do not add up to wall time. Successive queued heartbeats keep the
+server sequence and render with distinct heartbeat timestamps.
+
+Native watch startup/runtime fallback reports a fixed reason and an allowlisted
+error code (for example `watch_limit_reached` / `ENOSPC`). Unknown codes become
+`native_watch_unavailable` with a null code. NDJSON adds these fields in `fallback`;
+raw exception messages, filenames, and stacks are omitted. Periodic complete
+scans continue with the configured bounded scan interval.

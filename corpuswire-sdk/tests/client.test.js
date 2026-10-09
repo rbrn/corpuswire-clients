@@ -3152,3 +3152,175 @@ test("detach in and after the code-ready callback aborts a fully uploaded checkp
   assert.equal(fixture.calls.some(call=>call.type==="commit"),false);
   }
 });
+
+test("upload counters separate eleven queue cooldown retries from transport retries", { timeout: 4000 }, async () => {
+  let attempts = 0;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url) => {
+    if (url.endsWith("/sessions")) return jsonResponse(200, { ok: true, result: { session_id: "metrics", max_batch_bytes: 1024, max_concurrent_uploads: 1 } });
+    if (url.endsWith("/manifest/batch")) return jsonResponse(200, { ok: true, result: { accepted: 1, upload_required: ["a.py"], unchanged: 0, deletes: 0, skipped: 0, errors: [] } });
+    if (url.endsWith("/files/batch")) {
+      attempts += 1;
+      if (attempts <= 11) return jsonResponse(429, { detail: { code: "index_queue_full", retryable: true, retry_after_seconds: 0 } });
+      if (attempts === 12) return jsonResponse(503, { detail: "synthetic gateway failure" });
+      return jsonResponse(200, { ok: true, result: { files_received: 1, errors: [] } });
+    }
+    if (url.endsWith("/commit")) return jsonResponse(200, { ok: true, result: {}, status: { phase: "completed", progress: { ...progressEvent(77, 100, "completed"), retries: 3 } } });
+    throw new Error("Unexpected fixture route");
+  } });
+  const result = await client.indexWorkspace({ workspace: { workspaceId: "fixture" }, files: [{ relativePath: "a.py", content: "x" }], queueWaitTimeoutMs: 3000 });
+  assert.equal(result.transfer.upload_attempts, 13);
+  assert.equal(result.transfer.queue_full_responses, 11);
+  assert.equal(result.transfer.queue_retries, 11);
+  assert.equal(result.transfer.transport_retries, 1);
+  assert.ok(result.transfer.queue_wait_ms >= 90 && result.transfer.queue_wait_ms < 1000);
+  assert.equal(result.status.progress.retries, 3);
+});
+
+test("cancelled queue cooldown records rejection and actual wait without a fabricated retry", { timeout: 1000 }, async () => {
+  const controller = new AbortController();
+  let waits = 0, rejections = 0, retries = 0, attempts = 0;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async () => {
+    attempts += 1;
+    setTimeout(() => controller.abort(), 20);
+    return jsonResponse(429, { detail: { code: "index_queue_full", retryable: true, retry_after_seconds: 1 } });
+  } });
+  await assert.rejects(client.uploadFileBatch("fixture", { files: [] }, [], undefined, {
+    signal: controller.signal, queueWaitTimeoutMs: 500, onQueueFull: () => rejections++,
+    onQueueRetry: () => retries++, onQueueWait: (elapsed) => { waits += elapsed; },
+  }), { name: "AbortError" });
+  assert.equal(attempts, 1); assert.equal(rejections, 1); assert.equal(retries, 0);
+  assert.ok(waits >= 10 && waits < 200);
+});
+
+test("client phase timing begins before hashing and excludes earlier manifest work", async () => {
+  const events = [];
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "a.py", content: "x" }], capability: false });
+  const originalManifest = fixture.client.sendManifestBatch.bind(fixture.client);
+  fixture.client.sendManifestBatch = async (...args) => {
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    return originalManifest(...args);
+  };
+  const file = { relativePath: "a.py", get content() {
+    assert.ok(events.some((event) => event.phase === "filtering_hashing" && event.phase_completed === 0));
+    return "x";
+  } };
+  const result = await fixture.client.indexWorkspace({ ...fixture.request, files: [file], onProgress: (event) => events.push(event) });
+  const uploadStart = events.find((event) => event.phase === "uploading");
+  assert.ok(uploadStart.elapsed_ms >= 30);
+  assert.ok(uploadStart.phase_elapsed_ms < 20);
+  assert.ok(result.transfer.client_phase_timings_ms.manifest_comparison >= 30);
+  assert.ok(result.transfer.client_phase_timings_ms.uploading < result.transfer.client_phase_timings_ms.manifest_comparison);
+});
+
+test("same-sequence queued status emits bounded heartbeats with stable identity", { timeout: 3000 }, async () => {
+  const events = [];
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test" });
+  const started = Date.now();
+  client.getIndexSessionStatus = async () => ({ phase: Date.now() - started >= 1150 ? "completed" : "queued", queue_depth: 1, files_indexed: 0,
+    progress: { ...progressEvent(42, 0, "queued"), occurred_at: "2026-10-09T00:00:00Z", elapsed_ms: Date.now() - started + 10, phase_elapsed_ms: Date.now() - started + 5 } });
+  await client.followIndexSession("fixture", { pollMs: 10, onProgress: (event) => events.push(event) });
+  const heartbeats = events.filter((event) => event.heartbeat);
+  assert.equal(heartbeats.length, 1);
+  assert.equal(heartbeats[0].sequence, 42);
+  assert.equal(heartbeats[0].event_origin, "server");
+  assert.ok(heartbeats[0].phase_elapsed_ms >= 1000);
+  assert.ok(heartbeats[0].phase_elapsed_ms < 1250, "Fresh server elapsed is not counted twice");
+  assert.ok(heartbeats[0].last_heartbeat_at);
+});
+
+test("adaptive polling resets after progress and detach interrupts its delay", { timeout: 2000 }, async () => {
+  const times = [];
+  const controller = new AbortController();
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test" });
+  client.getIndexSessionStatus = async () => {
+    times.push(Date.now());
+    const count = times.length;
+    if (count === 5) setTimeout(() => controller.abort(), 5);
+    return { phase: "queued", queue_depth: 1, files_indexed: 0, progress: progressEvent(count >= 4 ? 2 : 1, 0, "queued") };
+  };
+  await assert.rejects(client.followIndexSession("fixture", { pollMs: 40, detachSignal: controller.signal }), RemoteIndexDetachedError);
+  assert.ok(times[3] - times[2] >= 80, "Idle polling backs off");
+  assert.ok(times[4] - times[3] < times[3] - times[2], "Progress resets the poll interval");
+  assert.ok(times[5] - times[4] < 35, "Detach wakes the pending delay");
+});
+
+
+test("large polling intervals respect absolute follow deadlines", { timeout: 1000 }, async () => {
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test" });
+  client.getIndexSessionStatus = async () => ({ phase: "queued", queue_depth: 1, files_indexed: 0, progress: progressEvent(1, 0, "queued") });
+  const startedAt = Date.now();
+  await assert.rejects(client.followIndexSession("fixture", { pollMs: 30_000, timeoutMs: 30 }), RemoteIndexDetachedError);
+  assert.ok(Date.now() - startedAt < 200);
+});
+
+
+test("configuration delay is excluded from hashing and queue heartbeat callback failure is awaited", { timeout: 3000 }, async () => {
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "a.py", content: "x" }], capability: false });
+  const originalStart = fixture.client.startIndexSession.bind(fixture.client);
+  fixture.client.startIndexSession = async (...args) => { await new Promise((resolve) => setTimeout(resolve, 40)); return originalStart(...args); };
+  const result = await fixture.client.indexWorkspace(fixture.request);
+  assert.ok(result.transfer.client_phase_timings_ms.resolving_configuration >= 35);
+  assert.ok(result.transfer.client_phase_timings_ms.filtering_hashing < 30);
+  let attempts = 0, retries = 0;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async () => {
+    attempts += 1;
+    return jsonResponse(429, { detail: { code: "index_queue_full", retryable: true, retry_after_seconds: 2 } });
+  } });
+  await assert.rejects(client.uploadFileBatch("fixture", { files: [] }, [], undefined, {
+    queueWaitTimeoutMs: 2500, onQueueRetry: () => retries++,
+    onQueueHeartbeat: (_elapsed, heartbeat) => { if (heartbeat) throw new Error("Synthetic observer failure"); },
+  }), /Synthetic observer failure/);
+  assert.equal(attempts, 1); assert.equal(retries, 0);
+});
+
+
+test("synchronous upload tiers exclude delayed code checkpoint from upload timing", { timeout: 2000 }, async () => {
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+  ], onUpload: async () => { await new Promise((resolve) => setTimeout(resolve, 10)); } });
+  const originalUpload = fixture.client.uploadFileBatch.bind(fixture.client);
+  fixture.client.uploadFileBatch = async (...args) => ({ ...await originalUpload(...args), queued: false });
+  const originalCheckpoint = fixture.client.checkpointIndexSessionCode.bind(fixture.client);
+  let checkpointWaitMs = 0;
+  fixture.client.checkpointIndexSessionCode = async (...args) => {
+    const startedAt = Date.now();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const status = await originalCheckpoint(...args);
+    checkpointWaitMs = Date.now() - startedAt;
+    return status;
+  };
+  const result = await fixture.client.indexWorkspace(fixture.request);
+  assert.equal(result.transfer.files_transferred, 2);
+  assert.equal(fixture.calls.filter((call) => call.type === "checkpoint").length, 1);
+  const uploadMs = result.transfer.client_phase_timings_ms.uploading;
+  assert.ok(uploadMs >= 15, "Both synchronous upload tiers remain measured");
+  assert.ok(uploadMs < checkpointWaitMs, "Checkpoint wait must not inflate upload time");
+  assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"], ["README.md"]]);
+});
+
+test("failed upload timing stops before delayed abort response cleanup", { timeout: 2000 }, async () => {
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }], capability: false });
+  fixture.client.uploadFileBatch = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    throw new Error("Synthetic upload rejection");
+  };
+  const originalAbort = fixture.client.abortIndexSession.bind(fixture.client);
+  let abortWaitMs = 0;
+  fixture.client.abortIndexSession = async (...args) => {
+    const startedAt = Date.now();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const response = await originalAbort(...args);
+    abortWaitMs = Date.now() - startedAt;
+    return response;
+  };
+  await assert.rejects(fixture.client.indexWorkspace(fixture.request), (error) => {
+    assert.match(error.message, /Synthetic upload rejection/);
+    assert.equal(error.transfer.complete, false);
+    assert.equal(error.transfer.files_transferred, 0);
+    const uploadMs = error.transfer.client_phase_timings_ms.uploading;
+    assert.ok(uploadMs >= 15, "Time spent attempting the upload remains measured");
+    assert.ok(uploadMs < abortWaitMs, "Abort cleanup must not inflate upload time");
+    return true;
+  });
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+});
