@@ -1,4 +1,16 @@
 import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceResponseEnvelope, CodebaseRepositoriesV1, CodebaseV1, CreateCodebaseRequest, GitHubProviderBindingPayload, GitHubProviderBindingRequest, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexSessionQuery, IndexWorkspaceRequest, IndexTransferSummary, CorpusWireClientOptions, LlmModelState, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, QualityEvent, QualityEventPayload, QualityEventRequest, QualityEventsQuery, QualityReview, QualityReviewQuery, QueryValueEvent, ProviderBindingResponseV1, ProviderBindingRevocationV1, ValueFeedbackRequest, ValueRollup, ValueRollupQuery, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexCodeStageResult, RemoteIndexProgressEvent, RemoteIndexPreview, RemoteIndexSession, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, ReviewContextCapabilitiesV1, ReviewContextJobV1, ReviewContextPollOptions, ReviewContextRequest, ReviewContextRequestV1, ReviewContextResult, ReviewContextCapabilitiesV2, ReviewContextJobV2, ReviewContextPollOptionsV2, ReviewContextRequestV2Input, ReviewContextRequestV2, ReviewContextResultV2, ReviewTelemetrySummaryV1, ReviewPurgeV1, ReviewStatusV1, ReviewStatusV2, SearchHit, StartRemoteIndexSessionRequest, WorkspaceDiagnosis, WorkspaceDiagnosisRequest, UpdateCodebaseRequest } from "./types.js";
+export type RemoteIndexOwnedSessionIdentity = Pick<RemoteIndexSession, "session_id" | "workspace_id" | "collection_name" | "mode">;
+export declare class RemoteIndexInterruptionError extends Error {
+    readonly reason: "cancel" | "detach" | "timeout";
+    readonly sessionIdentity: RemoteIndexOwnedSessionIdentity;
+    readonly status: RemoteIndexStatus | undefined;
+    readonly transfer: IndexTransferSummary;
+    readonly abortRequested: boolean;
+    readonly releaseConfirmed: boolean;
+    readonly interruptionOnly: boolean;
+    readonly sessionId: string;
+    constructor(message: string, reason: "cancel" | "detach" | "timeout", sessionIdentity: RemoteIndexOwnedSessionIdentity, status: RemoteIndexStatus | undefined, transfer: IndexTransferSummary, abortRequested: boolean, releaseConfirmed: boolean, interruptionOnly: boolean, cause: unknown);
+}
 export declare class RemoteIndexDetachedError extends Error {
     readonly transfer?: IndexTransferSummary;
     readonly sessionId: string;

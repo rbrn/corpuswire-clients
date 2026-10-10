@@ -19,6 +19,33 @@ class IndexProcessingInterruptedError extends Error {
         this.status = status;
     }
 }
+export class RemoteIndexInterruptionError extends Error {
+    reason;
+    sessionIdentity;
+    status;
+    transfer;
+    abortRequested;
+    releaseConfirmed;
+    interruptionOnly;
+    sessionId;
+    constructor(message, reason, sessionIdentity, status, transfer, abortRequested, releaseConfirmed, interruptionOnly, cause) {
+        super(message, { cause });
+        this.reason = reason;
+        this.sessionIdentity = sessionIdentity;
+        this.status = status;
+        this.transfer = transfer;
+        this.abortRequested = abortRequested;
+        this.releaseConfirmed = releaseConfirmed;
+        this.interruptionOnly = interruptionOnly;
+        this.name = "RemoteIndexInterruptionError";
+        this.sessionId = sessionIdentity.session_id;
+    }
+}
+function isInterruptionOnly(error) {
+    const cause = error instanceof IndexProcessingInterruptedError ? error.cause : error;
+    return (error instanceof IndexProcessingInterruptedError && cause === undefined)
+        || (cause instanceof DOMException && (cause.name === "AbortError" || cause.name === "TimeoutError"));
+}
 export class RemoteIndexDetachedError extends Error {
     transfer;
     sessionId;
@@ -944,6 +971,12 @@ export class CorpusWireClient {
                 status = await withRequestBudget(async (signal) => {
                     const observed = await this.getIndexSessionStatus(sessionId, { signal });
                     lastStatus = observed;
+                    // A returned backend failure takes precedence over a racing caller
+                    // interruption or deadline; retain its evidence through abort cleanup.
+                    if (["failed", "incomplete", "expired"].includes(observed.phase)
+                        || observed.errors.length > 0 || (observed.failed_batches ?? 0) > 0) {
+                        throw new Error(`Remote index session ${sessionId} failed: ${observed.errors.join("; ") || observed.phase}`, { cause: observed });
+                    }
                     if (signal.aborted)
                         throw new DOMException("Processing wait aborted", "AbortError");
                     if (deadline !== null && Date.now() >= deadline)
@@ -1279,6 +1312,8 @@ export class CorpusWireClient {
         }
         catch (error) {
             phaseClock.pause();
+            const originalError = error;
+            const interruptionOnly = isInterruptionOnly(originalError);
             if (codeStageReleaseStarted) {
                 if (error instanceof Error)
                     Object.assign(error, { transfer });
@@ -1304,8 +1339,9 @@ export class CorpusWireClient {
                             && (session.mode === undefined || terminal.mode === session.mode)
                             && (terminal.failed_batches === undefined || terminal.failed_batches === 0)
                             && terminal.pending_batches === 0 && terminal.active_batches === 0);
-                if ((request.signal?.aborted || error instanceof RemoteIndexCancelledError
-                    || (error instanceof IndexProcessingInterruptedError && error.reason === "cancel")) && confirmed) {
+                if ((interruptionOnly || error instanceof RemoteIndexCancelledError)
+                    && (request.signal?.aborted || error instanceof RemoteIndexCancelledError
+                        || (error instanceof IndexProcessingInterruptedError && error.reason === "cancel")) && confirmed) {
                     const cancelled = new RemoteIndexCancelledError(session.session_id, terminal);
                     Object.assign(cancelled, { transfer, cause: error });
                     throw cancelled;
@@ -1322,10 +1358,11 @@ export class CorpusWireClient {
                 const stopped = clientOwnedCheckpoint ? "Indexing stopped during the client-owned code checkpoint"
                     : incompleteUploads ? "Indexing stopped before all required source uploads were submitted"
                         : "Indexing stopped while waiting for source processing";
-                const interrupted = new Error(`${stopped}; ${confirmed
+                const interrupted = new RemoteIndexInterruptionError(`${stopped}; ${confirmed
                     ? `${incompleteUploads ? "an abort was requested for the incomplete session; " : ""}the owned session abort was confirmed`
-                    : `an abort was requested${incompleteUploads ? " for the incomplete session" : ""} but release could not be confirmed`}. Start a new index operation to complete the inventory.`, { cause: error });
-                Object.assign(interrupted, { transfer });
+                    : `an abort was requested${incompleteUploads ? " for the incomplete session" : ""} but release could not be confirmed`}. Start a new index operation to complete the inventory.`, error instanceof IndexProcessingInterruptedError ? error.reason
+                    : request.signal?.aborted ? "cancel" : request.detachSignal?.aborted ? "detach" : "timeout", { session_id: session.session_id, workspace_id: session.workspace_id,
+                    collection_name: session.collection_name, mode: session.mode }, terminal ?? (originalError instanceof IndexProcessingInterruptedError ? originalError.status : lastProcessingStatus), transfer, true, confirmed, interruptionOnly, originalError);
                 throw interrupted;
             }
             if (error instanceof Error)
@@ -1683,21 +1720,35 @@ async function withRequestBudget(operation, timeoutMs, callerSignal, timeoutErro
     const controller = new AbortController();
     let rejectInterruption;
     const interruption = new Promise((_, reject) => { rejectInterruption = reject; });
+    let callerAbortPending = false;
+    let callerAbortTimer;
     const interrupt = (error) => {
         rejectInterruption(error);
         controller.abort(error);
     };
-    const onAbort = () => interrupt(new DOMException("Upload aborted", "AbortError"));
+    const onAbort = () => {
+        const error = new DOMException("Upload aborted", "AbortError");
+        callerAbortPending = true;
+        controller.abort(error);
+        // Drain settled transport promise chains before choosing caller interruption.
+        // Only caller abort gets this single-turn grace; the timeout stays absolute.
+        callerAbortTimer = setTimeout(() => rejectInterruption(error), 0);
+    };
     callerSignal?.addEventListener("abort", onAbort, { once: true });
     // Zero retains the existing one-initial-attempt/no-queue-wait behavior.
     const timer = timeoutMs > 0 ? setTimeout(() => interrupt(timeoutError()), timeoutMs) : undefined;
     try {
         // Abort alone cannot bound injected transports or stalled response bodies.
-        return await Promise.race([operation(controller.signal), interruption]);
+        const result = await Promise.race([operation(controller.signal), interruption]);
+        if (callerAbortPending)
+            throw new DOMException("Upload aborted", "AbortError");
+        return result;
     }
     finally {
         if (timer !== undefined)
             clearTimeout(timer);
+        if (callerAbortTimer !== undefined)
+            clearTimeout(callerAbortTimer);
         callerSignal?.removeEventListener("abort", onAbort);
         controller.abort();
     }

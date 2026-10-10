@@ -8,6 +8,7 @@ import {
   CorpusWireHttpError,
   RemoteIndexCancelledError,
   RemoteIndexDetachedError,
+  RemoteIndexInterruptionError,
   ReviewContextPollingCancelledError,
   ReviewContextPollingTimeoutError,
   WorkspaceScanIncompleteError,
@@ -2915,6 +2916,9 @@ test("fully submitted precommit drain aborts after later stalled transport timeo
   await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: 30 }), (error) => {
     assert.equal(error instanceof RemoteIndexDetachedError, false);
     assert.match(error.message, /Start a new index operation/);
+    assert.equal(error instanceof RemoteIndexInterruptionError, true);
+    assert.equal(error.reason, "timeout");
+    assert.equal(error.interruptionOnly, true);
     assert.equal(error.transfer.complete, false);
     return true;
   });
@@ -2992,6 +2996,14 @@ for (const interruption of ["cancel", "detach"]) {
     }), (error) => {
       assert.equal(error instanceof RemoteIndexDetachedError, false);
       assert.equal(error instanceof RemoteIndexCancelledError, false, "Stalled cleanup did not confirm a terminal receipt");
+      assert.equal(error instanceof RemoteIndexInterruptionError, true);
+      assert.equal(error.reason, interruption);
+      assert.equal(error.interruptionOnly, true);
+      assert.equal(error.abortRequested, true);
+      assert.equal(error.releaseConfirmed, false);
+      assert.equal(error.sessionId, "priority");
+      assert.deepEqual(error.sessionIdentity, { session_id: "priority", workspace_id: "fixture", collection_name: "fixture", mode: "full" });
+      assert.equal(error.cause instanceof Error, true);
       assert.match(error.message, /release could not be confirmed.*Start a new index operation/);
       assert.equal(error.transfer.files_transferred, 1);
       assert.equal(error.transfer.complete, false);
@@ -3068,6 +3080,10 @@ for (const flow of ["documentation-only", "incremental", "checkpoint-disabled"])
     await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, mode, inventoryScan: flow == "incremental" ? undefined : fixture.request.inventoryScan, detachSignal: controller.signal }), (error) => {
       assert.equal(error instanceof RemoteIndexDetachedError, false);
       assert.match(error.message, /owned session abort was confirmed.*Start a new index operation/);
+      assert.equal(error instanceof RemoteIndexInterruptionError, true);
+      assert.equal(error.reason, "detach");
+      assert.equal(error.interruptionOnly, true);
+      assert.equal(error.releaseConfirmed, true);
       assert.equal(error.transfer.files_transferred, 1);
       assert.equal(error.transfer.complete, false);
       return true;
@@ -3076,6 +3092,153 @@ for (const flow of ["documentation-only", "incremental", "checkpoint-disabled"])
     assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
   });
 }
+
+for (const kind of ["callback", "scan", "http", "publication"]) {
+  for (const confirmed of [false, true]) {
+    test(`interruption evidence preserves ${kind} failure racing abort with release ${confirmed}`, async () => {
+      const controller = new AbortController();
+      const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+      const failure = kind === "scan" ? new WorkspaceScanIncompleteError("Actual scan failure")
+        : kind === "http" || kind === "publication" ? new CorpusWireHttpError(409, "Conflict", "Actual server failure", { retryable: false })
+        : new Error("Actual callback failure");
+      const fail = () => { controller.abort(); throw failure; };
+      const originalFetch = fixture.client.fetchFn;
+      fixture.client.fetchFn = async (url, init) => {
+        if (!confirmed && init.method === "DELETE") throw new Error("Abort rejected");
+        return originalFetch(url, init);
+      };
+      if (kind === "publication") fixture.client.checkpointIndexSessionCode = async () => fail();
+      else if (kind !== "callback") fixture.client.sendManifestBatch = async () => fail();
+      await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, signal: controller.signal,
+        onProgress: kind === "callback" ? (event) => { if (event.phase === "manifest_comparison") fail(); } : undefined,
+      }), (error) => {
+        assert.equal(error instanceof RemoteIndexCancelledError, false);
+        assert.equal(error instanceof RemoteIndexInterruptionError, true);
+        assert.equal(error.reason, "cancel");
+        assert.equal(error.interruptionOnly, false);
+        assert.equal(error.abortRequested, true);
+        assert.equal(error.releaseConfirmed, confirmed);
+        assert.equal(error.cause, failure);
+        assert.deepEqual(error.sessionIdentity, { session_id: "priority", workspace_id: "fixture", collection_name: "fixture", mode: "full" });
+        assert.equal(error.transfer.complete, false);
+        return true;
+      });
+      assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+    });
+  }
+}
+
+for (const source of ["status", "transport"]) {
+test(`interruption evidence preserves a wrapped ${source} HTTP failure racing abort`, async () => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  const failure = new CorpusWireHttpError(409, "Conflict", "Actual status failure", { retryable: false });
+  const originalStatus = fixture.client.getIndexSessionStatus.bind(fixture.client);
+  let reads = 0;
+  const failingStatus = async (...args) => {
+    if (++reads === 1) { controller.abort(); throw failure; }
+    return originalStatus(...args);
+  };
+  if (source === "status") fixture.client.getIndexSessionStatus = failingStatus;
+  else {
+    const originalFetch = fixture.client.fetchFn;
+    fixture.client.fetchFn = async (url, init) => {
+      if (url.endsWith("/status") && ++reads === 1) { controller.abort(); throw failure; }
+      return originalFetch(url, init);
+    };
+  }
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, signal: controller.signal }), (error) => {
+    assert.equal(error instanceof RemoteIndexInterruptionError, true);
+    assert.equal(error.interruptionOnly, false);
+    assert.equal(error.releaseConfirmed, true);
+    assert.equal(error.cause.cause, failure);
+    return true;
+  });
+});
+}
+
+for (const race of ["cancel", "deadline"]) {
+  for (const failed of [false, true]) {
+    test(`interruption evidence checks observed ${failed ? "failed" : "clean"} status before ${race} race`, async (t) => {
+      const controller = new AbortController();
+      const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }], capability: false });
+      const originalFetch = fixture.client.fetchFn;
+      let reads = 0, observed, now = 0;
+      t.mock.method(Date, "now", () => now);
+      fixture.client.fetchFn = async (url, init) => {
+        const response = await originalFetch(url, init);
+        if (!url.endsWith("/status") || ++reads !== 1) return response;
+        const payload = await response.json();
+        observed = { ...payload.result, phase: failed ? "failed" : "indexing",
+          failed_batches: failed ? 1 : 0, errors: failed ? ["genuine indexed operation failed"] : [] };
+        if (race === "cancel") controller.abort();
+        else now = 101;
+        return jsonResponse(200, { ...payload, result: observed });
+      };
+      await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, signal: controller.signal }), (error) => {
+        if (failed) {
+          assert.equal(error instanceof RemoteIndexCancelledError, false);
+          let cause = error;
+          while (cause instanceof Error && cause.cause !== undefined) cause = cause.cause;
+          assert.deepEqual(cause, observed);
+          if (race === "cancel") {
+            assert.equal(error instanceof RemoteIndexInterruptionError, true);
+            assert.equal(error.interruptionOnly, false);
+          }
+          assert.deepEqual(cause.errors, ["genuine indexed operation failed"]);
+        } else if (race === "cancel") assert.equal(error instanceof RemoteIndexCancelledError, true);
+        else {
+          assert.equal(error instanceof RemoteIndexInterruptionError, true);
+          assert.equal(error.reason, "timeout");
+          assert.equal(error.interruptionOnly, true);
+        }
+        return true;
+      });
+      assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+      assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+    });
+  }
+}
+
+test("interruption evidence bounds never-settling status transport on caller abort", { timeout: 500 }, async () => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  const originalStatus = fixture.client.getIndexSessionStatus.bind(fixture.client);
+  let reads = 0, stalledSignal;
+  fixture.client.getIndexSessionStatus = async (id, options) => {
+    if (++reads === 1) {
+      stalledSignal = options.signal;
+      queueMicrotask(() => controller.abort());
+      return new Promise(() => {});
+    }
+    return originalStatus(id, options);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, signal: controller.signal }),
+    (error) => error instanceof RemoteIndexCancelledError && error.status.workspace_id === "fixture");
+  assert.equal(stalledSignal.aborted, true);
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+});
+
+test("interruption evidence refuses mismatched terminal session identity", async () => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }],
+    onUpload: () => controller.abort() });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (!url.endsWith("/status")) return response;
+    const payload = await response.json(); payload.result.workspace_id = "foreign";
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, signal: controller.signal }), (error) => {
+    assert.equal(error instanceof RemoteIndexInterruptionError, true);
+    assert.equal(error.interruptionOnly, true);
+    assert.equal(error.releaseConfirmed, false);
+    assert.equal(error.status.workspace_id, "foreign");
+    assert.equal(error.sessionIdentity.workspace_id, "fixture");
+    return true;
+  });
+});
 
 test("fatal queue admission error survives stalled bounded abort cleanup", { timeout: 2500 }, async () => {
   const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }], capability: false });

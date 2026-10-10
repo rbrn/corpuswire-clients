@@ -2,6 +2,7 @@ export {
   CorpusWireClient,
   RemoteIndexCancelledError,
   RemoteIndexDetachedError,
+  RemoteIndexInterruptionError,
   ReviewContextPollingCancelledError,
   ReviewContextPollingTimeoutError,
   isReviewContextJob,
@@ -18,6 +19,7 @@ export {
   toReviewContextPayload,
   toReviewContextPayloadV2,
 } from "./client.js";
+export type { RemoteIndexOwnedSessionIdentity } from "./client.js";
 export {
   CorpusWireHttpError,
   buildHeaders,

@@ -365,6 +365,15 @@ raise a restart-required error even after all uploads are acknowledged: polling
 cannot perform the client-owned commit. Caller cancellation raises
 `RemoteIndexCancelledError` only when the owned aborted session has explicitly
 zero pending and active batches; unknown release requires a restart.
+`RemoteIndexInterruptionError` retains the owned `sessionIdentity`, `reason`, last
+`status`, partial `transfer` and original `cause`. `abortRequested` records the
+bounded cleanup attempt; only `releaseConfirmed` proves that it succeeded.
+`interruptionOnly` distinguishes caller interruption from an operation failure
+that happened alongside cancellation. Consumers must preserve genuine failures
+and obtain matching terminal status before treating an unconfirmed release as
+cancelled. Caller abort immediately cancels transport and allows one event-loop
+turn for an already observed transport failure to settle; stalled transports
+remain bounded and successful late responses are discarded.
 `followIndexSession(sessionId, ...)` remains available for observing work that is
 already owned by the server; its detach behavior does not finish a client commit.
 
