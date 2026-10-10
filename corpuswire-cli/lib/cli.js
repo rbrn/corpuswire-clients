@@ -23,8 +23,10 @@ const INDEX_TRACE_STAGES = new Set([
   "mcp_receipt", "server_receipt", "queue_wait", "file_discovery", "file_read",
   "filtering_hashing", "parsing_chunking", "model_wait", "embedding_batch",
   "vector_writes", "cleanup", "total",
+  "session_lock_wait", "session_lock_hold", "session_catalog",
+  "writer_creation", "schema_preflight", "session_persistence",
 ]);
-const CLI_VERSION = "0.1.4-beta.4";
+const CLI_VERSION = "0.1.4-beta.5";
 
 export function printHelp(write = console.log) {
   write(`cw
@@ -34,7 +36,7 @@ Usage:
   cw watch [options]         Index and keep reconciling local source changes
   cw --once                  Index once and exit
   cw init [--index] [--verify] Configure this workspace
-  cw doctor [options]        Check service and verified inventory (read-only)
+  cw doctor [options]        Check service and code/full readiness (read-only)
   cw reconcile [options]     Full workspace indexing with confirmation
   cw "<prompt>" [options]
   cw enhance "<prompt>" [options]
@@ -586,6 +588,16 @@ async function validateWatchFiles(root, scan) {
   }
 }
 
+const WATCH_ERROR_REASONS = {
+  ERR_FEATURE_UNAVAILABLE_ON_PLATFORM: "recursive_watch_unsupported", ENOSYS: "recursive_watch_unsupported",
+  ENOSPC: "watch_limit_reached", EMFILE: "watch_limit_reached", ENFILE: "watch_limit_reached",
+  EACCES: "watch_permission_denied", EPERM: "watch_permission_denied", ENOENT: "watch_root_unavailable",
+};
+function watcherFallbackDetails(error, stage) {
+  const code = typeof error?.code === "string" && Object.hasOwn(WATCH_ERROR_REASONS, error.code) ? error.code : null;
+  return { stage, reason: WATCH_ERROR_REASONS[code] ?? "native_watch_unavailable", error_code: code };
+}
+
 // The watcher is a wake-up hint; complete, content-hashed scans are the source of truth.
 export async function runWatchCommand(options, dependencies) {
   if (options.configuration.profile !== "local" || options.mode !== "full" || options.rebuild || options.attachSessionId) {
@@ -595,6 +607,13 @@ export async function runWatchCommand(options, dependencies) {
   const write = (message) => output(options.json || options.ndjson
     ? JSON.stringify({ schema_version: "watch-progress/v1", type: "watch_status", workspaceId: options.workspaceId, message })
     : message);
+  const reportWatcherFallback = (error, stage) => {
+    const fallback = watcherFallbackDetails(error, stage);
+    const message = "Filesystem notifications unavailable; periodic complete scans remain active.";
+    output(options.json || options.ndjson
+      ? JSON.stringify({ schema_version: "watch-progress/v1", type: "watch_status", workspaceId: options.workspaceId, message, fallback })
+      : `${message} Reason: ${fallback.reason}${fallback.error_code ? ` (${fallback.error_code})` : ""}.`);
+  };
   const signal = dependencies.signal;
   const requestedRoot = options.sourceRoot;
   const root = await realpath(requestedRoot);
@@ -664,14 +683,15 @@ export async function runWatchCommand(options, dependencies) {
     if (signal?.aborted) return { ok: true, stopped: true, publications, exitCode: 0 };
     try {
       watcher = (dependencies.watchFactory ?? watchFiles)(root, { recursive: true }, onChange);
-      watcher.on?.("error", () => {
+      watcher.on?.("error", (error) => {
         watcher?.close();
-        if (!watcherErrorReported) write("Filesystem notifications unavailable; periodic complete scans remain active.");
+        watcher = undefined;
+        if (!watcherErrorReported) reportWatcherFallback(error, "runtime");
         watcherErrorReported = true;
         onChange("change", null);
       });
-    } catch {
-      write("Filesystem notifications unavailable; using periodic complete scans.");
+    } catch (error) {
+      reportWatcherFallback(error, "startup");
     }
     let capabilities;
     for (let attempt = 0; ; attempt += 1) {
@@ -729,14 +749,15 @@ export async function runWatchCommand(options, dependencies) {
             && diagnosedIndex.coverage.session_id !== result.status.coverage.session_id) {
             throw watchFailure("The verified publication changed before the readiness check. Restart cw to reconcile again.");
           }
-          const verifiedEmpty = scan.files.length === 0 && doctor.coverage.state === "verified"
-            && diagnosedIndex?.coverage?.eligible_file_count === 0
-            && (diagnosedIndex.health_warnings ?? []).every((warning) => warning === "No indexed Qdrant points were found for this context.")
-            && doctor.reasons.every((reason) => ["retrieval_blocked", "index_health_degraded", "index_health_warnings"].includes(reason));
-          if (!doctor.ok && !verifiedEmpty) {
+          const verifiedEmpty = scan.files.length === 0
+            && verifiedEmptyDiagnosisForWatch(diagnosisEvidence?.diagnosis)
+            && doctor.reasons.every((reason) => ["retrieval_blocked", "index_not_indexed",
+              "index_health_degraded", "index_health_warnings", "diagnosis_check_warning",
+              "diagnosis_check_error"].includes(reason));
+          if (!(doctor.ok && doctor.coverage.state === "verified") && !verifiedEmpty) {
             const authFailure = doctor.reasons.includes("authentication_rejected");
             const unavailable = doctor.checks.some((check) => check.code === "unavailable");
-            throw watchFailure(`Reconciliation could not be verified (${doctor.reasons.join(", ")}).`, authFailure ? "authentication_rejected" : unavailable ? "watch_unavailable" : "watch_fence");
+            throw watchFailure(`Reconciliation could not be verified (${doctor.reasons.join(", ") || "inventory_not_verified"}).`, authFailure ? "authentication_rejected" : unavailable ? "watch_unavailable" : "watch_fence");
           }
           publishedDigest = digest;
           publications += 1;
@@ -908,6 +929,27 @@ export async function runIndexCommand(options, dependencies) {
   request.onProgress = (event) => {
     lastProgress = event;
     renderer.render(event);
+  };
+  request.onCodeReady = (status) => {
+    const coverage = status.coverage ?? {};
+    if (coverage.code_ready !== true) return;
+    if (options.ndjson || options.json) {
+      write(JSON.stringify({
+        type: "code_ready",
+        session_id: status.session_id,
+        workspace_id: configuration.workspaceId,
+        code_ready: true,
+        documentation_pending: coverage.documentation_pending === true,
+        other_pending: coverage.other_pending === true,
+      }));
+      return;
+    }
+    renderer.finish();
+    const pending = [
+      coverage.documentation_pending === true ? "documentation pending" : null,
+      coverage.other_pending === true ? "other files pending" : null,
+    ].filter(Boolean);
+    write(`Code ready${pending.length ? `; ${pending.join("; ")}` : ""}.`);
   };
   try {
     const result = await dependencies.client.indexWorkspace(request);
@@ -1160,6 +1202,28 @@ async function initializeWorkspace(options, dependencies) {
   return result;
 }
 
+function verifiedEmptyDiagnosisForWatch(diagnosis) {
+  const index = diagnosis?.index;
+  const emptyWarning = "No indexed Qdrant points were found for this context.";
+  if (index?.coverage?.state !== "verified" || index.coverage.eligible_file_count !== 0
+    || diagnosis.can_retrieve !== false || diagnosis.point_count !== 0
+    || typeof diagnosis.collection_exists !== "boolean" || diagnosis.qdrant_error
+    || !["ok", "ready", "healthy", "degraded"].includes(index.health_status)) return false;
+  if (!Array.isArray(index.health_warnings ?? [])
+    || !(index.health_warnings ?? []).every((warning) => warning === emptyWarning)) return false;
+  if (!Array.isArray(diagnosis.checks ?? [])) return false;
+  return (diagnosis.checks ?? []).every((check) => {
+    if (check?.status === "ok") return true;
+    if (check?.status === "warning") return (check.name === "index_health" && check.message === emptyWarning)
+      || (check.name === "explicit_target" && check.message === "No repoPath or workspaceId was supplied; retrieval will use the backend default context.");
+    return check?.status === "error" && ((check.name === "points"
+      && check.message === "Collection has no indexed points.")
+      || (diagnosis.collection_exists === false && check.name === "collection"
+        && typeof (diagnosis.collection ?? index.collection) === "string"
+        && check.message === `Collection does not exist: ${diagnosis.collection ?? index.collection}`));
+  });
+}
+
 async function runDoctorCommand(options, dependencies) {
   const request = { workspaceId: options.workspaceId, repoPath: options.repoPath || undefined };
   const results = await Promise.allSettled([
@@ -1177,6 +1241,9 @@ async function runDoctorCommand(options, dependencies) {
   });
   dependencies.onDiagnosis?.({ health, diagnosis });
   const coverage = diagnosis?.index?.coverage ?? health?.index?.coverage;
+  const diagnosisChecks = Array.isArray(diagnosis?.checks) ? diagnosis.checks : [];
+  const diagnosisCheckWarning = diagnosisChecks.some((check) => check?.status === "warning");
+  const diagnosisCheckError = diagnosisChecks.some((check) => check?.status === "error");
   const reasons = [];
   if (!health) reasons.push("health_unavailable");
   else if (health.ok !== true) reasons.push("service_unhealthy");
@@ -1185,24 +1252,41 @@ async function runDoctorCommand(options, dependencies) {
     if (diagnosis.can_retrieve !== true || diagnosis.status === "blocked") reasons.push("retrieval_blocked");
     else if (diagnosis.status !== "ready") reasons.push("workspace_degraded");
     if (diagnosis.resolved_workspace_id && diagnosis.resolved_workspace_id !== options.workspaceId) reasons.push("workspace_identity_mismatch");
+    if (diagnosis.index?.indexed === false) reasons.push("index_not_indexed");
     if (diagnosis.index?.read_needs_reconcile === true || diagnosis.index?.readNeedsReconcile === true) reasons.push("needs_reconcile");
     if (diagnosis.index?.health_status && !["ok", "ready", "healthy"].includes(diagnosis.index.health_status)) reasons.push("index_health_degraded");
     if (diagnosis.index?.health_warnings?.length) reasons.push("index_health_warnings");
+    if (diagnosis.qdrant_error) reasons.push("vector_store_error");
+    if (diagnosisCheckWarning) reasons.push("diagnosis_check_warning");
+    if (diagnosisCheckError) reasons.push("diagnosis_check_error");
   }
-  if (coverage?.state !== "verified") reasons.push("inventory_not_verified");
+  const partialCodeReady = coverage?.state === "pending" && coverage.code_ready === true
+    && coverage.reason_codes?.length === 1 && coverage.reason_codes[0] === "background_ingestion_pending"
+    && diagnosis?.status === "ready" && diagnosis.can_retrieve === true
+    && diagnosis.index?.indexed === true
+    && diagnosis.index?.readiness === "code_ready"
+    && ["ok", "ready", "healthy"].includes(diagnosis.index?.health_status)
+    && !diagnosis.index?.health_warnings?.length
+    && !diagnosis.qdrant_error && !diagnosisCheckWarning && !diagnosisCheckError;
+  if (coverage?.state !== "verified" && !partialCodeReady) reasons.push("inventory_not_verified");
   if (checks.some((check) => check.code === "authentication_rejected")) reasons.push("authentication_rejected");
-  const blocked = reasons.some((reason) => ["health_unavailable", "service_unhealthy", "diagnosis_unavailable", "retrieval_blocked", "workspace_identity_mismatch"].includes(reason));
+  const blocked = reasons.some((reason) => ["health_unavailable", "service_unhealthy", "diagnosis_unavailable", "retrieval_blocked", "workspace_identity_mismatch", "vector_store_error", "diagnosis_check_error"].includes(reason));
   const status = blocked ? "blocked" : reasons.length ? "attention" : "ready";
   const result = {
     schema_version: "workspace-doctor/v1", ok: status === "ready", status,
     exitCode: status === "ready" ? 0 : blocked ? 2 : 1,
     workspaceId: options.workspaceId, serviceUrl: displayServiceUrl(options.apiBaseUrl),
-    coverage: { state: coverage?.state ?? "unavailable", reasonCodes: coverage?.reason_codes ?? [] },
+    coverage: {
+      state: coverage?.state ?? "unavailable", reasonCodes: coverage?.reason_codes ?? [],
+      codeReady: status === "ready" && coverage?.code_ready === true,
+      documentationPending: coverage?.documentation_pending === true,
+      otherPending: coverage?.other_pending === true,
+    },
     reasons, checks,
     recoveryActions: status === "ready" ? [] : ["Check service/authentication, then run cw reconcile --yes and cw doctor."],
   };
   dependencies.write(options.json ? JSON.stringify(result, null, 2)
-    : `status: ${status}\nworkspace: ${sanitizeTerminalText(result.workspaceId)}\nservice: ${result.serviceUrl}\ninventory coverage: ${result.coverage.state}${reasons.length ? `\nchecks: ${reasons.join(", ")}` : ""}${checks.filter((check) => check.status === "error").map((check) => `\n${check.name}: ${check.code}${check.httpStatus === undefined ? "" : ` (HTTP ${check.httpStatus})`}`).join("")}`);
+    : `status: ${status}\nworkspace: ${sanitizeTerminalText(result.workspaceId)}\nservice: ${result.serviceUrl}\ninventory coverage: ${result.coverage.state}${partialCodeReady && result.coverage.codeReady ? `\ncode ready: true\ndocumentation pending: ${result.coverage.documentationPending}\nother files pending: ${result.coverage.otherPending}` : ""}${reasons.length ? `\nchecks: ${reasons.join(", ")}` : ""}${checks.filter((check) => check.status === "error").map((check) => `\n${check.name}: ${check.code}${check.httpStatus === undefined ? "" : ` (HTTP ${check.httpStatus})`}`).join("")}`);
   return result;
 }
 
@@ -1243,7 +1327,8 @@ async function scanWorkspace(sourceRoot, options) {
 }
 
 async function scanWorkspaceComplete(sourceRoot, options) {
-  const scanStartedAt = new Date().toISOString();
+  const scanPhaseStartedAt = Date.now();
+  const scanStartedAt = new Date(scanPhaseStartedAt).toISOString();
   const scannedPaths = [];
   let scanned = 0;
   const discoveryStartedAt = performance.now();
@@ -1271,7 +1356,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
       scanned += 1;
       scannedPaths.push({ absolutePath, relativePath });
       options.onProgress(localProgressEvent({
-        phase: "scanning",
+        phase: "scanning", phaseStartedAt: scanPhaseStartedAt,
         message: "Scanning workspace files",
         workspaceId: options.workspaceId,
         startedAt: options.startedAt,
@@ -1284,6 +1369,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
   await walk(sourceRoot);
   const fileDiscoveryMs = Math.max(0, Math.round(performance.now() - discoveryStartedAt));
 
+  const filteringPhaseStartedAt = Date.now();
   const filteringStartedAt = performance.now();
   const supportedExtensions = new Set(options.capabilities.supported_extensions ?? []);
   const supportedNames = new Set(options.capabilities.supported_filenames ?? []);
@@ -1305,7 +1391,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
     selected.push({ ...candidate, fileStats });
     candidateBytes += fileStats.size;
     options.onProgress(localProgressEvent({
-      phase: "filtering_hashing",
+      phase: "filtering_hashing", phaseStartedAt: filteringPhaseStartedAt,
       message: "Filtering candidate files",
       workspaceId: options.workspaceId,
       startedAt: options.startedAt,
@@ -1339,7 +1425,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
       mtimeNs: Math.trunc(candidate.fileStats.mtimeMs * 1_000_000),
     });
     options.onProgress(localProgressEvent({
-      phase: "filtering_hashing",
+      phase: "filtering_hashing", phaseStartedAt: filteringPhaseStartedAt,
       message: "Hashing candidate files",
       workspaceId: options.workspaceId,
       startedAt: options.startedAt,
@@ -1370,12 +1456,22 @@ async function scanWorkspaceComplete(sourceRoot, options) {
 
 export function createIndexTraceCollector() {
   const stageTimingsMs = {};
+  const serverTraceRequests = { available: 0, disabled: 0, unavailable: 0 };
+  const requestIds = new Set();
   let modelState = "unknown";
   let errorState = "none";
 
   const observe = (response) => {
-    if (response?.headers?.get?.("x-corpuswire-index-trace") !== INDEX_OBSERVABILITY_SCHEMA_VERSION) {
+    const availability = response?.headers?.get?.("x-corpuswire-index-trace-availability");
+    const traced = response?.headers?.get?.("x-corpuswire-index-trace") === INDEX_OBSERVABILITY_SCHEMA_VERSION;
+    if (availability === "disabled" || !traced) {
+      serverTraceRequests[availability === "disabled" ? "disabled" : "unavailable"] += 1;
       return;
+    }
+    serverTraceRequests.available += 1;
+    const requestId = response.headers.get("x-request-id") ?? "";
+    if (/^[a-f0-9]{12}4[a-f0-9]{3}[89ab][a-f0-9]{15}$/i.test(requestId) && requestIds.size < 32) {
+      requestIds.add(requestId.toLowerCase());
     }
     const serverTiming = response.headers.get("server-timing") ?? "";
     for (const item of serverTiming.split(",")) {
@@ -1426,6 +1522,8 @@ export function createIndexTraceCollector() {
         stageTimingsMs: { ...stageTimingsMs },
         modelState,
         errorState,
+        serverTraceRequests: { ...serverTraceRequests },
+        requestIds: [...requestIds],
       };
     },
   };
@@ -1465,6 +1563,8 @@ function buildIndexTrace({
     total_duration_ms: Math.max(0, Math.round(totalDurationMs)),
     error_state: errorState ?? collected.errorState,
     model_state: collected.modelState,
+    server_trace_requests: collected.serverTraceRequests,
+    request_ids: collected.requestIds,
     sensitive_payloads_captured: false,
   };
 }
@@ -1482,6 +1582,8 @@ function printIndexTrace(write, options) {
     `Index observability (${trace.schema_version})`,
     `  Model/error: ${trace.model_state}/${trace.error_state}`,
     `  Stages: ${measuredStages.length > 0 ? measuredStages.join(", ") : "no server stages reported"}`,
+    `  Server trace responses: available=${trace.server_trace_requests.available}, disabled=${trace.server_trace_requests.disabled}, unavailable=${trace.server_trace_requests.unavailable}`,
+    ...(trace.request_ids.length > 0 ? [`  Trace request IDs: ${trace.request_ids.join(", ")}`] : []),
     `  Total: ${formatDuration(trace.total_duration_ms)}`,
     "  Sensitive payloads captured: no",
   ].join("\n"));
@@ -1492,14 +1594,17 @@ function localProgressEvent({
   message,
   workspaceId,
   startedAt,
+  phaseStartedAt = startedAt,
   completed = 0,
   total = null,
   unit = "items",
 }) {
   const elapsedMs = Math.max(0, Date.now() - startedAt);
+  const phaseElapsedMs = Math.max(0, Date.now() - phaseStartedAt);
   const phasePercent = total && total > 0 ? (completed / total) * 100 : null;
   return {
     schema_version: INDEX_PROGRESS_SCHEMA_VERSION,
+    event_origin: "client",
     sequence: elapsedMs,
     session_id: "pending",
     workspace_id: workspaceId,
@@ -1516,8 +1621,8 @@ function localProgressEvent({
     phase_percent: phasePercent,
     unit,
     elapsed_ms: elapsedMs,
-    phase_elapsed_ms: elapsedMs,
-    throughput_per_second: elapsedMs > 0 && completed > 0 ? completed / (elapsedMs / 1_000) : null,
+    phase_elapsed_ms: phaseElapsedMs,
+    throughput_per_second: phaseElapsedMs > 0 && completed > 0 ? completed / (phaseElapsedMs / 1_000) : null,
     queue_depth: 0,
     retries: 0,
     warnings: [],
@@ -1545,7 +1650,7 @@ export function createProgressRenderer({ write, writeRaw, isTTY, ndjson }) {
       }
       completedEmitted = true;
     }
-    const key = `${event.session_id}:${event.sequence}:${event.phase}:${event.phase_completed}:${event.heartbeat}`;
+    const key = `${event.event_origin ?? "server"}:${event.session_id}:${event.sequence}:${event.phase}:${event.phase_completed}:${event.heartbeat}:${event.last_heartbeat_at ?? ""}`;
     if (key === lastKey) {
       return;
     }
@@ -1670,10 +1775,16 @@ function printIndexTerminalSummary(write, {
     files_transferred: result?.transfer?.files_transferred ?? null,
     source_bytes_transferred: result?.transfer?.source_bytes_transferred ?? null,
     upload_attempts: result?.transfer?.upload_attempts ?? null,
+    queue_retries: result?.transfer?.queue_retries ?? null,
+    queue_full_responses: result?.transfer?.queue_full_responses ?? null,
+    queue_wait_ms: result?.transfer?.queue_wait_ms ?? null,
+    transport_retries: result?.transfer?.transport_retries ?? null,
+    client_phase_timings_ms: result?.transfer?.client_phase_timings_ms ?? {},
     session_id: status?.session_id ?? progress.session_id ?? null,
     state: progress.state ?? status?.phase ?? "unknown",
     wall_time_ms: wallTimeMs,
     phase_timings_ms: progress.phase_timings_ms ?? {},
+    scan_phase_timings_ms: scan?.stageTimingsMs ?? {},
     files_scanned: scan?.scanned ?? null,
     files_included: preview?.included ?? scan?.included ?? null,
     files_excluded: scan
@@ -1701,10 +1812,13 @@ function printIndexTerminalSummary(write, {
     `  Wall time: ${formatDuration(summary.wall_time_ms)}`,
     `  Files: scanned=${summary.files_scanned ?? "unknown"} included=${summary.files_included ?? "unknown"} excluded=${summary.files_excluded ?? "unknown"} changed=${summary.files_changed ?? "unknown"} indexed=${summary.files_indexed} unchanged=${summary.files_unchanged} skipped=${summary.files_skipped} deleted=${summary.files_deleted}`,
     `  Data: ${formatBytes(summary.bytes)}; chunks=${summary.chunks}; embedding batches=${summary.embedding_batches}; vector writes=${summary.vector_writes}`,
-    `  Retries/warnings: ${summary.retries}/${summary.warnings.length}`,
+    `  Backend retries/warnings: ${summary.retries}/${summary.warnings.length}`,
+    `  Upload retries: queue=${summary.queue_retries ?? "unknown"}; transport=${summary.transport_retries ?? "unknown"}; queue cooldown=${summary.queue_wait_ms === null ? "unknown" : formatDuration(summary.queue_wait_ms)}`,
     `  Verification: ${summary.verification}; inventory coverage: ${summary.coverage_state}`,
     `  Transfer: ${summary.files_transferred ?? "unknown"} acknowledged files; ${summary.source_bytes_transferred ?? "unknown"} source bytes; ${summary.upload_attempts ?? "unknown"} attempts`,
     `  Phase timings: ${formatPhaseTimings(summary.phase_timings_ms)}`,
+    `  Client phase timings: ${formatPhaseTimings(summary.client_phase_timings_ms)}`,
+    `  Scan timings: ${formatPhaseTimings(summary.scan_phase_timings_ms)}`,
   ].join("\n"));
 }
 

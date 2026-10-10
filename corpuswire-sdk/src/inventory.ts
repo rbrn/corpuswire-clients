@@ -3,6 +3,18 @@ import type { InventoryScan, InventorySelectionPolicy, WorkspaceInventory } from
 const encoder = new TextEncoder();
 export const INVENTORY_VERSION = "workspace-inventory/v1" as const;
 
+// Keep in sync with corpuswire.ingest.capabilities.CODE_EXTENSIONS.
+const CODE_EXTENSIONS = new Set([".bat", ".scala", ".sh", ".cjs", ".js", ".jsx", ".mjs", ".cts", ".mts", ".ts", ".tsx", ".java", ".kt", ".kts", ".py", ".pyi", ".hcl", ".tf", ".html", ".htm"]);
+
+/** Scheduling tiers match the server's canonical supported-file registry. */
+export function ingestionPriority(relativePath: string): 1 | 2 | 3 {
+  const name = relativePath.replaceAll("\\", "/").split("/").at(-1)!.toLowerCase();
+  const extension = name.slice(name.lastIndexOf("."));
+  if (CODE_EXTENSIONS.has(extension) || name === "mvnw" || name === "gradlew" || name.endsWith(".tf.json")) return 1;
+  if ([".md", ".txt", ".pdf"].includes(extension)) return 2;
+  return 3;
+}
+
 export interface WorkspaceScanIncompleteDetails {
   sessionId?: string;
   manifestErrors?: readonly string[];

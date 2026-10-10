@@ -111,11 +111,12 @@ Build and install a local package snapshot without a source-tree entrypoint:
 
 ```bash
 cd /path/to/corpuswire-clients
+npm ci --prefix corpuswire-cli --offline --ignore-scripts --omit=dev
 npm pack ./corpuswire-sdk --pack-destination /tmp/corpuswire-snapshot
 npm pack ./corpuswire-cli --pack-destination /tmp/corpuswire-snapshot
 npm install --prefix /tmp/corpuswire-install \
   /tmp/corpuswire-snapshot/corpuswire-sdk-0.1.3.tgz \
-  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.4-beta.3.tgz
+  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.4-beta.5.tgz
 /tmp/corpuswire-install/node_modules/.bin/cw --version
 ```
 
@@ -148,11 +149,35 @@ repeatable `--include` and `--exclude`, `--mode full|incremental`, `--yes`,
 profile accepts only a loopback service; the hosted profile requires HTTPS.
 Credentials are never printed.
 
+The CLI bundles its SDK so an older globally installed SDK cannot override the
+indexing transport. Supported code uploads precede documentation and other
+files. After a successful code checkpoint, terminal output reports
+`Code ready; documentation pending.`; NDJSON emits a `code_ready` record with
+`documentation_pending` and `other_pending` booleans. Full completion remains a
+separate verified event.
+
+`cw doctor` accepts healthy published code while full coverage is still pending
+and reports `coverage.codeReady`, `documentationPending` and `otherPending`.
+Vector errors, publication/mirror failures, invalidation and real freshness
+warnings still require attention. Watch reconciliation continues to require its
+completed, fully verified inventory before establishing the next watch baseline.
+
+Temporary HTTP429 `index_queue_full` responses pause that batch according to
+`Retry-After` (normally one second), then retry the same payload. The bounded
+admission wait defaults to ten minutes per batch and honors cancellation.
+Permanent quotas fail immediately. The CLI uses the SDK's advertised batch
+and upload-concurrency limits automatically.
+
 `--trace` adds a content-free `index-observability/v1` record with client file
 discovery/read/hash time, server receipt and model-wait time when the backend
 enables `INDEX_OBSERVABILITY_ENABLED=true`, durable queue/chunk/embed/write/
 cleanup timings, warm/cold model state, total time, and a bounded error state.
-It never records file contents, prompts, credentials, or request headers.
+Initialization traces also measure session lock wait/hold, catalog checks,
+writer creation, schema preflight and persistence. `server_trace_requests`
+counts available, disabled and unavailable responses; unmeasured spans remain
+`null`. At most 32 server-generated UUID request identities allow correlation.
+Parent spans overlap their child stages, so their sum is not elapsed time.
+The trace never records file contents, prompts, credentials or caller headers.
 
 Example environment:
 
@@ -278,9 +303,13 @@ Incremental mode updates only files included in that invocation; it does not
 remove unmentioned paths. A second identical full run is reported as
 `no_change` in the preview and avoids re-embedding unchanged files.
 
-Ctrl+C sends a real backend abort and waits for acknowledgement. A second Ctrl+C
-detaches and reports the session id and reattachment command. An explicit
-`--timeout-ms` also detaches rather than falsely marking the backend run failed.
+Ctrl+C requests a real backend abort. A timeout or second interrupt before commit
+also requests bounded abort and asks for a new indexing operation, even if every
+source body was uploaded: attachment cannot upload missing files or send the
+missing commit. Cancellation is confirmed only after terminal acknowledgement;
+an unconfirmed release never advertises a freed slot. Tier processing waits share
+one deadline. `--attach` can follow an existing server-owned operation without
+resuming client-side work.
 
 The CLI helps verify those flows after they run:
 
@@ -317,3 +346,15 @@ Use `--json` when another process needs the full backend envelope.
 A successful full scan supplies a canonical inventory after the existing preview and confirmation. Read errors, disappearing files, cancellation and detected file changes stop the scan before mutation. The effective file-size ceiling is the minimum of the configured and advertised server limits. Selection policies include default directory exclusions; excluded counts cover inspected files, not descendants of excluded directories.
 
 Terminal and NDJSON results distinguish session verification, inventory coverage, acknowledged file transfers and sender attempts. Legacy services report unknown coverage. An intentionally empty full inventory can be verified while there is no searchable content.
+
+Final indexing output separates upload attempts, queue rejection/retry counts,
+measured queue cooldown, transport retries, and backend retries. Unknown counters
+from older SDK/server versions stay unknown. Client and server phase intervals can
+overlap and do not add up to wall time. Successive queued heartbeats keep the
+server sequence and render with distinct heartbeat timestamps.
+
+Native watch startup/runtime fallback reports a fixed reason and an allowlisted
+error code (for example `watch_limit_reached` / `ENOSPC`). Unknown codes become
+`native_watch_unavailable` with a null code. NDJSON adds these fields in `fallback`;
+raw exception messages, filenames, and stacks are omitted. Periodic complete
+scans continue with the configured bounded scan interval.

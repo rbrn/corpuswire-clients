@@ -25,6 +25,7 @@ the MCP package is the tool surface Copilot discovers.
 - Service-specific configuration for indexer, enhancer, and semantic search
   endpoints.
 - API key, Basic Auth, and custom header support.
+- CLI OS-keyring bearer authentication when no Authorization header is configured.
 - Optional home config at `~/.config/corpuswire/vscode-extension.json` or
   `~/.corpuswire/vscode-extension.json`.
 - Local fallback enhancement when generation is unavailable but the backend can
@@ -108,12 +109,24 @@ or prefixed:
 | --- | --- | --- |
 | `corpuswire.baseUrl` | `http://127.0.0.1:8000` | Compatibility fallback URL when service URLs are unset |
 | `corpuswire.userConfigPath` | empty | Optional explicit home config file |
+| `corpuswire.auth.cliPath` | `corpuswire` | User or machine CLI executable used to resolve an OS-keyring bearer token in trusted workspaces |
 | `corpuswire.repoPath` | first workspace folder | Service-local path used only when remote indexing is disabled |
 | `corpuswire.topK` | `5` | Retrieval chunk count for prompt enhancement |
 | `corpuswire.outputMode` | `generic` | `generic`, `copilot`, `claude-code`, or `sequential` |
 | `corpuswire.localOnly` | `false` | Ask backend for deterministic local rewrite instead of generation |
 
 ## Service Settings
+
+When an Authorization header is absent, the extension runs
+`corpuswire auth token --base-url <service-url>` through the configured CLI.
+Explicit Authorization, including Basic Auth or an API key using that header,
+takes precedence. Set an absolute `corpuswire.auth.cliPath` if the VS Code
+extension host's PATH does not contain the CLI. Token lookup has a five-second
+timeout and does not initiate login.
+Configure the executable in VS Code user or machine settings. Workspace and
+folder settings, and `auth.cliPath` in the optional JSON config file, are ignored.
+The extension never executes the CLI in an untrusted workspace; explicit
+Authorization headers remain available there.
 
 `serviceDefaults` applies to `indexer`, `enhancer`, and `semanticSearch` unless a
 service-specific setting overrides it.
@@ -136,6 +149,7 @@ no Authorization header has already been provided.
 | --- | --- | --- |
 | `corpuswire.remoteIndexing.enabled` | `false` | Enables remote-first indexing and sends `workspace_id` in enhancement requests |
 | `corpuswire.remoteIndexing.autoWatch` | `false` | Watches file create/change/delete events and sends incremental updates |
+| `corpuswire.remoteIndexing.codeFirstPass` | `false` | Experimental: publish code across roots before fresh full indexing of documentation and other files |
 | `corpuswire.remoteIndexing.workspaceId` | `local-docker://<folder-slug>#main` for local folders; folder URI otherwise | Stable workspace identity for remote indexing |
 | `corpuswire.remoteIndexing.maxConcurrentUploads` | `4` | Client concurrency hint for SDK upload batches |
 | `corpuswire.remoteIndexing.batchBytes` | `4194304` | Target maximum bytes per upload batch |
@@ -210,13 +224,18 @@ without deleting and recreating the target collection.
 
 The command:
 
-1. Reads settings for the first workspace folder.
+1. Selects every workspace folder with remote indexing enabled and reads its
+   own settings. At most two roots index concurrently. A single-folder
+   workspace also supports an explicit manual command when automatic indexing
+   is disabled.
 2. Uses the configured stable `remoteIndexing.workspaceId`, or the derived
    local-folder identity when no explicit value is set.
 3. Creates `CorpusWireClient` for the configured indexer service with
    `endpointMode: "v1-only"`.
 4. Finds workspace files with:
-   `**/*.{md,txt,csv,pdf,java,py,sh,cjs,js,jsx,mjs,ts,tsx,json,toml,yaml,yml}`.
+   `{**/*.{md,txt,csv,pdf,bat,scala,sh,cjs,js,jsx,mjs,cts,mts,ts,tsx,java,kt,kts,py,pyi,hcl,tf,html,htm,json,jsonl,ndjson,toml,yaml,yml},**/{mvnw,gradlew},**/*.json.example}`,
+   expanded into character classes to match uppercase and mixed-case filename
+   extensions and wrappers on case-sensitive filesystems. Watchers use the same pattern.
 5. Excludes:
    `.git`, `.vscode`, `node_modules`, `dist`, `build`, `target`, and
    `__pycache__`.
@@ -224,6 +243,14 @@ The command:
    file systems work.
 7. Skips files larger than `remoteIndexing.maxFileSizeBytes`.
 8. Calls `client.indexWorkspace({ mode: "full", recreateCollection: false, files, ... })`.
+
+Roots must have distinct workspace IDs on the same service; duplicate IDs are
+rejected before uploading, including equivalent URL spellings with different
+host or scheme casing, default ports, or trailing slashes. Nested roots are excluded from their parent root's
+inventory. Each root uploads code before documentation and other supported
+files. When the server publishes code, progress and the panel show code ready
+with documentation/other ingestion pending. The workspace panel reports ready
+only when every enabled root has a healthy complete or code-ready index.
 
 The cancellable notification renders the shared `index-progress/v1` contract:
 phase, processed/total work, elapsed time, numeric progress when a denominator
@@ -264,6 +291,9 @@ watcher for the same include glob used by full indexing. It batches events for
 - If a file is created or changed and then deleted before flush, the delete wins
   for that URI.
 - The SDK sends `mode: "incremental"`.
+- Changed and deleted events are grouped by their actual workspace root. Each
+  group uses that root's settings, identity and exclusions, including groups
+  containing only deletions.
 - Watcher flushes are serialized; a new flush waits until the active upload
   finishes.
 - Automatic watcher updates are bounded by `remoteIndexing.maxAutoWatchFiles`.
@@ -378,3 +408,28 @@ valid for hosted services that cannot mount the local path.
 ## Full-scan readiness
 
 Full indexing now fails if an eligible file cannot be read or changes during its read. It supplies a declared inventory for the selected include/exclude policy and skips symlinks. Watcher batches retain incremental semantics and cannot establish a full baseline by themselves. Completion notifications display inventory coverage and acknowledged transferred files separately; unsupported older services display unknown coverage.
+
+The source root must remain a directory that can be listed, with unchanged creation
+time, modification time and size before discovery, after discovery and after file reads.
+A missing, changed, symlink or cancelled root fails the scan before a session can
+publish an empty inventory. An intact empty directory remains valid. VS Code's
+filesystem API exposes no inode or generation identity, so replacement that
+preserves all those metadata values cannot be detected by these checks. Discovery
+and file reads do not provide an atomic snapshot of the whole directory tree.
+
+The experimental `corpuswire.remoteIndexing.codeFirstPass` setting applies to
+manual full indexing and rebuild commands. Keep it disabled for ordinary full
+indexing; no performance gain has yet been measured. When enabled, at most two
+root workers publish code and release their drained session slots before the
+full pass starts. Every continuation scans the folder again, reuses published
+code, and accounts for files changed, added or deleted between passes. Rebuild
+recreates each collection only in its first actual session.
+
+Documentation-only folders wait for the full pass. Empty folders complete an
+ordinary empty full inventory; older servers visibly fall back to ordinary full
+indexing. Published code remains marked pending until full verification. Cancel
+stops later roots/passes and retains already-published code; a released code
+stage never triggers a full-completion notification. Automatic incremental
+watcher updates keep their existing behavior.
+If the fresh continuation scan fails, its error also reports that published code
+is preserved and full inventory remains pending; no continuation session starts.

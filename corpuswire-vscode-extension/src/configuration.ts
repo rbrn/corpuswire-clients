@@ -30,6 +30,7 @@ export interface RemoteServiceSettings {
 }
 
 export interface ExtensionSettings {
+  auth: AuthSettings;
   baseUrl: string;
   repoPath?: string;
   topK: number;
@@ -40,9 +41,14 @@ export interface ExtensionSettings {
   configurationWarnings: string[];
 }
 
+export interface AuthSettings {
+  cliPath: string;
+}
+
 export interface RemoteIndexingSettings {
   enabled: boolean;
   autoWatch: boolean;
+  codeFirstPass: boolean;
   workspaceId?: string;
   maxConcurrentUploads: number;
   batchBytes: number;
@@ -98,6 +104,9 @@ export function readSettings(resource?: vscode.Uri): ExtensionSettings {
     );
 
   return {
+    auth: {
+      cliPath: readTrustedCliPath(),
+    },
     baseUrl,
     repoPath: resolveRepoPath(configuredRepoPath, workspaceFolderPath),
     topK: normalizeTopK(readConfiguredNumber(config, homeConfiguration.values, "topK", DEFAULT_TOP_K)),
@@ -118,6 +127,7 @@ export function readSettings(resource?: vscode.Uri): ExtensionSettings {
         false,
       ),
       autoWatch: readConfiguredBoolean(config, homeConfiguration.values, "remoteIndexing.autoWatch", false),
+      codeFirstPass: readConfiguredBoolean(config, homeConfiguration.values, "remoteIndexing.codeFirstPass", false),
       workspaceId,
       maxConcurrentUploads: normalizePositiveInteger(
         readConfiguredNumber(config, homeConfiguration.values, "remoteIndexing.maxConcurrentUploads", 4),
@@ -147,6 +157,12 @@ export function readSettings(resource?: vscode.Uri): ExtensionSettings {
     },
     configurationWarnings: homeConfiguration.warnings,
   };
+}
+
+function readTrustedCliPath(): string {
+  // Executable selection must never come from repository-controlled settings or config files.
+  const configured = vscode.workspace.getConfiguration(CONFIG_SECTION).inspect<unknown>("auth.cliPath")?.globalValue;
+  return typeof configured === "string" && configured.trim() ? configured.trim() : "corpuswire";
 }
 
 function readLegacyContextEngineSettings(resource?: vscode.Uri): LegacyContextEngineSettings {

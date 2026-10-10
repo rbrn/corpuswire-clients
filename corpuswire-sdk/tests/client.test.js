@@ -8,6 +8,7 @@ import {
   CorpusWireHttpError,
   RemoteIndexCancelledError,
   RemoteIndexDetachedError,
+  RemoteIndexInterruptionError,
   ReviewContextPollingCancelledError,
   ReviewContextPollingTimeoutError,
   WorkspaceScanIncompleteError,
@@ -24,6 +25,7 @@ import {
   toReviewContextPayloadV2,
   toStartIndexSessionPayload,
   assertReviewContextV2Result,
+  ingestionPriority,
 } from "../dist/index.js";
 
 const REVIEW_CONTEXT_V2_SCHEMA = JSON.parse(readFileSync(
@@ -677,6 +679,24 @@ test("diagnoseWorkspace calls versioned diagnosis endpoint with workspace scope"
   assert.match(diagnosis.recovery_actions[0], /Index or sync workspace/);
 });
 
+test("diagnoseWorkspace forwards caller cancellation through a cooperative response body", async () => {
+  const controller = new AbortController();
+  let observedSignal, bodyStarted = false;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (_url, init) => {
+    observedSignal = init.signal;
+    const response = jsonResponse(200, { ok: true, diagnosis: {} });
+    response.json = () => new Promise((_resolve, reject) => {
+      bodyStarted = true;
+      init.signal.addEventListener("abort", () => reject(new DOMException("Diagnosis aborted", "AbortError")), { once: true });
+      queueMicrotask(() => controller.abort());
+    });
+    return response;
+  } });
+  await assert.rejects(client.diagnoseWorkspace({ workspaceId: "fixture" }, { signal: controller.signal }), { name: "AbortError" });
+  assert.equal(observedSignal, controller.signal);
+  assert.equal(bodyStarted, true);
+});
+
 test("query posts workspace_id to semantic retrieval endpoint", async () => {
   const calls = [];
   const client = new CorpusWireClient({
@@ -924,7 +944,8 @@ test("remote indexWorkspace polls queued background batches before commit", asyn
   });
 
   assert.equal(result.ok, true);
-  assert.equal(statusReads, 2);
+  // Drain the documentation tier, then verify no manifest uploads remain.
+  assert.equal(statusReads, 3);
   assert.equal(calls.at(-1).input, "http://example.test/v1/index/sessions/sess-async/commit");
 });
 
@@ -1208,12 +1229,14 @@ test("remote indexWorkspace emits monotonic semantic progress and 100 once", asy
   assert.ok(progress.some((event) => event.phase === "embedding"));
 });
 
-test("explicit processing timeout detaches without aborting backend work", async () => {
+test("explicit precommit processing timeout aborts and requires restart", async () => {
   const calls = [];
+  let aborted = false;
   const client = new CorpusWireClient({
     baseUrl: "http://example.test",
-    fetchFn: async (input) => {
+    fetchFn: async (input, init = {}) => {
       calls.push(input);
+      if (init.method === "DELETE") { aborted = true; return jsonResponse(200, { ok: true }); }
       if (input.endsWith("/v1/index/sessions")) {
         return jsonResponse(200, { ok: true, result: {
           session_id: "sess-timeout", workspace_id: "workspace-1", collection_name: "collection-1",
@@ -1234,9 +1257,9 @@ test("explicit processing timeout detaches without aborting backend work", async
       if (input.endsWith("/status")) {
         return jsonResponse(200, { ok: true, result: {
           session_id: "sess-timeout", workspace_id: "workspace-1", collection_name: "collection-1",
-          mode: "full", phase: "indexing", files_manifested: 1, files_indexed: 0,
+          mode: "full", phase: aborted ? "aborted" : "indexing", files_manifested: 1, files_indexed: 0,
           files_deleted: 0, files_unchanged: 0, files_skipped: 0, bytes_uploaded: 0,
-          bytes_skipped: 0, queue_depth: 1, pending_batches: 0, active_batches: 1, errors: [],
+          bytes_skipped: 0, queue_depth: 1, pending_batches: 0, active_batches: aborted ? 0 : 1, errors: [],
         } });
       }
       throw new Error(`Unexpected request: ${input}`);
@@ -1248,8 +1271,8 @@ test("explicit processing timeout detaches without aborting backend work", async
     files: [{ relativePath: "README.md", content: "# Demo\n" }],
     processingTimeoutMs: 1,
     processingPollMs: 1,
-  }), RemoteIndexDetachedError);
-  assert.equal(calls.some((input) => input.endsWith("/sess-timeout")), false);
+  }), (error) => !(error instanceof RemoteIndexDetachedError) && /Start a new index operation/.test(error.message));
+  assert.equal(calls.some((input) => input.endsWith("/sess-timeout")), true);
 });
 
 test("AbortSignal sends a backend abort and waits for terminal acknowledgement", async () => {
@@ -2347,6 +2370,48 @@ test("review telemetry summary uses the operator endpoint and returns typed aggr
   }]);
 });
 
+test("requestJson honors explicit nonretryable errors before generic transient retries", { timeout: 1000 }, async () => {
+  for (const status of [429, 503]) {
+    let attempts = 0;
+    await assert.rejects(requestJson({
+      baseUrl: "http://fixture.test", paths: ["/v1/index/sessions"], retryAttempts: 2,
+      init: { signal: AbortSignal.timeout(500) },
+      fetchFn: async () => {
+        attempts++;
+        return jsonResponse(status, { detail: {
+          code: "index_quota_exceeded", message: "Active session limit reached", retryable: false,
+        } }, { "Retry-After": "60" });
+      },
+    }), (error) => error instanceof CorpusWireHttpError
+      && error.status === status && error.errorCode === "index_quota_exceeded"
+      && error.retryable === false && error.errorMessage === "Active session limit reached");
+    assert.equal(attempts, 1);
+  }
+});
+
+test("requestJson preserves legacy transient retries when retryability is omitted", async () => {
+  const cases = [
+    [429, { detail: "Tenant session limit reached" }],
+    [503, { detail: { code: "embedding_not_ready", message: "Warming up" } }],
+    [503, { ok: false, request_id: "legacy", duration_ms: 1, error: { code: "unavailable", message: "Try later" } }],
+    [503, { schema_version: "review-context/v2", error_code: "unavailable", message: "Try later", request_id: "legacy" }],
+  ];
+  for (const [status, payload] of cases) {
+    let attempts = 0;
+    const result = await requestJson({
+      baseUrl: "http://fixture.test", paths: ["/legacy"], retryDelayMs: 0,
+      fetchFn: async () => ++attempts === 1
+        ? jsonResponse(status, payload, { "Retry-After": "0" }) : jsonResponse(200, { ok: true }),
+    });
+    assert.deepEqual(result, { ok: true });
+    assert.equal(attempts, 2);
+    await assert.rejects(requestJson({
+      baseUrl: "http://fixture.test", paths: ["/legacy"], retryAttempts: 0,
+      fetchFn: async () => jsonResponse(status, payload),
+    }), (error) => error instanceof CorpusWireHttpError && error.retryable === true);
+  }
+});
+
 test("requestJson exposes stable review errors and Retry-After metadata", async () => {
   await assert.rejects(
     requestJson({
@@ -2574,7 +2639,7 @@ test("incomplete scan, supplied hash mismatch and duplicate files cannot allocat
   assert.equal(mutations, 0);
 });
 
-test("partial upload error waits for in-flight acknowledgements and retains truthful counts", async () => {
+test("partial upload error retains acknowledgements observed before sibling cancellation", async () => {
   let attempts = 0;
   const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url, init) => {
     if (url.endsWith("/sessions")) return jsonResponse(200, {ok:true,result:{session_id:"partial",max_batch_bytes:1000,max_batch_files:1,max_concurrent_uploads:2}});
@@ -2582,8 +2647,10 @@ test("partial upload error waits for in-flight acknowledgements and retains trut
     if (url.endsWith("/files/batch")) {
       attempts += 1;
       const body = await init.body.text();
-      if (body.includes("synth_fail")) return jsonResponse(400, {detail:"synthetic rejection"});
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      if (body.includes("synth_fail")) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return jsonResponse(400, {detail:"synthetic rejection"});
+      }
       return jsonResponse(200, {ok:true,result:{files_received:1,errors:[]}});
     }
     if (url.endsWith("/abort")) return jsonResponse(200, {ok:true});
@@ -2608,5 +2675,2053 @@ test("retrieval exclusions preserve source while rejecting discovery and Terrafo
   }
   for (const path of ["src/main.py", "README.md", "settings.json", "requirements-guide.md", "main.tf", "model.tf.json"]) {
     assert.equal(isRetrievalExcludedPath(path), false, path);
+  }
+});
+
+test("ingestion priority matches canonical code, documentation and other categories", () => {
+  for (const extension of ["bat", "scala", "sh", "cjs", "js", "jsx", "mjs", "cts", "mts", "ts", "tsx", "java", "kt", "kts", "py", "pyi", "hcl", "tf", "html", "htm"]) {
+    assert.equal(ingestionPriority(`src/main.${extension.toUpperCase()}`), 1);
+  }
+  for (const path of ["scripts/mvnw", "scripts/gradlew", "infra/main.tf.json"]) assert.equal(ingestionPriority(path), 1);
+  for (const path of ["README.md", "guide.txt", "manual.pdf"]) assert.equal(ingestionPriority(path), 2);
+  for (const path of ["settings.json", "data.csv", "config.yml"]) assert.equal(ingestionPriority(path), 3);
+});
+
+function priorityIndexFixture({ files, unchanged = [], capability = true, batchBytes = 1024, concurrency = 1, onUpload } = {}) {
+  const calls = [], uploaded = new Set(), uploadRequired = files.map((file) => file.relativePath).filter((path) => !unchanged.includes(path));
+  let released = false;
+  const status = (coverage) => ({
+    session_id: "priority", workspace_id: "fixture", collection_name: "fixture", mode: "full",
+    phase: released ? "aborted" : "indexing", files_manifested: files.length, files_indexed: uploaded.size,
+    files_deleted: 0, files_unchanged: unchanged.length, files_skipped: 0, bytes_uploaded: 0,
+    bytes_skipped: 0, queue_depth: uploadRequired.length - uploaded.size,
+    pending_batches: 0, active_batches: 0, errors: [], coverage,
+  });
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url, init) => {
+    if (url.endsWith("/capabilities")) return jsonResponse(200, {
+      ok: true, inventory_coverage_versions: ["workspace-inventory/v1"],
+      supported_file_registry_version: "fixture/v1", max_file_size_bytes: 1024,
+    });
+    if (url.endsWith("/sessions")) return jsonResponse(200, { ok: true, result: {
+      session_id: "priority", workspace_id: "fixture", collection_name: "fixture", manifest_revision: 1,
+      mode: "full", max_batch_bytes: batchBytes,
+      max_concurrent_uploads: concurrency, code_checkpoint: capability,
+    } });
+    if (url.endsWith("/manifest/batch")) return jsonResponse(200, { ok: true, result: {
+      accepted: files.length, upload_required: uploadRequired, unchanged: unchanged.length,
+      deletes: 0, skipped: 0, errors: [],
+    } });
+    if (url.endsWith("/files/batch")) {
+      const body = await init.body.text();
+      const paths = files.filter((file) => body.includes(`"relative_path":"${file.relativePath}"`)).map((file) => file.relativePath);
+      calls.push({ type: "upload", paths });
+      await onUpload?.(paths, init);
+      for (const path of paths) uploaded.add(path);
+      return jsonResponse(202, { ok: true, result: { files_received: paths.length, queued: true, errors: [] } });
+    }
+    if (url.endsWith("/status")) { calls.push({ type: "status" }); return jsonResponse(200, { ok: true, result: status() }); }
+    if (url.endsWith("/checkpoint/code")) {
+      calls.push({ type: "checkpoint" });
+      return jsonResponse(200, { ok: true, result: { ...status({
+        schema_version: "workspace-coverage/v1", state: "pending", reason_codes: [], session_id: "priority",
+        code_ready: true, documentation_pending: files.some((file) => ingestionPriority(file.relativePath) === 2),
+        other_pending: files.some((file) => ingestionPriority(file.relativePath) === 3),
+      }), phase: "ready_to_commit" } });
+    }
+    if (url.endsWith("/commit")) { calls.push({ type: "commit" }); return jsonResponse(200, { ok: true, result: {}, status: { ...status(), phase: "completed" } }); }
+    if (init.method === "DELETE") { released = true; calls.push({ type: "abort" }); return jsonResponse(200, { ok: true }); }
+    throw new Error(`Unexpected request ${url}`);
+  } });
+  const request = {
+    workspace: { workspaceId: "fixture" }, mode: "full", files, processingTimeoutMs: 100, processingPollMs: 10,
+    inventoryScan: { complete: true, startedAt: "2026-10-09T00:00:00Z", completedAt: "2026-10-09T00:00:01Z",
+      excludedFileCount: 0, ignoreDigest: "0".repeat(64), producer: "fixture/v1" },
+  };
+  return { client, request, calls };
+}
+
+test("code drains and publishes while documentation remains missing, before later tiers upload", async () => {
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "data.json", content: "{}" }, { relativePath: "README.md", content: "guide" },
+    { relativePath: "src/main.py", content: "x=1" },
+  ] });
+  let ready;
+  const result = await fixture.client.indexWorkspace({ ...fixture.request, onCodeReady: (status) => { ready = status; fixture.calls.push({ type: "callback" }); } });
+  assert.deepEqual(fixture.calls.filter((call) => call.type !== "status"), [
+    { type: "upload", paths: ["src/main.py"] }, { type: "checkpoint" }, { type: "callback" },
+    { type: "upload", paths: ["README.md"] }, { type: "upload", paths: ["data.json"] }, { type: "commit" },
+  ]);
+  assert.equal(ready.queue_depth, 2);
+  assert.equal(ready.coverage.code_ready, true);
+  assert.equal(ready.coverage.documentation_pending, true);
+  assert.equal(ready.coverage.other_pending, true);
+  assert.equal(result.transfer.files_transferred, 3);
+});
+
+test("unchanged code still checkpoints before documentation uploads", async () => {
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "README.md", content: "guide" }, { relativePath: "main.ts", content: "x" },
+  ], unchanged: ["main.ts"] });
+  await fixture.client.indexWorkspace(fixture.request);
+  assert.equal(fixture.calls[0].type, "checkpoint");
+  assert.deepEqual(fixture.calls.find((call) => call.type === "upload").paths, ["README.md"]);
+});
+
+test("cancel and detach interrupt a stalled code checkpoint and preserve transfer semantics", { timeout: 1000 }, async () => {
+  for (const mode of ["cancel", "incomplete detach", "complete detach"]) {
+    const controller = new AbortController();
+    const files = [{ relativePath: "main.py", content: "x" }];
+    if (mode !== "complete detach") files.push({ relativePath: "README.md", content: "guide" });
+    const fixture = priorityIndexFixture({ files });
+    const originalFetch = fixture.client.fetchFn;
+    let checkpointSignal;
+    fixture.client.fetchFn = async (url, init) => {
+      if (url.endsWith("/checkpoint/code")) {
+        checkpointSignal = init.signal;
+        queueMicrotask(() => controller.abort());
+        return new Promise(() => {});
+      }
+      const response = await originalFetch(url, init);
+      if (url.endsWith("/status") && fixture.calls.some((call) => call.type === "abort")) {
+        const payload = await response.json();
+        payload.result.phase = "aborted";
+        return jsonResponse(200, payload);
+      }
+      return response;
+    };
+    await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+      ...(mode === "cancel" ? { signal: controller.signal } : { detachSignal: controller.signal }),
+    }), (error) => {
+      if (mode === "cancel") assert.ok(error instanceof RemoteIndexCancelledError);
+      else {
+        assert.equal(error instanceof RemoteIndexDetachedError,false);
+        assert.match(error.message,/Start a new index operation/);
+        assert.equal(error.transfer.files_transferred,1);
+        assert.equal(error.transfer.complete,false);
+        if (mode === "complete detach") assert.match(error.message,/client-owned code checkpoint/);
+      }
+      return true;
+    });
+    assert.equal(checkpointSignal.aborted, true, mode);
+    assert.equal(fixture.calls.some((call) => call.type === "abort"), true, mode);
+    assert.equal(fixture.calls.some((call) => call.type === "upload" && call.paths.includes("README.md")), false);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  }
+});
+
+for (const tier of ["code", "documentation", "other", "code stage"]) {
+  for (const stall of ["headers", "body"]) {
+    for (const interruption of ["deadline", "cancel", "detach"]) {
+      test(`${tier} tier drain bounds stalled status ${stall} on ${interruption}`, { timeout: 2000 }, async (t) => {
+        t.mock.method(Date, "now", () => 0);
+        const controller = new AbortController();
+        const files = [{ relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" }];
+        if (tier === "other") files.push({ relativePath: "data.json", content: "{}" });
+        const fixture = priorityIndexFixture({ files });
+        const originalFetch = fixture.client.fetchFn;
+        const targetPath = tier === "documentation" ? "README.md" : tier === "other" ? "data.json" : "main.py";
+        let cleanupStarted = false, readyCallbacks = 0, drainSignal;
+        fixture.client.fetchFn = async (url, init) => {
+          if (init.method === "DELETE") cleanupStarted = true;
+          if (!url.endsWith("/status") || cleanupStarted
+            || !fixture.calls.some((call) => call.type === "upload" && call.paths.includes(targetPath))) return originalFetch(url, init);
+          drainSignal = init.signal;
+          const stallForever = () => {
+            if (interruption !== "deadline") queueMicrotask(() => controller.abort());
+            return new Promise(() => {});
+          };
+          if (stall === "headers") return stallForever();
+          const response = await originalFetch(url, init);
+          response.json = stallForever;
+          return response;
+        };
+        const request = { ...fixture.request, processingTimeoutMs: 20,
+          signal: interruption === "cancel" ? controller.signal : undefined,
+          detachSignal: interruption === "detach" ? controller.signal : undefined,
+          onCodeReady: () => { readyCallbacks += 1; },
+        };
+        await assert.rejects(tier === "code stage" ? fixture.client.indexWorkspaceCodeStage(request) : fixture.client.indexWorkspace(request), (error) => {
+          assert.equal(error instanceof RemoteIndexDetachedError, false);
+          if (interruption === "cancel") {
+            assert.ok(error instanceof RemoteIndexCancelledError);
+            assert.equal(error.status.active_batches, 0);
+            assert.equal(error.status.pending_batches, 0);
+          } else assert.match(error.message, /owned session abort was confirmed.*Start a new index operation/);
+          assert.equal(error.transfer.complete, false);
+          assert.equal(error.transfer.files_transferred, tier === "documentation" ? 2 : tier === "other" ? 3 : 1);
+          return true;
+        });
+        assert.equal(drainSignal instanceof AbortSignal && drainSignal.aborted, true);
+        assert.equal(readyCallbacks, tier === "documentation" || tier === "other" ? 1 : 0);
+        assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+        assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+      });
+    }
+  }
+}
+
+for (const tier of ["code", "documentation"]) {
+  test(`late ${tier} drain response cannot extend the original deadline or report progress`, async (t) => {
+    let now = 0, lateProgress = 0, readyCallbacks = 0, cleanupStarted = false;
+    t.mock.method(Date, "now", () => now);
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" }] });
+    const originalFetch = fixture.client.fetchFn;
+    fixture.client.fetchFn = async (url, init) => {
+      if (init.method === "DELETE") cleanupStarted = true;
+      const response = await originalFetch(url, init);
+      const targetUploaded = fixture.calls.some((call) => call.type === "upload" && call.paths.includes(tier === "code" ? "main.py" : "README.md"));
+      if (!url.endsWith("/status") || cleanupStarted || !targetUploaded) return response;
+      const payload = await response.json();
+      now = 21;
+      payload.result.progress = { ...progressEvent(999, 80, "queued"), session_id: "priority", workspace_id: "fixture" };
+      return jsonResponse(200, payload);
+    };
+    await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: 20,
+      onCodeReady: () => { readyCallbacks += 1; },
+      onProgress: (event) => { if (event.sequence === 999) lateProgress += 1; },
+    }), /Start a new index operation/);
+    assert.equal(lateProgress, 0);
+    assert.equal(readyCallbacks, tier === "code" ? 0 : 1);
+    assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  });
+}
+
+test("ordinary tier drains retain omitted processing timeout compatibility", async (t) => {
+  let now = 0;
+  t.mock.method(Date, "now", () => now);
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" }] });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (url.endsWith("/status")) now += 5001;
+    return response;
+  };
+  const result = await fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: undefined });
+  assert.equal(result.transfer.complete, true);
+  assert.equal(fixture.calls.some((call) => call.type === "abort"), false);
+});
+
+test("fully submitted precommit drain aborts after later stalled transport timeout", { timeout: 500 }, async () => {
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "README.md", content: "guide" }], capability: false });
+  const originalFetch = fixture.client.fetchFn;
+  let statusRequests = 0, stalledSignal;
+  fixture.client.fetchFn = async (url, init) => {
+    if (!url.endsWith("/status")) return originalFetch(url, init);
+    if (++statusRequests === 2) { stalledSignal = init.signal; return new Promise(() => {}); }
+    const payload = await (await originalFetch(url, init)).json();
+    payload.result.active_batches = 1;
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: 30 }), (error) => {
+    assert.equal(error instanceof RemoteIndexDetachedError, false);
+    assert.match(error.message, /Start a new index operation/);
+    assert.equal(error instanceof RemoteIndexInterruptionError, true);
+    assert.equal(error.reason, "timeout");
+    assert.equal(error.interruptionOnly, true);
+    assert.equal(error.transfer.complete, false);
+    return true;
+  });
+  assert.equal(statusRequests, 3);
+  assert.equal(stalledSignal instanceof AbortSignal && stalledSignal.aborted, true);
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+  assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+});
+
+test("tier drain caps polling sleep at its deadline without another status request", { timeout: 500 }, async (t) => {
+  let now = 0;
+  t.mock.method(Date, "now", () => now);
+  const originalSetTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, "setTimeout", (callback, delay, ...args) => originalSetTimeout(() => {
+    now = 20;
+    callback(...args);
+  }, delay));
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "README.md", content: "guide" }], capability: false });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (!url.endsWith("/status")) return response;
+    const payload = await response.json();
+    payload.result.active_batches = 1;
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: 20, processingPollMs: 5000 }), (error) => !(error instanceof RemoteIndexDetachedError) && /Start a new index operation/.test(error.message));
+  assert.equal(fixture.calls.filter((call) => call.type === "status").length, 2);
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+  assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+});
+
+test("legacy deadline expiry between tiers skips an unbounded status read and unsent documentation", { timeout: 500 }, async (t) => {
+  let now = 0, cleanupStarted = false, drainReads = 0;
+  t.mock.method(Date, "now", () => now);
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" }], capability: false });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = async (url, init) => {
+    if (init.method === "DELETE") cleanupStarted = true;
+    if (!url.endsWith("/status") || cleanupStarted) return originalFetch(url, init);
+    if (++drainReads > 1) return new Promise(() => {});
+    const payload = await (await originalFetch(url, init)).json();
+    payload.result.progress = { ...progressEvent(998, 50, "queued"), session_id: "priority", workspace_id: "fixture" };
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: 20,
+    onProgress: (event) => { if (event.sequence === 998) queueMicrotask(() => { now = 21; }); },
+  }), /before all required source uploads were submitted.*Start a new index operation/);
+  assert.equal(drainReads, 1);
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+  assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
+  assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+});
+
+for (const interruption of ["cancel", "detach"]) {
+  test(`legacy drained callback ${interruption} routes into bounded cleanup before unsent docs`, { timeout: 2500 }, async (t) => {
+    t.mock.method(Date, "now", () => 0);
+    const controller = new AbortController();
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" }], capability: false });
+    const originalFetch = fixture.client.fetchFn;
+    let statusReads = 0, callbackCount = 0, stalledSignal;
+    fixture.client.fetchFn = async (url, init) => {
+      if (!url.endsWith("/status")) return originalFetch(url, init);
+      if (++statusReads > 1) { stalledSignal = init.signal; return new Promise(() => {}); }
+      const payload = await (await originalFetch(url, init)).json();
+      payload.result.progress = { ...progressEvent(997, 50, "queued"), session_id: "priority", workspace_id: "fixture" };
+      return jsonResponse(200, payload);
+    };
+    await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+      signal: interruption === "cancel" ? controller.signal : undefined,
+      detachSignal: interruption === "detach" ? controller.signal : undefined,
+      onProgress: (event) => {
+        if (event.sequence === 997) { callbackCount += 1; queueMicrotask(() => controller.abort()); }
+      },
+    }), (error) => {
+      assert.equal(error instanceof RemoteIndexDetachedError, false);
+      assert.equal(error instanceof RemoteIndexCancelledError, false, "Stalled cleanup did not confirm a terminal receipt");
+      assert.equal(error instanceof RemoteIndexInterruptionError, true);
+      assert.equal(error.reason, interruption);
+      assert.equal(error.interruptionOnly, true);
+      assert.equal(error.abortRequested, true);
+      assert.equal(error.releaseConfirmed, false);
+      assert.equal(error.sessionId, "priority");
+      assert.deepEqual(error.sessionIdentity, { session_id: "priority", workspace_id: "fixture", collection_name: "fixture", mode: "full" });
+      assert.equal(error.cause instanceof Error, true);
+      assert.match(error.message, /release could not be confirmed.*Start a new index operation/);
+      assert.equal(error.transfer.files_transferred, 1);
+      assert.equal(error.transfer.complete, false);
+      return true;
+    });
+    assert.equal(callbackCount, 1);
+    assert.equal(statusReads, 2);
+    assert.equal(stalledSignal instanceof AbortSignal && stalledSignal.aborted, true);
+    assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+    assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  });
+}
+
+for (const point of ["before manifest", "synchronous upload callback"]) {
+  for (const stall of ["headers", "body"]) {
+    for (const interruption of ["cancel", "detach"]) {
+      test(`${point} ${interruption} bounds stalled cleanup ${stall} without first processing receipt`, { timeout: 2500 }, async () => {
+        const controller = new AbortController();
+        const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }], capability: false });
+        const originalFetch = fixture.client.fetchFn;
+        let manifests = 0, cleanupSignal;
+        fixture.client.fetchFn = async (url, init) => {
+          if (url.endsWith("/manifest/batch")) manifests += 1;
+          if (!url.endsWith("/status")) return originalFetch(url, init);
+          cleanupSignal = init.signal;
+          if (stall === "headers") return new Promise(() => {});
+          const response = await originalFetch(url, init);
+          response.json = () => new Promise(() => {});
+          return response;
+        };
+        if (point === "before manifest") {
+          const start = fixture.client.startIndexSession.bind(fixture.client);
+          fixture.client.startIndexSession = async (...args) => { const session = await start(...args); controller.abort(); return session; };
+        } else {
+          const upload = fixture.client.uploadFileBatch.bind(fixture.client);
+          fixture.client.uploadFileBatch = async (...args) => ({ ...await upload(...args), queued: false });
+        }
+        await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+          signal: interruption === "cancel" ? controller.signal : undefined,
+          detachSignal: interruption === "detach" ? controller.signal : undefined,
+          onProgress: (event) => { if (point !== "before manifest" && event.phase === "uploading") controller.abort(); },
+        }), (error) => {
+          assert.equal(error instanceof RemoteIndexDetachedError || error instanceof RemoteIndexCancelledError, false);
+          assert.match(error.message, /release could not be confirmed.*Start a new index operation/);
+          assert.equal(error.transfer.complete, false);
+          assert.equal(error.transfer.files_transferred, point === "before manifest" ? 0 : 1);
+          return true;
+        });
+        assert.equal(manifests, point === "before manifest" ? 0 : 1);
+        assert.equal(cleanupSignal instanceof AbortSignal && cleanupSignal.aborted, true);
+        assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+        assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+      });
+    }
+  }
+}
+
+for (const flow of ["documentation-only", "incremental", "checkpoint-disabled"]) {
+  test(`fully submitted ${flow} ready-to-commit detach aborts instead of advertising polling reattachment`, async () => {
+    const controller = new AbortController();
+    const fixture = priorityIndexFixture({ files: [{ relativePath: flow === "documentation-only" ? "README.md" : "main.py", content: "x" }], capability: false });
+    const mode = flow === "incremental" ? "incremental" : "full";
+    const originalFetch = fixture.client.fetchFn;
+    let aborted = false;
+    fixture.client.fetchFn = async (url, init) => {
+      if (init.method === "DELETE") aborted = true;
+      const response = await originalFetch(url, init);
+      if (!url.endsWith("/sessions") && !url.endsWith("/status")) return response;
+      const payload = await response.json(); payload.result.mode = mode;
+      if (url.endsWith("/status") && !aborted) { payload.result.phase = "ready_to_commit"; controller.abort(); }
+      return jsonResponse(200, payload);
+    };
+    await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, mode, inventoryScan: flow == "incremental" ? undefined : fixture.request.inventoryScan, detachSignal: controller.signal }), (error) => {
+      assert.equal(error instanceof RemoteIndexDetachedError, false);
+      assert.match(error.message, /owned session abort was confirmed.*Start a new index operation/);
+      assert.equal(error instanceof RemoteIndexInterruptionError, true);
+      assert.equal(error.reason, "detach");
+      assert.equal(error.interruptionOnly, true);
+      assert.equal(error.releaseConfirmed, true);
+      assert.equal(error.transfer.files_transferred, 1);
+      assert.equal(error.transfer.complete, false);
+      return true;
+    });
+    assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  });
+}
+
+for (const kind of ["callback", "scan", "http", "publication"]) {
+  for (const confirmed of [false, true]) {
+    test(`interruption evidence preserves ${kind} failure racing abort with release ${confirmed}`, async () => {
+      const controller = new AbortController();
+      const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+      const failure = kind === "scan" ? new WorkspaceScanIncompleteError("Actual scan failure")
+        : kind === "http" || kind === "publication" ? new CorpusWireHttpError(409, "Conflict", "Actual server failure", { retryable: false })
+        : new Error("Actual callback failure");
+      const fail = () => { controller.abort(); throw failure; };
+      const originalFetch = fixture.client.fetchFn;
+      fixture.client.fetchFn = async (url, init) => {
+        if (!confirmed && init.method === "DELETE") throw new Error("Abort rejected");
+        return originalFetch(url, init);
+      };
+      if (kind === "publication") fixture.client.checkpointIndexSessionCode = async () => fail();
+      else if (kind !== "callback") fixture.client.sendManifestBatch = async () => fail();
+      await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, signal: controller.signal,
+        onProgress: kind === "callback" ? (event) => { if (event.phase === "manifest_comparison") fail(); } : undefined,
+      }), (error) => {
+        assert.equal(error instanceof RemoteIndexCancelledError, false);
+        assert.equal(error instanceof RemoteIndexInterruptionError, true);
+        assert.equal(error.reason, "cancel");
+        assert.equal(error.interruptionOnly, false);
+        assert.equal(error.abortRequested, true);
+        assert.equal(error.releaseConfirmed, confirmed);
+        assert.equal(error.cause, failure);
+        assert.deepEqual(error.sessionIdentity, { session_id: "priority", workspace_id: "fixture", collection_name: "fixture", mode: "full" });
+        assert.equal(error.transfer.complete, false);
+        return true;
+      });
+      assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+    });
+  }
+}
+
+for (const source of ["status", "transport"]) {
+test(`interruption evidence preserves a wrapped ${source} HTTP failure racing abort`, async () => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  const failure = new CorpusWireHttpError(409, "Conflict", "Actual status failure", { retryable: false });
+  const originalStatus = fixture.client.getIndexSessionStatus.bind(fixture.client);
+  let reads = 0;
+  const failingStatus = async (...args) => {
+    if (++reads === 1) { controller.abort(); throw failure; }
+    return originalStatus(...args);
+  };
+  if (source === "status") fixture.client.getIndexSessionStatus = failingStatus;
+  else {
+    const originalFetch = fixture.client.fetchFn;
+    fixture.client.fetchFn = async (url, init) => {
+      if (url.endsWith("/status") && ++reads === 1) { controller.abort(); throw failure; }
+      return originalFetch(url, init);
+    };
+  }
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, signal: controller.signal }), (error) => {
+    assert.equal(error instanceof RemoteIndexInterruptionError, true);
+    assert.equal(error.interruptionOnly, false);
+    assert.equal(error.releaseConfirmed, true);
+    assert.equal(error.cause.cause, failure);
+    return true;
+  });
+});
+}
+
+for (const race of ["cancel", "deadline"]) {
+  for (const failed of [false, true]) {
+    test(`interruption evidence checks observed ${failed ? "failed" : "clean"} status before ${race} race`, async (t) => {
+      const controller = new AbortController();
+      const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }], capability: false });
+      const originalFetch = fixture.client.fetchFn;
+      let reads = 0, observed, now = 0;
+      t.mock.method(Date, "now", () => now);
+      fixture.client.fetchFn = async (url, init) => {
+        const response = await originalFetch(url, init);
+        if (!url.endsWith("/status") || ++reads !== 1) return response;
+        const payload = await response.json();
+        observed = { ...payload.result, phase: failed ? "failed" : "indexing",
+          failed_batches: failed ? 1 : 0, errors: failed ? ["genuine indexed operation failed"] : [] };
+        if (race === "cancel") controller.abort();
+        else now = 101;
+        return jsonResponse(200, { ...payload, result: observed });
+      };
+      await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, signal: controller.signal }), (error) => {
+        if (failed) {
+          assert.equal(error instanceof RemoteIndexCancelledError, false);
+          let cause = error;
+          while (cause instanceof Error && cause.cause !== undefined) cause = cause.cause;
+          assert.deepEqual(cause, observed);
+          if (race === "cancel") {
+            assert.equal(error instanceof RemoteIndexInterruptionError, true);
+            assert.equal(error.interruptionOnly, false);
+          }
+          assert.deepEqual(cause.errors, ["genuine indexed operation failed"]);
+        } else if (race === "cancel") assert.equal(error instanceof RemoteIndexCancelledError, true);
+        else {
+          assert.equal(error instanceof RemoteIndexInterruptionError, true);
+          assert.equal(error.reason, "timeout");
+          assert.equal(error.interruptionOnly, true);
+        }
+        return true;
+      });
+      assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+      assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+    });
+  }
+}
+
+test("interruption evidence bounds never-settling status transport on caller abort", { timeout: 500 }, async () => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  const originalStatus = fixture.client.getIndexSessionStatus.bind(fixture.client);
+  let reads = 0, stalledSignal;
+  fixture.client.getIndexSessionStatus = async (id, options) => {
+    if (++reads === 1) {
+      stalledSignal = options.signal;
+      queueMicrotask(() => controller.abort());
+      return new Promise(() => {});
+    }
+    return originalStatus(id, options);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, signal: controller.signal }),
+    (error) => error instanceof RemoteIndexCancelledError && error.status.workspace_id === "fixture");
+  assert.equal(stalledSignal.aborted, true);
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+});
+
+test("interruption evidence refuses mismatched terminal session identity", async () => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }],
+    onUpload: () => controller.abort() });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (!url.endsWith("/status")) return response;
+    const payload = await response.json(); payload.result.workspace_id = "foreign";
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, signal: controller.signal }), (error) => {
+    assert.equal(error instanceof RemoteIndexInterruptionError, true);
+    assert.equal(error.interruptionOnly, true);
+    assert.equal(error.releaseConfirmed, false);
+    assert.equal(error.status.workspace_id, "foreign");
+    assert.equal(error.sessionIdentity.workspace_id, "fixture");
+    return true;
+  });
+});
+
+test("fatal queue admission error survives stalled bounded abort cleanup", { timeout: 2500 }, async () => {
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }], capability: false });
+  const originalFetch = fixture.client.fetchFn;
+  let abortAttempts = 0, abortSignal;
+  fixture.client.fetchFn = async (url, init) => {
+    if (url.endsWith("/files/batch")) return jsonResponse(429, { detail: "permanent synthetic workspace quota exceeded" });
+    if (init.method === "DELETE") { abortAttempts += 1; abortSignal = init.signal; return new Promise(() => {}); }
+    return originalFetch(url, init);
+  };
+  await assert.rejects(fixture.client.indexWorkspace(fixture.request), (error) => {
+    assert.ok(error instanceof CorpusWireHttpError);
+    assert.equal(error.status, 429);
+    assert.match(error.message, /quota exceeded/);
+    assert.equal(error.transfer.complete, false);
+    assert.equal(error.transfer.files_transferred, 0);
+    assert.equal(error.transfer.upload_attempts, 1);
+    assert.equal(error.release_status, undefined);
+    return true;
+  });
+  assert.equal(abortAttempts, 1);
+  assert.equal(abortSignal instanceof AbortSignal && abortSignal.aborted, true);
+  assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+});
+
+test("final precommit drain callback cancellation uses one bounded cleanup reserve", { timeout: 2500 }, async () => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "README.md", content: "guide" }], capability: false });
+  const originalFetch = fixture.client.fetchFn;
+  let reads = 0, stalledSignal;
+  fixture.client.fetchFn = async (url, init) => {
+    if (!url.endsWith("/status")) return originalFetch(url, init);
+    if (++reads === 3) { stalledSignal = init.signal; return new Promise(() => {}); }
+    const payload = await (await originalFetch(url, init)).json();
+    if (reads === 2) payload.result.progress = { ...progressEvent(996, 80, "queued"), session_id: "priority", workspace_id: "fixture" };
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, signal: controller.signal,
+    onProgress: (event) => { if (event.sequence === 996) queueMicrotask(() => controller.abort()); },
+  }), (error) => {
+    assert.equal(error instanceof RemoteIndexDetachedError || error instanceof RemoteIndexCancelledError, false);
+    assert.match(error.message, /release could not be confirmed.*Start a new index operation/);
+    assert.equal(error.transfer.files_transferred, 1);
+    assert.equal(error.transfer.complete, false);
+    return true;
+  });
+  assert.equal(reads, 3);
+  assert.equal(stalledSignal instanceof AbortSignal && stalledSignal.aborted, true);
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+  assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+});
+
+for (const race of ["cancel", "detach", "deadline"]) {
+  test(`returned failed checkpoint receipt survives ${race} race and clean abort`, async (t) => {
+    const controller = new AbortController();
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+    const originalFetch = fixture.client.fetchFn;
+    let failedStatus, now = 0, readyCallbacks = 0;
+    t.mock.method(Date, "now", () => now);
+    fixture.client.fetchFn = async (url, init) => {
+      const response = await originalFetch(url, init);
+      if (!url.endsWith("/checkpoint/code")) return response;
+      const payload = await response.json();
+      failedStatus = { ...payload.result, phase: "failed", errors: ["Actual checkpoint publication failure"], failed_batches: 1 };
+      if (race === "deadline") now = 101;
+      else controller.abort();
+      return jsonResponse(200, { ...payload, result: failedStatus });
+    };
+    await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+      signal: race === "cancel" ? controller.signal : undefined,
+      detachSignal: race === "detach" ? controller.signal : undefined,
+      onCodeReady: () => { readyCallbacks += 1; },
+    }), (error) => {
+      assert.equal(error instanceof RemoteIndexCancelledError, false);
+      let cause = error;
+      while (cause instanceof Error && cause.cause !== undefined) cause = cause.cause;
+      assert.equal(cause, failedStatus);
+      assert.deepEqual(cause.errors, ["Actual checkpoint publication failure"]);
+      if (race !== "deadline") {
+        assert.ok(error instanceof RemoteIndexInterruptionError);
+        assert.equal(error.reason, race);
+        assert.equal(error.interruptionOnly, false);
+      }
+      assert.equal(error.transfer.complete, false);
+      return true;
+    });
+    assert.equal(readyCallbacks, 0);
+    assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  });
+}
+
+for (const failureKind of ["HTTP", "transport"]) {
+  for (const interruption of ["cancel", "detach"]) {
+    test(`genuine checkpoint ${failureKind} failure stays primary when ${interruption} arrives during cleanup`, async () => {
+      const controller = new AbortController();
+      const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+      const failure = new TypeError("Actual checkpoint transport failure", { cause: new Error("Actual socket cause") });
+      const originalFetch = fixture.client.fetchFn;
+      const checkpoint = fixture.client.checkpointIndexSessionCode.bind(fixture.client);
+      let checkpointFailure;
+      fixture.client.checkpointIndexSessionCode = async (...args) => {
+        try { return await checkpoint(...args); }
+        catch (error) { checkpointFailure = error; throw error; }
+      };
+      fixture.client.fetchFn = async (url, init) => {
+        if (url.endsWith("/checkpoint/code")) {
+          if (failureKind === "transport") throw failure;
+          return jsonResponse(409, { error: "Actual checkpoint publication failure" });
+        }
+        if (init.method === "DELETE") controller.abort();
+        return originalFetch(url, init);
+      };
+      await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+        signal: interruption === "cancel" ? controller.signal : undefined,
+        detachSignal: interruption === "detach" ? controller.signal : undefined,
+      }), (error) => {
+        assert.equal(error, checkpointFailure);
+        assert.equal(error instanceof RemoteIndexInterruptionError, false);
+        assert.equal(error.reason, undefined);
+        assert.equal(error.transfer.complete, false);
+        if (failureKind === "transport") assert.equal(error, failure);
+        else assert.equal(error.status, 409);
+        return true;
+      });
+      assert.equal(controller.signal.aborted, true);
+      assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+      assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+    });
+  }
+}
+
+test("requestJson retains pure cancellation during retry backoff without issuing another attempt", async () => {
+  for (const failureKind of ["transport", "HTTP", "error body", "AbortError"]) {
+    const controller = new AbortController();
+    const abort = new DOMException("Actual transport cancellation", "AbortError");
+    let attempts = 0, retries = 0;
+    await assert.rejects(requestJson({ baseUrl: "http://fixture.test", paths: ["/retry"],
+      init: { signal: controller.signal }, retryDelayMs: 100, onRetry: () => { retries += 1; },
+      fetchFn: async () => {
+        attempts += 1;
+        if (failureKind === "AbortError") { controller.abort(); throw abort; }
+        setTimeout(() => controller.abort(), 5);
+        if (failureKind === "transport") throw new TypeError("fetch failed");
+        const response = jsonResponse(503, { error: "Transient unavailable" });
+        if (failureKind === "error body") response.text = async () => { throw new TypeError("fetch failed"); };
+        return response;
+      },
+    }), (error) => {
+      assert.equal(error.name, "AbortError");
+      if (failureKind === "AbortError") assert.equal(error, abort);
+      return true;
+    });
+    assert.equal(attempts, 1);
+    assert.equal(retries, 0);
+  }
+});
+
+for (const failureKind of ["transport", "HTTP", "error body"]) {
+  for (const cleanup of ["confirmed", "stalled"]) {
+    test(`retryable checkpoint ${failureKind} failure racing cancellation preserves observed failure with ${cleanup} cleanup`, { timeout: 2500 }, async () => {
+      const controller = new AbortController();
+      const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+      const socketCause = new Error("Actual socket cause");
+      const transportFailure = new TypeError("fetch failed", { cause: socketCause });
+      const originalFetch = fixture.client.fetchFn;
+      let checkpointRequests = 0, abortRequests = 0, cleanupSignal;
+      fixture.client.fetchFn = async (url, init) => {
+        if (url.endsWith("/checkpoint/code")) {
+          checkpointRequests += 1;
+          if (failureKind === "transport") { controller.abort(); throw transportFailure; }
+          const response = jsonResponse(503, { error: "Actual checkpoint unavailable" });
+          if (failureKind === "HTTP") controller.abort();
+          else response.text = async () => { controller.abort(); throw transportFailure; };
+          return response;
+        }
+        if (init.method === "DELETE") {
+          abortRequests += 1; cleanupSignal = init.signal;
+          if (cleanup === "stalled") return new Promise(() => {});
+        }
+        return originalFetch(url, init);
+      };
+      await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, signal: controller.signal }), (error) => {
+        assert.ok(error instanceof RemoteIndexInterruptionError);
+        assert.equal(error.reason, "cancel");
+        assert.equal(error.interruptionOnly, false);
+        assert.equal(error.releaseConfirmed, cleanup === "confirmed");
+        if (failureKind === "HTTP") {
+          assert.ok(error.cause instanceof CorpusWireHttpError);
+          assert.equal(error.cause.status, 503);
+          assert.match(error.cause.responseBody, /Actual checkpoint unavailable/);
+        } else {
+          assert.equal(error.cause, transportFailure);
+          assert.equal(error.cause.cause, socketCause);
+        }
+        assert.equal(error.transfer.complete, false);
+        assert.equal(error.transfer.files_transferred, 1);
+        return true;
+      });
+      assert.equal(checkpointRequests, 1);
+      assert.equal(abortRequests, 1);
+      if (cleanup === "stalled") assert.equal(cleanupSignal.aborted, true);
+      assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+    });
+  }
+}
+
+for (const failureKind of ["HTTP", "transport"]) {
+  for (const cleanup of ["confirmed", "stalled"]) {
+    test(`genuine checkpoint ${failureKind} failure survives ${cleanup} owned cleanup without fabricated timeout`, { timeout: 2500 }, async () => {
+      const fixture = priorityIndexFixture({ files: [
+        { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+      ] });
+      const transportCause = new Error("Actual socket cause");
+      const transportFailure = new TypeError("Actual checkpoint transport failure", { cause: transportCause });
+      const originalFetch = fixture.client.fetchFn;
+      let cleanupSignal, checkpointFailure, readyCallbacks = 0, abortRequests = 0;
+      const checkpoint = fixture.client.checkpointIndexSessionCode.bind(fixture.client);
+      fixture.client.checkpointIndexSessionCode = async (...args) => {
+        try { return await checkpoint(...args); }
+        catch (error) { checkpointFailure = error; throw error; }
+      };
+      fixture.client.fetchFn = async (url, init) => {
+        if (url.endsWith("/checkpoint/code")) {
+          if (failureKind === "transport") throw transportFailure;
+          return jsonResponse(409, { error: "Actual checkpoint publication failure" });
+        }
+        if (init.method === "DELETE") {
+          abortRequests += 1;
+          cleanupSignal = init.signal;
+          if (cleanup === "stalled") return new Promise(() => {});
+        }
+        return originalFetch(url, init);
+      };
+      await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: undefined,
+        onCodeReady: () => { readyCallbacks += 1; },
+      }), (error) => {
+        assert.equal(error, checkpointFailure, "Owned cleanup must preserve the exact primary failure");
+        assert.equal(error instanceof RemoteIndexInterruptionError, false);
+        assert.equal(error.reason, undefined);
+        if (failureKind === "HTTP") {
+          assert.ok(error instanceof CorpusWireHttpError);
+          assert.equal(error.status, 409);
+          assert.match(error.message, /Actual checkpoint publication failure/);
+        } else {
+          assert.equal(error, transportFailure);
+          assert.equal(error.cause, transportCause);
+        }
+        assert.equal(error.transfer.complete, false);
+        assert.equal(error.transfer.files_transferred, 1);
+        return true;
+      });
+      assert.equal(abortRequests, 1);
+      if (cleanup === "stalled") assert.equal(cleanupSignal.aborted, true);
+      else assert.equal(fixture.calls.at(-1).type, "status");
+      assert.equal(readyCallbacks, 0);
+      assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+      assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
+    });
+  }
+}
+
+for (const codeStage of [false, true]) {
+  for (const stall of ["headers", "body"]) {
+    for (const interruption of ["deadline", "cancel", "detach"]) {
+      test(`${codeStage ? "code stage" : "ordinary indexing"} bounds synchronous checkpoint ${stall} on ${interruption}`, { timeout: 2000 }, async (t) => {
+        let now = 0;
+        t.mock.method(Date, "now", () => now);
+        const controller = new AbortController();
+        const fixture = priorityIndexFixture({ files: [
+          { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+        ] });
+        const originalUpload = fixture.client.uploadFileBatch.bind(fixture.client);
+        fixture.client.uploadFileBatch = async (...args) => ({ ...await originalUpload(...args), queued: false });
+        const originalFetch = fixture.client.fetchFn;
+        let checkpointSignal, readyCallbacks = 0;
+        fixture.client.fetchFn = async (url, init) => {
+          if (!url.endsWith("/checkpoint/code")) return originalFetch(url, init);
+          checkpointSignal = init.signal;
+          const stallForever = () => {
+            if (interruption !== "deadline") queueMicrotask(() => controller.abort());
+            return new Promise(() => {});
+          };
+          if (stall === "headers") return stallForever();
+          const response = await originalFetch(url, init);
+          response.json = stallForever;
+          return response;
+        };
+        const request = { ...fixture.request, processingTimeoutMs: 20,
+          signal: interruption === "cancel" ? controller.signal : undefined,
+          detachSignal: interruption === "detach" ? controller.signal : undefined,
+          onCodeReady: () => { readyCallbacks += 1; },
+        };
+        await assert.rejects(codeStage ? fixture.client.indexWorkspaceCodeStage(request) : fixture.client.indexWorkspace(request), (error) => {
+          assert.equal(error instanceof RemoteIndexDetachedError, false);
+          if (interruption === "cancel") assert.ok(error instanceof RemoteIndexCancelledError);
+          else {
+            assert.match(error.message, /client-owned code checkpoint.*owned session abort was confirmed/);
+            assert.match(error.message, /Start a new index operation/);
+            if (interruption === "deadline") assert.match(error.cause.message, /checkpoint timeout elapsed/);
+          }
+          assert.equal(error.transfer.complete, false);
+          assert.equal(error.transfer.files_transferred, 1);
+          return true;
+        });
+        assert.equal(checkpointSignal.aborted, true);
+        assert.equal(readyCallbacks, 0);
+        assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+        assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+        assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
+      });
+    }
+  }
+}
+
+test("checkpoint rejects late synchronous response and starts its absolute budget before request IO", async (t) => {
+  let now = 0;
+  t.mock.method(Date, "now", () => now);
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  const originalUpload = fixture.client.uploadFileBatch.bind(fixture.client);
+  fixture.client.uploadFileBatch = async (...args) => ({ ...await originalUpload(...args), queued: false });
+  const originalFetch = fixture.client.fetchFn;
+  let readyCallbacks = 0;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (url.endsWith("/checkpoint/code")) now = 21;
+    return response;
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: 20,
+    onCodeReady: () => { readyCallbacks += 1; },
+  }), (error) => /checkpoint timeout elapsed/.test(error.cause.message));
+  assert.equal(readyCallbacks, 0);
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+  assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+});
+
+test("code-stage omitted budget is finite before checkpoint while ordinary omitted budget remains compatible", async (t) => {
+  let now = 0;
+  t.mock.method(Date, "now", () => now);
+  for (const codeStage of [false, true]) {
+    now = 0;
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+    const originalUpload = fixture.client.uploadFileBatch.bind(fixture.client);
+    fixture.client.uploadFileBatch = async (...args) => ({ ...await originalUpload(...args), queued: false });
+    const originalFetch = fixture.client.fetchFn;
+    fixture.client.fetchFn = async (url, init) => {
+      const response = await originalFetch(url, init);
+      if (url.endsWith("/checkpoint/code")) now = 5001;
+      return response;
+    };
+    const request = { ...fixture.request, processingTimeoutMs: undefined };
+    if (codeStage) await assert.rejects(fixture.client.indexWorkspaceCodeStage(request), (error) => /checkpoint timeout elapsed/.test(error.cause.message));
+    else assert.equal((await fixture.client.indexWorkspace(request)).transfer.complete, true);
+  }
+});
+
+for (const stall of ["abort headers", "terminal body"]) {
+  test(`checkpoint deadline bounds ${stall} cleanup without claiming release`, { timeout: 2500 }, async (t) => {
+    t.mock.method(Date, "now", () => 0);
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+    const originalFetch = fixture.client.fetchFn;
+    const signals = [];
+    let cleanupStarted = false;
+    fixture.client.fetchFn = async (url, init) => {
+      if (url.endsWith("/checkpoint/code")) { signals.push(init.signal); return new Promise(() => {}); }
+      if (init.method === "DELETE") {
+        cleanupStarted = true; signals.push(init.signal);
+        if (stall === "abort headers") return new Promise(() => {});
+      }
+      const response = await originalFetch(url, init);
+      if (cleanupStarted && url.endsWith("/status")) {
+        signals.push(init.signal); response.json = () => new Promise(() => {});
+      }
+      return response;
+    };
+    await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request, processingTimeoutMs: 20 }), (error) => {
+      assert.equal(error instanceof RemoteIndexDetachedError, false);
+      assert.match(error.message, /release could not be confirmed/);
+      assert.equal(error.transfer.complete, false);
+      return true;
+    });
+    assert.ok(signals.every((signal) => signal instanceof AbortSignal && signal.aborted));
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  });
+}
+
+test("a checkpoint without confirmed code readiness cannot call the ready callback", async () => {
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+  ] });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (!url.endsWith("/checkpoint/code")) return response;
+    const payload = await response.json();
+    payload.result.coverage.code_ready = false;
+    return jsonResponse(200, payload);
+  };
+  let callbacks = 0;
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, onCodeReady: () => callbacks++ }), /did not confirm code readiness/);
+  assert.equal(callbacks, 0);
+  assert.equal(fixture.calls.filter((call) => call.type === "upload").length, 1);
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+  assert.equal(fixture.calls.at(-1).type, "status", "Owned cleanup confirms terminal status after requesting abort");
+});
+
+test("tier draining waits for legacy background work without optional batch counters", async () => {
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+  ] });
+  const originalFetch = fixture.client.fetchFn;
+  let statusReads = 0;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (!url.endsWith("/status")) return response;
+    const payload = await response.json();
+    delete payload.result.pending_batches;
+    delete payload.result.active_batches;
+    if (++statusReads === 1) payload.result.queue_depth++;
+    return jsonResponse(200, payload);
+  };
+  await fixture.client.indexWorkspace(fixture.request);
+  const beforeCheckpoint = fixture.calls.slice(0, fixture.calls.findIndex((call) => call.type === "checkpoint"));
+  assert.equal(beforeCheckpoint.filter((call) => call.type === "status").length, 2);
+});
+
+test("final completeness still waits for missing uploads after all tiers drain", async () => {
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }], capability: false });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (!url.endsWith("/status")) return response;
+    const payload = await response.json();
+    payload.result.queue_depth = 1;
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: 20 }), (error) => !(error instanceof RemoteIndexDetachedError) && /Start a new index operation/.test(error.message));
+  assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+});
+
+test("a code-tier processing timeout aborts while documentation uploads are still unsent", async () => {
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+  ] });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (!url.endsWith("/status")) return response;
+    const payload = await response.json();
+    payload.result.active_batches = 1;
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: 20 }), (error) => {
+    assert.equal(error instanceof RemoteIndexDetachedError, false);
+    assert.match(error.message, /abort was requested for the incomplete session/);
+    assert.equal(error.transfer.files_transferred, 1);
+    assert.equal(error.transfer.complete, false);
+    return true;
+  });
+  assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+  assert.equal(fixture.calls.at(-1).type, "status");
+  assert.equal(fixture.calls.some((call) => call.type === "checkpoint" || call.type === "commit"), false);
+});
+
+test("tier processing waits share one deadline instead of restarting the caller budget", async (t) => {
+  let now = 0, codeReads = 0, documentationReads = 0;
+  t.mock.method(Date, "now", () => now);
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+    { relativePath: "data.json", content: "{}" },
+  ] });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (!url.endsWith("/status")) return response;
+    const payload = await response.json();
+    if (payload.result.phase === "aborted") return jsonResponse(200, payload);
+    if (payload.result.queue_depth === 2) {
+      now = ++codeReads === 1 ? 60 : 90;
+      payload.result.active_batches = codeReads === 1 ? 1 : 0;
+    } else {
+      now = ++documentationReads === 1 ? 110 : 220;
+      payload.result.active_batches = 1;
+    }
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspace(fixture.request), /abort was requested for the incomplete session/);
+  assert.equal(codeReads, 2);
+  assert.equal(documentationReads, 1);
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+  assert.equal(fixture.calls.at(-1).type, "status");
+  assert.equal(fixture.calls.some((call) => call.type === "upload" && call.paths.includes("data.json")), false);
+});
+
+test("an incomplete detach reports an unconfirmed abort without claiming reattachment", async () => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+  ], onUpload: () => controller.abort() });
+  const originalFetch = fixture.client.fetchFn;
+  fixture.client.fetchFn = (url, init) => {
+    if (init.method === "DELETE") throw new Error("Synthetic abort rejection");
+    return originalFetch(url, init);
+  };
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, detachSignal: controller.signal }), (error) => {
+    assert.equal(error instanceof RemoteIndexDetachedError, false);
+    assert.match(error.message, /release could not be confirmed/);
+    assert.equal(error.transfer.complete, false);
+    return true;
+  });
+  assert.equal(fixture.calls.some((call) => call.type === "upload" && call.paths.includes("README.md")), false);
+});
+
+test("expiry after code publication prevents the next tier from uploading", async (t) => {
+  let now = 0;
+  t.mock.method(Date, "now", () => now);
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+  ] });
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, onCodeReady: () => { now = 110; } }), /abort was requested for the incomplete session/);
+  assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+  assert.equal(fixture.calls.at(-1).type, "status");
+});
+
+test("old server capability and zero-code inventories skip code publication", async () => {
+  for (const options of [
+    { files: [{ relativePath: "main.py", content: "x" }], capability: false },
+    { files: [{ relativePath: "README.md", content: "guide" }] },
+  ]) {
+    const fixture = priorityIndexFixture(options);
+    let callbacks = 0;
+    await fixture.client.indexWorkspace({ ...fixture.request, onCodeReady: () => callbacks++ });
+    assert.equal(callbacks, 0);
+    assert.equal(fixture.calls.some((call) => call.type === "checkpoint"), false);
+  }
+});
+
+test("upload batches and concurrency are clamped to the server limits", async () => {
+  let active = 0, maximum = 0;
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "a.py", content: "abc" }, { relativePath: "b.py", content: "def" }, { relativePath: "c.py", content: "ghi" },
+  ], batchBytes: 4, concurrency: 1, onUpload: async () => {
+    active++; maximum = Math.max(maximum, active);
+    await new Promise((resolve) => setTimeout(resolve, 5)); active--;
+  } });
+  await fixture.client.indexWorkspace({ ...fixture.request, batchBytes: 1000, maxConcurrentUploads: 20 });
+  assert.equal(maximum, 1);
+  assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths.length), [1, 1, 1]);
+});
+
+test("an empty inventory commits without requiring unused upload capacity", async () => {
+  const fixture = priorityIndexFixture({ files: [], batchBytes: 0, concurrency: 0 });
+  const result = await fixture.client.indexWorkspace(fixture.request);
+  assert.equal(result.transfer.complete, true);
+  assert.equal(result.transfer.files_upload_required, 0);
+  assert.equal(result.transfer.files_transferred, 0);
+  assert.equal(fixture.calls.some((call) => call.type === "upload" || call.type === "checkpoint" || call.type === "abort"), false);
+  assert.equal(fixture.calls.at(-1).type, "commit");
+});
+
+test("all-reused code checkpoints and commits without requiring upload capacity", async () => {
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+  ], unchanged: ["main.py", "README.md"], batchBytes: 0, concurrency: 0 });
+  let codeReady = false;
+  const result = await fixture.client.indexWorkspace({ ...fixture.request,
+    onCodeReady: (status) => { codeReady = status.coverage.code_ready; },
+  });
+  assert.equal(codeReady, true);
+  assert.equal(result.transfer.complete, true);
+  assert.equal(result.transfer.files_upload_required, 0);
+  assert.equal(result.transfer.files_reused, 2);
+  assert.equal(result.transfer.files_transferred, 0);
+  assert.deepEqual(fixture.calls, [{ type: "checkpoint" }, { type: "commit" }]);
+});
+
+test("actual upload payloads still reject zero byte or concurrency capacity", async () => {
+  for (const limits of [{ batchBytes: 0 }, { concurrency: 0 }]) {
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "README.md", content: "guide" }], ...limits });
+    await assert.rejects(fixture.client.indexWorkspace(fixture.request), /positive finite limit/);
+    assert.equal(fixture.calls.some((call) => call.type === "upload" || call.type === "commit"), false);
+    assert.equal(fixture.calls.at(-1).type, "abort");
+  }
+});
+
+function queueBusy(retryAfter = "0") {
+  const response = jsonResponse(429, { detail: { error_code: "index_queue_full", message: "Queue busy", retryable: true } });
+  response.headers.set("Retry-After", retryAfter);
+  return response;
+}
+
+const QUEUE_TEST_FILE = { descriptor: { relativePath: "main.py", contentId: "file-0", size: 1, sha256: "0".repeat(64), mtimeNs: 0 }, content: "x" };
+
+test("typed queue pressure bypasses generic retries and admission retries identical bytes losslessly", async () => {
+  let genericCalls = 0;
+  await assert.rejects(requestJson({ baseUrl: "http://fixture.test", paths: ["/busy"], retryDelayMs: 0,
+    fetchFn: async () => { genericCalls++; return queueBusy(); },
+  }), (error) => error.errorCode === "index_queue_full" && error.retryable && error.retryAfterSeconds === 0);
+  assert.equal(genericCalls, 1);
+  const bodies = [];
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (_, init) => {
+    bodies.push(await init.body.text());
+    return bodies.length < 3 ? queueBusy() : jsonResponse(202, { ok: true, result: { files_received: 1, errors: [], queued: true } });
+  } });
+  let attempts = 0;
+  const result = await client.uploadFileBatch("queue", { files: [QUEUE_TEST_FILE.descriptor] }, [QUEUE_TEST_FILE], () => attempts++, { queueWaitTimeoutMs: 200 });
+  assert.equal(result.files_received, 1);
+  assert.equal(attempts, 3);
+  assert.equal(new Set(bodies).size, 1);
+});
+
+test("admission timeout is finite and permanent quota responses fail without retries", async () => {
+  for (const busy of [true, false]) {
+    let attempts = 0;
+    const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async () => {
+      attempts++;
+      return busy ? queueBusy("1") : jsonResponse(429, { detail: "permanent workspace byte quota exceeded" });
+    } });
+    await assert.rejects(client.uploadFileBatch("queue", { files: [QUEUE_TEST_FILE.descriptor] }, [QUEUE_TEST_FILE], undefined, { queueWaitTimeoutMs: 15 }), CorpusWireHttpError);
+    assert.equal(attempts, 1);
+  }
+});
+
+test("admission budget bounds stalled fetch and response bodies even when transport ignores abort", { timeout: 1000 }, async () => {
+  for (const stalled of ["fetch", "success body", "error body"]) {
+    let transportSignal, attempts = 0;
+    const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (_, init) => {
+      transportSignal = init.signal;
+      attempts++;
+      const never = new Promise(() => {});
+      if (stalled === "fetch") return never;
+      const response = jsonResponse(stalled === "success body" ? 202 : 429, {});
+      if (stalled === "success body") response.json = () => never;
+      else response.text = () => never;
+      return response;
+    } });
+    await assert.rejects(client.uploadFileBatch("queue", { files: [QUEUE_TEST_FILE.descriptor] }, [QUEUE_TEST_FILE], undefined,
+      { queueWaitTimeoutMs: 10 }), /Upload admission timeout elapsed/);
+    assert.equal(attempts, 1, stalled);
+    assert.equal(transportSignal.aborted, true, stalled);
+  }
+});
+
+test("caller cancellation bounds an uncooperative admission fetch", { timeout: 1000 }, async () => {
+  const controller = new AbortController();
+  let transportSignal;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (_, init) => {
+    transportSignal = init.signal;
+    queueMicrotask(() => controller.abort());
+    return new Promise(() => {});
+  } });
+  await assert.rejects(client.uploadFileBatch("queue", { files: [QUEUE_TEST_FILE.descriptor] }, [QUEUE_TEST_FILE], undefined,
+    { queueWaitTimeoutMs: 500, signal: controller.signal }), { name: "AbortError" });
+  assert.equal(transportSignal.aborted, true);
+});
+
+test("generic HTTP retry backoff stays inside the admission budget", { timeout: 1000 }, async () => {
+  let attempts = 0, transportSignal;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (_, init) => {
+    transportSignal = init.signal;
+    attempts++;
+    return jsonResponse(503, { detail: "Synthetic transient gateway failure" });
+  } });
+  await assert.rejects(client.uploadFileBatch("queue", { files: [QUEUE_TEST_FILE.descriptor] }, [QUEUE_TEST_FILE], undefined,
+    { queueWaitTimeoutMs: 10 }), /Upload admission timeout elapsed/);
+  assert.equal(attempts, 1);
+  assert.equal(transportSignal.aborted, true);
+});
+
+test("zero admission budget permits one initial attempt without queue retries", async () => {
+  for (const mode of ["success", "queue", "gateway", "network"]) {
+    let attempts = 0;
+    const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async () => {
+      attempts++;
+      if (mode === "network") throw new TypeError("fetch failed");
+      if (mode === "queue") return queueBusy();
+      if (mode === "gateway") return jsonResponse(503, { detail: "Synthetic gateway failure" });
+      return jsonResponse(202, { ok: true, result: { files_received: 1, errors: [] } });
+    } });
+    const upload = client.uploadFileBatch("queue", { files: [QUEUE_TEST_FILE.descriptor] }, [QUEUE_TEST_FILE], undefined,
+      { queueWaitTimeoutMs: 0 });
+    if (mode === "success") assert.equal((await upload).files_received, 1);
+    else await assert.rejects(upload, mode === "network" ? TypeError : CorpusWireHttpError);
+    assert.equal(attempts, 1, mode);
+  }
+});
+
+test("cancellation and incomplete detach interrupt admission waits and abort unsent inventories", async () => {
+  for (const detach of [false, true]) {
+    const controller = new AbortController();
+    let uploads = 0, aborts = 0;
+    const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url, init) => {
+      if (url.endsWith("/sessions")) return jsonResponse(200, { ok: true, result: { session_id: "queue", max_batch_bytes: 1000, max_concurrent_uploads: 1 } });
+      if (url.endsWith("/manifest/batch")) return jsonResponse(200, { ok: true, result: { accepted: 1, upload_required: ["main.py"], unchanged: 0, deletes: 0, skipped: 0, errors: [] } });
+      if (url.endsWith("/files/batch")) { uploads++; setTimeout(() => controller.abort(), 5); return queueBusy("60"); }
+      if (init.method === "DELETE") { aborts++; return jsonResponse(200, { ok: true }); }
+      if (url.endsWith("/status")) return jsonResponse(200, { ok: true, result: { session_id: "queue", phase: aborts ? "aborted" : "indexing", errors: [], pending_batches: 0, active_batches: 0 } });
+      throw new Error(`Unexpected request ${url}`);
+    } });
+    const started = Date.now();
+    await assert.rejects(client.indexWorkspace({ workspace: { workspaceId: "fixture" }, files: [{ relativePath: "main.py", content: "x" }],
+      signal: detach ? undefined : controller.signal, detachSignal: detach ? controller.signal : undefined,
+    }), (error) => detach
+      ? !(error instanceof RemoteIndexDetachedError) && /abort was requested for the incomplete session/.test(error.message)
+      : error instanceof RemoteIndexCancelledError);
+    assert.ok(Date.now() - started < 1000);
+    assert.equal(uploads, 1);
+    assert.equal(aborts, 1);
+  }
+});
+
+test("explicit precommit detach aborts after every required upload is acknowledged", async () => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, detachSignal: controller.signal,
+    onProgress: (event) => { if (event.phase === "uploading") controller.abort(); },
+  }), (error) => !(error instanceof RemoteIndexDetachedError) && /Start a new index operation/.test(error.message));
+  assert.equal(fixture.calls.some((call) => call.type === "abort"), true);
+});
+
+test("one failing upload stops sibling queue retries and prevents the next batch", async () => {
+  let uploads = 0, aborts = 0;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url, init) => {
+    if (url.endsWith("/sessions")) return jsonResponse(200, { ok: true, result: { session_id: "queue", max_batch_bytes: 1000, max_batch_files: 1, max_concurrent_uploads: 2 } });
+    if (url.endsWith("/manifest/batch")) return jsonResponse(200, { ok: true, result: { accepted: 3, upload_required: ["a.py", "b.py", "c.py"], unchanged: 0, deletes: 0, skipped: 0, errors: [] } });
+    if (url.endsWith("/files/batch")) {
+      uploads++;
+      const body = await init.body.text();
+      if (body.includes("a.py")) { await new Promise((resolve) => setTimeout(resolve, 10)); return jsonResponse(400, { detail: "rejected" }); }
+      return queueBusy("60");
+    }
+    if (init.method === "DELETE") { aborts++; return jsonResponse(200, { ok: true }); }
+    throw new Error(`Unexpected request ${url}`);
+  } });
+  await assert.rejects(client.indexWorkspace({ workspace: { workspaceId: "fixture" }, files: ["a.py", "b.py", "c.py"].map((relativePath) => ({ relativePath, content: "x" })) }), (error) => error instanceof CorpusWireHttpError && error.status === 400);
+  assert.equal(uploads, 2);
+  assert.equal(aborts, 1);
+});
+
+
+test("detach in and after the code-ready callback aborts a fully uploaded checkpoint awaiting client commit", async () => {
+  for (const deferred of [false,true]) {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({files:[{relativePath:"main.py",content:"x"}]});
+  await assert.rejects(fixture.client.indexWorkspace({...fixture.request,detachSignal:controller.signal,
+    onCodeReady:()=>deferred ? queueMicrotask(()=>controller.abort()) : controller.abort()}),(error)=>{
+    assert.equal(error instanceof RemoteIndexDetachedError,false);
+    assert.match(error.message,/client-owned code checkpoint/);
+    assert.equal(error.transfer.files_transferred,1);
+    return true;
+  });
+  assert.equal(fixture.calls.some(call=>call.type==="abort"),true);
+  assert.equal(fixture.calls.some(call=>call.type==="commit"),false);
+  }
+});
+
+for (const interruption of ["processing timeout", "detach during drain", "cancel during drain", "detach after drained callback", "timeout after drained callback"]) {
+  test(`queued documentation retains owned checkpoint through ${interruption}`, async (t) => {
+    let now = 0;
+    t.mock.method(Date, "now", () => now);
+    const controller = new AbortController();
+    const fixture = priorityIndexFixture({ files: [
+      { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+    ] });
+    const originalFetch = fixture.client.fetchFn;
+    const afterDrainedCallback = interruption.includes("after drained callback");
+    let drainedCallbacks = 0, readyCallbacks = 0;
+    fixture.client.fetchFn = async (url, init) => {
+      const response = await originalFetch(url, init);
+      const documentationUploaded = fixture.calls.some((call) => call.type === "upload" && call.paths.includes("README.md"));
+      if (!url.endsWith("/status") || !documentationUploaded || fixture.calls.some((call) => call.type === "abort")) return response;
+      const payload = await response.json();
+      payload.result.phase = afterDrainedCallback ? "ready_to_commit" : "indexing";
+      payload.result.pending_batches = afterDrainedCallback ? 0 : 1;
+      if (afterDrainedCallback) {
+        payload.result.progress = { ...progressEvent(700, 80, "queued"), session_id: "priority", workspace_id: "fixture" };
+      } else if (interruption === "processing timeout") {
+        now = 101;
+      } else {
+        controller.abort();
+      }
+      return jsonResponse(200, payload);
+    };
+    await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+      signal: interruption === "cancel during drain" ? controller.signal : undefined,
+      detachSignal: interruption.includes("detach") ? controller.signal : undefined,
+      onCodeReady: () => { readyCallbacks += 1; },
+      onProgress: (event) => {
+        if (!afterDrainedCallback || event.sequence !== 700 || drainedCallbacks++) return;
+        queueMicrotask(() => {
+          if (interruption.includes("detach")) controller.abort();
+          else now = 101;
+        });
+      },
+    }), (error) => {
+      assert.equal(error instanceof RemoteIndexDetachedError, false, "Client-owned commit cannot be resumed by status polling");
+      if (interruption === "cancel during drain") assert.ok(error instanceof RemoteIndexCancelledError);
+      else {
+        assert.match(error.message, /client-owned code checkpoint/);
+        assert.match(error.message, /Start a new index operation/);
+      }
+      assert.equal(error.transfer.files_transferred, 2);
+      assert.equal(error.transfer.complete, false);
+      return true;
+    });
+    assert.equal(readyCallbacks, 1);
+    if (afterDrainedCallback) assert.ok(drainedCallbacks > 0);
+    assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"], ["README.md"]]);
+    assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  });
+}
+
+for (const stall of ["DELETE headers", "DELETE body", "GET headers", "GET body"]) {
+  for (const interruption of ["timeout", "detach", "cancel"]) {
+    test(`published checkpoint plus queued documentation bounds ${stall} cleanup after ${interruption}`, { timeout: 2500 }, async (t) => {
+      let now = 0;
+      t.mock.method(Date, "now", () => now);
+      const controller = new AbortController();
+      const fixture = priorityIndexFixture({ files: [
+        { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+      ] });
+      const originalFetch = fixture.client.fetchFn;
+      let cleanupStarted = false, readyCallbacks = 0;
+      const signals = [];
+      fixture.client.fetchFn = async (url, init) => {
+        if (init.method === "DELETE") {
+          cleanupStarted = true; signals.push(init.signal);
+          if (stall === "DELETE headers") return new Promise(() => {});
+        }
+        const response = await originalFetch(url, init);
+        if (cleanupStarted && init.method === "DELETE" && stall === "DELETE body") response.json = () => new Promise(() => {});
+        if (!url.endsWith("/status")) return response;
+        if (cleanupStarted) {
+          signals.push(init.signal);
+          if (stall === "GET headers") return new Promise(() => {});
+          if (stall === "GET body") response.json = () => new Promise(() => {});
+          return response;
+        }
+        if (!fixture.calls.some((call) => call.type === "upload" && call.paths.includes("README.md"))) return response;
+        const payload = await response.json();
+        payload.result.pending_batches = 1;
+        if (interruption === "timeout") now = 101;
+        else controller.abort();
+        return jsonResponse(200, payload);
+      };
+      await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+        signal: interruption === "cancel" ? controller.signal : undefined,
+        detachSignal: interruption === "detach" ? controller.signal : undefined,
+        onCodeReady: () => { readyCallbacks += 1; },
+      }), (error) => {
+        assert.equal(error instanceof RemoteIndexDetachedError, false);
+        assert.equal(error instanceof RemoteIndexCancelledError, false, "Unconfirmed cleanup cannot advertise terminal cancellation");
+        assert.match(error.message, /release could not be confirmed.*Start a new index operation/);
+        assert.equal(error.transfer.files_transferred, 2);
+        assert.equal(error.transfer.complete, false);
+        return true;
+      });
+      assert.equal(readyCallbacks, 1);
+      assert.ok(signals.length > 0 && signals.every((signal) => signal instanceof AbortSignal && signal.aborted));
+      assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+    });
+  }
+}
+
+for (const counter of ["active_batches", "pending_batches"]) {
+  for (const cleanup of ["unconfirmed", "stalled body", "confirmed"]) {
+    test(`backend abort after code publication requires drained ${counter} cleanup proof (${cleanup})`, { timeout: 2500 }, async () => {
+      const fixture = priorityIndexFixture({ files: [
+        { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+      ] });
+      const originalFetch = fixture.client.fetchFn;
+      let cleanupStarted = false, readyCallbacks = 0;
+      let cleanupSignal;
+      fixture.client.fetchFn = async (url, init) => {
+        if (init.method === "DELETE") cleanupStarted = true;
+        const response = await originalFetch(url, init);
+        if (!url.endsWith("/status") || !fixture.calls.some((call) => call.type === "upload" && call.paths.includes("README.md"))) return response;
+        if (cleanupStarted && cleanup === "stalled body") {
+          cleanupSignal = init.signal;
+          response.json = () => new Promise(() => {});
+          return response;
+        }
+        const payload = await response.json();
+        payload.result.phase = "aborted";
+        payload.result[counter] = cleanupStarted && cleanup === "confirmed" ? 0 : 1;
+        return jsonResponse(200, payload);
+      };
+      await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+        onCodeReady: () => { readyCallbacks += 1; },
+      }), (error) => {
+        assert.equal(error instanceof RemoteIndexDetachedError, false);
+        assert.equal(error.transfer.files_transferred, 2);
+        assert.equal(error.transfer.complete, false);
+        assert.ok(error.cause instanceof RemoteIndexCancelledError);
+        assert.equal(error.cause.status[counter], 1, "Original backend abort was not drained");
+        if (cleanup === "confirmed") {
+          assert.ok(error instanceof RemoteIndexCancelledError);
+          assert.equal(error.status.active_batches, 0);
+          assert.equal(error.status.pending_batches, 0);
+        } else {
+          assert.equal(error instanceof RemoteIndexCancelledError, false);
+          assert.match(error.message, /release could not be confirmed.*Start a new index operation/);
+        }
+        return true;
+      });
+      assert.equal(readyCallbacks, 1);
+      assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+      assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+      if (cleanup === "stalled body") assert.ok(cleanupSignal instanceof AbortSignal && cleanupSignal.aborted);
+    });
+  }
+}
+
+for (const interruption of ["cancel", "detach"]) {
+  test(`owned commit progress callback ${interruption} cannot bypass bounded cleanup`, async () => {
+    const controller = new AbortController();
+    const fixture = priorityIndexFixture({ files: [
+      { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+    ] });
+    let committing = 0;
+    await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+      signal: interruption === "cancel" ? controller.signal : undefined,
+      detachSignal: interruption === "detach" ? controller.signal : undefined,
+      onProgress: (event) => { if (event.phase === "committing") { committing += 1; queueMicrotask(() => controller.abort()); } },
+    }), (error) => {
+      assert.equal(error instanceof RemoteIndexDetachedError, false);
+      if (interruption === "cancel") assert.ok(error instanceof RemoteIndexCancelledError);
+      else assert.match(error.message, /owned session abort was confirmed/);
+      assert.equal(error.transfer.complete, false);
+      return true;
+    });
+    assert.equal(committing, 1);
+    assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  });
+}
+
+test("upload counters separate eleven queue cooldown retries from transport retries", { timeout: 4000 }, async () => {
+  let attempts = 0;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url) => {
+    if (url.endsWith("/sessions")) return jsonResponse(200, { ok: true, result: { session_id: "metrics", max_batch_bytes: 1024, max_concurrent_uploads: 1 } });
+    if (url.endsWith("/manifest/batch")) return jsonResponse(200, { ok: true, result: { accepted: 1, upload_required: ["a.py"], unchanged: 0, deletes: 0, skipped: 0, errors: [] } });
+    if (url.endsWith("/files/batch")) {
+      attempts += 1;
+      if (attempts <= 11) return jsonResponse(429, { detail: { code: "index_queue_full", retryable: true, retry_after_seconds: 0 } });
+      if (attempts === 12) return jsonResponse(503, { detail: "synthetic gateway failure" });
+      return jsonResponse(200, { ok: true, result: { files_received: 1, errors: [] } });
+    }
+    if (url.endsWith("/commit")) return jsonResponse(200, { ok: true, result: {}, status: { phase: "completed", progress: { ...progressEvent(77, 100, "completed"), retries: 3 } } });
+    throw new Error("Unexpected fixture route");
+  } });
+  const result = await client.indexWorkspace({ workspace: { workspaceId: "fixture" }, files: [{ relativePath: "a.py", content: "x" }], queueWaitTimeoutMs: 3000 });
+  assert.equal(result.transfer.upload_attempts, 13);
+  assert.equal(result.transfer.queue_full_responses, 11);
+  assert.equal(result.transfer.queue_retries, 11);
+  assert.equal(result.transfer.transport_retries, 1);
+  assert.ok(result.transfer.queue_wait_ms >= 90 && result.transfer.queue_wait_ms < 1000);
+  assert.equal(result.status.progress.retries, 3);
+});
+
+test("cancelled queue cooldown records rejection and actual wait without a fabricated retry", { timeout: 1000 }, async () => {
+  const controller = new AbortController();
+  let waits = 0, rejections = 0, retries = 0, attempts = 0;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async () => {
+    attempts += 1;
+    setTimeout(() => controller.abort(), 20);
+    return jsonResponse(429, { detail: { code: "index_queue_full", retryable: true, retry_after_seconds: 1 } });
+  } });
+  await assert.rejects(client.uploadFileBatch("fixture", { files: [] }, [], undefined, {
+    signal: controller.signal, queueWaitTimeoutMs: 500, onQueueFull: () => rejections++,
+    onQueueRetry: () => retries++, onQueueWait: (elapsed) => { waits += elapsed; },
+  }), { name: "AbortError" });
+  assert.equal(attempts, 1); assert.equal(rejections, 1); assert.equal(retries, 0);
+  assert.ok(waits >= 10 && waits < 200);
+});
+
+test("client phase timing begins before hashing and excludes earlier manifest work", async () => {
+  const events = [];
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "a.py", content: "x" }], capability: false });
+  const originalManifest = fixture.client.sendManifestBatch.bind(fixture.client);
+  fixture.client.sendManifestBatch = async (...args) => {
+    await new Promise((resolve) => setTimeout(resolve, 35));
+    return originalManifest(...args);
+  };
+  const file = { relativePath: "a.py", get content() {
+    assert.ok(events.some((event) => event.phase === "filtering_hashing" && event.phase_completed === 0));
+    return "x";
+  } };
+  const result = await fixture.client.indexWorkspace({ ...fixture.request, files: [file], onProgress: (event) => events.push(event) });
+  const uploadStart = events.find((event) => event.phase === "uploading");
+  assert.ok(uploadStart.elapsed_ms >= 30);
+  assert.ok(uploadStart.phase_elapsed_ms < 20);
+  assert.ok(result.transfer.client_phase_timings_ms.manifest_comparison >= 30);
+  assert.ok(result.transfer.client_phase_timings_ms.uploading < result.transfer.client_phase_timings_ms.manifest_comparison);
+});
+
+test("same-sequence queued status emits bounded heartbeats with stable identity", { timeout: 3000 }, async () => {
+  const events = [];
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test" });
+  const started = Date.now();
+  client.getIndexSessionStatus = async () => ({ phase: Date.now() - started >= 1150 ? "completed" : "queued", queue_depth: 1, files_indexed: 0,
+    progress: { ...progressEvent(42, 0, "queued"), occurred_at: "2026-10-09T00:00:00Z", elapsed_ms: Date.now() - started + 10, phase_elapsed_ms: Date.now() - started + 5 } });
+  await client.followIndexSession("fixture", { pollMs: 10, onProgress: (event) => events.push(event) });
+  const heartbeats = events.filter((event) => event.heartbeat);
+  assert.equal(heartbeats.length, 1);
+  assert.equal(heartbeats[0].sequence, 42);
+  assert.equal(heartbeats[0].event_origin, "server");
+  assert.ok(heartbeats[0].phase_elapsed_ms >= 1000);
+  assert.ok(heartbeats[0].phase_elapsed_ms < 1250, "Fresh server elapsed is not counted twice");
+  assert.ok(heartbeats[0].last_heartbeat_at);
+});
+
+test("adaptive polling resets after progress and detach interrupts its delay", { timeout: 2000 }, async () => {
+  const times = [];
+  const controller = new AbortController();
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test" });
+  client.getIndexSessionStatus = async () => {
+    times.push(Date.now());
+    const count = times.length;
+    if (count === 5) setTimeout(() => controller.abort(), 5);
+    return { phase: "queued", queue_depth: 1, files_indexed: 0, progress: progressEvent(count >= 4 ? 2 : 1, 0, "queued") };
+  };
+  await assert.rejects(client.followIndexSession("fixture", { pollMs: 40, detachSignal: controller.signal }), RemoteIndexDetachedError);
+  assert.ok(times[3] - times[2] >= 80, "Idle polling backs off");
+  assert.ok(times[4] - times[3] < times[3] - times[2], "Progress resets the poll interval");
+  assert.ok(times[5] - times[4] < 35, "Detach wakes the pending delay");
+});
+
+
+test("large polling intervals respect absolute follow deadlines", { timeout: 1000 }, async () => {
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test" });
+  client.getIndexSessionStatus = async () => ({ phase: "queued", queue_depth: 1, files_indexed: 0, progress: progressEvent(1, 0, "queued") });
+  const startedAt = Date.now();
+  await assert.rejects(client.followIndexSession("fixture", { pollMs: 30_000, timeoutMs: 30 }), RemoteIndexDetachedError);
+  assert.ok(Date.now() - startedAt < 200);
+});
+
+
+test("configuration delay is excluded from hashing and queue heartbeat callback failure is awaited", { timeout: 3000 }, async () => {
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "a.py", content: "x" }], capability: false });
+  const originalStart = fixture.client.startIndexSession.bind(fixture.client);
+  fixture.client.startIndexSession = async (...args) => { await new Promise((resolve) => setTimeout(resolve, 40)); return originalStart(...args); };
+  const result = await fixture.client.indexWorkspace(fixture.request);
+  assert.ok(result.transfer.client_phase_timings_ms.resolving_configuration >= 35);
+  assert.ok(result.transfer.client_phase_timings_ms.filtering_hashing < 30);
+  let attempts = 0, retries = 0;
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async () => {
+    attempts += 1;
+    return jsonResponse(429, { detail: { code: "index_queue_full", retryable: true, retry_after_seconds: 2 } });
+  } });
+  await assert.rejects(client.uploadFileBatch("fixture", { files: [] }, [], undefined, {
+    queueWaitTimeoutMs: 2500, onQueueRetry: () => retries++,
+    onQueueHeartbeat: (_elapsed, heartbeat) => { if (heartbeat) throw new Error("Synthetic observer failure"); },
+  }), /Synthetic observer failure/);
+  assert.equal(attempts, 1); assert.equal(retries, 0);
+});
+
+
+test("synchronous upload tiers exclude delayed code checkpoint from upload timing", { timeout: 2000 }, async () => {
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+  ], onUpload: async () => { await new Promise((resolve) => setTimeout(resolve, 10)); } });
+  const originalUpload = fixture.client.uploadFileBatch.bind(fixture.client);
+  fixture.client.uploadFileBatch = async (...args) => ({ ...await originalUpload(...args), queued: false });
+  const originalCheckpoint = fixture.client.checkpointIndexSessionCode.bind(fixture.client);
+  let checkpointWaitMs = 0;
+  fixture.client.checkpointIndexSessionCode = async (...args) => {
+    const startedAt = Date.now();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const status = await originalCheckpoint(...args);
+    checkpointWaitMs = Date.now() - startedAt;
+    return status;
+  };
+  const result = await fixture.client.indexWorkspace(fixture.request);
+  assert.equal(result.transfer.files_transferred, 2);
+  assert.equal(fixture.calls.filter((call) => call.type === "checkpoint").length, 1);
+  const uploadMs = result.transfer.client_phase_timings_ms.uploading;
+  assert.ok(uploadMs >= 15, "Both synchronous upload tiers remain measured");
+  assert.ok(uploadMs < checkpointWaitMs, "Checkpoint wait must not inflate upload time");
+  assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"], ["README.md"]]);
+});
+
+test("failed upload timing stops before delayed abort response cleanup", { timeout: 2000 }, async () => {
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }], capability: false });
+  fixture.client.uploadFileBatch = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    throw new Error("Synthetic upload rejection");
+  };
+  const originalAbort = fixture.client.abortIndexSession.bind(fixture.client);
+  let abortWaitMs = 0;
+  fixture.client.abortIndexSession = async (...args) => {
+    const startedAt = Date.now();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const response = await originalAbort(...args);
+    abortWaitMs = Date.now() - startedAt;
+    return response;
+  };
+  await assert.rejects(fixture.client.indexWorkspace(fixture.request), (error) => {
+    assert.match(error.message, /Synthetic upload rejection/);
+    assert.equal(error.transfer.complete, false);
+    assert.equal(error.transfer.files_transferred, 0);
+    const uploadMs = error.transfer.client_phase_timings_ms.uploading;
+    assert.ok(uploadMs >= 15, "Time spent attempting the upload remains measured");
+    assert.ok(uploadMs < abortWaitMs, "Abort cleanup must not inflate upload time");
+    return true;
+  });
+  assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+});
+
+
+test("explicit code stage submits the complete manifest, publishes only code and confirms drained release", async () => {
+  const fixture = priorityIndexFixture({ files: [
+    { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+    { relativePath: "settings.json", content: "{}" },
+  ] });
+  let manifestPaths, checkpoint;
+  const originalManifest = fixture.client.sendManifestBatch.bind(fixture.client);
+  fixture.client.sendManifestBatch = async (session, entries) => { manifestPaths = entries.map((entry) => entry.relativePath); return originalManifest(session, entries); };
+  const result = await fixture.client.indexWorkspaceCodeStage({ ...fixture.request, onCodeReady: (status) => { checkpoint = status; } });
+  assert.equal(result.outcome, "code_ready");
+  assert.equal(result.full_inventory_complete, false);
+  assert.equal(result.transfer.complete, false);
+  assert.equal(result.transfer.files_submitted, 3);
+  assert.equal(result.transfer.files_transferred, 1);
+  assert.equal(result.checkpoint, checkpoint);
+  assert.equal(result.checkpoint.coverage.code_ready, true);
+  assert.equal(result.checkpoint.coverage.documentation_pending, true);
+  assert.equal(result.release_status.phase, "aborted");
+  assert.equal(result.release_status.pending_batches, 0);
+  assert.equal(result.release_status.active_batches, 0);
+  assert.deepEqual(manifestPaths.sort(), ["README.md", "main.py", "settings.json"]);
+  assert.deepEqual(fixture.calls.filter((call) => call.type !== "status"), [
+    { type: "upload", paths: ["main.py"] }, { type: "checkpoint" }, { type: "abort" },
+  ]);
+});
+
+test("code stage defers documentation-only roots and fully commits empty or unsupported roots", async () => {
+  const docs = priorityIndexFixture({ files: [{ relativePath: "README.md", content: "guide" }] });
+  assert.deepEqual(await docs.client.indexWorkspaceCodeStage(docs.request), {
+    outcome: "deferred", reason: "no_code", full_inventory_complete: false, files_submitted: 1,
+  });
+  assert.deepEqual(docs.calls, []);
+  for (const empty of [true, false]) {
+    const fixture = priorityIndexFixture({ files: empty ? [] : [{ relativePath: "main.py", content: "x" }], capability: false });
+    const result = await fixture.client.indexWorkspaceCodeStage(fixture.request);
+    assert.equal(result.outcome, "full");
+    assert.equal(result.reason, empty ? "empty_inventory" : "checkpoint_unsupported");
+    assert.equal(result.committed.transfer.complete, true);
+    assert.equal(fixture.calls.filter((call) => call.type === "commit").length, 1);
+    assert.equal(fixture.calls.some((call) => call.type === "abort"), false);
+  }
+});
+
+test("code-stage cancellation preserves published code without uploading documentation or claiming completion", async () => {
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" }] });
+  const controller = new AbortController();
+  let ready;
+  await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request, signal: controller.signal,
+    onCodeReady: (status) => { ready = status; controller.abort(); },
+  }), (error) => {
+    assert.ok(error instanceof RemoteIndexCancelledError);
+    assert.equal(error.transfer.complete, false);
+    assert.equal(error.transfer.files_transferred, 1);
+    return true;
+  });
+  assert.equal(ready.coverage.code_ready, true);
+  assert.equal(fixture.calls.filter((call) => call.type === "checkpoint").length, 1);
+  assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
+  assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+});
+
+for (const stall of ["headers", "body"]) {
+  for (const interruption of ["deadline", "cancel", "detach"]) {
+    test(`code-stage release bounds stalled ${stall} on ${interruption} and confirms cleanup separately`, { timeout: 2000 }, async (t) => {
+      let now = 0;
+      t.mock.method(Date, "now", () => now);
+      const delays = [], signals = [];
+      const nativeSetTimeout = globalThis.setTimeout;
+      t.mock.method(globalThis, "setTimeout", (callback, delay, ...args) => {
+        delays.push(delay); return nativeSetTimeout(callback, delay, ...args);
+      });
+      const controller = new AbortController();
+      const fixture = priorityIndexFixture({ files: [
+        { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+      ] });
+      const originalFetch = fixture.client.fetchFn;
+      let deletes = 0, ready;
+      fixture.client.fetchFn = async (url, init) => {
+        if (init.method !== "DELETE") return originalFetch(url, init);
+        signals.push(init.signal);
+        if (++deletes > 1) return originalFetch(url, init);
+        const stallForever = () => {
+          if (interruption !== "deadline") queueMicrotask(() => controller.abort());
+          return new Promise(() => {}); // Deliberately ignore transport abort.
+        };
+        if (stall === "headers") return stallForever();
+        const response = await originalFetch(url, init);
+        response.json = stallForever;
+        return response;
+      };
+      await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request,
+        signal: interruption === "cancel" ? controller.signal : undefined,
+        detachSignal: interruption === "detach" ? controller.signal : undefined,
+        onCodeReady: (status) => { ready = status; now = 80; },
+      }), (error) => {
+        assert.equal(error instanceof RemoteIndexDetachedError, false);
+        if (interruption === "cancel") {
+          assert.ok(error instanceof RemoteIndexCancelledError);
+          assert.equal(error.status.phase, "aborted");
+          assert.equal(error.status.pending_batches, 0);
+          assert.equal(error.status.active_batches, 0);
+        } else {
+          assert.match(error.message, /owned session abort was confirmed/);
+          if (interruption === "deadline") assert.match(error.cause.message, /release timed out/);
+        }
+        assert.equal(error.transfer.complete, false);
+        assert.equal(error.transfer.files_transferred, 1);
+        return true;
+      });
+      assert.equal(ready.coverage.code_ready, true);
+      assert.equal(deletes, 2, "Cleanup uses a new request after the stalled request is bounded");
+      assert.ok(signals.every((signal) => signal instanceof AbortSignal && signal.aborted));
+      assert.ok(delays.includes(20), "Release retains only the unspent processing budget");
+      assert.ok(delays.includes(1000), "Best-effort cleanup has an independent capped reserve");
+      assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+      assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
+    });
+  }
+}
+
+test("code-stage cancellation bounds uncooperative release and cleanup without claiming slot release", { timeout: 2500 }, async () => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  const originalFetch = fixture.client.fetchFn;
+  const signals = [];
+  fixture.client.fetchFn = (url, init) => {
+    if (init.method !== "DELETE") return originalFetch(url, init);
+    signals.push(init.signal);
+    if (signals.length === 1) queueMicrotask(() => controller.abort());
+    return new Promise(() => {});
+  };
+  await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request,
+    processingTimeoutMs: undefined, signal: controller.signal,
+  }), (error) => {
+    assert.equal(error instanceof RemoteIndexCancelledError, false);
+    assert.equal(error instanceof RemoteIndexDetachedError, false);
+    assert.match(error.message, /release could not be confirmed/);
+    assert.equal(error.transfer.complete, false);
+    return true;
+  });
+  assert.equal(signals.length, 2);
+  assert.ok(signals.every((signal) => signal.aborted));
+  assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+});
+
+for (const stall of ["headers", "body"]) {
+  for (const interruption of ["deadline", "cancel"]) {
+    test(`terminal release ${stall} receives transport signal and bounds ignored abort on ${interruption}`, { timeout: 2000 }, async (t) => {
+      let now = 0;
+      t.mock.method(Date, "now", () => now);
+      const controller = new AbortController();
+      const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+      const originalFetch = fixture.client.fetchFn;
+      const statusSignals = [], deleteSignals = [];
+      fixture.client.fetchFn = async (url, init) => {
+        if (init.method === "DELETE") deleteSignals.push(init.signal);
+        const response = await originalFetch(url, init);
+        if (!url.endsWith("/status") || deleteSignals.length === 0) return response;
+        statusSignals.push(init.signal);
+        if (deleteSignals.length > 1) return response;
+        const stallForever = () => {
+          if (interruption === "cancel") queueMicrotask(() => controller.abort());
+          return new Promise(() => {});
+        };
+        if (stall === "headers") return stallForever();
+        response.json = stallForever;
+        return response;
+      };
+      await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request,
+        signal: interruption === "cancel" ? controller.signal : undefined,
+        onCodeReady: () => { now = 80; },
+      }), (error) => {
+        if (interruption === "cancel") assert.ok(error instanceof RemoteIndexCancelledError);
+        else assert.match(error.message, /owned session abort was confirmed/);
+        assert.equal(error.transfer.complete, false);
+        return true;
+      });
+      assert.equal(statusSignals.length, 2);
+      assert.equal(statusSignals[0], deleteSignals[0]);
+      assert.equal(statusSignals[1], deleteSignals[1]);
+      assert.ok(statusSignals.every((signal) => signal instanceof AbortSignal && signal.aborted));
+    });
+  }
+}
+
+test("cooperative terminal GET is aborted on caller cancellation before cleanup uses a fresh signal", async () => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  const originalFetch = fixture.client.fetchFn;
+  let deletes = 0, abortedReads = 0;
+  fixture.client.fetchFn = async (url, init) => {
+    if (init.method === "DELETE") deletes += 1;
+    if (!url.endsWith("/status") || deletes !== 1) return originalFetch(url, init);
+    assert.ok(init.signal instanceof AbortSignal);
+    return new Promise((_, reject) => {
+      init.signal.addEventListener("abort", () => { abortedReads += 1; reject(new DOMException("Stopped", "AbortError")); }, { once: true });
+      queueMicrotask(() => controller.abort());
+    });
+  };
+  await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request, signal: controller.signal }), RemoteIndexCancelledError);
+  assert.equal(abortedReads, 1);
+  assert.equal(deletes, 2);
+});
+
+test("terminal polling cancellation removes its pending delay without another abandoned GET", async (t) => {
+  const controller = new AbortController();
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  const originalFetch = fixture.client.fetchFn;
+  const nativeSetTimeout = globalThis.setTimeout, nativeClearTimeout = globalThis.clearTimeout;
+  const timers = new Map(), clearedDelays = [];
+  t.mock.method(globalThis, "setTimeout", (callback, delay, ...args) => {
+    const timer = nativeSetTimeout(callback, delay, ...args); timers.set(timer, delay); return timer;
+  });
+  t.mock.method(globalThis, "clearTimeout", (timer) => {
+    clearedDelays.push(timers.get(timer)); return nativeClearTimeout(timer);
+  });
+  let deletes = 0, terminalReads = 0;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (init.method === "DELETE") deletes += 1;
+    if (!url.endsWith("/status") || deletes === 0) return response;
+    terminalReads += 1;
+    if (deletes > 1) return response;
+    const payload = await response.json();
+    payload.result.phase = "indexing";
+    payload.result.progress = { ...progressEvent(991, 80, "queued"), session_id: "priority" };
+    return jsonResponse(200, payload);
+  };
+  await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request,
+    processingTimeoutMs: 2000, processingPollMs: 500, signal: controller.signal,
+    onProgress: (event) => { if (event.sequence === 991) queueMicrotask(() => controller.abort()); },
+  }), RemoteIndexCancelledError);
+  assert.ok(clearedDelays.includes(500), "Transport cancellation removes the pending terminal poll delay");
+  assert.equal(terminalReads, 2, "Only the original attempt and independent cleanup read status");
+});
+
+test("late terminal response cannot extend the absolute release deadline after DELETE", async (t) => {
+  let now = 0;
+  t.mock.method(Date, "now", () => now);
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  const originalFetch = fixture.client.fetchFn;
+  let deletes = 0;
+  fixture.client.fetchFn = async (url, init) => {
+    const response = await originalFetch(url, init);
+    if (init.method === "DELETE") { if (++deletes === 1) now = 90; }
+    if (url.endsWith("/status") && deletes === 1) now = 101;
+    return response;
+  };
+  await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request,
+    onCodeReady: () => { now = 80; },
+  }), (error) => {
+    assert.match(error.message, /release was interrupted/);
+    assert.match(error.cause.message, /timed out/);
+    assert.equal(error.transfer.complete, false);
+    return true;
+  });
+  assert.equal(deletes, 2, "Late terminal evidence enters independently bounded cleanup instead of stage success");
+});
+
+test("code-stage failed checkpoint, release or incomplete scan cannot masquerade as full success", async () => {
+  for (const failure of ["checkpoint", "release", "active release", "unknown release"]) {
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+    if (failure === "checkpoint") fixture.client.checkpointIndexSessionCode = async () => ({ coverage: { code_ready: false } });
+    else if (failure === "release") fixture.client.abortIndexSession = async () => { throw new Error("Synthetic abort outage"); };
+    else fixture.client.getIndexSessionStatus = async () => ({ phase: fixture.calls.some((call) => call.type === "abort") ? "aborted" : "indexing",
+      pending_batches: failure === "unknown release" && fixture.calls.some((call) => call.type === "abort") ? undefined : 0,
+      active_batches: failure === "active release" && fixture.calls.some((call) => call.type === "abort") ? 1 : 0, queue_depth: 0, errors: [] });
+    await assert.rejects(fixture.client.indexWorkspaceCodeStage(fixture.request));
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  }
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+  await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request, inventoryScan: undefined }), { code: "scan_incomplete" });
+  assert.deepEqual(fixture.calls, []);
+});
+
+test("public capability and health declarations retain additive code-readiness fields", () => {
+  const declarations = readFileSync(new URL("../dist/types.d.ts", import.meta.url), "utf8");
+  assert.match(declarations, /file_batch_priorities\?:\s*\{\s*code: number;\s*documentation: number;\s*other: number;/);
+  const indexHealth = declarations.slice(declarations.indexOf("interface IndexHealth"), declarations.indexOf("interface IndexHealth") + 1600);
+  for (const flag of ["code_ready", "documentation_pending", "other_pending"]) assert.match(indexHealth, new RegExp(`${flag}\\?: boolean`));
+});
+
+
+test("health and indexing capabilities preserve server code readiness and processing quantum metadata", async () => {
+  const metadata = { file_batch_priorities: { code: 1, documentation: 2, other: 3 },
+    max_processing_files: 4, max_processing_source_bytes: 1000,
+    processing_quantum_boundary: "complete_files", chunk_stream_preemption: false };
+  const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url) =>
+    jsonResponse(200, url.endsWith("/capabilities") ? { ok: true, ...metadata }
+      : { ok: true, index: { code_ready: true, documentation_pending: true, other_pending: false } }) });
+  const capabilities = await client.getIndexCapabilities();
+  for (const [key, value] of Object.entries(metadata)) assert.deepEqual(capabilities[key], value);
+  assert.deepEqual((await client.health()).index, { code_ready: true, documentation_pending: true, other_pending: false });
+});
+
+
+test("code stage rejects malformed pending checkpoint evidence before release success", async () => {
+  for (const change of [
+    { coverage: { code_ready: true, state: "verified" } },
+    { pending_batches: 1 }, { active_batches: 1 }, { pending_batches: undefined },
+    { phase: "failed" }, { errors: ["synthetic worker failure"] },
+  ]) {
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+    const checkpoint = fixture.client.checkpointIndexSessionCode.bind(fixture.client);
+    fixture.client.checkpointIndexSessionCode = async (...args) => ({ ...await checkpoint(...args), ...change });
+    let readyCallbacks = 0;
+    await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request, onCodeReady: () => readyCallbacks++ }), /drained pending code publication/);
+    assert.equal(readyCallbacks, 0);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  }
+});
+
+test("code-stage full fallback distinguishes verified coverage from legacy unknown and rejects pending commit", async () => {
+  for (const state of ["verified", "pending", undefined]) {
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }], capability: false });
+    const commit = fixture.client.commitIndexSession.bind(fixture.client);
+    fixture.client.commitIndexSession = async (...args) => {
+      const result = await commit(...args);
+      return { ...result, status: { ...result.status, coverage: state ? { state } : undefined } };
+    };
+    const result = await fixture.client.indexWorkspaceCodeStage(fixture.request);
+    assert.equal(result.outcome, "full");
+    assert.equal(result.full_inventory_complete, state === "verified");
+    assert.equal(result.committed.transfer.complete, true);
+  }
+  const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }], capability: false });
+  fixture.client.commitIndexSession = async () => ({ ok: true, result: {}, status: { phase: "indexing", coverage: { state: "pending" } } });
+  await assert.rejects(fixture.client.indexWorkspaceCodeStage(fixture.request), (error) => {
+    assert.equal(error.code, "scan_incomplete");
+    assert.equal(error.transfer.complete, false);
+    return true;
+  });
+});
+
+
+test("code-stage checkpoint proof is bound to owned identity before readiness callback", async () => {
+  for (const change of [
+    { session_id: "another-session" }, { workspace_id: "another-workspace" },
+    { mode: "incremental" }, { collection_name: "another-collection" }, { phase: undefined },
+    { phase: "indexing" }, { errors: undefined }, { errors: "synthetic failure" }, { failed_batches: 1 },
+    { coverage: { state: "pending", code_ready: true, session_id: "another-session" } },
+    { coverage: { state: "pending", code_ready: true } },
+  ]) {
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+    const checkpoint = fixture.client.checkpointIndexSessionCode.bind(fixture.client);
+    fixture.client.checkpointIndexSessionCode = async (...args) => ({ ...await checkpoint(...args), ...change });
+    let callbacks = 0;
+    await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request, onCodeReady: () => callbacks++ }), /drained pending code publication/);
+    assert.equal(callbacks, 0, `Malformed checkpoint must not publish callback: ${JSON.stringify(change)}`);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  }
+});
+
+test("code-stage release proof cannot confirm another session or conflicting scope", async () => {
+  for (const change of [
+    { session_id: "another-session" }, { workspace_id: "another-workspace" },
+    { mode: "incremental" }, { collection_name: "another-collection" },
+    { errors: undefined }, { errors: ["synthetic abort error"] }, { failed_batches: 1 },
+    { coverage: { state: "pending", code_ready: true, session_id: "another-session" } },
+  ]) {
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+    const getStatus = fixture.client.getIndexSessionStatus.bind(fixture.client);
+    fixture.client.getIndexSessionStatus = async (...args) => {
+      const status = await getStatus(...args);
+      return status.phase === "aborted" ? { ...status, ...change } : status;
+    };
+    let callbacks = 0;
+    await assert.rejects(fixture.client.indexWorkspaceCodeStage({ ...fixture.request, onCodeReady: () => callbacks++ }), /session release was not confirmed/);
+    assert.equal(callbacks, 1, "Owned publication may precede failed release proof; it never becomes stage success");
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
   }
 });

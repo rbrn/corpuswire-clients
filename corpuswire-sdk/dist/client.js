@@ -1,5 +1,5 @@
-import { INVENTORY_VERSION, WorkspaceScanIncompleteError, buildWorkspaceInventory, canonicalInventoryPath, inventoryDigest } from "./inventory.js";
-import { createBearerAuthHeader, requestJson } from "./http.js";
+import { INVENTORY_VERSION, WorkspaceScanIncompleteError, buildWorkspaceInventory, canonicalInventoryPath, ingestionPriority, inventoryDigest } from "./inventory.js";
+import { CorpusWireHttpError, createBearerAuthHeader, requestJson, waitForAbortableDelay } from "./http.js";
 const RUNTIME_ENV = globalThis.process?.env ?? {};
 const DEFAULT_BASE_URL = RUNTIME_ENV.CORPUSWIRE_BASE_URL ?? "http://127.0.0.1:8000";
 const DEFAULT_BASIC_AUTH = RUNTIME_ENV.CORPUSWIRE_BASIC_AUTH ?? "";
@@ -9,6 +9,43 @@ const DEFAULT_REVIEW_POLL_TIMEOUT_MS = 60_000;
 const DEFAULT_REVIEW_POLL_INTERVAL_MS = 1_000;
 const MAX_MANIFEST_ERROR_DETAILS = 20;
 const MAX_MANIFEST_ERROR_LENGTH = 256;
+const DEFAULT_QUEUE_WAIT_TIMEOUT_MS = 600_000;
+class IndexProcessingInterruptedError extends Error {
+    reason;
+    status;
+    constructor(reason, status, cause) {
+        super(reason === "timeout" ? "Caller wait timeout elapsed" : "Processing wait interrupted by caller", { cause });
+        this.reason = reason;
+        this.status = status;
+    }
+}
+export class RemoteIndexInterruptionError extends Error {
+    reason;
+    sessionIdentity;
+    status;
+    transfer;
+    abortRequested;
+    releaseConfirmed;
+    interruptionOnly;
+    sessionId;
+    constructor(message, reason, sessionIdentity, status, transfer, abortRequested, releaseConfirmed, interruptionOnly, cause) {
+        super(message, { cause });
+        this.reason = reason;
+        this.sessionIdentity = sessionIdentity;
+        this.status = status;
+        this.transfer = transfer;
+        this.abortRequested = abortRequested;
+        this.releaseConfirmed = releaseConfirmed;
+        this.interruptionOnly = interruptionOnly;
+        this.name = "RemoteIndexInterruptionError";
+        this.sessionId = sessionIdentity.session_id;
+    }
+}
+function isInterruptionOnly(error) {
+    const cause = error instanceof IndexProcessingInterruptedError ? error.cause : error;
+    return (error instanceof IndexProcessingInterruptedError && cause === undefined)
+        || (cause instanceof DOMException && (cause.name === "AbortError" || cause.name === "TimeoutError"));
+}
 export class RemoteIndexDetachedError extends Error {
     transfer;
     sessionId;
@@ -114,7 +151,7 @@ export class CorpusWireClient {
             init: { method: "GET" },
         });
     }
-    async diagnoseWorkspace(request = {}) {
+    async diagnoseWorkspace(request = {}, options = {}) {
         const query = toQueryString({
             repo_path: request.repoPath,
             workspace_id: request.workspaceId,
@@ -127,7 +164,7 @@ export class CorpusWireClient {
             fetchFn: this.fetchFn,
             defaultHeaders: this.defaultHeaders,
             basicAuth: this.basicAuth,
-            init: { method: "GET" },
+            init: { method: "GET", signal: options.signal },
         });
         return response.diagnosis;
     }
@@ -741,24 +778,98 @@ export class CorpusWireClient {
         });
         return response.result;
     }
-    async uploadFileBatch(sessionId, metadata, files, onAttempt) {
+    async uploadFileBatch(sessionId, metadata, files, onAttempt, options = {}) {
         const multipart = buildMultipartMixed(metadata, files);
-        const response = await requestJson({
-            baseUrl: this.baseUrl,
-            paths: [`/v1/index/sessions/${encodeURIComponent(sessionId)}/files/batch`],
-            fetchFn: (input, init) => { onAttempt?.(); return (this.fetchFn ?? globalThis.fetch)(input, init); },
-            defaultHeaders: this.defaultHeaders,
-            basicAuth: this.basicAuth,
-            init: {
-                method: "POST",
-                headers: {
-                    "Content-Type": multipart.contentType,
-                    Prefer: "respond-async",
-                },
-                body: new Blob([toArrayBuffer(multipart.body)]),
-            },
-        });
-        return response.result;
+        const timeoutMs = validateNonNegativeNumber(options.queueWaitTimeoutMs ?? DEFAULT_QUEUE_WAIT_TIMEOUT_MS, "queueWaitTimeoutMs");
+        const deadline = Date.now() + timeoutMs;
+        let lastQueueError;
+        return withRequestBudget(async (signal) => {
+            for (;;) {
+                if (signal.aborted)
+                    throw new DOMException("Upload aborted", "AbortError");
+                try {
+                    const response = await requestJson({
+                        retryHttp429: false,
+                        onRetry: options.onTransportRetry,
+                        retryAttempts: timeoutMs === 0 ? 0 : undefined,
+                        baseUrl: this.baseUrl,
+                        paths: [`/v1/index/sessions/${encodeURIComponent(sessionId)}/files/batch`],
+                        fetchFn: (input, init) => {
+                            if (signal.aborted)
+                                throw new DOMException("Upload aborted", "AbortError");
+                            onAttempt?.();
+                            return (this.fetchFn ?? globalThis.fetch)(input, init);
+                        },
+                        defaultHeaders: this.defaultHeaders,
+                        basicAuth: this.basicAuth,
+                        init: {
+                            method: "POST",
+                            signal,
+                            headers: {
+                                "Content-Type": multipart.contentType,
+                                Prefer: "respond-async",
+                            },
+                            body: new Blob([toArrayBuffer(multipart.body)]),
+                        },
+                    });
+                    return response.result;
+                }
+                catch (error) {
+                    if (!(error instanceof CorpusWireHttpError) || error.status !== 429
+                        || error.errorCode !== "index_queue_full" || !error.retryable)
+                        throw error;
+                    lastQueueError = error;
+                    options.onQueueFull?.();
+                    const remainingMs = deadline - Date.now();
+                    if (remainingMs <= 0)
+                        throw error;
+                    const waitStartedAt = Date.now();
+                    options.onQueueHeartbeat?.(0, false);
+                    const waitEndsAt = waitStartedAt
+                        + Math.min(remainingMs, Math.max(10, (error.retryAfterSeconds ?? 1) * 1_000));
+                    try {
+                        while (Date.now() < waitEndsAt) {
+                            await waitForAbortableDelay(Math.min(waitEndsAt - Date.now(), options.onQueueHeartbeat ? 1_000 : remainingMs), signal);
+                            if (Date.now() < waitEndsAt) {
+                                options.onQueueHeartbeat?.(Math.max(0, Date.now() - waitStartedAt), true);
+                            }
+                        }
+                    }
+                    finally {
+                        options.onQueueWait?.(Math.max(0, Date.now() - waitStartedAt));
+                    }
+                    if (Date.now() >= deadline)
+                        throw error;
+                    options.onQueueRetry?.();
+                }
+            }
+        }, timeoutMs, options.signal, () => lastQueueError ?? new Error("Upload admission timeout elapsed"));
+    }
+    async checkpointIndexSessionCode(sessionId, options = {}) {
+        const remainingMs = options.deadline === undefined ? 0 : options.deadline - Date.now();
+        if (options.deadline !== undefined && remainingMs <= 0)
+            throw new DOMException("Code checkpoint timeout elapsed", "TimeoutError");
+        return withRequestBudget(async (signal) => {
+            const response = await requestJson({
+                baseUrl: this.baseUrl,
+                paths: [`/v1/index/sessions/${encodeURIComponent(sessionId)}/checkpoint/code`],
+                fetchFn: this.fetchFn,
+                defaultHeaders: this.defaultHeaders,
+                basicAuth: this.basicAuth,
+                init: { method: "POST", signal },
+            });
+            const observed = response.result;
+            // Returned backend failure evidence takes precedence over caller races.
+            if (["failed", "incomplete", "expired"].includes(observed.phase)
+                || observed.errors.length > 0 || (observed.failed_batches ?? 0) > 0) {
+                throw new Error(`Remote index session ${sessionId} failed: ${observed.errors.join("; ") || observed.phase}`, { cause: observed });
+            }
+            if (signal.aborted)
+                throw new DOMException("Code checkpoint aborted", "AbortError");
+            if (options.deadline !== undefined && Date.now() >= options.deadline)
+                throw new DOMException("Code checkpoint timeout elapsed", "TimeoutError");
+            return response.result;
+        }, remainingMs, options.signal, () => new DOMException("Code checkpoint timeout elapsed", "TimeoutError"));
     }
     async commitIndexSession(sessionId) {
         return requestJson({
@@ -770,14 +881,14 @@ export class CorpusWireClient {
             init: { method: "POST" },
         });
     }
-    async getIndexSessionStatus(sessionId) {
+    async getIndexSessionStatus(sessionId, options = {}) {
         const response = await requestJson({
             baseUrl: this.baseUrl,
             paths: [`/v1/index/sessions/${encodeURIComponent(sessionId)}/status`],
             fetchFn: this.fetchFn,
             defaultHeaders: this.defaultHeaders,
             basicAuth: this.basicAuth,
-            init: { method: "GET" },
+            init: { method: "GET", signal: options.signal },
         });
         return response.result;
     }
@@ -786,13 +897,10 @@ export class CorpusWireClient {
             ? null
             : Date.now() + Math.max(1, options.timeoutMs);
         let abortSent = false;
-        let lastSequence = -1;
+        const observeStatus = createIndexStatusObserver(options.pollMs ?? 250, options.onProgress);
         for (;;) {
             const status = await this.getIndexSessionStatus(sessionId);
-            if (status.progress && status.progress.sequence !== lastSequence) {
-                options.onProgress?.(status.progress);
-                lastSequence = status.progress.sequence;
-            }
+            const pollDelay = observeStatus(status);
             if (["completed", "aborted", "failed", "expired"].includes(status.phase)) {
                 return status;
             }
@@ -806,36 +914,89 @@ export class CorpusWireClient {
             if (deadline !== null && Date.now() >= deadline) {
                 throw new RemoteIndexDetachedError(sessionId, status, "Caller wait timeout elapsed");
             }
-            await new Promise((resolve) => setTimeout(resolve, Math.max(10, options.pollMs ?? 250)));
+            await waitForIndexInterruptDelay(remainingIndexPollDelay(pollDelay, deadline), abortSent
+                ? { detachSignal: options.detachSignal } : options);
         }
     }
-    async abortIndexSession(sessionId) {
+    async abortIndexSession(sessionId, options = {}) {
         return requestJson({
             baseUrl: this.baseUrl,
             paths: [`/v1/index/sessions/${encodeURIComponent(sessionId)}`],
             fetchFn: this.fetchFn,
             defaultHeaders: this.defaultHeaders,
             basicAuth: this.basicAuth,
-            init: { method: "DELETE" },
+            init: { method: "DELETE", signal: options.signal },
         });
     }
-    async abortIndexSessionQuietly(sessionId) {
+    async releaseCodeStageSession(session, workspaceId, deadline, pollMs, callerSignal, cancellationSignal, onProgress) {
+        const release = (attemptDeadline, signal) => this.abortIndexSessionByDeadline(session.session_id, attemptDeadline, pollMs, onProgress, signal);
         try {
-            await this.abortIndexSession(sessionId);
+            return await release(deadline ?? Date.now() + 5_000, callerSignal);
         }
-        catch {
-            // Best effort: preserve the original indexing failure for callers.
+        catch (cause) {
+            // A cancelled transport may already have delivered DELETE. Retry cleanup
+            // with an independent finite reserve; never strand callers on its IO.
+            let cleanupStatus;
+            try {
+                cleanupStatus = await release(Date.now() + 1_000);
+            }
+            catch { /* Best effort only. */ }
+            const confirmed = cleanupStatus !== undefined
+                && isOwnedCodeStageStatus(cleanupStatus, session, workspaceId)
+                && cleanupStatus.phase === "aborted" && cleanupStatus.pending_batches === 0
+                && cleanupStatus.active_batches === 0;
+            if (cancellationSignal?.aborted && confirmed)
+                return cleanupStatus;
+            throw new Error(`Code stage session release was interrupted; ${confirmed
+                ? "the owned session abort was confirmed" : "an abort was requested but release could not be confirmed"}. Start a new index operation.`, { cause });
         }
     }
-    async waitForIndexSessionProcessing(sessionId, timeoutMs, pollMs, request) {
-        const deadline = timeoutMs === undefined ? null : Date.now() + Math.max(1, timeoutMs);
-        let lastSequence = -1;
+    abortIndexSessionByDeadline(sessionId, deadline, pollMs, onProgress, callerSignal) {
+        const budgetMs = deadline - Date.now();
+        if (budgetMs <= 0)
+            return Promise.reject(new Error("Code stage session release timed out"));
+        return withRequestBudget(async (transportSignal) => {
+            await this.abortIndexSession(sessionId, { signal: transportSignal });
+            const status = await this.waitForIndexSessionTerminal(sessionId, pollMs, onProgress, undefined, deadline, transportSignal);
+            if (Date.now() >= deadline)
+                throw new Error("Code stage session release timed out");
+            return status;
+        }, budgetMs, callerSignal, () => new Error("Code stage session release timed out"));
+    }
+    async waitForIndexSessionProcessing(sessionId, deadline, pollMs, request, ignoreMissingUploads = false, remainingUploads = 0, transportSignal) {
+        const observeStatus = createIndexStatusObserver(pollMs, request.onProgress);
+        let lastStatus;
+        const interrupt = (cause) => new IndexProcessingInterruptedError(request.signal?.aborted ? "cancel"
+            : request.detachSignal?.aborted ? "detach" : "timeout", lastStatus, cause);
         for (;;) {
-            const status = await this.getIndexSessionStatus(sessionId);
-            if (status.progress && status.progress.sequence !== lastSequence) {
-                request.onProgress?.(status.progress);
-                lastSequence = status.progress.sequence;
+            if (request.signal?.aborted || request.detachSignal?.aborted
+                || (deadline !== null && Date.now() >= deadline))
+                throw interrupt();
+            let status;
+            try {
+                status = await withRequestBudget(async (signal) => {
+                    const observed = await this.getIndexSessionStatus(sessionId, { signal });
+                    lastStatus = observed;
+                    // A returned backend failure takes precedence over a racing caller
+                    // interruption or deadline; retain its evidence through abort cleanup.
+                    if (["failed", "incomplete", "expired"].includes(observed.phase)
+                        || observed.errors.length > 0 || (observed.failed_batches ?? 0) > 0) {
+                        throw new Error(`Remote index session ${sessionId} failed: ${observed.errors.join("; ") || observed.phase}`, { cause: observed });
+                    }
+                    if (signal.aborted)
+                        throw new DOMException("Processing wait aborted", "AbortError");
+                    if (deadline !== null && Date.now() >= deadline)
+                        throw new DOMException("Caller wait timeout elapsed", "TimeoutError");
+                    return observed;
+                }, deadline === null ? 0 : Math.max(1, deadline - Date.now()), transportSignal, () => new DOMException("Caller wait timeout elapsed", "TimeoutError"));
             }
+            catch (cause) {
+                if (request.signal?.aborted || request.detachSignal?.aborted
+                    || (cause instanceof Error && cause.name === "TimeoutError"))
+                    throw interrupt(cause);
+                throw cause;
+            }
+            const pollDelay = observeStatus(status);
             if (["failed", "incomplete", "aborted", "expired"].includes(status.phase)) {
                 if (status.phase === "aborted") {
                     return status;
@@ -844,24 +1005,40 @@ export class CorpusWireClient {
             }
             const pendingBatches = status.pending_batches ?? 0;
             const activeBatches = status.active_batches ?? 0;
-            if (pendingBatches === 0 && activeBatches === 0 && status.queue_depth === 0) {
+            if (status.errors.length > 0)
+                throw new Error(`Remote index session ${sessionId} failed: ${status.errors.join("; ")}`);
+            const countersAvailable = status.pending_batches !== undefined && status.active_batches !== undefined;
+            const drained = ignoreMissingUploads
+                ? countersAvailable || status.queue_depth <= remainingUploads
+                : status.queue_depth === 0;
+            if (request.signal?.aborted || request.detachSignal?.aborted
+                || (deadline !== null && Date.now() >= deadline))
+                throw interrupt();
+            if (pendingBatches === 0 && activeBatches === 0 && drained) {
                 return status;
             }
-            if (request.signal?.aborted) {
-                return status;
-            }
-            if (request.detachSignal?.aborted) {
-                throw new RemoteIndexDetachedError(sessionId, status, "Detached by caller");
-            }
-            if (deadline !== null && Date.now() >= deadline) {
-                throw new RemoteIndexDetachedError(sessionId, status, "Caller wait timeout elapsed");
-            }
-            await new Promise((resolve) => setTimeout(resolve, Math.max(10, pollMs)));
+            await waitForIndexInterruptDelay(remainingIndexPollDelay(pollDelay, deadline), request);
         }
     }
     async indexWorkspace(request) {
+        return this.runIndexWorkspace(request, false);
+    }
+    /**
+     * Publish code from a complete scan and release the drained owned session.
+     * Checkpoint and release share the processing budget, or 5 seconds when unspecified.
+     * Interruption allows up to 1 extra second for best-effort abort confirmation.
+     */
+    async indexWorkspaceCodeStage(request) {
+        if (request.mode !== "full" || request.snapshotScope || request.evaluationInventoryAttestation
+            || request.inventoryScan?.complete !== true) {
+            throw new WorkspaceScanIncompleteError("Code stage requires a complete canonical v1 full scan");
+        }
+        return this.runIndexWorkspace(request, true);
+    }
+    async runIndexWorkspace(request, codeStage) {
         const clientStartedAt = Date.now();
         let clientSequence = 0;
+        const phaseClock = createClientPhaseClock();
         let lastOverallPercent = null;
         const emitProgress = (event) => {
             const normalized = { ...event };
@@ -884,18 +1061,24 @@ export class CorpusWireClient {
                 unit,
                 message,
                 startedAt: clientStartedAt,
+                phaseStartedAt: phaseClock.enter(phase),
+                phaseTimings: phaseClock.snapshot(),
+                throughputCompleted: phaseClock.workCompleted(completed),
                 overallCompleted,
                 overallTotal,
             }));
             clientSequence += 1;
         };
         emitClientProgress("resolving_configuration", 0, null, "items", "Resolving remote indexing configuration");
+        emitClientProgress("filtering_hashing", 0, request.files.length, "files", "Preparing workspace file hashes");
         const remoteFiles = await Promise.all(request.files.map(prepareRemoteWorkspaceFile));
         emitClientProgress("filtering_hashing", remoteFiles.length, remoteFiles.length, "files", "Workspace file hashes prepared");
         if (request.inventoryScan && request.signal?.aborted)
             throw new WorkspaceScanIncompleteError("Scan cancelled before session creation");
         const triples = remoteFiles.map(({ file, sha256, content }) => [file.relativePath, sha256, content.length]);
         await inventoryDigest(triples);
+        phaseClock.pause();
+        phaseClock.enter("resolving_configuration");
         if (request.inventoryScan) {
             if (request.mode !== "full" || request.snapshotScope)
                 throw new WorkspaceScanIncompleteError("Inventory requires a v1 full scan");
@@ -921,18 +1104,40 @@ export class CorpusWireClient {
                 throw new WorkspaceScanIncompleteError("Evaluation inventory attestation requires workspace inventory coverage");
             }
         }
+        if (codeStage && remoteFiles.length > 0
+            && !remoteFiles.some(({ file }) => ingestionPriority(file.relativePath) === 1)) {
+            return { outcome: "deferred", reason: "no_code", full_inventory_complete: false,
+                files_submitted: remoteFiles.length };
+        }
         const transfer = {
             files_submitted: remoteFiles.length, files_upload_required: null, files_reused: null,
             files_transferred: 0, source_bytes_transferred: 0, upload_attempts: 0,
-            source_bytes_attempted: 0, complete: false, acknowledged_files: [],
+            source_bytes_attempted: 0, queue_retries: 0, queue_full_responses: 0, queue_wait_ms: 0, transport_retries: 0,
+            client_phase_timings_ms: {}, complete: false, acknowledged_files: [],
         };
         const session = await this.startIndexSession(request);
+        const uploadStop = new AbortController();
+        let clientOwnedCheckpoint = false;
+        let codeStageReleaseStarted = false;
+        let lastProcessingStatus;
+        const stopUploads = () => uploadStop.abort();
+        request.signal?.addEventListener("abort", stopUploads, { once: true });
+        request.detachSignal?.addEventListener("abort", stopUploads, { once: true });
+        const checkInterrupt = async () => {
+            // Include interrupts queued by a just-delivered progress callback.
+            await Promise.resolve();
+            if (request.signal?.aborted || request.detachSignal?.aborted) {
+                throw new IndexProcessingInterruptedError(request.signal?.aborted ? "cancel" : "detach", lastProcessingStatus);
+            }
+        };
         try {
+            await checkInterrupt();
             const manifestEntries = buildWorkspaceManifest(remoteFiles, request.deletedPaths ?? []);
             emitClientProgress("manifest_comparison", 0, manifestEntries.length, "files", "Sending manifest for comparison", session.session_id);
             const manifestResult = await this.sendManifestBatch(session.session_id, manifestEntries);
             const initiallyComplete = manifestResult.unchanged + manifestResult.deletes + manifestResult.skipped;
             emitClientProgress("manifest_comparison", manifestEntries.length, manifestEntries.length, "files", "Manifest comparison complete", session.session_id, initiallyComplete, manifestEntries.length);
+            phaseClock.pause();
             const uploadRequired = new Set(manifestResult.upload_required);
             transfer.files_upload_required = uploadRequired.size;
             transfer.files_reused = manifestResult.unchanged;
@@ -957,72 +1162,270 @@ export class CorpusWireClient {
             const filesToUpload = remoteFiles.filter(({ file }) => uploadRequired.has(file.relativePath));
             let queuedBackgroundWork = false;
             let uploadedFiles = 0;
-            if (filesToUpload.length > 0) {
-                const uploadBatches = buildUploadBatches(filesToUpload, request.batchBytes ?? session.max_batch_bytes, session.max_batch_files);
-                await runWithConcurrency(uploadBatches, request.maxConcurrentUploads ?? session.max_concurrent_uploads, async (batchFiles) => {
-                    const result = await this.uploadFileBatch(session.session_id, { files: batchFiles.map((file) => file.descriptor) }, batchFiles, () => {
-                        transfer.upload_attempts += 1;
-                        transfer.source_bytes_attempted += batchFiles.reduce((sum, file) => sum + file.descriptor.size, 0);
-                    });
-                    if (result.errors.length)
-                        throw new Error("Source upload was not fully acknowledged");
-                    transfer.files_transferred += batchFiles.length;
-                    transfer.source_bytes_transferred += batchFiles.reduce((sum, file) => sum + file.descriptor.size, 0);
-                    transfer.acknowledged_files.push(...batchFiles.map((file) => ({
-                        relative_path: file.descriptor.relativePath, sha256: file.descriptor.sha256, disposition: "uploaded",
-                    })));
-                    queuedBackgroundWork ||= result.queued === true;
-                    uploadedFiles += batchFiles.length;
-                    emitClientProgress("uploading", uploadedFiles, filesToUpload.length, "files", "Uploading changed files", session.session_id, initiallyComplete, manifestEntries.length);
-                });
-            }
-            if (queuedBackgroundWork) {
-                const processingStatus = await this.waitForIndexSessionProcessing(session.session_id, request.processingTimeoutMs, request.processingPollMs ?? 250, { ...request, onProgress: emitProgress });
-                if (request.signal?.aborted || processingStatus.phase === "aborted") {
-                    if (processingStatus.phase !== "aborted") {
-                        await this.abortIndexSession(session.session_id);
+            // All tier drains share the caller's processing budget. Starting it at
+            // the first drain or checkpoint preserves the upload-versus-processing split.
+            let processingDeadline = null;
+            const processingWaitDeadline = () => {
+                const timeoutMs = request.processingTimeoutMs ?? (codeStage ? 5_000 : undefined);
+                if (processingDeadline === null && timeoutMs !== undefined) {
+                    processingDeadline = Date.now() + Math.max(1, timeoutMs);
+                }
+                return processingDeadline;
+            };
+            for (const priority of [1, 2, 3]) {
+                await checkInterrupt();
+                if (processingDeadline !== null && Date.now() >= processingDeadline
+                    && uploadedFiles < filesToUpload.length) {
+                    if (clientOwnedCheckpoint)
+                        throw new DOMException("Caller wait timeout elapsed", "TimeoutError");
+                    throw new IndexProcessingInterruptedError("timeout");
+                }
+                const tierFiles = filesToUpload.filter(({ file }) => ingestionPriority(file.relativePath) === priority);
+                let tierQueued = false;
+                const uploadBatches = tierFiles.length === 0 ? [] : buildUploadBatches(tierFiles, clampUploadLimit(request.batchBytes, session.max_batch_bytes, "batchBytes"), session.max_batch_files);
+                if (uploadBatches.length)
+                    phaseClock.enter("uploading", uploadedFiles);
+                await runWithConcurrency(uploadBatches, uploadBatches.length === 0 ? 1
+                    : clampUploadLimit(request.maxConcurrentUploads, session.max_concurrent_uploads, "maxConcurrentUploads"), async (batchFiles) => {
+                    if (uploadStop.signal.aborted)
+                        throw new DOMException("Upload stopped", "AbortError");
+                    if (batchFiles.some((file) => file.descriptor.size > session.max_batch_bytes)) {
+                        uploadStop.abort();
+                        throw new Error("A source file exceeds the server's upload batch byte limit");
                     }
-                    const terminal = await this.waitForIndexSessionTerminal(session.session_id, request.processingPollMs ?? 250, emitProgress, request.detachSignal);
-                    throw new RemoteIndexCancelledError(session.session_id, terminal);
+                    try {
+                        let queueSequence = clientSequence;
+                        let queueProgressAt = new Date().toISOString();
+                        const result = await this.uploadFileBatch(session.session_id, { files: batchFiles.map((file) => file.descriptor) }, batchFiles, () => {
+                            transfer.upload_attempts += 1;
+                            transfer.source_bytes_attempted += batchFiles.reduce((sum, file) => sum + file.descriptor.size, 0);
+                        }, {
+                            signal: uploadStop.signal, queueWaitTimeoutMs: request.queueWaitTimeoutMs,
+                            onQueueRetry: () => { transfer.queue_retries += 1; },
+                            onQueueFull: () => { transfer.queue_full_responses += 1; },
+                            onTransportRetry: () => { transfer.transport_retries += 1; },
+                            onQueueWait: (elapsedMs) => { transfer.queue_wait_ms += elapsedMs; },
+                            onQueueHeartbeat: (elapsedMs, heartbeat) => {
+                                const occurredAt = new Date().toISOString();
+                                if (!heartbeat) {
+                                    queueSequence = clientSequence;
+                                    clientSequence += 1;
+                                    queueProgressAt = occurredAt;
+                                }
+                                emitProgress({ ...clientIndexProgressEvent({
+                                        sequence: queueSequence, sessionId: session.session_id,
+                                        workspaceId: request.workspace.workspaceId, phase: "queued",
+                                        completed: uploadedFiles, total: filesToUpload.length, unit: "files",
+                                        message: "Waiting for upload queue capacity", startedAt: clientStartedAt,
+                                        phaseStartedAt: Date.now() - elapsedMs, phaseTimings: phaseClock.snapshot(),
+                                        throughputCompleted: 0,
+                                        overallCompleted: initiallyComplete, overallTotal: manifestEntries.length,
+                                    }), heartbeat, active_heartbeat: heartbeat, last_progress_at: queueProgressAt,
+                                    last_heartbeat_at: heartbeat ? occurredAt : null });
+                            },
+                        });
+                        if (result.errors.length)
+                            throw new Error("Source upload was not fully acknowledged");
+                        transfer.files_transferred += batchFiles.length;
+                        transfer.source_bytes_transferred += batchFiles.reduce((sum, file) => sum + file.descriptor.size, 0);
+                        transfer.acknowledged_files.push(...batchFiles.map((file) => ({
+                            relative_path: file.descriptor.relativePath, sha256: file.descriptor.sha256, disposition: "uploaded",
+                        })));
+                        queuedBackgroundWork ||= result.queued === true;
+                        tierQueued ||= result.queued === true;
+                        uploadedFiles += batchFiles.length;
+                        emitClientProgress("uploading", uploadedFiles, filesToUpload.length, "files", "Uploading changed files", session.session_id, initiallyComplete, manifestEntries.length);
+                    }
+                    catch (error) {
+                        uploadStop.abort();
+                        throw error;
+                    }
+                });
+                phaseClock.pause();
+                if (tierQueued) {
+                    // Later queued tiers still need this client's commit after they drain.
+                    const status = await this.waitForIndexSessionProcessing(session.session_id, processingWaitDeadline(), request.processingPollMs ?? 250, { ...request, onProgress: emitProgress }, true, filesToUpload.length - uploadedFiles, uploadStop.signal);
+                    lastProcessingStatus = status;
+                    if (status.phase === "aborted")
+                        throw new RemoteIndexCancelledError(session.session_id, status);
+                }
+                await checkInterrupt();
+                if (priority === 1 && session.code_checkpoint === true && request.inventory
+                    && session.mode === "full" && !request.snapshotScope && !request.evaluationInventoryAttestation
+                    && remoteFiles.some(({ file }) => ingestionPriority(file.relativePath) === 1)) {
+                    clientOwnedCheckpoint = true;
+                    const status = await this.checkpointIndexSessionCode(session.session_id, {
+                        signal: uploadStop.signal, deadline: processingWaitDeadline() ?? undefined,
+                    });
+                    if (status.coverage?.code_ready !== true) {
+                        throw new Error("Code checkpoint did not confirm code readiness");
+                    }
+                    if (codeStage && (!isOwnedCodeStageStatus(status, session, request.workspace.workspaceId)
+                        || status.coverage.state !== "pending" || status.coverage.session_id !== session.session_id
+                        || status.pending_batches !== 0 || status.active_batches !== 0
+                        || status.phase !== "ready_to_commit")) {
+                        throw new Error("Code stage checkpoint did not confirm drained pending code publication");
+                    }
+                    if (status.progress)
+                        emitProgress(status.progress);
+                    request.onCodeReady?.(status);
+                    if (codeStage) {
+                        codeStageReleaseStarted = true;
+                        const releaseStatus = await this.releaseCodeStageSession(session, request.workspace.workspaceId, processingWaitDeadline(), request.processingPollMs ?? 250, uploadStop.signal, request.signal, emitProgress);
+                        if (!isOwnedCodeStageStatus(releaseStatus, session, request.workspace.workspaceId)
+                            || releaseStatus.phase !== "aborted" || releaseStatus.pending_batches !== 0
+                            || releaseStatus.active_batches !== 0) {
+                            throw new Error("Code stage session release was not confirmed");
+                        }
+                        if (request.signal?.aborted)
+                            throw new RemoteIndexCancelledError(session.session_id, releaseStatus);
+                        transfer.client_phase_timings_ms = phaseClock.snapshot();
+                        return { outcome: "code_ready", full_inventory_complete: false, checkpoint: status,
+                            release_status: releaseStatus, transfer };
+                    }
+                    await checkInterrupt();
                 }
             }
-            if (request.signal?.aborted) {
-                await this.abortIndexSession(session.session_id);
-                const terminal = await this.waitForIndexSessionTerminal(session.session_id, request.processingPollMs ?? 250, emitProgress, request.detachSignal);
-                throw new RemoteIndexCancelledError(session.session_id, terminal);
+            if (queuedBackgroundWork) {
+                phaseClock.pause();
+                const processingStatus = await this.waitForIndexSessionProcessing(session.session_id, processingWaitDeadline(), request.processingPollMs ?? 250, { ...request, onProgress: emitProgress }, false, 0, uploadStop.signal);
+                lastProcessingStatus = processingStatus;
+                if (request.signal?.aborted || processingStatus.phase === "aborted") {
+                    throw new IndexProcessingInterruptedError("cancel", processingStatus);
+                }
             }
+            await checkInterrupt();
+            emitClientProgress("committing", 0, null, "items", "Waiting for verified commit", session.session_id);
+            await checkInterrupt();
             const committed = await this.commitIndexSession(session.session_id);
+            clientOwnedCheckpoint = false;
+            phaseClock.pause();
+            transfer.client_phase_timings_ms = phaseClock.snapshot();
             if (committed.status.progress) {
                 emitProgress(committed.status.progress);
             }
+            if (codeStage && committed.status.phase !== "completed") {
+                throw new WorkspaceScanIncompleteError("Code-stage full fallback did not confirm completed indexing");
+            }
             transfer.complete = true;
-            return { ...committed, transfer };
+            const fullResult = { ...committed, transfer };
+            return codeStage ? { outcome: "full", reason: remoteFiles.length === 0 ? "empty_inventory"
+                    : "checkpoint_unsupported", full_inventory_complete: committed.status.coverage?.state === "verified",
+                committed: fullResult } : fullResult;
         }
         catch (error) {
-            if (error instanceof Error)
-                Object.assign(error, { transfer });
-            if (error instanceof RemoteIndexDetachedError || error instanceof RemoteIndexCancelledError) {
+            phaseClock.pause();
+            const originalError = error;
+            const interruptionOnly = isInterruptionOnly(originalError);
+            // Cleanup can itself trigger caller abort callbacks. Preserve the reason
+            // observed on catch entry rather than reclassifying the primary failure.
+            const cancelledAtCatch = request.signal?.aborted === true;
+            const detachedAtCatch = request.detachSignal?.aborted === true;
+            if (codeStageReleaseStarted) {
+                if (error instanceof Error)
+                    Object.assign(error, { transfer });
                 throw error;
             }
-            await this.abortIndexSessionQuietly(session.session_id);
+            if (!(error instanceof IndexProcessingInterruptedError) && (cancelledAtCatch || detachedAtCatch
+                || error instanceof RemoteIndexDetachedError)) {
+                error = new IndexProcessingInterruptedError(cancelledAtCatch ? "cancel" : "detach", lastProcessingStatus, error);
+            }
+            if (clientOwnedCheckpoint || error instanceof IndexProcessingInterruptedError || error instanceof RemoteIndexCancelledError) {
+                let terminal;
+                try {
+                    terminal = await this.abortIndexSessionByDeadline(session.session_id, Date.now() + 1_000, request.processingPollMs ?? 250, emitProgress);
+                }
+                catch { /* The owned abort has only a finite best-effort reserve. */ }
+                const confirmed = terminal !== undefined && terminal.phase === "aborted"
+                    && (clientOwnedCheckpoint
+                        ? isOwnedCodeStageStatus(terminal, session, request.workspace.workspaceId)
+                            && terminal.pending_batches === 0 && terminal.active_batches === 0
+                        : terminal.session_id === session.session_id && Array.isArray(terminal.errors) && terminal.errors.length === 0
+                            && (session.workspace_id === undefined || terminal.workspace_id === session.workspace_id)
+                            && (session.collection_name === undefined || terminal.collection_name === session.collection_name)
+                            && (session.mode === undefined || terminal.mode === session.mode)
+                            && (terminal.failed_batches === undefined || terminal.failed_batches === 0)
+                            && terminal.pending_batches === 0 && terminal.active_batches === 0);
+                if ((interruptionOnly || error instanceof RemoteIndexCancelledError)
+                    && (cancelledAtCatch || error instanceof RemoteIndexCancelledError
+                        || (error instanceof IndexProcessingInterruptedError && error.reason === "cancel")) && confirmed) {
+                    const cancelled = new RemoteIndexCancelledError(session.session_id, terminal);
+                    Object.assign(cancelled, { transfer, cause: error });
+                    throw cancelled;
+                }
+                // Genuine checkpoint/publication failures remain primary after cleanup;
+                // only actual interruption evidence should receive an interruption label.
+                if (!cancelledAtCatch && !detachedAtCatch
+                    && !(error instanceof RemoteIndexDetachedError) && !(error instanceof RemoteIndexCancelledError)
+                    && !(error instanceof IndexProcessingInterruptedError)
+                    && !(error instanceof Error && error.name === "TimeoutError")) {
+                    if (error instanceof Error)
+                        Object.assign(error, { transfer });
+                    throw error;
+                }
+                const incompleteUploads = transfer.files_upload_required === null || transfer.files_transferred < transfer.files_upload_required;
+                const stopped = clientOwnedCheckpoint ? "Indexing stopped during the client-owned code checkpoint"
+                    : incompleteUploads ? "Indexing stopped before all required source uploads were submitted"
+                        : "Indexing stopped while waiting for source processing";
+                const interrupted = new RemoteIndexInterruptionError(`${stopped}; ${confirmed
+                    ? `${incompleteUploads ? "an abort was requested for the incomplete session; " : ""}the owned session abort was confirmed`
+                    : `an abort was requested${incompleteUploads ? " for the incomplete session" : ""} but release could not be confirmed`}. Start a new index operation to complete the inventory.`, error instanceof IndexProcessingInterruptedError ? error.reason
+                    : cancelledAtCatch ? "cancel" : detachedAtCatch ? "detach" : "timeout", { session_id: session.session_id, workspace_id: session.workspace_id,
+                    collection_name: session.collection_name, mode: session.mode }, terminal ?? (originalError instanceof IndexProcessingInterruptedError ? originalError.status : lastProcessingStatus), transfer, true, confirmed, interruptionOnly, originalError);
+                throw interrupted;
+            }
+            if (error instanceof Error)
+                Object.assign(error, { transfer });
+            try {
+                await withRequestBudget((signal) => this.abortIndexSession(session.session_id, { signal }), 1_000, undefined, () => new Error("Index failure cleanup timed out"));
+            }
+            catch { /* Preserve the original failure; release remains unconfirmed. */ }
             throw error;
         }
+        finally {
+            phaseClock.pause();
+            transfer.client_phase_timings_ms = phaseClock.snapshot();
+            request.signal?.removeEventListener("abort", stopUploads);
+            request.detachSignal?.removeEventListener("abort", stopUploads);
+        }
     }
-    async waitForIndexSessionTerminal(sessionId, pollMs, onProgress, detachSignal) {
+    async waitForIndexSessionTerminal(sessionId, pollMs, onProgress, detachSignal, deadline = null, transportSignal) {
+        const observeStatus = createIndexStatusObserver(pollMs, onProgress);
         for (;;) {
-            const status = await this.getIndexSessionStatus(sessionId);
-            if (status.progress) {
-                onProgress?.(status.progress);
+            if (transportSignal?.aborted)
+                throw new DOMException("Session release aborted", "AbortError");
+            if (deadline !== null && Date.now() >= deadline)
+                throw new Error("Session release confirmation timed out");
+            const status = await this.getIndexSessionStatus(sessionId, { signal: transportSignal });
+            if (transportSignal?.aborted)
+                throw new DOMException("Session release aborted", "AbortError");
+            if (deadline !== null && Date.now() >= deadline) {
+                throw new RemoteIndexDetachedError(sessionId, status, "Session release confirmation timed out");
             }
+            const pollDelay = observeStatus(status);
             if (["aborted", "failed", "expired", "completed"].includes(status.phase)) {
                 return status;
             }
             if (detachSignal?.aborted) {
                 throw new RemoteIndexDetachedError(sessionId, status, "Detached while cancellation was pending");
             }
-            await new Promise((resolve) => setTimeout(resolve, Math.max(10, pollMs)));
+            if (deadline !== null && Date.now() >= deadline) {
+                throw new RemoteIndexDetachedError(sessionId, status, "Session release confirmation timed out");
+            }
+            await waitForIndexInterruptDelay(remainingIndexPollDelay(pollDelay, deadline), { signal: transportSignal, detachSignal });
         }
     }
+}
+/** A code publication/release receipt must identify the owned canonical session. */
+function isOwnedCodeStageStatus(status, session, workspaceId) {
+    return typeof session.session_id === "string" && session.session_id.length > 0
+        && session.workspace_id === workspaceId && session.mode === "full"
+        && typeof session.collection_name === "string" && session.collection_name.length > 0
+        && status.session_id === session.session_id && status.workspace_id === session.workspace_id
+        && status.mode === session.mode && status.collection_name === session.collection_name
+        && (status.coverage?.session_id === undefined || status.coverage.session_id === session.session_id)
+        && Array.isArray(status.errors) && status.errors.length === 0
+        && (status.failed_batches === undefined || status.failed_batches === 0);
 }
 function sanitizeManifestErrors(errors) {
     return errors
@@ -1252,14 +1655,17 @@ function buildWorkspaceManifest(remoteFiles, deletedPaths) {
 }
 function clientIndexProgressEvent(options) {
     const elapsedMs = Math.max(0, Date.now() - options.startedAt);
-    const throughput = elapsedMs > 0 && options.completed > 0
-        ? options.completed / (elapsedMs / 1_000)
+    const phaseElapsedMs = Math.max(0, Date.now() - (options.phaseStartedAt ?? options.startedAt));
+    const workCompleted = options.throughputCompleted ?? options.completed;
+    const throughput = phaseElapsedMs > 0 && workCompleted > 0
+        ? workCompleted / (phaseElapsedMs / 1_000)
         : null;
     const overallPercent = options.overallTotal && options.overallTotal > 0
         ? Math.min(99, (options.overallCompleted / options.overallTotal) * 99)
         : null;
     return {
         schema_version: "index-progress/v1",
+        event_origin: "client",
         sequence: options.sequence,
         session_id: options.sessionId,
         workspace_id: options.workspaceId,
@@ -1275,7 +1681,7 @@ function clientIndexProgressEvent(options) {
         phase_total: options.total,
         unit: options.unit,
         elapsed_ms: elapsedMs,
-        phase_elapsed_ms: elapsedMs,
+        phase_elapsed_ms: phaseElapsedMs,
         throughput_per_second: throughput,
         queue_depth: 0,
         retries: 0,
@@ -1287,7 +1693,7 @@ function clientIndexProgressEvent(options) {
         last_heartbeat_at: null,
         active_heartbeat: false,
         counts: {},
-        phase_timings_ms: {},
+        phase_timings_ms: options.phaseTimings ?? {},
         verification_status: "pending",
     };
 }
@@ -1316,6 +1722,137 @@ function buildUploadBatches(files, batchBytes, batchFiles) {
         batches.push(currentBatch);
     }
     return batches;
+}
+async function withRequestBudget(operation, timeoutMs, callerSignal, timeoutError) {
+    if (callerSignal?.aborted)
+        throw new DOMException("Upload aborted", "AbortError");
+    const controller = new AbortController();
+    let rejectInterruption;
+    const interruption = new Promise((_, reject) => { rejectInterruption = reject; });
+    let callerAbortPending = false;
+    let callerAbortTimer;
+    const interrupt = (error) => {
+        rejectInterruption(error);
+        controller.abort(error);
+    };
+    const onAbort = () => {
+        const error = new DOMException("Upload aborted", "AbortError");
+        callerAbortPending = true;
+        controller.abort(error);
+        // Drain settled transport promise chains before choosing caller interruption.
+        // Only caller abort gets this single-turn grace; the timeout stays absolute.
+        callerAbortTimer = setTimeout(() => rejectInterruption(error), 0);
+    };
+    callerSignal?.addEventListener("abort", onAbort, { once: true });
+    // Zero retains the existing one-initial-attempt/no-queue-wait behavior.
+    const timer = timeoutMs > 0 ? setTimeout(() => interrupt(timeoutError()), timeoutMs) : undefined;
+    try {
+        // Abort alone cannot bound injected transports or stalled response bodies.
+        const result = await Promise.race([operation(controller.signal), interruption]);
+        if (callerAbortPending)
+            throw new DOMException("Upload aborted", "AbortError");
+        return result;
+    }
+    finally {
+        if (timer !== undefined)
+            clearTimeout(timer);
+        if (callerAbortTimer !== undefined)
+            clearTimeout(callerAbortTimer);
+        callerSignal?.removeEventListener("abort", onAbort);
+        controller.abort();
+    }
+}
+function clampUploadLimit(requested, advertised, name) {
+    if (!Number.isFinite(advertised) || advertised < 1
+        || (requested !== undefined && (!Number.isFinite(requested) || requested < 1))) {
+        throw new Error(`${name} requires a positive finite limit`);
+    }
+    return Math.floor(Math.min(requested ?? advertised, advertised));
+}
+/** Keep client phases separate from server processing time and repeated upload tiers. */
+function createClientPhaseClock() {
+    const timings = {};
+    let phase;
+    let initialCompleted = 0;
+    let startedAt = Date.now();
+    const pause = () => {
+        if (phase)
+            timings[phase] = (timings[phase] ?? 0) + Math.max(0, Date.now() - startedAt);
+        phase = undefined;
+    };
+    return {
+        enter(next, completed = 0) {
+            if (next !== phase) {
+                pause();
+                phase = next;
+                startedAt = Date.now();
+                initialCompleted = completed;
+            }
+            return startedAt;
+        },
+        pause,
+        workCompleted(completed) { return Math.max(0, completed - initialCompleted); },
+        snapshot() {
+            return { ...timings, ...(phase ? { [phase]: (timings[phase] ?? 0) + Math.max(0, Date.now() - startedAt) } : {}) };
+        },
+    };
+}
+function remainingIndexPollDelay(delay, deadline) {
+    return deadline === null ? delay : Math.max(0, Math.min(delay, deadline - Date.now()));
+}
+/** Preserve server identity; a timestamp identifies each bounded liveness observation. */
+function createIndexStatusObserver(pollMs, onProgress) {
+    const baseDelay = Math.min(2_000, Math.max(10, pollMs));
+    let delay = baseDelay;
+    let identity = "";
+    let receivedAt = Date.now();
+    let baselineProgress;
+    let emittedAt = 0;
+    return (status) => {
+        const progress = status.progress;
+        const nextIdentity = JSON.stringify([status.phase, status.queue_depth, status.pending_batches,
+            status.active_batches, status.files_indexed, progress?.sequence, progress?.phase, progress?.state, progress?.phase_completed]);
+        const now = Date.now();
+        if (nextIdentity !== identity) {
+            identity = nextIdentity;
+            receivedAt = now;
+            baselineProgress = progress ?? undefined;
+            emittedAt = now;
+            delay = baseDelay;
+            if (progress)
+                onProgress?.({ ...progress, event_origin: progress.event_origin ?? "server" });
+        }
+        else {
+            if (baseDelay > 10)
+                delay = Math.min(2_000, Math.ceil(delay * 1.5));
+            if (progress && now - emittedAt >= 1_000 && !["completed", "failed", "aborted", "expired"].includes(status.phase)) {
+                const occurredAt = new Date(now).toISOString();
+                onProgress?.({ ...progress, event_origin: progress.event_origin ?? "server",
+                    occurred_at: occurredAt,
+                    elapsed_ms: Math.max(progress.elapsed_ms, (baselineProgress?.elapsed_ms ?? progress.elapsed_ms) + now - receivedAt),
+                    phase_elapsed_ms: Math.max(progress.phase_elapsed_ms, (baselineProgress?.phase_elapsed_ms ?? progress.phase_elapsed_ms) + now - receivedAt),
+                    heartbeat: true, active_heartbeat: true, last_heartbeat_at: occurredAt });
+                emittedAt = now;
+            }
+        }
+        return delay;
+    };
+}
+/** Wake polling immediately on either interrupt; the caller owns its semantics. */
+async function waitForIndexInterruptDelay(delayMs, request) {
+    if (request.signal?.aborted || request.detachSignal?.aborted)
+        return;
+    await new Promise((resolve) => {
+        const finish = () => {
+            clearTimeout(timer);
+            request.signal?.removeEventListener("abort", finish);
+            request.detachSignal?.removeEventListener("abort", finish);
+            resolve();
+        };
+        const timer = setTimeout(finish, delayMs);
+        request.signal?.addEventListener("abort", finish, { once: true });
+        request.detachSignal?.addEventListener("abort", finish, { once: true });
+    });
 }
 function toRemoteFileContent(preparedFile, contentId) {
     return {

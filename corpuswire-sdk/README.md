@@ -315,6 +315,29 @@ const commit = await client.indexWorkspace({
 console.log(commit.status.files_indexed, commit.status.files_deleted);
 ```
 
+Uploads use code priority 1, documentation priority 2, and other supported files
+priority 3. Each tier drains before the next. A capable server publishes code
+after the first tier of a complete v1 inventory supplied through `inventoryScan`;
+subscribe with
+`onCodeReady: (status) => { ... }` to read `status.coverage.code_ready`,
+`documentation_pending` and `other_pending`. Full coverage remains pending
+until final commit. Legacy servers and snapshot/evaluation sessions retain the
+final-commit contract.
+
+Cancellation and detach also interrupt a stalled code-checkpoint request.
+Cancellation aborts the session. Detach during the client-owned code checkpoint
+also requests abort and requires a new indexing operation, even when every
+source upload was acknowledged: polling cannot finish checkpoint or commit.
+Before commit, every timeout or detach requests a bounded abort and requires a new indexing operation, including documentation-only, incremental and checkpoint-disabled sessions.
+
+Temporary queue saturation is retried within `queueWaitTimeoutMs` (default
+600000), preserving the original payload and honoring the request's
+`AbortSignal`. A positive budget bounds HTTP admission, response reading,
+retry backoff and queue cooldown. Zero permits one initial request without an
+admission deadline or retries; cancellation still applies. Permanent quotas
+fail immediately. Upload concurrency and batch bytes are clamped to advertised
+server limits, and inventories needing no uploads require no upload capacity.
+
 Preview the same hashed manifest without acquiring a workspace lock or starting
 a session, then subscribe to semantic progress:
 
@@ -335,11 +358,24 @@ caps unverified overall progress below 100, and reports 100 only after verified
 commit. It includes heartbeat/liveness, phase timing, throughput, queue, retry,
 warning, ETA-confidence, and cumulative count fields.
 
-`processingTimeoutMs` is an explicit caller wait budget, not a backend job
-timeout. Expiry raises `RemoteIndexDetachedError`; backend work continues and
-the error contains the session id. Use `followIndexSession(sessionId, ...)` to
-reattach. An `AbortSignal` sends `DELETE /v1/index/sessions/{id}` and waits for
-the terminal `aborted` status before raising `RemoteIndexCancelledError`.
+`processingTimeoutMs` is one caller wait budget across tier drains, starting at
+first processing wait or code checkpoint. Every interruption before commit
+requests abort within a separate one-second cleanup budget. Timeout and detach
+raise a restart-required error even after all uploads are acknowledged: polling
+cannot perform the client-owned commit. Caller cancellation raises
+`RemoteIndexCancelledError` only when the owned aborted session has explicitly
+zero pending and active batches; unknown release requires a restart.
+`RemoteIndexInterruptionError` retains the owned `sessionIdentity`, `reason`, last
+`status`, partial `transfer` and original `cause`. `abortRequested` records the
+bounded cleanup attempt; only `releaseConfirmed` proves that it succeeded.
+`interruptionOnly` distinguishes caller interruption from an operation failure
+that happened alongside cancellation. Consumers must preserve genuine failures
+and obtain matching terminal status before treating an unconfirmed release as
+cancelled. Caller abort immediately cancels transport and allows one event-loop
+turn for an already observed transport failure to settle; stalled transports
+remain bounded and successful late responses are discarded.
+`followIndexSession(sessionId, ...)` remains available for observing work that is
+already owned by the server; its detach behavior does not finish a client commit.
 
 Use `mode: "full"` when the file list represents the complete workspace
 snapshot. The backend stores a new manifest generation and, during commit,
@@ -460,3 +496,55 @@ incomplete index sessions.
 Full filesystem producers pass `inventoryScan` to `indexWorkspace()`. The SDK freezes and hashes uploaded buffers, computes `workspace-inventory/v1`, and negotiates `inventory_coverage_versions` before sending new fields. Supplying a `files` array alone does not certify a complete scan. Legacy servers receive the compatible request without coverage fields. Capability failures propagate before session creation.
 
 `status.coverage` describes a verified full baseline and compatible observed deltas. Session completion and 100% progress retain their existing meaning. The optional `transfer` result separates submitted, upload-required, reused and acknowledged unique transferred files; source bytes exclude multipart/TLS overhead. `upload_attempts` and `source_bytes_attempted` include HTTP retries. Error/detach objects retain partial counters with `complete: false`; do not interpret absent counters as zero. `acknowledged_files` is for authorized local cache updates and must not be copied into broad telemetry.
+
+Index progress polling backs off while status is unchanged, resets on observed work,
+and never waits more than two seconds between polls. Explicit intervals of 10ms
+or less retain the fast test cadence. Cancellation, detach, and processing deadlines
+interrupt the wait. Unchanged active status produces a heartbeat at most once per
+second with the original server sequence and an updated `last_heartbeat_at`.
+Client events include optional `event_origin` to distinguish their sequence space.
+Tier-drain status headers and bodies share the remaining processing deadline and
+are interrupted by cancellation or detach; late responses cannot update progress.
+Cancellation and detach before the first poll, including synchronous upload
+callbacks and before manifest submission, use the same bounded abort cleanup.
+No precommit session is advertised as resumable through status polling.
+Fatal errors keep their original cause while a best-effort abort is limited to
+one second; a failed cleanup attempt does not confirm session release.
+
+Transfer results also report `queue_full_responses`, `queue_retries`,
+`queue_wait_ms`, and `transport_retries`. A queue rejection followed by cancellation
+increments the response count without claiming another attempt. Queue wait is the
+measured cumulative cooldown across batches; overlapping batch waits can exceed
+wall time. Backend `progress.retries` retains its separate server meaning.
+`client_phase_timings_ms` measures client phase intervals, including repeated
+upload tiers; upload intervals include admission/transport waits. Server phase
+timings remain authoritative for server work and must not be summed with client
+intervals to infer wall time.
+
+For opt-in scheduling across many roots, `indexWorkspaceCodeStage(request)` accepts
+a complete canonical `mode: "full"` scan and declares the entire manifest. It
+uploads/drains code, publishes the code checkpoint, calls `onCodeReady`, then
+uses the existing abort route to release its drained owned session. A
+`code_ready` result contains distinct `checkpoint` and `release_status` fields;
+`full_inventory_complete` and `transfer.complete` are both false. Aborting this
+released stage preserves already-published code and its pending coverage.
+
+`processingTimeoutMs` covers the checkpoint response and session release using
+one remaining budget. Code-stage calls default to five seconds when it is omitted.
+An interrupted client-owned checkpoint, including later documentation processing,
+allows at most one extra second for abort confirmation. Cancellation requires
+an owned terminal session with no active or pending batches; an unconfirmed
+release reports that a new indexing operation is needed. Ordinary indexing keeps
+its existing omitted-timeout behavior.
+
+After all roots finish their code pass, scan each root again and call ordinary
+`indexWorkspace` with `recreateCollection: false` for roots that published code.
+Fresh full manifests account for edits, additions, and code deletions between
+passes. Documentation-only roots return `deferred` without allocating a session.
+An empty inventory or a server without checkpoint support returns `full` with
+a real `committed` response and an explicit fallback reason. Its
+`full_inventory_complete` flag requires verified inventory coverage; legacy
+completed services without that evidence report false. Such roots already
+finished and need no second pass. A deferred rebuild root still needs its first
+full session to recreate. Cancellation/errors never turn a code stage into full
+inventory completion. The SDK does not start a background continuation.

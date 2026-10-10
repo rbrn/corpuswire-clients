@@ -35,10 +35,15 @@ export interface RequestJsonOptions {
     init?: RequestInit;
     retryAttempts?: number;
     retryDelayMs?: number;
+    /** Upload admission distinguishes retryable queue pressure from fatal quotas. */
+    retryHttp429?: boolean;
+    /** Called only when a further transport attempt is about to start. */
+    onRetry?: () => void;
 }
 export declare function normalizeBaseUrl(baseUrl: string): string;
 export declare function createBasicAuthHeader(credentials: string): string;
 export declare function createBearerAuthHeader(token: string): string;
 export declare function buildHeaders(defaultHeaders?: Record<string, string>, basicAuth?: string, initHeaders?: HeadersInit): Headers;
 export declare function requestJson<T>(options: RequestJsonOptions): Promise<T>;
+export declare function waitForAbortableDelay(delayMs: number, signal?: AbortSignal | null): Promise<void>;
 export {};

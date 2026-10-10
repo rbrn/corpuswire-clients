@@ -14,6 +14,7 @@ import {
   main,
   parseCliArgs,
   runCliCommand,
+  runIndexCommand,
   sanitizeTerminalText,
 } from "../lib/cli.js";
 
@@ -309,7 +310,7 @@ test("main indexes the current folder with no arguments after printing the previ
 test("main prints the installed CLI version offline for command and flags", async () => {
   const metadata = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const lock = JSON.parse(await readFile(new URL("../package-lock.json", import.meta.url), "utf8"));
-  assert.equal(metadata.version, "0.1.4-beta.4");
+  assert.equal(metadata.version, "0.1.4-beta.5");
   assert.deepEqual(metadata.bin, { cw: "bin/corpuswire.js" });
   assert.equal(lock.version, metadata.version);
   assert.equal(lock.packages[""].version, metadata.version);
@@ -322,7 +323,7 @@ test("main prints the installed CLI version offline for command and flags", asyn
       fetchFn: () => { throw new Error("Version must not contact the backend"); },
       sdk: { CorpusWireClient: class { constructor() { throw new Error("Version must not load a client"); } } },
     });
-    assert.deepEqual(writes, ["0.1.4-beta.4"]);
+    assert.deepEqual(writes, ["0.1.4-beta.5"]);
   }
   const help = [];
   await main(["--help"], { write: (line) => help.push(line) });
@@ -616,6 +617,64 @@ test("non-interactive rebuild requires an exact workspace acknowledgement", asyn
   }
 });
 
+for (const ndjson of [false, true]) {
+  test(`index reports code readiness with pending flags in ${ndjson ? "NDJSON" : "terminal"} output`, async () => {
+    const fixture = await syntheticWorkspace();
+    const writes = [];
+    const client = fakeIndexClient({
+      indexWorkspace: async (request) => {
+        request.onProgress(progressEvent(1, "embedding", 40, "running"));
+        request.onCodeReady({
+          session_id: "code-session",
+          coverage: { state: "pending", code_ready: true, documentation_pending: true, other_pending: false },
+        });
+        request.onProgress(progressEvent(2, "embedding", 60, "running"));
+        request.onProgress(progressEvent(3, "completed", 100, "completed"));
+        return { ok: true, result: {}, status: {
+          phase: "completed", coverage: { state: "verified" },
+          progress: progressEvent(3, "completed", 100, "completed"),
+        } };
+      },
+    });
+    try {
+      await runCliCommand({ ...indexOptions(fixture), yes: true, ndjson }, {
+        client, write: (line) => writes.push(line), writeRaw: () => {}, isTTY: false,
+      });
+      if (ndjson) {
+        const events = writes.map((line) => JSON.parse(line));
+        assert.deepEqual(events.filter((event) => event.type === "code_ready"), [{
+          type: "code_ready", session_id: "code-session", workspace_id: "demo://cli-synthetic#main",
+          code_ready: true, documentation_pending: true, other_pending: false,
+        }]);
+        const published = events.findIndex((event) => event.type === "code_ready");
+        const completed = events.findIndex((event) => event.event?.overall_percent === 100);
+        assert.ok(published >= 0 && completed > published);
+      } else {
+        assert.equal(writes.filter((line) => line === "Code ready; documentation pending.").length, 1);
+      }
+    } finally {
+      await rm(fixture, { recursive: true, force: true });
+    }
+  });
+}
+
+test("index does not report code readiness when publication is still pending", async () => {
+  const fixture = await syntheticWorkspace();
+  const writes = [];
+  try {
+    await runCliCommand({ ...indexOptions(fixture), yes: true, ndjson: true }, {
+      client: fakeIndexClient({ indexWorkspace: async (request) => {
+        request.onCodeReady({ coverage: { code_ready: false, documentation_pending: true } });
+        return { ok: true, result: {}, status: { phase: "completed" } };
+      } }),
+      write: (line) => writes.push(line), writeRaw: () => {}, isTTY: false,
+    });
+    assert.ok(writes.map((line) => JSON.parse(line)).every((event) => event.type !== "code_ready"));
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
 test("workspace lock conflict can attach to and follow the owning session", async () => {
   const fixture = await syntheticWorkspace();
   const prompts = [];
@@ -779,6 +838,62 @@ test("index trace collector accepts only the fixed safe server timing contract",
   assert.equal(snapshot.modelState, "cold");
   assert.equal(snapshot.errorState, "none");
   assert.equal("secret_prompt" in snapshot.stageTimingsMs, false);
+});
+
+test("index trace distinguishes disabled and missing spans and bounds safe request identities", async () => {
+  const collector = createIndexTraceCollector();
+  const traceId = "123456789abc4def8123456789abcdef";
+  const responses = [
+    new Response("{}", { headers: { "x-corpuswire-index-trace-availability": "disabled", "x-request-id": "private-path" } }),
+    new Response("{}"),
+    new Response("{}", { headers: {
+      "x-corpuswire-index-trace": "index-observability/v1",
+      "x-corpuswire-index-trace-availability": "available",
+      "x-request-id": traceId,
+      "server-timing": "cw_session_lock_wait;dur=12, cw_session_lock_hold;dur=30, cw_writer_creation;dur=20, cw_schema_preflight;dur=4, cw_session_catalog;dur=2, cw_session_persistence;dur=3, cw_private_path;dur=999",
+    } }),
+    new Response("{}", { headers: { "x-corpuswire-index-trace": "index-observability/v1", "x-request-id": "caller-supplied-secret" } }),
+  ];
+  const fetchWithTrace = collector.wrapFetch(async () => responses.shift());
+  for (let index = 0; index < 4; index += 1) await fetchWithTrace("http://127.0.0.1/v1/index/sessions");
+  const snapshot = collector.snapshot();
+  assert.deepEqual(snapshot.serverTraceRequests, { available: 2, disabled: 1, unavailable: 1 });
+  assert.deepEqual(snapshot.requestIds, [traceId]);
+  assert.equal(snapshot.stageTimingsMs.session_lock_wait, 12);
+  assert.equal(snapshot.stageTimingsMs.writer_creation, 20);
+  assert.equal(snapshot.stageTimingsMs.session_lock_hold, 30); // Nested spans are retained, never summed here.
+  assert.doesNotMatch(JSON.stringify(snapshot), /private-path|caller-supplied-secret|private_path/);
+
+  const bounded = createIndexTraceCollector();
+  let counter = 0;
+  const boundedFetch = bounded.wrapFetch(async () => new Response("{}", { headers: {
+    "x-corpuswire-index-trace": "index-observability/v1",
+    "x-request-id": `123456789abc4def8123${String(counter++).padStart(12, "0")}`,
+  } }));
+  for (let index = 0; index < 40; index += 1) await boundedFetch("http://127.0.0.1/v1/index/capabilities");
+  assert.equal(bounded.snapshot().requestIds.length, 32);
+  assert.equal(bounded.snapshot().serverTraceRequests.available, 40);
+});
+
+test("terminal index trace distinguishes disabled and unavailable server measurement", async () => {
+  const fixture = await syntheticWorkspace();
+  try {
+    for (const disabled of [true, false]) {
+      const collector = createIndexTraceCollector();
+      const tracedFetch = collector.wrapFetch(async () => new Response("{}", {
+        headers: disabled ? { "x-corpuswire-index-trace-availability": "disabled" } : {},
+      }));
+      await tracedFetch("http://127.0.0.1/v1/index/capabilities");
+      const writes = [];
+      await runIndexCommand({ ...indexOptions(fixture), trace: true, yes: true }, {
+        client: fakeIndexClient(), traceCollector: collector,
+        write: (line) => writes.push(line), writeRaw: () => {}, isTTY: false,
+      });
+      assert.match(writes.join("\n"), disabled
+        ? /Server trace responses: available=0, disabled=1, unavailable=0/
+        : /Server trace responses: available=0, disabled=0, unavailable=1/);
+    }
+  } finally { await rm(fixture, { recursive: true, force: true }); }
 });
 
 test("progress formatting preserves unknown denominators, ETA confidence, heartbeat, and redaction", () => {
@@ -956,6 +1071,50 @@ test("explicit reconcile retains confirmation and hosted implicit indexing never
   } finally { await rm(fixture, { recursive: true, force: true }); }
 });
 
+test("doctor accepts healthy published code and keeps incomplete or degraded coverage unhealthy", async () => {
+  const fixture = await syntheticWorkspace();
+  const coverage = { state: "pending", reason_codes: ["background_ingestion_pending"],
+    code_ready: true, documentation_pending: true, other_pending: false };
+  const cases = [
+    { name: "code-ready", coverage, status: "ready" },
+    { name: "explicitly unindexed", coverage, indexed: false, status: "attention" },
+    { name: "still publishing", coverage: { ...coverage, code_ready: false }, status: "attention" },
+    { name: "mirror pending", coverage: { ...coverage, reason_codes: ["mirror_pending"] }, status: "attention" },
+    { name: "invalidated", coverage: { ...coverage, state: "invalidated" }, status: "attention" },
+    { name: "vector error", coverage, health_status: "degraded", status: "attention" },
+    { name: "real warning", coverage, health_warnings: ["vector_store_error"], status: "attention" },
+    { name: "reconcile needed", coverage, read_needs_reconcile: true, status: "attention" },
+    { name: "missing diagnosis readiness", coverage, readiness: "incomplete", status: "attention" },
+    { name: "unhealthy service", coverage, healthOk: false, status: "blocked" },
+    { name: "wrong identity", coverage, workspaceId: "local-docker://other#main", status: "blocked" },
+  ];
+  try {
+    for (const entry of cases) {
+      const writes = [];
+      const dependencies = {
+        cwd: fixture, env: {}, homeDirectory: fixture, write: (line) => writes.push(line),
+        client: { health: async () => ({ ok: entry.healthOk ?? true }), diagnoseWorkspace: async () => ({
+          status: "ready", can_retrieve: true, resolved_workspace_id: entry.workspaceId ?? "local-docker://code#main",
+          index: { indexed: entry.indexed ?? true, health_status: entry.health_status ?? "ok", readiness: entry.readiness ?? "code_ready",
+            coverage: entry.coverage, health_warnings: entry.health_warnings ?? [],
+            read_needs_reconcile: entry.read_needs_reconcile ?? false },
+        }) },
+      };
+      const result = await main(["doctor", "--workspace-id", "local-docker://code#main", "--json"], dependencies);
+      assert.equal(result.status, entry.status, entry.name);
+      assert.equal(result.exitCode, entry.status === "ready" ? 0 : entry.status === "blocked" ? 2 : 1, entry.name);
+      assert.equal(result.coverage.codeReady, entry.status === "ready", entry.name);
+      const serialized = JSON.parse(writes.at(-1));
+      assert.equal(serialized.coverage.codeReady, entry.status === "ready", entry.name);
+      assert.equal(serialized.coverage.documentationPending, true);
+      assert.equal(serialized.coverage.otherPending, false);
+      writes.length = 0;
+      await main(["doctor", "--workspace-id", "local-docker://code#main"], dependencies);
+      assert.equal(writes.join("\n").includes("\ncode ready: true"), entry.status === "ready", entry.name);
+    }
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
 test("doctor requires verified inventory, reports unavailable service, and never writes files", async () => {
   const fixture = await syntheticWorkspace();
   const initialEntries = await readdir(fixture);
@@ -964,12 +1123,12 @@ test("doctor requires verified inventory, reports unavailable service, and never
     const writes = [];
     const baseDiagnosis = { status: "ready", can_retrieve: true,
       resolved_workspace_id: "local-docker://verified#main", index: { health_status: "ok" } };
-    for (const [state, status, exitCode] of [["verified", "ready", 0], ["unknown", "attention", 1], ["invalidated", "attention", 1], [undefined, "attention", 1]]) {
+    for (const [state, status, exitCode, indexed] of [["verified", "attention", 1, false], ["verified", "ready", 0, true], ["verified", "ready", 0], ["unknown", "attention", 1], ["invalidated", "attention", 1], [undefined, "attention", 1]]) {
       const result = await main(["doctor", "--workspace-id", "local-docker://verified#main", "--json"], {
         cwd: fixture, env: {}, homeDirectory: fixture, write: (line) => writes.push(line),
         client: {
           health: async () => ({ ok: true }),
-          diagnoseWorkspace: async () => ({ ...baseDiagnosis, index: { health_status: "ok", coverage: state ? { state } : undefined } }),
+          diagnoseWorkspace: async () => ({ ...baseDiagnosis, index: { indexed, health_status: "ok", coverage: state ? { state } : undefined } }),
         },
       });
       assert.equal(result.status, status);
@@ -997,6 +1156,44 @@ test("doctor requires verified inventory, reports unavailable service, and never
     assert.equal(rejectedWrites.join("\n").includes("private"), false);
     assert.deepEqual(await readdir(fixture), initialEntries);
     assert.equal(process.exitCode, priorExitCode);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
+test("doctor rejects explicit vector errors and diagnosis checks even with ready coverage", async () => {
+  const fixture = await syntheticWorkspace();
+  try {
+    for (const state of ["pending", "verified"]) {
+      for (const entry of [
+        { name: "vector error", qdrant_error: "Synthetic vector outage", checks: [], reason: "vector_store_error", status: "blocked", exitCode: 2 },
+        { name: "check warning", checks: [{ name: "publication", status: "warning", message: "Synthetic publication warning" }], reason: "diagnosis_check_warning", status: "attention", exitCode: 1 },
+        { name: "check error", checks: [{ name: "vector_probe", status: "error", message: "Synthetic probe error" }], reason: "diagnosis_check_error", status: "blocked", exitCode: 2 },
+      ]) {
+        const writes = [];
+        const result = await main(["doctor", "--workspace-id", "local-docker://signals#main", "--json"], {
+          cwd: fixture, env: {}, homeDirectory: fixture, write: (line) => writes.push(line),
+          client: {
+            health: async () => ({ ok: true }),
+            diagnoseWorkspace: async () => ({
+              status: "ready", can_retrieve: true, resolved_workspace_id: "local-docker://signals#main",
+              qdrant_error: entry.qdrant_error ?? null, checks: entry.checks,
+              index: { health_status: "ok", health_warnings: [], readiness: state === "pending" ? "code_ready" : "ready",
+                coverage: { state, reason_codes: state === "pending" ? ["background_ingestion_pending"] : [],
+                  code_ready: true, documentation_pending: state === "pending", other_pending: false } },
+            }),
+          },
+        });
+        const label = `${state}: ${entry.name}`;
+        assert.equal(result.ok, false, label);
+        assert.equal(result.status, entry.status, label);
+        assert.equal(result.exitCode, entry.exitCode, label);
+        assert.ok(result.reasons.includes(entry.reason), label);
+        assert.equal(result.coverage.codeReady, false, label);
+        const serialized = JSON.parse(writes.at(-1));
+        assert.equal(serialized.status, entry.status, label);
+        assert.equal(serialized.coverage.codeReady, false, label);
+        assert.equal(serialized.coverage.documentationPending, state === "pending", label);
+      }
+    }
   } finally { await rm(fixture, { recursive: true, force: true }); }
 });
 
@@ -1210,7 +1407,7 @@ test("CLI complete scan carries inventory evidence and cancellation cannot reach
   } finally { await rm(fixture, { recursive: true, force: true }); }
 });
 
-async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, onPreview, onDiagnosis, onSetup, watcherUnavailable = false } = {}) {
+async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, onPreview, onDiagnosis, onSetup, watcherUnavailable = false, watcherError } = {}) {
   const root = await syntheticWorkspace();
   const controller = new AbortController();
   const state = {
@@ -1258,9 +1455,10 @@ async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, 
       watchFactory: (sourceRoot, options, callback) => {
         assert.equal(sourceRoot, root);
         assert.equal(options.recursive, true);
-        if (watcherUnavailable) throw new Error("Synthetic recursive watcher unavailable");
+        if (watcherUnavailable) throw watcherError ?? new Error("Synthetic recursive watcher unavailable");
         state.opened += 1;
         const watcher = new EventEmitter();
+        state.failWatcher = (error) => watcher.emit("error", error);
         state.notify = (filename = "README.md", event = "change") => callback(event, filename);
         watcher.close = () => { state.closed += 1; watcher.removeAllListeners(); };
         return watcher;
@@ -1282,6 +1480,21 @@ async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, 
   assert.equal(state.maximumActive <= 1, true, "Index sessions must never overlap");
   return state;
 }
+
+test("watch cannot establish a full baseline from a code-ready partial diagnosis", async () => {
+  const state = await watchFixture({
+    onDiagnosis: async (_current, request) => ({
+      status: "ready", can_retrieve: true, resolved_workspace_id: request.workspaceId,
+      index: { indexed: true, health_status: "ok", readiness: "code_ready", coverage: {
+        state: "pending", code_ready: true, documentation_pending: true,
+        reason_codes: ["background_ingestion_pending"],
+      } },
+    }),
+  });
+  assert.match(state.error?.message ?? "", /inventory_not_verified/);
+  assert.equal(state.waits, 0);
+  assert.equal(state.requests.length, 1);
+});
 
 test("watch timing flags reject unsafe or ambiguous values", () => {
   for (const args of [["watch", "--poll-ms", "99"], ["watch", "--poll-ms", "1.5"],
@@ -1639,35 +1852,48 @@ test("a hanging mutation response body survives first stop but settles on detach
 });
 
 test("verified empty backend diagnosis permits watching and a later source addition", { timeout: 5000 }, async () => {
-  let added = false;
-  const state = await watchFixture({
-    onSetup: async (current) => { await rm(path.join(current.root, "README.md")); await rm(path.join(current.root, "src", "index.js")); },
-    onDiagnosis: (current, request) => current.requests.at(-1).files.length === 0 ? {
-      status: "blocked", can_retrieve: false, resolved_workspace_id: request.workspaceId,
-      index: { health_status: "degraded", health_warnings: ["No indexed Qdrant points were found for this context."], coverage: { state: "verified", eligible_file_count: 0 } },
-    } : undefined,
-    onWait: async (current) => {
-      if (!added) { added = true; await writeFile(path.join(current.root, "README.md"), "# Added after verified empty inventory\n"); current.notify("README.md"); }
-      if (current.requests.length === 2) current.controller.abort();
-    },
-  });
-  assert.ifError(state.error);
-  assert.equal(state.requests.length, 2);
-  assert.deepEqual(state.requests[0].files, []);
-  assert.deepEqual(state.requests[1].files.map((file) => file.path), ["README.md"]);
-  assert.equal(state.result.publications, 2);
+  for (const collectionExists of [true,false]) {
+    let added = false;
+    const state = await watchFixture({
+      onSetup: async (current) => { await rm(path.join(current.root, "README.md")); await rm(path.join(current.root, "src", "index.js")); },
+      onIndex: (current) => ({ok:true,result:{},status:{phase:"completed",coverage:{state:"verified",session_id:`synthetic-${current.requests.length}`}},transfer:{complete:true}}),
+      onDiagnosis: (current, request) => current.requests.at(-1).files.length === 0 ? {
+        status: "blocked", can_retrieve: false, resolved_workspace_id: request.workspaceId,
+        collection:"synthetic-watch",collection_exists:collectionExists,point_count:0,
+        checks:[{name:"points",status:"error",message:"Collection has no indexed points."},
+          ...(collectionExists ? [] : [{name:"collection",status:"error",message:"Collection does not exist: synthetic-watch"}]),
+          {name:"index_health",status:"warning",message:"No indexed Qdrant points were found for this context."}],
+        index: { indexed:false,health_status: "degraded", health_warnings: ["No indexed Qdrant points were found for this context."],
+          coverage: { state: "verified", eligible_file_count: 0,session_id:"synthetic-1" } },
+      } : undefined,
+      onWait: async (current) => {
+        if (!added) { added = true; await writeFile(path.join(current.root, "README.md"), "# Added after verified empty inventory\n"); current.notify("README.md"); }
+        if (current.requests.length === 2) current.controller.abort();
+      },
+    });
+    assert.ifError(state.error);
+    assert.equal(state.requests.length, 2);
+    assert.deepEqual(state.requests[0].files, []);
+    assert.deepEqual(state.requests[1].files.map((file) => file.path), ["README.md"]);
+    assert.equal(state.result.publications, 2);
+  }
 });
 
 test("empty inventory never excuses divergent warnings, authorization failure, or another session", { timeout: 5000 }, async () => {
-  for (const failure of ["warning", "authentication", "session"]) {
+  for (const failure of ["warning", "authentication", "session", "qdrant", "check", "positive_eligible", "unconfirmed_collection", "reconcile"]) {
     const state = await watchFixture({
       onSetup: async (current) => { await rm(path.join(current.root, "README.md")); await rm(path.join(current.root, "src", "index.js")); },
       onIndex: () => ({ ok: true, result: {}, status: { phase: "completed", coverage: { state: "verified", session_id: "synthetic-current" } }, transfer: { complete: true } }),
       onDiagnosis: (_current, request) => {
         if (failure === "authentication") throw Object.assign(new Error("Synthetic rejected auth"), { status: 403 });
         return { status: "blocked", can_retrieve: false, resolved_workspace_id: request.workspaceId,
-          index: { health_status: "degraded", health_warnings: [failure === "warning" ? "Unexpected synthetic index failure" : "No indexed Qdrant points were found for this context."],
-            coverage: { state: "verified", eligible_file_count: 0, session_id: failure === "session" ? "synthetic-previous" : "synthetic-current" } },
+          collection:"synthetic-watch",collection_exists:failure === "unconfirmed_collection" ? undefined : false,point_count:0,
+          qdrant_error:failure === "qdrant" ? "Synthetic vector outage" : null,
+          checks:[{name:"points",status:"error",message:"Collection has no indexed points."},
+            {name:"collection",status:"error",message:"Collection does not exist: synthetic-watch"},
+            ...(failure === "check" ? [{name:"local_path",status:"error",message:"Synthetic source unreadable"}] : [])],
+          index: { indexed:false,read_needs_reconcile:failure === "reconcile",health_status: "degraded", health_warnings: [failure === "warning" ? "Unexpected synthetic index failure" : "No indexed Qdrant points were found for this context."],
+            coverage: { state: "verified", eligible_file_count: failure === "positive_eligible" ? 1 : 0, session_id: failure === "session" ? "synthetic-previous" : "synthetic-current" } },
         };
       },
     });
@@ -1706,4 +1932,50 @@ test("watch retries startup capabilities and stops cleanly when startup is inter
       assert.equal(closed, 1);
     } finally { await rm(root, { recursive: true, force: true }); }
   }
+});
+
+
+test("watch rejects explicitly unindexed verified diagnosis", async () => {
+  const state = await watchFixture({onDiagnosis:async (_current,request)=>({status:"ready",can_retrieve:true,
+    resolved_workspace_id:request.workspaceId,index:{indexed:false,health_status:"ok",coverage:{state:"verified"}}})});
+  assert.match(state.error?.message ?? "",/index_not_indexed/);
+  assert.equal(state.waits,0);
+  assert.equal(state.writes.some(line=>line.includes("Index verified")),false);
+});
+
+test("successive same-sequence heartbeat timestamps remain visible in NDJSON", () => {
+  const writes = [];
+  const renderer = createProgressRenderer({ write: (line) => writes.push(line), writeRaw: () => {}, isTTY: false, ndjson: true });
+  const event = { ...progressEvent(3, "queued", null, "running"), heartbeat: true };
+  renderer.render({ ...event, last_heartbeat_at: "2026-10-09T00:00:01Z" });
+  renderer.render({ ...event, last_heartbeat_at: "2026-10-09T00:00:02Z" });
+  renderer.render({ ...event, last_heartbeat_at: "2026-10-09T00:00:02Z" });
+  assert.equal(writes.length, 2);
+});
+
+test("watch fallback exposes only allowlisted native reason and error code", { timeout: 5000 }, async () => {
+  for (const code of ["ENOSPC", "private/path token=secret"]) {
+    const state = await watchFixture({ argv: ["watch", "--ndjson"], watcherUnavailable: true,
+      watcherError: Object.assign(new Error("private/path token=secret"), { code }),
+      onWait: (current) => current.controller.abort(),
+    });
+    assert.ifError(state.error);
+    const fallback = state.writes.map((line) => JSON.parse(line)).find((entry) => entry.fallback)?.fallback;
+    assert.deepEqual(fallback, { stage: "startup", reason: code === "ENOSPC" ? "watch_limit_reached" : "native_watch_unavailable", error_code: code === "ENOSPC" ? "ENOSPC" : null });
+    assert.ok(state.writes.every((line) => !line.includes("secret") && !line.includes("private/path")));
+  }
+});
+
+
+test("runtime watcher failure reports safe reason and closes its handle once", { timeout: 5000 }, async () => {
+  let failed = false;
+  const state = await watchFixture({ argv: ["watch", "--ndjson"], onWait: (current) => {
+    if (!failed) { failed = true; current.failWatcher(Object.assign(new Error("token=secret /private/path"), { code: "EPERM" })); }
+    else current.controller.abort();
+  } });
+  assert.ifError(state.error);
+  const fallback = state.writes.map((line) => JSON.parse(line)).find((entry) => entry.fallback)?.fallback;
+  assert.deepEqual(fallback, { stage: "runtime", reason: "watch_permission_denied", error_code: "EPERM" });
+  assert.equal(state.closed, 1);
+  assert.ok(state.writes.every((line) => !line.includes("secret") && !line.includes("/private/path")));
 });

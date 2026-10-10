@@ -57,6 +57,8 @@ const INDEX_OBSERVABILITY_STAGES = new Set([
   "mcp_receipt", "server_receipt", "queue_wait", "file_discovery", "file_read",
   "filtering_hashing", "parsing_chunking", "model_wait", "embedding_batch",
   "vector_writes", "cleanup",
+  "session_lock_wait", "session_lock_hold", "session_catalog",
+  "writer_creation", "schema_preflight", "session_persistence",
 ]);
 const REVIEW_V2_JOB_STATES = new Set([
   "queued", "running", "succeeded", "partial", "failed", "cancelled", "superseded",
@@ -417,7 +419,8 @@ class SyncManager {
     return this.isCacheEnabled() && this.observationGap === false
       && !this.activeBootstrapCheck && this.bootstrapStatus.coverage?.state === "verified"
       && Boolean(this.bootstrapStatus.coverage.coverage_token)
-      && this.bootstrapStatus.needsReconcile !== true;
+      && this.bootstrapStatus.needsReconcile !== true
+      && !isBootstrapHealthBlocked(this.bootstrapStatus);
   }
 
   async probePaths(args = {}) {
@@ -711,7 +714,7 @@ class SyncManager {
         this.env.CORPUSWIRE_SYNC_READ_FRESHNESS_TIMEOUT_MS ?? this.env.CORPUSWIRE_SYNC_BOOTSTRAP_TIMEOUT_MS,
         DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS,
       );
-      const checked = await awaitWithTimeout(this.refreshBootstrapStatus(args), maxWaitMs);
+      const checked = await this.checkBootstrapStatus(args, maxWaitMs);
       if (checked.timedOut) {
         this.recordBootstrapStatus(bootstrapStatusForTimeout(maxWaitMs));
       }
@@ -751,7 +754,7 @@ class SyncManager {
       reason: this.bootstrapStatus.reason,
       strict,
       strictStaleAfterMs: staleAfterMs,
-      strictBlocked: strict && isStaleForStrict,
+      strictBlocked: strict && (isBootstrapHealthBlocked(this.bootstrapStatus) || isStaleForStrict),
     };
   }
 
@@ -919,7 +922,7 @@ class SyncManager {
       args.maxWaitMs ?? args.max_wait_ms ?? this.env.CORPUSWIRE_SYNC_BOOTSTRAP_TIMEOUT_MS,
       DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS,
     );
-    const checked = await awaitWithTimeout(this.refreshBootstrapStatus(args), maxWaitMs);
+    const checked = await this.checkBootstrapStatus(args, maxWaitMs);
     if (checked.timedOut) {
       this.recordBootstrapStatus(bootstrapStatusForTimeout(maxWaitMs));
       return {
@@ -935,7 +938,7 @@ class SyncManager {
     let reconcileResult = null;
     if (optionalBoolean(args.reconcile ?? args.runReconcile ?? args.run_reconcile, false)) {
       reconcileResult = await this.reconcileExplicit(args);
-      const refreshed = await awaitWithTimeout(this.refreshBootstrapStatus(args), maxWaitMs);
+      const refreshed = await this.checkBootstrapStatus(args, maxWaitMs);
       if (refreshed.timedOut) {
         this.recordBootstrapStatus(bootstrapStatusForTimeout(maxWaitMs));
       }
@@ -952,7 +955,37 @@ class SyncManager {
     };
   }
 
-  async refreshBootstrapStatus(args = {}) {
+  async checkBootstrapStatus(args, maxWaitMs) {
+    try {
+      const value = await this.refreshBootstrapStatus(args, Date.now() + maxWaitMs);
+      return { timedOut: false, value };
+    } catch (error) {
+      if (error?.code === "CORPUSWIRE_HEALTH_TIMEOUT") return { timedOut: true };
+      throw error;
+    }
+  }
+
+  async refreshBootstrapStatus(args = {}, callerDeadline = Infinity) {
+    const healthStop = new AbortController();
+    const budgetMs = optionalPositiveInteger(this.env.CORPUSWIRE_SYNC_BOOTSTRAP_TIMEOUT_MS, DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS);
+    const deadline = Math.min(Date.now() + budgetMs, callerDeadline);
+    try {
+      const remainingMs = deadline - Date.now();
+      const checked = remainingMs > 0
+        ? await awaitWithTimeout(this.readBootstrapStatus(args, healthStop.signal), remainingMs)
+        : { timedOut: true };
+      if (checked.timedOut || Date.now() >= deadline) {
+        const error = new Error("Workspace health diagnosis timed out");
+        error.code = "CORPUSWIRE_HEALTH_TIMEOUT";
+        throw error;
+      }
+      return this.applyBootstrapStatus(checked.value);
+    } finally {
+      healthStop.abort();
+    }
+  }
+
+  async readBootstrapStatus(args = {}, signal = undefined) {
     const context = this.resolveContext(args);
     const repoPath = firstNonEmptyString(
       args.repoPath,
@@ -963,9 +996,13 @@ class SyncManager {
     const workspaceId = firstNonEmptyString(args.workspaceId, args.workspace_id, context.workspaceId);
     const client = buildClient();
     const diagnosis = typeof client.diagnoseWorkspace === "function"
-      ? await client.diagnoseWorkspace({ repoPath, workspaceId })
+      ? await client.diagnoseWorkspace({ repoPath, workspaceId }, { signal })
       : diagnosisFromHealth(await client.health({ repoPath, workspaceId }), { repoPath, workspaceId });
-    const bootstrapStatus = bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId });
+    if (signal?.aborted) throw new Error("Workspace health diagnosis was interrupted");
+    return bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId });
+  }
+
+  applyBootstrapStatus(bootstrapStatus) {
     if (this.observationGap === false && (
       this.bootstrapStatus.coverage?.coverage_token !== bootstrapStatus.coverage?.coverage_token
       || this.bootstrapStatus.coverage?.selection_policy_digest
@@ -1165,6 +1202,15 @@ class SyncManager {
       try { await this.refreshBootstrapStatus(batch); }
       catch { this.observationGap = true; }
     }
+    if (isBootstrapHealthBlocked(this.bootstrapStatus) && this.bootstrapStatus.emptyWriteReady !== true) {
+      this.requeueBatch(batch);
+      const result = { ok: false, blocked: true, requeued: true,
+        error: this.bootstrapStatus.reason ?? "Index health blocks incremental sync.",
+        filesQueued: batch.changedPaths.length, filesUploaded: 0,
+        filesDeleted: batch.deletedPaths.length, filesSkipped: 0 };
+      this.recordResult(result, "flush");
+      return result;
+    }
     const files = [];
     const cacheEntries = [];
     const deletedPaths = new Set(batch.deletedPaths);
@@ -1230,7 +1276,8 @@ class SyncManager {
     }
 
     const coverage = this.bootstrapStatus.coverage;
-    if (this.observationGap !== false || this.bootstrapStatus.needsReconcile === true
+    if (this.observationGap !== false
+      || (this.bootstrapStatus.needsReconcile === true && this.bootstrapStatus.emptyWriteReady !== true)
       || coverage?.state !== "verified" || !coverage.coverage_token
       || !coverage.selection_policy_digest
       || this.coverageContextKey !== syncContextKey(batch)) {
@@ -1574,10 +1621,35 @@ class SyncManager {
   async applySyncCacheUploadResult(context, cacheEntries, deletedPaths, response, fullBaseline = false) {
     const evidence = response.status?.coverage;
     if (evidence?.state === "verified" && response.transfer?.complete) {
+      const firstNonemptyPublication = this.bootstrapStatus.emptyWriteReady === true
+        && evidence.eligible_file_count > 0;
       this.coverageContextKey = syncContextKey(context);
       this.bootstrapStatus = { ...this.bootstrapStatus, coverage: evidence,
         checkedAt: new Date().toISOString(), collection: response.status.collection_name,
-        state: "ready", needsReconcile: false };
+        state: isBootstrapHealthBlocked(this.bootstrapStatus) ? "blocked" : "ready", needsReconcile: false };
+      if (firstNonemptyPublication) {
+        try {
+          const fresh = await this.refreshBootstrapStatus(context);
+          if (fresh.canRetrieve !== true || !["ready", "attention"].includes(fresh.state)
+            || fresh.healthBlocked === true || !["ok", "ready", "healthy"].includes(fresh.indexHealthStatus)
+            || fresh.collectionExists !== true || !(fresh.pointCount > 0)
+            || !response.status.collection_name || fresh.collection !== response.status.collection_name
+            || fresh.coverage?.state !== "verified" || !evidence.coverage_token || !evidence.selection_policy_digest
+            || fresh.coverage.coverage_token !== evidence.coverage_token
+            || fresh.coverage.selection_policy_digest !== evidence.selection_policy_digest) {
+            this.observationGap = true;
+            this.bootstrapStatus = { ...fresh, state: "blocked", healthBlocked: true,
+              emptyWriteReady: false, canRetrieve: false, needsReconcile: true,
+              reason: "The fresh health diagnosis does not match the completed publication." };
+          }
+        } catch (error) {
+          this.observationGap = true;
+          this.bootstrapStatus = { ...this.bootstrapStatus, state: "blocked", healthBlocked: true,
+            emptyWriteReady: false, canRetrieve: null, needsReconcile: true,
+            reason: "The first nonempty publication needs a fresh health diagnosis." };
+          this.recordError(error, "bootstrap");
+        }
+      }
     } else {
       this.observationGap = true;
     }
@@ -1596,9 +1668,6 @@ class SyncManager {
         await this.saveSyncCache(cacheState);
         return;
       }
-      this.coverageContextKey = syncContextKey(context);
-      this.bootstrapStatus = { ...this.bootstrapStatus, coverage, checkedAt: new Date().toISOString(),
-        collection: response.status.collection_name, state: "ready", needsReconcile: false };
       const manifestRevision = asRecord(asRecord(response).status).manifest_revision;
       const uploadedAt = new Date().toISOString();
       for (const entry of cacheEntries) {
@@ -2126,6 +2195,9 @@ class SyncManager {
       bootstrapReason: this.bootstrapStatus.reason,
       bootstrapStatus: this.bootstrapStatus.status,
       bootstrapCanRetrieve: this.bootstrapStatus.canRetrieve,
+      bootstrapCodeReady: this.bootstrapStatus.codeReady ?? false,
+      documentationPending: this.bootstrapStatus.documentationPending ?? false,
+      otherPending: this.bootstrapStatus.otherPending ?? false,
       bootstrapCollection: this.bootstrapStatus.collection,
       bootstrapIndexHealthStatus: this.bootstrapStatus.indexHealthStatus,
       bootstrapIndexedAt: this.bootstrapStatus.indexedAt,
@@ -5159,6 +5231,8 @@ function bootstrapStatusForTimeout(maxWaitMs) {
   return {
     ...initialBootstrapStatus(),
     state: "unknown",
+    healthBlocked: true,
+    canRetrieve: false,
     checkedAt: new Date().toISOString(),
     reason: `Bootstrap freshness check timed out after ${maxWaitMs}ms.`,
   };
@@ -5175,6 +5249,10 @@ function bootstrapStatusFromError(error) {
   };
 }
 
+function isBootstrapHealthBlocked(status) {
+  return status?.healthBlocked === true || ["blocked", "error"].includes(status?.state);
+}
+
 function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
   const index = asRecord(diagnosis.index);
   const checks = Array.isArray(diagnosis.checks) ? diagnosis.checks.filter(isRecord) : [];
@@ -5185,8 +5263,22 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
     .filter(Boolean);
   const diagnosisStatus = optionalString(diagnosis.status);
   const indexHealthStatus = optionalString(index.health_status);
+  const collectionExists = typeof diagnosis.collection_exists === "boolean" ? diagnosis.collection_exists : null;
+  const canRetrieve = typeof diagnosis.can_retrieve === "boolean" ? diagnosis.can_retrieve : null;
+  const pointCount = Number.isInteger(diagnosis.point_count) ? diagnosis.point_count : null;
+  const statusLooksBlocked = ["blocked", "error", "missing"].includes((diagnosisStatus ?? "").toLowerCase());
+  const isHealthWarning = (check) => String(check.status ?? "").toLowerCase() === "warning"
+    && ["index_health", "qdrant", "vectors", "vector_store", "collection", "points"].includes(
+      String(check.name ?? "").toLowerCase());
+  const hasAdvisoryWarning = checks.some((check) => String(check.status ?? "").toLowerCase() === "warning"
+    && !isHealthWarning(check));
+  const hasHealthProblem = index.indexed === false || Boolean(optionalString(diagnosis.qdrant_error))
+    || healthWarnings.length > 0
+    || (indexHealthStatus != null && !["ok", "ready", "healthy"].includes(indexHealthStatus.toLowerCase()))
+    || checks.some((check) => isHealthWarning(check) || ["error", "blocked", "failed"].includes(
+      String(check.status ?? "").toLowerCase()));
   const textSignals = [
-    diagnosisStatus,
+    diagnosisStatus === "degraded" && hasAdvisoryWarning && !hasHealthProblem ? null : diagnosisStatus,
     indexHealthStatus,
     optionalString(diagnosis.qdrant_error),
     ...healthWarnings,
@@ -5194,13 +5286,37 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
     ...recoveryActions,
   ].filter(Boolean);
   const hasFreshnessProblem = textSignals.some(hasBootstrapFreshnessSignal);
-  const collectionExists = typeof diagnosis.collection_exists === "boolean" ? diagnosis.collection_exists : null;
-  const canRetrieve = typeof diagnosis.can_retrieve === "boolean" ? diagnosis.can_retrieve : null;
-  const pointCount = Number.isInteger(diagnosis.point_count) ? diagnosis.point_count : null;
-  const statusLooksBlocked = ["blocked", "error", "missing"].includes((diagnosisStatus ?? "").toLowerCase());
   const coverage = asRecord(index.coverage);
+  // A verified empty inventory can receive its first file despite the expected
+  // no-points diagnosis. This exception applies only to incremental admission.
+  const emptyWarning = "No indexed Qdrant points were found for this context.";
+  const emptyWriteReady = coverage.state === "verified" && coverage.eligible_file_count === 0
+    && collectionExists !== null && pointCount === 0 && canRetrieve === false
+    && !optionalString(diagnosis.qdrant_error)
+    && ["ok", "ready", "healthy", "degraded"].includes(indexHealthStatus)
+    && healthWarnings.every((warning) => warning === emptyWarning)
+    && checks.every((check) => {
+      const status = String(check.status ?? "").toLowerCase();
+      if (status === "ok") return true;
+      if (status === "warning") return !isHealthWarning(check)
+        || (check.name === "index_health" && check.message === emptyWarning);
+      return status === "error" && ((check.name === "points"
+        && check.message === "Collection has no indexed points.")
+        || (collectionExists === false && check.name === "collection"
+          && check.message === `Collection does not exist: ${diagnosis.collection ?? index.collection}`));
+    });
+  const codeReady = index.indexed === true && index.readiness === "code_ready" && coverage.code_ready === true
+    && coverage.state === "pending"
+    && Array.isArray(coverage.reason_codes)
+    && coverage.reason_codes.length === 1
+    && coverage.reason_codes[0] === "background_ingestion_pending"
+    && canRetrieve === true && (diagnosisStatus === "ready"
+      || (diagnosisStatus === "degraded" && hasAdvisoryWarning && !hasHealthProblem))
+    && collectionExists === true && Number.isInteger(pointCount) && pointCount > 0
+    && indexHealthStatus === "ok" && healthWarnings.length === 0
+    && !hasHealthProblem && !hasFreshnessProblem;
   const coverageUnknown = !["verified", "not_applicable"].includes(coverage.state);
-  const needsReconcile = coverageUnknown || hasFreshnessProblem
+  const needsReconcile = (coverageUnknown && !codeReady) || hasFreshnessProblem
     || collectionExists === false
     || indexHealthStatus === "degraded"
     || indexHealthStatus === "stale"
@@ -5208,19 +5324,28 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
   const firstActionableSignal = textSignals.find(hasBootstrapFreshnessSignal);
   const state = needsReconcile
     ? "needs_reconcile"
-    : canRetrieve === true || diagnosisStatus === "ready"
-      ? "ready"
-      : statusLooksBlocked || canRetrieve === false
-        ? "blocked"
+    : statusLooksBlocked || hasHealthProblem || canRetrieve === false
+      ? "blocked"
+      : hasAdvisoryWarning ? "attention"
+      : (diagnosisStatus == null || diagnosisStatus === "ready")
+        && (canRetrieve === true || diagnosisStatus === "ready")
+        ? "ready"
         : "unknown";
 
   return {
     coverage,
+    healthBlocked: statusLooksBlocked || hasHealthProblem || canRetrieve === false,
+    emptyWriteReady,
+    codeReady,
+    documentationPending: codeReady && coverage.documentation_pending === true,
+    otherPending: codeReady && coverage.other_pending === true,
     state,
     needsReconcile,
     checkedAt: new Date().toISOString(),
     reason: firstNonEmptyString(
       firstActionableSignal,
+      optionalString(diagnosis.qdrant_error),
+      index.indexed === false ? "Index is not indexed." : null,
       recoveryActions[0],
       healthWarnings[0],
       checkMessages[0],
@@ -5376,7 +5501,10 @@ function determineDoctorVerdict({ healthResponse, diagnosis, syncStatus, session
   }
   const canRetrieve = diagnosis?.can_retrieve;
   const diagnosisStatus = optionalString(diagnosis?.status);
-  if (healthResponse?.ok === false || canRetrieve === false || diagnosisStatus === "blocked") {
+  const freshDiagnosisStatus = diagnosis ? bootstrapStatusFromDiagnosis(diagnosis, {}) : null;
+  if (healthResponse?.ok === false || canRetrieve === false || diagnosisStatus === "blocked"
+    || (freshDiagnosisStatus ? isBootstrapHealthBlocked(freshDiagnosisStatus)
+      : ["blocked", "error"].includes(syncStatus?.bootstrapState))) {
     return "blocked";
   }
   const pendingTotal = Number(syncStatus?.pendingTotal ?? 0);
@@ -5385,6 +5513,8 @@ function determineDoctorVerdict({ healthResponse, diagnosis, syncStatus, session
   const consecutiveFailures = Number(activity?.consecutive_failures ?? 0);
   if (
     syncStatus?.needsReconcile === true
+    || freshDiagnosisStatus?.needsReconcile === true
+    || freshDiagnosisStatus?.state === "attention"
     || pendingTotal > 0
     || hasActiveSessions
     || hasActivityGap
@@ -5712,7 +5842,7 @@ function formatReadPreparation(readPreparation) {
     `- readFreshnessAgeMs: ${freshness.ageMs ?? "unknown"}`,
     `- readFreshnessStrict: ${freshness.strict ?? false}`,
   ];
-  if (freshness.needsReconcile) {
+  if (freshness.needsReconcile || isBootstrapHealthBlocked(freshness)) {
     lines.push(`- readFreshnessWarning: ${freshness.reason ?? "Index needs reconciliation before it should be trusted."}`);
   }
   if (readPreparation.gitDelta?.git) {
@@ -6342,6 +6472,9 @@ function searchFailureMode({ result, hits, readPreparation }) {
   // successful backend response is known to be stale. Reporting it as a
   // failure would make offline renderers non-deterministic and create a
   // diagnostic on every search.
+  if (readPreparation?.enabled === true && isBootstrapHealthBlocked(readPreparation.freshness)) {
+    return "index_health_blocked";
+  }
   if (readPreparation?.enabled === true && readPreparation.freshness?.needsReconcile === true) {
     return "index_needs_reconcile";
   }
@@ -6352,6 +6485,9 @@ function searchFailureMode({ result, hits, readPreparation }) {
 }
 
 function enhancementFailureMode({ result, enhancedPrompt, usedLocalFallback, readPreparation }) {
+  if (readPreparation?.enabled === true && isBootstrapHealthBlocked(readPreparation.freshness)) {
+    return "index_health_blocked";
+  }
   if (readPreparation?.enabled === true && readPreparation.freshness?.needsReconcile === true) {
     return "index_needs_reconcile";
   }
@@ -6728,12 +6864,22 @@ function buildClient() {
 
 function createMcpServerTraceCollector() {
   const stageTimingsMs = {};
+  const serverTraceRequests = { available: 0, disabled: 0, unavailable: 0 };
+  const requestIds = new Set();
   let modelState = "unknown";
   let errorState = "none";
   return {
     observe(response) {
-      if (response?.headers?.get?.("x-corpuswire-index-trace") !== INDEX_OBSERVABILITY_SCHEMA_VERSION) {
+      const availability = response?.headers?.get?.("x-corpuswire-index-trace-availability");
+      const traced = response?.headers?.get?.("x-corpuswire-index-trace") === INDEX_OBSERVABILITY_SCHEMA_VERSION;
+      if (availability === "disabled" || !traced) {
+        serverTraceRequests[availability === "disabled" ? "disabled" : "unavailable"] += 1;
         return;
+      }
+      serverTraceRequests.available += 1;
+      const requestId = response.headers.get("x-request-id") ?? "";
+      if (/^[a-f0-9]{12}4[a-f0-9]{3}[89ab][a-f0-9]{15}$/i.test(requestId) && requestIds.size < 32) {
+        requestIds.add(requestId.toLowerCase());
       }
       for (const item of (response.headers.get("server-timing") ?? "").split(",")) {
         const match = item.match(/^\s*cw_([a-z_]+)\s*;\s*dur=([0-9]+(?:\.[0-9]+)?)/i);
@@ -6762,7 +6908,10 @@ function createMcpServerTraceCollector() {
       }
     },
     snapshot() {
-      return { stageTimingsMs: { ...stageTimingsMs }, modelState, errorState };
+      return {
+        stageTimingsMs: { ...stageTimingsMs }, modelState, errorState,
+        serverTraceRequests: { ...serverTraceRequests }, requestIds: [...requestIds],
+      };
     },
   };
 }
@@ -6796,6 +6945,8 @@ function buildMcpIndexTrace({
     stageTimingsMs: {},
     modelState: "unknown",
     errorState: "none",
+    serverTraceRequests: { available: 0, disabled: 0, unavailable: 0 },
+    requestIds: [],
   };
   addTimings(collected.stageTimingsMs);
   addTimings(response?.status?.progress?.phase_timings_ms);
@@ -6812,6 +6963,8 @@ function buildMcpIndexTrace({
     total_duration_ms: Math.max(0, Math.round(totalDurationMs)),
     error_state: collected.errorState,
     model_state: collected.modelState,
+    server_trace_requests: collected.serverTraceRequests,
+    request_ids: collected.requestIds,
     sensitive_payloads_captured: false,
   };
 }
@@ -7476,6 +7629,9 @@ function formatSyncPayload(payload) {
     `- bootstrapReason: ${status.bootstrapReason ?? "none"}`,
     `- bootstrapDiagnosisStatus: ${status.bootstrapStatus ?? "unknown"}`,
     `- bootstrapCanRetrieve: ${status.bootstrapCanRetrieve ?? "unknown"}`,
+    `- codeReady: ${status.bootstrapCodeReady ?? false}`,
+    `- documentationPending: ${status.documentationPending ?? false}`,
+    `- otherPending: ${status.otherPending ?? false}`,
     `- bootstrapCollection: ${status.bootstrapCollection ?? "unknown"}`,
     `- bootstrapIndexHealthStatus: ${status.bootstrapIndexHealthStatus ?? "unknown"}`,
     `- bootstrapIndexedAt: ${status.bootstrapIndexedAt ?? "unknown"}`,
@@ -7644,6 +7800,10 @@ function formatSyncSummary(summary, ordinal) {
       ? [
         `   observability: ${observability.schema_version} model=${observability.model_state ?? "unknown"} error=${observability.error_state ?? "unknown"} total=${observability.total_duration_ms ?? 0}ms`,
         `   stages: ${measuredStages.length > 0 ? measuredStages.join(", ") : "none"}`,
+        `   server trace responses: ${formatSyncCountMap(observability.server_trace_requests, ["available", "disabled", "unavailable"])}`,
+        ...(observability.request_ids?.length > 0
+          ? [`   trace request IDs: ${observability.request_ids.join(", ")}`]
+          : []),
       ]
       : []),
   ].join("\n");

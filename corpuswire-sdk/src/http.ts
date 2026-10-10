@@ -69,6 +69,10 @@ export interface RequestJsonOptions {
   init?: RequestInit;
   retryAttempts?: number;
   retryDelayMs?: number;
+  /** Upload admission distinguishes retryable queue pressure from fatal quotas. */
+  retryHttp429?: boolean;
+  /** Called only when a further transport attempt is about to start. */
+  onRetry?: () => void;
 }
 
 export function normalizeBaseUrl(baseUrl: string): string {
@@ -124,8 +128,11 @@ export async function requestJson<T>(options: RequestJsonOptions): Promise<T> {
           headers: buildHeaders(options.defaultHeaders, options.basicAuth, options.init?.headers),
         });
       } catch (error) {
-        if (attempt < retryAttempts && isRetryableFetchError(error)) {
-          await waitForRetry(retryDelayMs, attempt);
+        // Keep an observed transport failure primary when cancellation already
+        // raced it; an aborted retry delay would replace it with AbortError.
+        if (!options.init?.signal?.aborted && attempt < retryAttempts && isRetryableFetchError(error)) {
+          await waitForRetry(retryDelayMs, attempt, null, options.init?.signal);
+          options.onRetry?.();
           continue;
         }
         throw error;
@@ -137,15 +144,32 @@ export async function requestJson<T>(options: RequestJsonOptions): Promise<T> {
       }
 
       if (!response.ok) {
-        if (attempt < retryAttempts && TRANSIENT_HTTP_STATUSES.has(response.status)) {
+        let responseBody: string;
+        try {
+          responseBody = await response.text();
+        } catch (error) {
+          // Retain best-effort gateway-body handling for existing retries.
+          if (!options.init?.signal?.aborted && attempt < retryAttempts && TRANSIENT_HTTP_STATUSES.has(response.status)
+            && (response.status !== 429 || options.retryHttp429 !== false)) {
+            await waitForRetry(retryDelayMs, attempt, responseRetryAfterSeconds(response), options.init?.signal);
+            options.onRetry?.();
+            continue;
+          }
+          throw error;
+        }
+        const parsed = parseApiError(responseBody);
+        // Queue admission has its own finite, cancellation-aware budget in the
+        // uploader. Do not consume that budget inside generic HTTP retries.
+        if (!options.init?.signal?.aborted && attempt < retryAttempts && TRANSIENT_HTTP_STATUSES.has(response.status)
+          && (response.status !== 429 || options.retryHttp429 !== false)
+          && parsed?.retryable !== false
+          && parsed?.errorCode !== "index_queue_full") {
           const retryAfterSeconds = responseRetryAfterSeconds(response);
-          await discardResponseBody(response);
-          await waitForRetry(retryDelayMs, attempt, retryAfterSeconds);
+          await waitForRetry(retryDelayMs, attempt, retryAfterSeconds, options.init?.signal);
+          options.onRetry?.();
           continue;
         }
 
-        const responseBody = await response.text();
-        const parsed = parseApiError(responseBody);
         const headerRequestId = response.headers?.get?.("x-request-id") ?? null;
         const headerRetryAfter = responseRetryAfterSeconds(response);
 
@@ -173,14 +197,6 @@ export async function requestJson<T>(options: RequestJsonOptions): Promise<T> {
   throw new Error(`No response received from ${normalizedBaseUrl}`);
 }
 
-async function discardResponseBody(response: Response): Promise<void> {
-  try {
-    await response.text();
-  } catch {
-    // Best effort: retry eligibility should not depend on reading a gateway error page.
-  }
-}
-
 function isRetryableFetchError(error: unknown): boolean {
   if (error instanceof Error && error.name === "AbortError") {
     return false;
@@ -199,15 +215,28 @@ async function waitForRetry(
   baseDelayMs: number,
   attempt: number,
   retryAfterSeconds: number | null = null,
+  signal?: AbortSignal | null,
 ): Promise<void> {
   const delayMs = retryAfterSeconds === null
     ? baseDelayMs * (attempt + 1)
     : retryAfterSeconds * 1_000;
-  if (delayMs <= 0) {
-    return;
-  }
-  await new Promise((resolve) => {
-    setTimeout(resolve, delayMs);
+  await waitForAbortableDelay(delayMs, signal);
+}
+
+export async function waitForAbortableDelay(delayMs: number, signal?: AbortSignal | null): Promise<void> {
+  if (signal?.aborted) throw new DOMException("Request aborted", "AbortError");
+  if (delayMs <= 0) return;
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(new DOMException("Request aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -218,7 +247,7 @@ interface ParsedApiError {
   errorMessage: string;
   errorDetail: unknown;
   errorEnvelope: EnhanceErrorEnvelope | ReviewContextErrorEnvelope | null;
-  retryable: boolean;
+  retryable: boolean | null;
   retryAfterSeconds: number | null;
   recoveryGuidance: readonly string[];
 }
@@ -264,7 +293,7 @@ function parseApiError(responseBody: string): ParsedApiError | null {
         errorMessage: candidate.message,
         errorDetail: candidate.details,
         errorEnvelope: candidate,
-        retryable: candidate.retryable === true,
+        retryable: typeof candidate.retryable === "boolean" ? candidate.retryable : null,
         retryAfterSeconds: nonNegativeIntegerOrNull(candidate.retry_after_seconds),
         recoveryGuidance: normalizeRecoveryGuidance(candidate.recovery_guidance),
       };
@@ -284,12 +313,14 @@ function parseApiError(responseBody: string): ParsedApiError | null {
       return {
         requestId: "",
         durationMs: null,
-        errorCode: "http_error",
+        errorCode: typeof detailRecord?.error_code === "string"
+          ? detailRecord.error_code
+          : typeof detailRecord?.code === "string" ? detailRecord.code : "http_error",
         errorMessage: message,
         errorDetail: detail,
         errorEnvelope: null,
-        retryable: false,
-        retryAfterSeconds: null,
+        retryable: typeof detailRecord?.retryable === "boolean" ? detailRecord.retryable : null,
+        retryAfterSeconds: nonNegativeIntegerOrNull(detailRecord?.retry_after_seconds),
         recoveryGuidance: [],
       };
     }
@@ -312,7 +343,7 @@ function parseApiError(responseBody: string): ParsedApiError | null {
       errorMessage: envelope.error.message,
       errorDetail: envelope.error.detail,
       errorEnvelope: envelope,
-      retryable: false,
+      retryable: null,
       retryAfterSeconds: null,
       recoveryGuidance: [],
     };

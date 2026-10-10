@@ -2,6 +2,7 @@ export {
   CorpusWireClient,
   RemoteIndexCancelledError,
   RemoteIndexDetachedError,
+  RemoteIndexInterruptionError,
   ReviewContextPollingCancelledError,
   ReviewContextPollingTimeoutError,
   isReviewContextJob,
@@ -18,6 +19,7 @@ export {
   toReviewContextPayload,
   toReviewContextPayloadV2,
 } from "./client.js";
+export type { RemoteIndexOwnedSessionIdentity } from "./client.js";
 export {
   CorpusWireHttpError,
   buildHeaders,
@@ -98,6 +100,7 @@ export type {
   RemoteFileDescriptor,
   RemoteIndexCapabilities,
   RemoteIndexCommitResponse,
+  RemoteIndexCodeStageResult,
   RemoteIndexLayer,
   RemoteIndexMode,
   RemoteIndexEtaConfidence,
@@ -204,4 +207,4 @@ export type {
 export { INVENTORY_VERSION, WorkspaceScanIncompleteError, canonicalInventoryPath, inventoryDigest, inventorySha256, selectionPolicyDigest, buildWorkspaceInventory } from "./inventory.js";
 export type { InventoryScan, InventorySelectionPolicy, WorkspaceInventory, WorkspaceCoverage, IndexTransferSummary } from "./types.js";
 
-export { isRetrievalExcludedPath } from "./inventory.js";
+export { isRetrievalExcludedPath, ingestionPriority } from "./inventory.js";

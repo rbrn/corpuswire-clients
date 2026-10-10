@@ -203,6 +203,9 @@ export interface QdrantHealth {
 }
 
 export interface IndexHealth {
+  code_ready?: boolean;
+  documentation_pending?: boolean;
+  other_pending?: boolean;
   coverage?: WorkspaceCoverage;
   workspace_id?: string | null;
   path: string;
@@ -1649,6 +1652,8 @@ export type RemoteIndexVerificationStatus = "pending" | "verified" | "failed" | 
 
 export interface RemoteIndexProgressEvent {
   schema_version: "index-progress/v1";
+  /** Optional origin disambiguates client and server sequence spaces. */
+  event_origin?: "client" | "server";
   sequence: number;
   session_id: string;
   workspace_id: string;
@@ -1726,6 +1731,8 @@ export interface StartRemoteIndexSessionRequest {
 }
 
 export interface RemoteIndexSession {
+  /** This session supports publishing verified code before lower-priority files. */
+  code_checkpoint?: boolean;
   session_id: string;
   workspace_id: string;
   collection_name: string;
@@ -1855,8 +1862,14 @@ export interface RemoteIndexCapabilities {
   background_file_batches?: boolean;
   worker_count?: number;
   max_queued_batches?: number;
+  max_queued_bytes?: number;
   protocol_versions?: string[];
   snapshot_scoping?: boolean;
+  file_batch_priorities?: { code: number; documentation: number; other: number };
+  max_processing_files?: number;
+  max_processing_source_bytes?: number;
+  processing_quantum_boundary?: "complete_files";
+  chunk_stream_preemption?: boolean;
 }
 
 export interface RemoteIndexCommitResponse {
@@ -1865,6 +1878,15 @@ export interface RemoteIndexCommitResponse {
   result: Record<string, unknown>;
   status: RemoteIndexStatus;
 }
+
+/** A released code publication is distinct from a verified full commit. */
+export type RemoteIndexCodeStageResult =
+  | { outcome: "code_ready"; full_inventory_complete: false; checkpoint: RemoteIndexStatus;
+      release_status: RemoteIndexStatus; transfer: IndexTransferSummary }
+  | { outcome: "deferred"; reason: "no_code"; full_inventory_complete: false; files_submitted: number }
+  | { outcome: "full"; reason: "checkpoint_unsupported" | "empty_inventory";
+      /** False when an older service cannot certify inventory coverage. */
+      full_inventory_complete: boolean; committed: RemoteIndexCommitResponse };
 
 export interface RemoteWorkspaceFile {
   relativePath: string;
@@ -1882,9 +1904,12 @@ export interface IndexWorkspaceRequest extends Omit<StartRemoteIndexSessionReque
   maxConcurrentUploads?: number;
   processingTimeoutMs?: number;
   processingPollMs?: number;
+  /** Maximum admission wait per batch; defaults to 10 minutes. */
+  queueWaitTimeoutMs?: number;
   signal?: AbortSignal;
   detachSignal?: AbortSignal;
   onProgress?: (event: RemoteIndexProgressEvent) => void;
+  onCodeReady?: (status: RemoteIndexStatus) => void;
 }
 
 /** Evidence emitted only by a complete filesystem scan; a files array alone is insufficient. */
@@ -1943,6 +1968,9 @@ export interface WorkspaceCoverage {
   schema_version: "workspace-coverage/v1";
   state: "unknown" | "pending" | "verified" | "invalidated" | "unavailable" | "not_applicable";
   reason_codes: string[];
+  code_ready?: boolean;
+  documentation_pending?: boolean;
+  other_pending?: boolean;
   coverage_token?: string | null;
   session_id?: string | null;
   published_revision?: number | null;
@@ -1973,6 +2001,12 @@ export interface IndexTransferSummary {
   source_bytes_transferred: number;
   upload_attempts: number;
   source_bytes_attempted: number;
+  queue_retries?: number;
+  queue_full_responses?: number;
+  /** Cumulative measured cooldown across batches, not session wall time. */
+  queue_wait_ms?: number;
+  transport_retries?: number;
+  client_phase_timings_ms?: Record<string, number>;
   complete: boolean;
   /** Per-operation acknowledgements for authorized local cache updates; never activity telemetry. */
   acknowledged_files: Array<{ relative_path: string; sha256: string; disposition: "uploaded" | "confirmed_reused" }>;
