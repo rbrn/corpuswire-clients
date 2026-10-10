@@ -2,12 +2,13 @@
 
 import { execFile } from "node:child_process";
 import { Buffer } from "node:buffer";
-import { createHash } from "node:crypto";
-import { existsSync, watch as watchFileSystem } from "node:fs";
-import { mkdir, readdir, readFile, rename, stat, lstat, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants, existsSync, watch as watchFileSystem } from "node:fs";
+import { link, mkdir, readdir, readFile, realpath, rename, stat, lstat, open, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { planSelectedNeighbor } from "../lib/selected-neighbor.mjs";
 
 const JSONRPC_VERSION = "2.0";
 const PROTOCOL_VERSION = "2024-11-05";
@@ -32,6 +33,10 @@ const DEFAULT_SYNC_SESSION_CONFLICT_RETRY_MAX_DELAY_MS = 5000;
 const DEFAULT_SYNC_RECENT_EVENTS_LIMIT = 25;
 const DEFAULT_SYNC_LATENCY_SAMPLE_LIMIT = 20;
 const DEFAULT_SYNC_CACHE_SCHEMA_VERSION = 2;
+const PRIVATE_SEARCH_TELEMETRY_ENV = "CORPUSWIRE_PRIVATE_SEARCH_TELEMETRY_PATH";
+const PRIVATE_SEARCH_TELEMETRY_MAX_EVENTS = 1000;
+const PRIVATE_SEARCH_TELEMETRY_MAX_FILE_BYTES = 128 * 1024;
+const PRIVATE_SEARCH_TELEMETRY_PREFIX = "cw-search-timing-";
 const DIRECTORY_GLOB_PROBE = "__corpuswire_directory_probe__";
 const OUTPUT_MODES = new Set(["generic", "copilot", "claude-code", "sequential"]);
 const QUALITY_WORK_TYPES = Object.freeze([
@@ -40,12 +45,40 @@ const QUALITY_WORK_TYPES = Object.freeze([
   "review_context",
 ]);
 const QUALITY_WORK_TYPE_SET = new Set(QUALITY_WORK_TYPES);
+const QUALITY_COMPARISON_ROUNDS = new Map();
+const RETRIEVAL_FAILURE_SCHEMA = "corpuswire-retrieval-failure/v1";
+const RETRIEVAL_FAILURE_DIRECTORY = path.join("reports", "retrieval-failures");
+const MATERIAL_OVERALL_SCORE_GAP = 1;
+const MATERIAL_DIMENSION_SCORE_GAP = 2;
 const INDEX_OBSERVABILITY_SCHEMA_VERSION = "index-observability/v1";
 const INDEX_OBSERVABILITY_HEADER = "X-CorpusWire-Index-Observability";
 const INDEX_OBSERVABILITY_STAGES = new Set([
   "mcp_receipt", "server_receipt", "queue_wait", "file_discovery", "file_read",
   "filtering_hashing", "parsing_chunking", "model_wait", "embedding_batch",
   "vector_writes", "cleanup",
+]);
+const REVIEW_V2_JOB_STATES = new Set([
+  "queued", "running", "succeeded", "partial", "failed", "cancelled", "superseded",
+]);
+const REVIEW_V2_CHANGE_KINDS = new Set([
+  "added", "removed", "modified", "signature_changed", "renamed", "moved",
+  "renamed_and_moved", "unchanged_context", "ambiguous", "unresolved",
+  "unsupported_split_merge",
+]);
+const REVIEW_V2_PAIRING_STATUSES = new Set([
+  "exact_symbol_id", "exact_analyzer_declaration_id", "exact_unique_declaration_key",
+  "one_sided", "ambiguous", "unresolved", "unsupported",
+]);
+const REVIEW_V2_CONTINUITY_STATUSES = new Set([
+  "proven", "not_established", "ambiguous", "unavailable",
+]);
+const REVIEW_V2_DELTA_STATUSES = new Set([
+  "added", "removed", "preserved", "evidence_changed", "ambiguous", "unresolved",
+]);
+const REVIEW_V2_OMISSION_REASONS = new Set([
+  "required_pair_budget_exceeded",
+  "required_evidence_unavailable",
+  "required_evidence_capacity_exceeded",
 ]);
 const INDEXABLE_EXTENSIONS = new Set([
   ".md",
@@ -122,6 +155,7 @@ const EXCLUDED_PATH_SEGMENTS = new Set([
   ".ruff_cache",
   ".qdrant",
 ]);
+const PROTECTED_DIAGNOSTIC_DIRECTORY = "reports/retrieval-failures";
 const SAFE_INDEXABLE_PATHS = new Set([".vscode/mcp.json.example"]);
 const CONFIG_EXAMPLE_SUFFIXES = new Set([".json.example"]);
 
@@ -954,6 +988,11 @@ class SyncManager {
           filesUploaded: error.transfer?.files_transferred ?? null,
           transfer: error.transfer ?? null,
           code: error.code ?? null,
+          sessionId: boundedErrorMetadata(error.sessionId),
+          manifestErrors: boundedManifestErrors(error.manifestErrors),
+          manifestSkipped: Number.isSafeInteger(error.manifestSkipped)
+            ? error.manifestSkipped
+            : null,
           filesDeleted: 0,
           filesSkipped: 0,
         };
@@ -2211,7 +2250,9 @@ async function callTool(params) {
     try {
       return textToolResult(await searchContext(args));
     } catch (error) {
-      return textToolResult(formatToolError(error, "search request"), true);
+      const message = formatToolError(error, "search request");
+      const reportPath = await reportToolFailureSafely(name, args, error);
+      return textToolResult(appendFailureReportPath(message, reportPath), true);
     }
   }
   if (name === "corpuswire_review_context") {
@@ -2219,6 +2260,13 @@ async function callTool(params) {
       return textToolResult(await reviewContext(args));
     } catch (error) {
       return textToolResult(formatToolError(error, "review context request"), true);
+    }
+  }
+  if (name === "corpuswire_review_context_v2") {
+    try {
+      return textToolResult(await reviewContextV2(args));
+    } catch (error) {
+      return textToolResult(formatToolError(error, "deterministic review context request"), true);
     }
   }
   if (name === "corpuswire_codebase_status") {
@@ -2232,7 +2280,9 @@ async function callTool(params) {
     try {
       return textToolResult(await enhancePrompt(args));
     } catch (error) {
-      return textToolResult(formatToolError(error, "enhancement request"), true);
+      const message = formatToolError(error, "enhancement request");
+      const reportPath = await reportToolFailureSafely(name, args, error);
+      return textToolResult(appendFailureReportPath(message, reportPath), true);
     }
   }
   if (name === "corpuswire_rate_result") {
@@ -2602,6 +2652,50 @@ function toolDefinitions() {
             type: "boolean",
             default: true,
             description: "Poll durable work until usable or terminal when true.",
+          },
+          timeoutMs: { type: "integer", minimum: 0, default: 60000 },
+          pollIntervalMs: { type: "integer", minimum: 0, default: 1000 },
+        },
+        required: ["codebaseId", "targetRepositoryId", "providerReviewId", "objective"],
+      },
+    },
+    {
+      name: "corpuswire_review_context_v2",
+      description: "Build or poll deterministic, atomic BASE/HEAD symbol-change evidence for one code review. Model judgment remains probabilistic.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          codebaseId: { type: "string", minLength: 1, maxLength: 256, description: "Opaque Codebase identifier." },
+          targetRepositoryId: { type: "string", minLength: 1, maxLength: 256, description: "Immutable target Repository identifier." },
+          providerReviewId: { type: "string", minLength: 1, maxLength: 256, description: "Provider review or pull-request identifier." },
+          expectedHeadSha: { type: ["string", "null"], pattern: "^[0-9a-f]{40,64}$" },
+          objective: { type: "string", minLength: 1, maxLength: 16000, description: "Review objective used only to rank optional related evidence." },
+          strictFreshness: { type: "boolean", default: true },
+          budgets: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              graphHops: { type: "integer", minimum: 0, maximum: 4, default: 2 },
+              candidateRepositories: { type: "integer", minimum: 1, maximum: 100, default: 25 },
+              preRankCandidates: { type: "integer", minimum: 1, maximum: 5000, default: 500 },
+              evidenceItems: { type: "integer", minimum: 1, maximum: 500, default: 40 },
+              serializedTokens: { type: "integer", minimum: 256, maximum: 100000, default: 12000 },
+              serializedCharacters: { type: "integer", minimum: 256, maximum: 2000000, default: 200000 },
+              serializedUtf8Bytes: { type: "integer", minimum: 256, maximum: 8388608, default: 524288 },
+              waitMs: { type: "integer", minimum: 0, maximum: 60000, default: 2500 },
+            },
+          },
+          outputCharacterLimit: {
+            type: ["integer", "null"],
+            minimum: 256,
+            maximum: 2000000,
+            description: "MCP text limit. Required BASE/HEAD evidence is admitted or omitted as a whole bundle.",
+          },
+          waitForCompletion: {
+            type: "boolean",
+            default: true,
+            description: "Poll durable v2 work until usable or terminal when true.",
           },
           timeoutMs: { type: "integer", minimum: 0, default: 60000 },
           pollIntervalMs: { type: "integer", minimum: 0, default: 1000 },
@@ -3266,6 +3360,50 @@ async function reviewContext(args) {
   return formatReviewContextResult({ result, maxChars });
 }
 
+async function reviewContextV2(args) {
+  const codebaseId = requiredString(args, "codebaseId");
+  const targetRepositoryId = requiredString(args, "targetRepositoryId");
+  const providerReviewId = requiredString(args, "providerReviewId");
+  const objective = requiredString(args, "objective");
+  const expectedHeadSha = args.expectedHeadSha === null
+    ? null
+    : optionalString(args.expectedHeadSha);
+  const outputCharacterLimit = nullableBoundedInteger(
+    args.outputCharacterLimit,
+    "outputCharacterLimit",
+    256,
+    2_000_000,
+  );
+  const waitForCompletion = optionalBoolean(args.waitForCompletion, true);
+  const timeoutMs = optionalNonNegativeInteger(args.timeoutMs, 60_000);
+  const pollIntervalMs = optionalNonNegativeInteger(args.pollIntervalMs, 1_000);
+  const client = buildClient();
+  if (
+    typeof client.requestReviewContextV2 !== "function"
+    || typeof client.requestReviewContextV2AndWait !== "function"
+  ) {
+    throw new Error(
+      "@corpuswire/sdk does not expose v2 review-context methods; rebuild and re-vendor the SDK.",
+    );
+  }
+  const request = {
+    codebaseId,
+    targetRepositoryId,
+    providerReviewId,
+    expectedHeadSha,
+    objective,
+    strictFreshness: optionalBoolean(args.strictFreshness, true),
+    budgets: reviewBudgetsV2(args.budgets),
+  };
+  const result = waitForCompletion
+    ? await client.requestReviewContextV2AndWait(request, { timeoutMs, pollIntervalMs })
+    : await client.requestReviewContextV2(request);
+  return formatReviewContextResultV2({
+    result,
+    maxChars: outputCharacterLimit ?? 200_000,
+  });
+}
+
 async function codebaseStatus(args) {
   const codebaseId = requiredString(args, "codebaseId");
   const reviewId = optionalString(args.reviewId);
@@ -3344,6 +3482,50 @@ function reviewBudgets(value) {
   });
 }
 
+function reviewBudgetsV2(value) {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (!isRecord(value)) {
+    throw new JsonRpcError(-32602, "Invalid params: budgets must be an object.");
+  }
+  return removeUndefinedValues({
+    graphHops: optionalBoundedInteger(value.graphHops, "graphHops", 0, 4),
+    candidateRepositories: optionalBoundedInteger(
+      value.candidateRepositories,
+      "candidateRepositories",
+      1,
+      100,
+    ),
+    preRankCandidates: optionalBoundedInteger(
+      value.preRankCandidates,
+      "preRankCandidates",
+      1,
+      5_000,
+    ),
+    evidenceItems: optionalBoundedInteger(value.evidenceItems, "evidenceItems", 1, 500),
+    serializedTokens: optionalBoundedInteger(
+      value.serializedTokens,
+      "serializedTokens",
+      256,
+      100_000,
+    ),
+    serializedCharacters: optionalBoundedInteger(
+      value.serializedCharacters,
+      "serializedCharacters",
+      256,
+      2_000_000,
+    ),
+    serializedUtf8Bytes: optionalBoundedInteger(
+      value.serializedUtf8Bytes,
+      "serializedUtf8Bytes",
+      256,
+      8_388_608,
+    ),
+    waitMs: optionalBoundedInteger(value.waitMs, "waitMs", 0, 60_000),
+  });
+}
+
 function formatReviewContextResult({ result, maxChars }) {
   if (!isRecord(result)) {
     throw new Error("CorpusWire returned an invalid review-context result.");
@@ -3401,6 +3583,408 @@ function formatReviewContextResult({ result, maxChars }) {
     lines.push("- none");
   }
   return truncateText(lines.join("\n"), maxChars);
+}
+
+function formatReviewContextResultV2({ result, maxChars }) {
+  if (!isRecord(result)) {
+    throw new Error("CorpusWire returned an invalid v2 review-context result.");
+  }
+  if (result.schema_version !== "review-context/v2") {
+    throw new Error(
+      `CorpusWire returned unsupported v2 review schema: ${String(result.schema_version ?? "missing")}.`,
+    );
+  }
+  if (typeof sdk.assertReviewContextV2Result !== "function") {
+    throw new Error(
+      "@corpuswire/sdk does not expose exhaustive v2 review validation; rebuild and re-vendor the SDK.",
+    );
+  }
+  sdk.assertReviewContextV2Result(result);
+  if (typeof result.state === "string" && typeof result.job_id === "string") {
+    if (result.contract_version !== "review-context/v2") {
+      throw new Error(
+        `CorpusWire returned unsupported v2 job contract: ${String(result.contract_version ?? "missing")}.`,
+      );
+    }
+    if (!REVIEW_V2_JOB_STATES.has(result.state)) {
+      throw new Error(`CorpusWire returned unsupported v2 job state: ${result.state}.`);
+    }
+    if (
+      !Array.isArray(result.partial_reasons)
+      || !result.partial_reasons.every(isReviewContextV2PartialReason)
+    ) {
+      throw new Error("CorpusWire returned malformed v2 job partial reasons.");
+    }
+    const reasons = result.partial_reasons.map((reason) => (
+      `${reason.code}:${reason.affected_side}:retryable=${reason.retryable}`
+    ));
+    const full = [
+      "CorpusWire deterministic review context v2 job:",
+      `- jobId: ${result.job_id}`,
+      `- requestId: ${result.request_id ?? "unknown"}`,
+      `- codebaseId: ${result.codebase_id ?? "unknown"}`,
+      `- repositorySetId: ${result.repository_set_id ?? "unknown"}`,
+      `- state: ${result.state}`,
+      `- attempts: ${result.attempts ?? 0}`,
+      `- statusUrl: ${result.status_url ?? "unknown"}`,
+      `- retryAfterSeconds: ${result.retry_after_seconds ?? "none"}`,
+      `- partialReasons: ${reasons.join(", ") || "none"}`,
+      "- guarantee: evidence construction is deterministic; model judgment remains probabilistic.",
+    ].join("\n");
+    if (full.length <= maxChars) {
+      return full;
+    }
+    const mandatory = [
+      "CorpusWire v2 job:",
+      `- state: ${result.state}`,
+      `- partialReasons: ${reasons.join(", ") || "none"}`,
+      "- judgment: deterministic evidence; probabilistic model conclusions.",
+    ].join("\n");
+    if (mandatory.length > maxChars) {
+      throw new Error(
+        `outputCharacterLimit is too small for mandatory v2 job state metadata; required=${mandatory.length}.`,
+      );
+    }
+    const jobLine = `- jobId: ${result.job_id}`;
+    return mandatory.length + jobLine.length + 1 <= maxChars
+      ? `${mandatory}\n${jobLine}`
+      : mandatory;
+  }
+
+  if (!Array.isArray(result.bundles) || !result.bundles.every(isReviewContextV2Bundle)) {
+    throw new Error("CorpusWire returned malformed v2 atomic bundle evidence.");
+  }
+  if (
+    !Array.isArray(result.omitted_bundles)
+    || !result.omitted_bundles.every(isReviewContextV2Omission)
+  ) {
+    throw new Error("CorpusWire returned malformed v2 omission metadata.");
+  }
+  if (
+    !["exact", "partial"].includes(result.freshness)
+    || result.base_artifact_contract_version !== "snapshot-artifacts/v2"
+    || result.artifact_contract_version !== "review-artifacts/v2"
+    || !Array.isArray(result.partial_reasons)
+    || !result.partial_reasons.every(isReviewContextV2PartialReason)
+    || (result.retry_guidance !== null && typeof result.retry_guidance !== "string")
+  ) {
+    throw new Error("CorpusWire returned malformed v2 response provenance or partial state.");
+  }
+  const bundles = result.bundles;
+  const serverOmissions = result.omitted_bundles;
+  const bundleBlocks = bundles.map(formatReviewContextV2BundleBlock);
+  const localOmissions = bundles.map(reviewContextV2LocalOmission);
+  const serverOmissionLines = serverOmissions.map((omission) => (
+    formatReviewContextV2OmissionLine("server", omission)
+  ));
+  const localOmissionLines = localOmissions.map((omission) => (
+    formatReviewContextV2OmissionLine("mcp", omission)
+  ));
+  const admittedIndexes = [];
+  const admittedMask = new Uint8Array(bundles.length);
+  let admittedCharacters = 0;
+  let localOmissionCharacters = sumStringLengths(localOmissionLines);
+  const serverOmissionCharacters = sumStringLengths(serverOmissionLines);
+
+  let renderedLength = reviewContextV2RenderedLength({
+    result,
+    admittedCount: 0,
+    admittedCharacters,
+    serverOmissionCount: serverOmissionLines.length,
+    serverOmissionCharacters,
+    localOmissionCount: localOmissionLines.length,
+    localOmissionCharacters,
+  });
+  if (renderedLength <= maxChars) {
+    for (let index = 0; index < bundles.length; index += 1) {
+      const nextLength = reviewContextV2RenderedLength({
+        result,
+        admittedCount: admittedIndexes.length + 1,
+        admittedCharacters: admittedCharacters + bundleBlocks[index].length,
+        serverOmissionCount: serverOmissionLines.length,
+        serverOmissionCharacters,
+        localOmissionCount: bundles.length - admittedIndexes.length - 1,
+        localOmissionCharacters: localOmissionCharacters - localOmissionLines[index].length,
+      });
+      if (nextLength > maxChars) continue;
+      admittedIndexes.push(index);
+      admittedMask[index] = 1;
+      admittedCharacters += bundleBlocks[index].length;
+      localOmissionCharacters -= localOmissionLines[index].length;
+      renderedLength = nextLength;
+    }
+    return renderReviewContextV2({
+      result,
+      admittedBlocks: admittedIndexes.map((index) => bundleBlocks[index]),
+      serverOmissionLines,
+      localOmissionLines: localOmissionLines.filter((_, index) => admittedMask[index] === 0),
+    });
+  }
+  const mandatory = formatMandatoryReviewContextV2Omissions(
+    result,
+    serverOmissions,
+    localOmissions,
+  );
+  if (mandatory.length > maxChars) {
+    throw new Error(
+      `outputCharacterLimit is too small for mandatory v2 omission metadata; required=${mandatory.length}.`,
+    );
+  }
+  return mandatory;
+}
+
+function formatReviewContextV2BundleBlock(bundle) {
+  return [
+    `## Bundle ${bundle.ordinal}`,
+    "```json",
+    JSON.stringify(bundle, null, 2),
+    "```",
+  ].join("\n");
+}
+
+function reviewContextV2LocalOmission(bundle) {
+  const record = bundle.change_record;
+  const omittedSides = [];
+  if (record.base !== null && record.base !== undefined) omittedSides.push("base");
+  if (record.head !== null && record.head !== undefined) omittedSides.push("head");
+  if (bundle.related_evidence.length > 0) omittedSides.push("related");
+  return {
+    schema_version: "review-context/v2",
+    change_id: record.change_id,
+    ordinal: bundle.ordinal,
+    change_kind: record.change_kind,
+    pairing_status: record.pairing_status,
+    reason: "mcp_output_character_limit",
+    omitted_sides: omittedSides,
+    minimum_required_budget: null,
+    model_evidence_available: false,
+  };
+}
+
+function formatReviewContextV2OmissionLine(source, omission) {
+  return `- ${source} ${JSON.stringify(omission)}`;
+}
+
+function sumStringLengths(values) {
+  return values.reduce((total, value) => total + value.length, 0);
+}
+
+function joinedStringLength(count, characterCount, emptyValue) {
+  return count === 0 ? emptyValue.length : characterCount + count - 1;
+}
+
+function reviewContextV2RenderedLength({
+  result,
+  admittedCount,
+  admittedCharacters,
+  serverOmissionCount,
+  serverOmissionCharacters,
+  localOmissionCount,
+  localOmissionCharacters,
+}) {
+  const header = reviewContextV2Header({
+    result,
+    admittedCount,
+    localOmissionCount,
+    serverOmissionCount,
+  });
+  const omissionCount = serverOmissionCount + localOmissionCount;
+  const omissionCharacters = serverOmissionCharacters + localOmissionCharacters;
+  return header.length
+    + "\n\nAtomic change bundles:\n".length
+    + joinedStringLength(admittedCount, admittedCharacters, "- none")
+    + "\n\nOmission metadata:\n".length
+    + joinedStringLength(omissionCount, omissionCharacters, "- none");
+}
+
+function isReviewContextV2Bundle(value) {
+  if (
+    !isRecord(value)
+    || value.schema_version !== "review-context/v2"
+    || !Number.isInteger(value.ordinal)
+  ) {
+    return false;
+  }
+  const record = value.change_record;
+  if (
+    !isRecord(record)
+    || record.schema_version !== "review-context/v2"
+    || typeof record.change_id !== "string"
+    || !record.change_id
+    || !REVIEW_V2_CHANGE_KINDS.has(record.change_kind)
+    || !REVIEW_V2_PAIRING_STATUSES.has(record.pairing_status)
+    || !REVIEW_V2_CONTINUITY_STATUSES.has(record.continuity_status)
+    || !Array.isArray(record.relationship_deltas)
+    || !record.relationship_deltas.every(isReviewContextV2RelationshipDelta)
+  ) {
+    return false;
+  }
+  for (const [side, instance, evidence] of [
+    ["base", record.base, value.base_evidence],
+    ["head", record.head, value.head_evidence],
+  ]) {
+    const sidePresent = instance !== null && instance !== undefined;
+    if (sidePresent !== (evidence !== null && evidence !== undefined)) {
+      return false;
+    }
+    if (!sidePresent) continue;
+    if (
+      !isRecord(instance)
+      || instance.schema_version !== "review-context/v2"
+      || typeof instance.symbol_instance_id !== "string"
+      || !isRecord(evidence)
+      || evidence.schema_version !== "review-context/v2"
+      || evidence.side !== side
+      || evidence.symbol_instance_id !== instance.symbol_instance_id
+    ) return false;
+  }
+  return isRecord(value.completeness)
+    && value.completeness.schema_version === "review-context/v2"
+    && value.completeness.required_sides_complete === true
+    && Array.isArray(value.related_evidence)
+    && value.related_evidence.every((item) => (
+      isRecord(item) && item.schema_version === "review-context/v2"
+    ));
+}
+
+function isReviewContextV2Omission(value) {
+  if (!(isRecord(value)
+    && value.schema_version === "review-context/v2"
+    && typeof value.change_id === "string"
+    && value.change_id.length > 0
+    && Number.isInteger(value.ordinal)
+    && REVIEW_V2_CHANGE_KINDS.has(value.change_kind)
+    && REVIEW_V2_PAIRING_STATUSES.has(value.pairing_status)
+    && REVIEW_V2_OMISSION_REASONS.has(value.reason)
+    && Array.isArray(value.omitted_sides)
+    && value.omitted_sides.every((side) => ["base", "head", "related"].includes(side))
+    && value.model_evidence_available === false)) return false;
+  const budgetCaused = value.reason === "required_pair_budget_exceeded";
+  return budgetCaused
+    ? isReviewContextV2MinimumBudget(value.minimum_required_budget)
+    : value.minimum_required_budget === null;
+}
+
+function isReviewContextV2MinimumBudget(value) {
+  return isRecord(value)
+    && value.schema_version === "review-context/v2"
+    && [value.evidence_items, value.tokens, value.characters, value.utf8_bytes]
+      .every((item) => Number.isInteger(item) && item > 0);
+}
+
+function isReviewContextV2RelationshipDelta(value) {
+  if (
+    !isRecord(value)
+    || value.schema_version !== "review-context/v2"
+    || !REVIEW_V2_DELTA_STATUSES.has(value.status)
+    || !["incoming", "outgoing"].includes(value.direction)
+  ) return false;
+  for (const fact of [value.base_fact, value.head_fact]) {
+    if (fact === null || fact === undefined) continue;
+    if (
+      !isRecord(fact)
+      || fact.schema_version !== "review-context/v2"
+      || !["resolved", "unresolved"].includes(fact.fact_type)
+      || fact.direction !== value.direction
+      || !["snapshot", "overlay"].includes(fact.layer)
+    ) return false;
+  }
+  return true;
+}
+
+function isReviewContextV2PartialReason(value) {
+  return isRecord(value)
+    && value.schema_version === "review-context/v2"
+    && typeof value.code === "string"
+    && value.code.length > 0
+    && typeof value.retryable === "boolean"
+    && ["base", "head", "both", "graph", "response"].includes(value.affected_side);
+}
+
+function formatMandatoryReviewContextV2Omissions(result, serverOmissions, localOmissions) {
+  const scope = asRecord(result.review_scope);
+  const lines = [
+    "CorpusWire deterministic v2 response:",
+    `- requestId=${result.request_id ?? "unknown"} reviewId=${result.review_id ?? "unknown"}`,
+    `- repositorySetId=${scope.repository_set_id ?? "unknown"}`,
+    `- normalizedDiffHash=${result.normalized_diff_hash ?? "unknown"}`,
+    `- partial=${result.partial ?? false} reasons=${JSON.stringify(result.partial_reasons)}`,
+    `- retryGuidance=${JSON.stringify(result.retry_guidance)}`,
+    "Atomic omissions:",
+  ];
+  for (const omission of serverOmissions) {
+    lines.push(formatReviewContextV2OmissionLine("server", omission));
+  }
+  for (const omission of localOmissions) {
+    lines.push(formatReviewContextV2OmissionLine("mcp", omission));
+  }
+  if (serverOmissions.length === 0 && localOmissions.length === 0) {
+    lines.push("- none");
+  }
+  return lines.join("\n");
+}
+
+function reviewContextV2Header({
+  result,
+  admittedCount,
+  localOmissionCount,
+  serverOmissionCount,
+}) {
+  const scope = asRecord(result.review_scope);
+  return [
+    "CorpusWire deterministic symbol-change evidence v2:",
+    `- requestId: ${result.request_id ?? "unknown"}`,
+    `- telemetryId: ${result.telemetry_id ?? "unknown"}`,
+    `- jobId: ${result.job_id ?? "none"}`,
+    `- reviewId: ${result.review_id ?? "unknown"}`,
+    `- targetRepositoryId: ${result.target_repository_id ?? "unknown"}`,
+    `- repositorySetId: ${scope.repository_set_id ?? "unknown"}`,
+    `- repositorySelectionDigest: ${scope.repository_selection_digest ?? "unknown"}`,
+    `- baseSha: ${result.base_sha ?? "unknown"}`,
+    `- headSha: ${result.head_sha ?? "unknown"}`,
+    `- baseSnapshot: ${result.base_snapshot_id ?? "unknown"}@${result.base_snapshot_generation ?? "unknown"}`
+      + ` refresh=${result.base_snapshot_refresh_sequence ?? "unknown"}`,
+    `- baseBuild: ${result.base_artifact_contract_version ?? "unknown"}`
+      + ` builder=${result.base_snapshot_builder_version ?? "unknown"}`
+      + ` policy=${result.base_build_policy_digest ?? "unknown"}`,
+    `- overlay: ${result.overlay_id ?? "unknown"}@${result.overlay_generation ?? "unknown"}`
+      + ` refresh=${result.overlay_refresh_sequence ?? "unknown"}`,
+    `- overlayBuild: ${result.artifact_contract_version ?? "unknown"}`
+      + ` builder=${result.evidence_builder_version ?? "unknown"}`
+      + ` policy=${result.overlay_build_policy_digest ?? "unknown"}`,
+    `- normalizedDiffHash: ${result.normalized_diff_hash ?? "unknown"}`,
+    `- freshness: ${result.freshness ?? "unknown"}`,
+    `- partial: ${result.partial ?? false}`,
+    `- partialReasons: ${JSON.stringify(result.partial_reasons)}`,
+    `- retryGuidance: ${JSON.stringify(result.retry_guidance)}`,
+    `- serializedCounts: tokens=${result.serialized_token_count ?? "unknown"}`
+      + ` characters=${result.serialized_character_count ?? "unknown"}`
+      + ` utf8Bytes=${result.serialized_utf8_byte_count ?? "unknown"}`,
+    `- serverBundles: ${result.bundles.length}`,
+    `- serverOmittedBundles: ${serverOmissionCount}`,
+    `- mcpAdmittedBundles: ${admittedCount}`,
+    `- mcpOmittedBundles: ${localOmissionCount}`,
+    "- guarantee: each serialized bundle is atomic; a required BASE/HEAD side is never truncated or emitted alone.",
+    "- judgment: evidence construction is deterministic; language-model conclusions remain probabilistic.",
+  ].join("\n");
+}
+
+function renderReviewContextV2({
+  result,
+  admittedBlocks,
+  serverOmissionLines,
+  localOmissionLines,
+}) {
+  const header = reviewContextV2Header({
+    result,
+    admittedCount: admittedBlocks.length,
+    localOmissionCount: localOmissionLines.length,
+    serverOmissionCount: serverOmissionLines.length,
+  });
+  const bundles = admittedBlocks.length > 0 ? admittedBlocks.join("\n") : "- none";
+  const omissionLines = [...serverOmissionLines, ...localOmissionLines];
+  const omissions = omissionLines.length > 0 ? omissionLines.join("\n") : "- none";
+  return `${header}\n\nAtomic change bundles:\n${bundles}\n\nOmission metadata:\n${omissions}`;
 }
 
 function formatReviewEvidence(item, ordinal, remaining) {
@@ -3558,7 +4142,282 @@ function nullableBoundedInteger(value, name, minimum, maximum) {
   return optionalBoundedInteger(value, name, minimum, maximum);
 }
 
-async function searchContext(args) {
+const SELECTED_NEIGHBOR_MAX_FILE_BYTES = 1024 * 1024;
+
+let privateSearchTelemetryQueue = Promise.resolve();
+
+function searchTimingMs(start) {
+  return Math.round(Number(process.hrtime.bigint() - start) / 1000) / 1000;
+}
+
+function privateSearchTelemetryState() {
+  const target = process.env[PRIVATE_SEARCH_TELEMETRY_ENV];
+  if (typeof target !== "string" || !target.startsWith("/private/tmp/")) return null;
+  return {
+    target, started: process.hrtime.bigint(), backendQueryRawMs: null,
+    selectedNeighborEntered: false, selectedNeighborEntryMs: null,
+    selectedNeighborMs: null, selectedNeighborSourceReadMs: null,
+    selectedNeighborProposalMs: null, treatmentProduced: false,
+  };
+}
+
+async function privateSearchTelemetryWrite(state, totalHandlerMs, outcome) {
+  const target = state.target;
+  const resolved = await realpath(target);
+  if (!resolved.startsWith("/private/tmp/") || resolved === "/private/tmp/") return;
+  const info = await lstat(target);
+  if (info.isSymbolicLink() || (typeof process.getuid === "function"
+    && info.uid !== process.getuid())) return;
+  const event = {
+    schema_version: "rqt110g-search-timing/v1",
+    totalHandlerMs,
+    backendQueryRawMs: state.backendQueryRawMs,
+    selectedNeighborEntered: state.selectedNeighborEntered,
+    selectedNeighborEntryMs: state.selectedNeighborEntryMs,
+    selectedNeighborMs: state.selectedNeighborMs,
+    selectedNeighborSourceReadMs: state.selectedNeighborSourceReadMs,
+    selectedNeighborProposalMs: state.selectedNeighborProposalMs,
+    treatmentProduced: state.treatmentProduced,
+    outcome,
+  };
+  const line = `${JSON.stringify(event)}\n`;
+  if (Buffer.byteLength(line, "utf8") > 512) return;
+  const directory = info.isDirectory();
+  if (directory) {
+    if ((info.mode & 0o777) !== 0o700) return;
+  } else if (info.isFile()) {
+    const parentInfo = await lstat(path.dirname(target));
+    if ((info.mode & 0o777) !== 0o600 || !parentInfo.isDirectory()
+      || parentInfo.isSymbolicLink() || (parentInfo.mode & 0o777) !== 0o700
+      || (typeof process.getuid === "function" && parentInfo.uid !== process.getuid())) return;
+  } else return;
+  const parent = directory ? target : path.dirname(target);
+  const temp = path.join(parent, `.${PRIVATE_SEARCH_TELEMETRY_PREFIX}${randomUUID()}.tmp`);
+  const lockPath = directory ? null : `${target}.lock`;
+  let lockHandle;
+  let handle;
+  try {
+    let body = line;
+    if (!directory) {
+      try {
+        lockHandle = await open(lockPath, fsConstants.O_WRONLY | fsConstants.O_CREAT
+          | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+        await lockHandle.chmod(0o600);
+      } catch (error) {
+        if (error?.code === "EEXIST") return;
+        throw error;
+      }
+      if (info.size > PRIVATE_SEARCH_TELEMETRY_MAX_FILE_BYTES) return;
+      const previous = await readFile(target, "utf8");
+      const rows = previous.trimEnd() ? previous.trimEnd().split("\n") : [];
+      if (rows.length >= PRIVATE_SEARCH_TELEMETRY_MAX_EVENTS
+        || rows.some((row) => {
+          try { return JSON.parse(row).schema_version !== "rqt110g-search-timing/v1"; }
+          catch { return true; }
+        })) return;
+      body = previous + line;
+      if (Buffer.byteLength(body, "utf8") > PRIVATE_SEARCH_TELEMETRY_MAX_FILE_BYTES) return;
+    }
+    handle = await open(temp, fsConstants.O_WRONLY | fsConstants.O_CREAT
+      | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    await handle.chmod(0o600);
+    await handle.writeFile(body, "utf8");
+    await handle.close();
+    handle = null;
+    if (directory) {
+      for (let slot = 0; slot < PRIVATE_SEARCH_TELEMETRY_MAX_EVENTS; slot += 1) {
+        const final = path.join(target,
+          `${PRIVATE_SEARCH_TELEMETRY_PREFIX}${String(slot).padStart(4, "0")}.json`);
+        try {
+          await link(temp, final);
+          break;
+        } catch (error) {
+          if (error?.code !== "EEXIST") throw error;
+        }
+      }
+    } else await rename(temp, target);
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+    await unlink(temp).catch(() => {});
+    if (lockHandle) {
+      await lockHandle.close().catch(() => {});
+      await unlink(lockPath).catch(() => {});
+    }
+  }
+}
+
+async function writePrivateSearchTelemetrySafely(state, totalHandlerMs, outcome) {
+  if (!state) return;
+  const next = privateSearchTelemetryQueue.then(
+    () => privateSearchTelemetryWrite(state, totalHandlerMs, outcome),
+  ).catch(() => {});
+  privateSearchTelemetryQueue = next;
+  await next;
+}
+
+function selectedNeighborSourcePath(value) {
+  if (typeof value !== "string" || !value || value.startsWith("/")
+    || value.includes("\\") || value.includes("\0")) return null;
+  const parts = value.split("/");
+  return parts.some((part) => !part || part === "." || part === "..") ? null : parts;
+}
+
+async function readSelectedNeighborSource(root, relativePath, expectedHash) {
+  const parts = selectedNeighborSourcePath(relativePath);
+  if (!parts || typeof expectedHash !== "string" || !/^[0-9a-f]{64}$/.test(expectedHash)) {
+    return null;
+  }
+  const rootInfo = await lstat(root);
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) return null;
+  let current = root;
+  for (const [index, part] of parts.entries()) {
+    current = path.join(current, part);
+    const info = await lstat(current);
+    if (info.isSymbolicLink()) return null;
+    if (index < parts.length - 1 && !info.isDirectory()) return null;
+    if (index === parts.length - 1
+      && (!info.isFile() || info.size > SELECTED_NEIGHBOR_MAX_FILE_BYTES)) return null;
+  }
+  if (typeof fsConstants.O_NOFOLLOW !== "number") return null;
+  const handle = await open(current, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let bytes;
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.size > SELECTED_NEIGHBOR_MAX_FILE_BYTES) return null;
+    const chunks = [];
+    let offset = 0;
+    while (true) {
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, SELECTED_NEIGHBOR_MAX_FILE_BYTES + 1 - offset));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+      if (offset > SELECTED_NEIGHBOR_MAX_FILE_BYTES) return null;
+      chunks.push(buffer.subarray(0, bytesRead));
+    }
+    bytes = Buffer.concat(chunks, offset);
+  } finally {
+    await handle.close();
+  }
+  if (createHash("sha256").update(bytes).digest("hex") !== expectedHash) return null;
+  const source = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  if (!Buffer.from(source, "utf8").equals(bytes)
+    || /[\r\u000b\f\u0085\u2028\u2029]/u.test(source)) return null;
+  return source;
+}
+
+function selectedNeighborDelivered(observed, sourceTexts) {
+  if (observed.length === 0 || observed.length > 5) return null;
+  const runs = [];
+  const completeLines = new Set();
+  let excerptChars = 0;
+  for (const { hit, formatted } of observed) {
+    const metadata = asRecord(hit?.metadata);
+    const sourcePath = metadata.source_path;
+    const sourceHash = metadata.source_hash;
+    const source = sourceTexts.get(sourcePath);
+    const match = /^(\d+)-(\d+)$/.exec(formatted.renderedLineRange ?? "");
+    if (typeof source !== "string" || !match || !verifiedDisplayLines(hit)
+      || createHash("sha256").update(source, "utf8").digest("hex") !== sourceHash) return null;
+    const startLine = Number(match[1]);
+    const endLine = Number(match[2]);
+    const physical = source.split("\n");
+    if (source.endsWith("\n")) physical.pop();
+    if (!Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine)
+      || startLine < 1 || endLine < startLine || endLine > physical.length) return null;
+    const exact = physical.slice(startLine - 1, endLine).join("\n");
+    if (formatted.snippet !== exact) return null;
+    excerptChars += exact.length;
+    for (let line = startLine; line <= endLine; line += 1) {
+      completeLines.add(JSON.stringify([sourcePath, sourceHash, line, physical[line - 1]]));
+    }
+    runs.push({ chunkId: hit.chunk_id, startLine, endLine, text: exact });
+  }
+  return { runs, completeLines, excerptChars };
+}
+
+async function selectedNeighborResult({ formatInput, formatted, deliveredControl, telemetry, maxRadius }) {
+  const neighborStarted = telemetry ? process.hrtime.bigint() : null;
+  if (telemetry) {
+    telemetry.selectedNeighborEntered = true;
+    telemetry.selectedNeighborEntryMs = searchTimingMs(telemetry.started);
+  }
+  try {
+  const { result, context, hits, workspaceId, topK, maxChars, query } = formatInput;
+  const rootRaw = optionalString(process.env.CORPUSWIRE_SELECTED_NEIGHBOR_ROOT
+    ?? process.env.CORPUSWIRE_SYNC_ROOT);
+  if (optionalString(result.retrieval_evidence_policy) !== "generic-v2"
+    || !workspaceId || context.workspace_id !== workspaceId
+    || topK !== 5 || maxChars > 12_000 || hits.length < 1 || hits.length > 5
+    || !rootRaw || !path.isAbsolute(rootRaw)) return formatted;
+  try {
+    const root = path.resolve(rootRaw);
+    const sourceTexts = new Map();
+    let generation = null;
+    let scopedPublication = null;
+    const sourceReadStarted = telemetry ? process.hrtime.bigint() : null;
+    try {
+    for (const hit of hits) {
+      const metadata = asRecord(hit?.metadata);
+      if (!Number.isInteger(metadata.source_generation)
+        || metadata.source_generation < 1) return formatted;
+      const scoped = metadata.index_scope !== null && metadata.index_scope !== undefined;
+      if (scopedPublication !== null && scopedPublication !== scoped) return formatted;
+      scopedPublication = scoped;
+      if (scoped) {
+        if (generation !== null && metadata.source_generation !== generation) return formatted;
+        generation = metadata.source_generation;
+      }
+      const sourcePath = metadata.source_path;
+      const sourceHash = metadata.source_hash;
+      if (sourceTexts.has(sourcePath)) {
+        if (createHash("sha256").update(sourceTexts.get(sourcePath), "utf8").digest("hex")
+          !== sourceHash) return formatted;
+        continue;
+      }
+      const source = await readSelectedNeighborSource(root, sourcePath, sourceHash);
+      if (source === null) return formatted;
+      sourceTexts.set(sourcePath, source);
+    }
+    } finally {
+      if (telemetry) telemetry.selectedNeighborSourceReadMs = searchTimingMs(sourceReadStarted);
+    }
+    const control = selectedNeighborDelivered(deliveredControl, sourceTexts);
+    if (!control || control.excerptChars > maxChars) return formatted;
+    const proposalStarted = telemetry ? process.hrtime.bigint() : null;
+    const proposal = planSelectedNeighbor({
+      baselineHits: hits,
+      deliveredRuns: control.runs,
+      sourceTexts,
+      query,
+      maxChars,
+      generation,
+      maxRadius,
+    });
+    if (telemetry) telemetry.selectedNeighborProposalMs = searchTimingMs(proposalStarted);
+    if (!proposal.usedNeighbor || !Array.isArray(proposal.hits)
+      || proposal.hits.length > 5) return formatted;
+    const deliveredTreatment = [];
+    const treatment = formatSearchResult({
+      ...formatInput,
+      hits: proposal.hits,
+      onRenderedHit: (item) => deliveredTreatment.push(item),
+    });
+    const treated = selectedNeighborDelivered(deliveredTreatment, sourceTexts);
+    if (!treated || treated.excerptChars > maxChars
+      || [...control.completeLines].some((line) => !treated.completeLines.has(line))) {
+      return formatted;
+    }
+    if (telemetry) telemetry.treatmentProduced = true;
+    return treatment;
+  } catch {
+    return formatted;
+  }
+  } finally {
+    if (telemetry) telemetry.selectedNeighborMs = searchTimingMs(neighborStarted);
+  }
+}
+
+async function searchContextCore(args, telemetry) {
   const query = requiredString(args, "query");
   const topK = optionalPositiveInteger(args.topK ?? process.env.CORPUSWIRE_TOP_K, DEFAULT_TOP_K);
   const minScore = optionalScore(args.minScore ?? process.env.CORPUSWIRE_MIN_SCORE);
@@ -3582,14 +4441,29 @@ async function searchContext(args) {
     includeAnswer: false,
     sourceFilter,
   };
-  const response = typeof client.queryRaw === "function"
-    ? await client.queryRaw(request)
-    : { result: await client.query(request), context: {} };
+  let response;
+  if (typeof client.queryRaw === "function") {
+    const queryStarted = telemetry ? process.hrtime.bigint() : null;
+    try {
+      response = await client.queryRaw(request);
+    } finally {
+      if (telemetry) telemetry.backendQueryRawMs = searchTimingMs(queryStarted);
+    }
+  } else {
+    response = { result: await client.query(request), context: {} };
+  }
   const result = response.result ?? response;
   const context = response.context ?? {};
   const hits = Array.isArray(result.retrieved_chunks) ? result.retrieved_chunks : [];
 
-  return formatSearchResult({
+  // The personal local default is v2; explicit off/unknown values retain the
+  // original renderer and provide an immediate per-host rollback.
+  const selectedNeighborPolicy = process.env.CORPUSWIRE_SELECTED_NEIGHBOR_POLICY
+    || "selected-neighbor-v2";
+  const observeNeighbor = selectedNeighborPolicy === "selected-neighbor-v1"
+    || selectedNeighborPolicy === "selected-neighbor-v2";
+  const deliveredControl = [];
+  const formatInput = {
     baseUrl: client.baseUrl,
     query,
     repoPath,
@@ -3601,7 +4475,54 @@ async function searchContext(args) {
     context,
     hits,
     readPreparation,
+  };
+  const formatted = formatSearchResult({
+    ...formatInput,
+    ...(observeNeighbor ? { onRenderedHit: (item) => deliveredControl.push(item) } : {}),
   });
+  const delivered = observeNeighbor
+    ? await selectedNeighborResult({
+      formatInput, formatted, deliveredControl, telemetry,
+      maxRadius: selectedNeighborPolicy === "selected-neighbor-v2" ? 20 : 8,
+    })
+    : formatted;
+  const failureMode = searchFailureMode({ result, hits, readPreparation });
+  if (!failureMode) {
+    return delivered;
+  }
+  const failureReportPath = await writeRetrievalFailureReportSafely({
+    workspaceId: workspaceId ?? optionalString(context.workspace_id),
+    workType: "semantic_retrieval",
+    toolName: "corpuswire_search",
+    query,
+    roundId: optionalString(args.roundId),
+    failureMode,
+    scores: { corpuswire: { status: "not_rated" }, augment: { status: "not_compared" } },
+    resultPaths: retrievedSourcePaths(hits),
+    details: {
+      hitCount: hits.length,
+      retrievalNotFound: result.retrieval_not_found === true,
+      readNeedsReconcile: readPreparation?.freshness?.needsReconcile === true,
+      retrievalConfidence: finiteScore(result.retrieval_confidence),
+    },
+  });
+  return appendFailureReportPath(delivered, failureReportPath);
+}
+
+async function searchContext(args) {
+  const telemetry = privateSearchTelemetryState();
+  let outcome = "ok";
+  try {
+    return await searchContextCore(args, telemetry);
+  } catch (error) {
+    outcome = "error";
+    throw error;
+  } finally {
+    if (telemetry) {
+      const totalHandlerMs = searchTimingMs(telemetry.started);
+      await writePrivateSearchTelemetrySafely(telemetry, totalHandlerMs, outcome);
+    }
+  }
 }
 
 async function health() {
@@ -4175,7 +5096,7 @@ function formatIndexActivity({ baseUrl, workspaceId, collection, windowHours, li
   return lines.join("\n");
 }
 
-function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minScore, maxChars, result, context, hits, readPreparation }) {
+function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minScore, maxChars, result, context, hits, readPreparation, onRenderedHit }) {
   const index = asRecord(context.index);
   const retrievalWarning = optionalString(result.retrieval_warning);
   const lines = [
@@ -4218,27 +5139,104 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minSc
   }
 
   const packets = Array.isArray(result.agent_context_packets) ? result.agent_context_packets : [];
+  if (optionalString(result.retrieval_evidence_policy) !== "generic-v2") {
+    if (packets.length > 0) {
+      lines.push("", "Agent context packets:");
+      for (const packet of packets) {
+        lines.push(formatAgentContextPacket(packet));
+      }
+    }
+    lines.push("", "Hits:");
+    let remainingChars = maxChars;
+    for (const [index, hit] of hits.entries()) {
+      const formatted = formatLegacySearchHit(hit, index + 1, remainingChars);
+      lines.push(formatted.text);
+      remainingChars = formatted.remainingChars;
+      if (remainingChars <= 0 && index < hits.length - 1) {
+        lines.push(`\nResponse truncated before ${hits.length - index - 1} additional hit(s). Increase maxChars to include more text.`);
+        break;
+      }
+    }
+    if (Array.isArray(result.citations) && result.citations.length > 0) {
+      lines.push("", "Citations:", ...result.citations.map((citation) => `- ${citation}`));
+    }
+    return lines.join("\n");
+  }
+
+  let remainingChars = maxChars;
+  let renderedHitCount = 0;
+  let incompleteHitCount = 0;
+  const renderedHits = [];
+  const deliveredCitations = new Set();
+  const deliveredLineRanges = new Map();
+  const excerptLength = (hit) => searchHitDisplayText(hit).length;
+  const selectedExcerptChars = hits.reduce((sum, hit) => sum + excerptLength(hit), 0);
+  const priorityTailChars = hits.slice(1, 3).reduce((sum, hit) => sum + excerptLength(hit), 0);
+  const anchorSourcePath = asRecord(hits[0]?.metadata).source_path;
+  const priorityTailRepeatsAnchor = hits.slice(1, 3).some(
+    (hit) => asRecord(hit.metadata).source_path === anchorSourcePath,
+  );
+  const minimumAnchorChars = Math.min(excerptLength(hits[0]), Math.floor(maxChars * 0.2));
+  // Keep the anchor present, but avoid letting a long first excerpt crowd out
+  // two higher-coverage excerpts when one of them complements the same source.
+  const anchorBudget = selectedExcerptChars > maxChars && priorityTailRepeatsAnchor
+    ? Math.max(minimumAnchorChars, maxChars - priorityTailChars)
+    : maxChars;
+  for (const [index, hit] of hits.entries()) {
+    const successorReservation = index === 0
+      ? 0
+      : boundedSuccessorReservation(hit, hits[index + 1], remainingChars, maxChars);
+    const hitBudget = index === 0
+      ? Math.min(remainingChars, anchorBudget)
+      : Math.max(0, remainingChars - successorReservation);
+    const formatted = formatSearchHit(hit, renderedHitCount + 1, hitBudget);
+    if (!formatted) {
+      incompleteHitCount += 1;
+      continue;
+    }
+    renderedHits.push(formatted.text);
+    onRenderedHit?.({ hit, formatted });
+    renderedHitCount += 1;
+    remainingChars -= hitBudget - formatted.remainingChars;
+    if (formatted.renderedLineRange) {
+      deliveredCitations.add(`${formatted.sourcePath}:${formatted.renderedLineRange}`);
+    }
+    if (formatted.renderedLineRange) {
+      const ranges = deliveredLineRanges.get(formatted.sourcePath) ?? [];
+      if (!ranges.includes(formatted.renderedLineRange)) {
+        ranges.push(formatted.renderedLineRange);
+      }
+      deliveredLineRanges.set(formatted.sourcePath, ranges);
+    }
+    if (formatted.truncated) {
+      incompleteHitCount += 1;
+      if (remainingChars <= 0) {
+        incompleteHitCount += hits.length - index - 1;
+        break;
+      }
+    }
+  }
+
   if (packets.length > 0) {
     lines.push("", "Agent context packets:");
     for (const packet of packets) {
-      lines.push(formatAgentContextPacket(packet));
+      const sourcePath = optionalString(packet?.source_path);
+      lines.push(formatAgentContextPacket(packet, {
+        lineRanges: sourcePath ? deliveredLineRanges.get(sourcePath) ?? [] : [],
+      }));
     }
   }
+  lines.push("", "Hits:", ...renderedHits);
 
-  lines.push("", "Hits:");
-  let remainingChars = maxChars;
-  for (const [index, hit] of hits.entries()) {
-    const formatted = formatSearchHit(hit, index + 1, remainingChars);
-    lines.push(formatted.text);
-    remainingChars = formatted.remainingChars;
-    if (remainingChars <= 0 && index < hits.length - 1) {
-      lines.push(`\nResponse truncated before ${hits.length - index - 1} additional hit(s). Increase maxChars to include more text.`);
-      break;
-    }
+  if (incompleteHitCount > 0) {
+    lines.push(
+      "",
+      `Response truncated: ${incompleteHitCount} selected hit(s) clipped or omitted because their full excerpts did not fit the ${maxChars}-character excerpt budget.`,
+    );
   }
 
-  if (Array.isArray(result.citations) && result.citations.length > 0) {
-    lines.push("", "Citations:", ...result.citations.map((citation) => `- ${citation}`));
+  if (deliveredCitations.size > 0) {
+    lines.push("", "Citations:", ...[...deliveredCitations].map((citation) => `- ${citation}`));
   }
 
   return lines.join("\n");
@@ -4270,12 +5268,12 @@ function formatReadPreparation(readPreparation) {
   return lines;
 }
 
-function formatAgentContextPacket(packet) {
+function formatAgentContextPacket(packet, { lineRanges = packet.line_ranges } = {}) {
   const symbols = Array.isArray(packet.symbols) && packet.symbols.length > 0
     ? packet.symbols.join(", ")
     : "none";
-  const lines = Array.isArray(packet.line_ranges) && packet.line_ranges.length > 0
-    ? packet.line_ranges.join(", ")
+  const lines = Array.isArray(lineRanges) && lineRanges.length > 0
+    ? lineRanges.join(", ")
     : "unknown";
   const reasons = Array.isArray(packet.reasons) && packet.reasons.length > 0
     ? packet.reasons.join("; ")
@@ -4290,7 +5288,7 @@ function formatAgentContextPacket(packet) {
   ].join("\n");
 }
 
-function formatSearchHit(hit, ordinal, remainingChars) {
+function formatLegacySearchHit(hit, ordinal, remainingChars) {
   const metadata = asRecord(hit.metadata);
   const sourcePath = optionalString(metadata.source_path) ?? "unknown";
   const heading = optionalString(metadata.section_heading);
@@ -4330,6 +5328,230 @@ function formatSearchHit(hit, ordinal, remainingChars) {
   };
 }
 
+function verifiedDisplayLines(hit) {
+  const metadata = asRecord(hit.metadata);
+  const projection = asRecord(asRecord(metadata.extras).corpuswire_display_lines);
+  const sourceHash = metadata.source_hash;
+  const displayText = projection.text;
+  const chunkText = typeof hit.text === "string" ? hit.text.trim() : "";
+  const sourceContextMapping = projection.mapping_kind === "source-context/v1";
+  if (
+    projection.schema_version !== "corpuswire-complete-source-lines/v1"
+    || typeof sourceHash !== "string"
+    || !/^[0-9a-f]{64}$/.test(sourceHash)
+    || projection.source_hash !== sourceHash
+    || typeof displayText !== "string"
+    || !displayText.trim()
+    || (displayText.endsWith("\n") && !sourceContextMapping)
+    || Buffer.byteLength(displayText, "utf8") > 16_000
+    || !Number.isInteger(projection.start_line)
+    || !Number.isInteger(projection.end_line)
+    || projection.start_line < 1
+    || projection.end_line < projection.start_line
+    || !Number.isInteger(metadata.start_line)
+    || !Number.isInteger(metadata.end_line)
+    || displayText.split("\n").length !== projection.end_line - projection.start_line + 1
+    || projection.text_sha256 !== createHash("sha256").update(displayText, "utf8").digest("hex")
+    || typeof hit.text !== "string"
+    || !chunkText
+  ) {
+    return null;
+  }
+  const directMapping = projection.mapping_kind === undefined
+    && projection.start_line >= metadata.start_line
+    && projection.end_line <= metadata.end_line
+    && displayText.includes(chunkText);
+  let verifiedSourceContext = false;
+  if (
+    sourceContextMapping
+    && projection.chunk_text_sha256 === createHash("sha256").update(hit.text, "utf8").digest("hex")
+    && projection.start_line <= metadata.start_line
+    && projection.end_line >= metadata.end_line
+    && metadata.start_line - projection.start_line <= 3
+    && projection.end_line - metadata.end_line <= 3
+    && (projection.start_line < metadata.start_line || projection.end_line > metadata.end_line)
+    && displayText.split("\n").slice(
+      metadata.start_line - projection.start_line,
+      metadata.end_line - projection.start_line + 1,
+    ).join("\n").includes(chunkText)
+  ) {
+    const lines = displayText.split("\n");
+    const before = lines.slice(0, metadata.start_line - projection.start_line);
+    const after = lines.slice(lines.length - (projection.end_line - metadata.end_line));
+    const markdown = optionalString(metadata.source_path)?.toLowerCase().endsWith(".md") ?? false;
+    const permitted = (line) => !line.trim()
+      || (markdown && /^#{1,6}\s+\S/.test(line.replace(/\r$/, "")));
+    verifiedSourceContext = before.every(permitted) && after.every(permitted);
+  }
+  let transformedMapping = false;
+  if (
+    !directMapping
+    && projection.chunk_text_sha256 === createHash("sha256").update(hit.text, "utf8").digest("hex")
+  ) {
+    try {
+      const sourcePath = optionalString(metadata.source_path)?.toLowerCase() ?? "";
+      if (
+        projection.mapping_kind === "json-record/v1"
+        && (sourcePath.endsWith(".jsonl") || sourcePath.endsWith(".ndjson"))
+        && metadata.symbol_kind === "data_record"
+        && metadata.section_heading === `record line ${projection.start_line}`
+        && projection.start_line === projection.end_line
+        && projection.start_line === metadata.start_line
+      ) {
+        transformedMapping = JSON.stringify(JSON.parse(displayText), null, 2).includes(chunkText);
+      } else if (
+        projection.mapping_kind === "json-top-level-value/v1"
+        && (sourcePath.endsWith(".json") || sourcePath.endsWith(".json.example"))
+        && metadata.symbol_kind === "config_section"
+      ) {
+        const parsed = JSON.parse(displayText);
+        transformedMapping = parsed !== null
+          && !Array.isArray(parsed)
+          && typeof parsed === "object"
+          && Object.hasOwn(parsed, metadata.section_heading)
+          && JSON.stringify(parsed[metadata.section_heading], null, 2).includes(chunkText);
+      }
+    } catch {
+      return null;
+    }
+  }
+  if (!directMapping && !verifiedSourceContext && !transformedMapping) {
+    return null;
+  }
+  return projection;
+}
+
+function searchHitDisplayText(hit) {
+  const projection = verifiedDisplayLines(hit);
+  return projection?.text ?? (typeof hit.text === "string" ? hit.text.trim() : "");
+}
+
+function formatSearchHit(hit, ordinal, remainingChars) {
+  const metadata = asRecord(hit.metadata);
+  const sourcePath = optionalString(metadata.source_path) ?? "unknown";
+  const heading = optionalString(metadata.section_heading);
+  const title = optionalString(metadata.title);
+  const docType = optionalString(metadata.doc_type);
+  const chunkIndex = Number.isInteger(metadata.chunk_index) ? metadata.chunk_index : "unknown";
+  const score = typeof hit.score === "number" ? hit.score.toFixed(4) : "unknown";
+  const tags = Array.isArray(metadata.tags) && metadata.tags.length > 0
+    ? metadata.tags.filter((tag) => typeof tag === "string" && tag.trim()).join(", ")
+    : "";
+  const projection = verifiedDisplayLines(hit);
+  const rawText = searchHitDisplayText(hit);
+  if (!rawText || remainingChars <= 0) {
+    return null;
+  }
+  const rawLines = rawText.split("\n");
+  const complete = rawText.length <= remainingChars;
+  let snippet = rawText;
+  let renderedLineRange = projection ? `${projection.start_line}-${projection.end_line}` : "";
+  if (!complete) {
+    const sourceContext = projection?.mapping_kind === "source-context/v1";
+    const originalRangeLines = sourceContext
+      ? rawLines.slice(
+        metadata.start_line - projection.start_line,
+        metadata.end_line - projection.start_line + 1,
+      )
+      : rawLines;
+    const clipped = truncateAtLineBoundary(originalRangeLines, remainingChars);
+    if (clipped) {
+      snippet = clipped.text;
+      renderedLineRange = projection
+        ? `${sourceContext ? metadata.start_line : projection.start_line}-${
+          (sourceContext ? metadata.start_line : projection.start_line) + clipped.lineCount - 1}`
+        : "";
+    } else {
+      return null;
+    }
+    if (!snippet) {
+      return null;
+    }
+  }
+  const consumedChars = snippet.length;
+
+  return {
+    remainingChars: Math.max(0, remainingChars - consumedChars),
+    complete,
+    truncated: !complete,
+    sourcePath,
+    renderedLineRange,
+    snippet,
+    text: [
+      `\n${ordinal}. ${sourcePath}`,
+      `   score: ${score}`,
+      `   chunk: ${chunkIndex}`,
+      ...(title ? [`   title: ${title}`] : []),
+      ...(heading ? [`   heading: ${heading}`] : []),
+      ...(docType ? [`   docType: ${docType}`] : []),
+      ...(renderedLineRange ? [`   lines: ${renderedLineRange}`] : []),
+      ...(!renderedLineRange ? ["   sourceRange: unavailable"] : []),
+      ...(!complete ? ["   excerptStatus: shortened"] : []),
+      ...(metadata.package_name ? [`   package: ${metadata.package_name}`] : []),
+      ...(metadata.symbol_kind ? [`   symbolKind: ${metadata.symbol_kind}`] : []),
+      ...(metadata.indexed_commit ? [`   indexedCommit: ${metadata.indexed_commit}`] : []),
+      ...(tags ? [`   tags: ${tags}`] : []),
+      ...(hit.chunk_id ? [`   chunkId: ${hit.chunk_id}`] : []),
+      "   text:",
+      indentSnippet(snippet || "(empty)"),
+    ].join("\n"),
+  };
+}
+
+function boundedSuccessorReservation(hit, successor, remainingChars, maxChars) {
+  if (!successor) {
+    return 0;
+  }
+  const metadata = asRecord(hit.metadata);
+  const rawText = searchHitDisplayText(hit);
+  const successorText = searchHitDisplayText(successor);
+  const projection = verifiedDisplayLines(hit);
+  const lineCount = projection
+    ? projection.end_line - projection.start_line + 1
+    : Number.isInteger(metadata.start_line) && Number.isInteger(metadata.end_line)
+      ? metadata.end_line - metadata.start_line + 1
+      : 0;
+  const rawLines = rawText.split("\n");
+  const successorLength = successorText.length;
+  if (
+    !rawText
+    || !successorText
+    || successorLength > Math.floor(maxChars * 0.2)
+    || successorLength >= remainingChars
+    || rawText.length + successorLength <= remainingChars
+    || lineCount <= 0
+    || rawLines.length !== lineCount
+  ) {
+    return 0;
+  }
+  const clipped = truncateAtLineBoundary(rawLines, remainingChars - successorLength);
+  if (
+    !clipped
+    || rawText.length - clipped.text.length > Math.floor(rawText.length * 0.05)
+  ) {
+    return 0;
+  }
+  return successorLength;
+}
+
+function truncateAtLineBoundary(lines, maxChars) {
+  const retained = [];
+  let length = 0;
+  for (const line of lines) {
+    const nextLength = length + (retained.length > 0 ? 1 : 0) + line.length;
+    if (nextLength > maxChars) {
+      break;
+    }
+    retained.push(line);
+    length = nextLength;
+  }
+  const text = retained.join("\n");
+  if (!text.trim()) {
+    return null;
+  }
+  return { text, lineCount: retained.length };
+}
+
 function truncateText(text, maxChars) {
   if (maxChars <= 0) {
     return "";
@@ -4337,8 +5559,20 @@ function truncateText(text, maxChars) {
   if (text.length <= maxChars) {
     return text;
   }
-  const suffix = "\n... truncated";
-  return `${text.slice(0, Math.max(0, maxChars - suffix.length)).trimEnd()}${suffix}`;
+  const marker = "\n... truncated";
+  const suffix = maxChars >= marker.length ? marker : ".".repeat(maxChars);
+  let endIndex = Math.max(0, maxChars - suffix.length);
+  if (
+    endIndex > 0
+    && endIndex < text.length
+    && text.charCodeAt(endIndex - 1) >= 0xd800
+    && text.charCodeAt(endIndex - 1) <= 0xdbff
+    && text.charCodeAt(endIndex) >= 0xdc00
+    && text.charCodeAt(endIndex) <= 0xdfff
+  ) {
+    endIndex -= 1;
+  }
+  return `${text.slice(0, endIndex).trimEnd()}${suffix}`;
 }
 
 function indentSnippet(text) {
@@ -4391,7 +5625,7 @@ async function enhancePrompt(args) {
     })
     : [];
 
-  return [
+  const formatted = [
     "Prompt augmentation preview",
     "",
     "Original prompt:",
@@ -4429,6 +5663,33 @@ async function enhancePrompt(args) {
       ? ["", "Citations:", ...result.citations.map((citation) => `- ${citation}`)]
       : []),
   ].join("\n");
+  const failureMode = enhancementFailureMode({
+    result,
+    enhancedPrompt,
+    usedLocalFallback,
+    readPreparation,
+  });
+  if (!failureMode) {
+    return formatted;
+  }
+  const failureReportPath = await writeRetrievalFailureReportSafely({
+    workspaceId: workspaceId ?? optionalString(result.workspace_id),
+    workType: "prompt_enhancement",
+    toolName: "corpuswire_enhance_prompt",
+    query: prompt,
+    roundId: optionalString(args.roundId),
+    failureMode,
+    scores: { corpuswire: { status: "not_rated" }, augment: { status: "not_compared" } },
+    resultPaths: retrievedSourcePaths(result.agent_context_packets),
+    details: {
+      hasEnhancedPrompt: Boolean(enhancedPrompt),
+      usedLocalFallback,
+      retrievalNotFound: result.retrieval_not_found === true,
+      readNeedsReconcile: readPreparation?.freshness?.needsReconcile === true,
+      retrievalConfidence: finiteScore(result.retrieval_confidence),
+    },
+  });
+  return appendFailureReportPath(formatted, failureReportPath);
 }
 
 function indentPreviewBlock(text) {
@@ -4451,18 +5712,19 @@ async function recordQualityResult(args) {
     );
   }
   const engine = requiredString(args, "engine").toLowerCase();
+  const scorecard = {
+    relevance: qualityDimension(args.relevance, "relevance"),
+    fileSpecificity: qualityDimension(args.fileSpecificity, "fileSpecificity"),
+    coverage: qualityDimension(args.coverage, "coverage"),
+    freshness: qualityDimension(args.freshness, "freshness"),
+    actionability: qualityDimension(args.actionability, "actionability"),
+  };
   const client = buildClient();
   const event = await client.recordQualityEvent({
     workspaceId,
     workType,
     engine,
-    scorecard: {
-      relevance: qualityDimension(args.relevance, "relevance"),
-      fileSpecificity: qualityDimension(args.fileSpecificity, "fileSpecificity"),
-      coverage: qualityDimension(args.coverage, "coverage"),
-      freshness: qualityDimension(args.freshness, "freshness"),
-      actionability: qualityDimension(args.actionability, "actionability"),
-    },
+    scorecard,
     query: optionalString(args.query) ?? "",
     surface: optionalString(args.surface) ?? "codex",
     roundId: optionalString(args.roundId),
@@ -4472,6 +5734,17 @@ async function recordQualityResult(args) {
     notes: optionalString(args.notes),
     issueUrl: optionalString(args.issueUrl),
     metadata: isRecord(args.metadata) ? args.metadata : {},
+  });
+  const failureReportPath = await compareQualityRoundAndReport({
+    workspaceId,
+    workType,
+    engine,
+    scorecard,
+    roundId: optionalString(args.roundId),
+    query: optionalString(args.query),
+    resultPaths: optionalStringArray(args, "resultPaths"),
+    improvement: optionalString(args.improvement),
+    warning: optionalString(args.warning),
   });
   return [
     "CorpusWire quality rating recorded:",
@@ -4488,7 +5761,277 @@ async function recordQualityResult(args) {
     `- queryStoredAs: ${event.query}`,
     ...(event.improvement ? [`- improvement: ${event.improvement}`] : []),
     ...(event.issue_url ? [`- issueUrl: ${event.issue_url}`] : []),
+    ...(failureReportPath ? [`- failureReport: ${failureReportPath}`] : []),
   ].join("\n");
+}
+
+async function compareQualityRoundAndReport({
+  workspaceId,
+  workType,
+  engine,
+  scorecard,
+  roundId,
+  query,
+  resultPaths,
+  improvement,
+  warning,
+}) {
+  if (!roundId || !["augment", "corpuswire"].includes(engine)) {
+    return null;
+  }
+  const key = `${workspaceId}\u0000${workType}\u0000${roundId}`;
+  const round = QUALITY_COMPARISON_ROUNDS.get(key) ?? {};
+  round[engine] = {
+    dimensions: scorecard,
+    overall: averageScore(scorecard),
+    query,
+    resultPaths,
+    improvement,
+    warning,
+  };
+  QUALITY_COMPARISON_ROUNDS.set(key, round);
+  while (QUALITY_COMPARISON_ROUNDS.size > 256) {
+    const oldestKey = QUALITY_COMPARISON_ROUNDS.keys().next().value;
+    QUALITY_COMPARISON_ROUNDS.delete(oldestKey);
+  }
+
+  if (!round.augment || !round.corpuswire) {
+    return null;
+  }
+  QUALITY_COMPARISON_ROUNDS.delete(key);
+
+  const overallGap = round.augment.overall - round.corpuswire.overall;
+  const dimensionGaps = Object.fromEntries(
+    Object.keys(round.augment.dimensions).map((dimension) => [
+      dimension,
+      round.augment.dimensions[dimension] - round.corpuswire.dimensions[dimension],
+    ]),
+  );
+  const largestDimensionGap = Math.max(...Object.values(dimensionGaps));
+  if (
+    overallGap < MATERIAL_OVERALL_SCORE_GAP
+    && largestDimensionGap < MATERIAL_DIMENSION_SCORE_GAP
+  ) {
+    return null;
+  }
+
+  return writeRetrievalFailureReportSafely({
+    workspaceId,
+    workType,
+    toolName: "corpuswire_rate_result",
+    query: round.corpuswire.query ?? round.augment.query,
+    roundId,
+    failureMode: "corpuswire_materially_weaker_than_augment",
+    scores: {
+      augment: {
+        status: "rated",
+        overall: round.augment.overall,
+        dimensions: round.augment.dimensions,
+      },
+      corpuswire: {
+        status: "rated",
+        overall: round.corpuswire.overall,
+        dimensions: round.corpuswire.dimensions,
+      },
+    },
+    resultPaths: round.corpuswire.resultPaths,
+    details: {
+      overallGap: roundNumber(overallGap),
+      dimensionGaps,
+      overallGapThreshold: MATERIAL_OVERALL_SCORE_GAP,
+      dimensionGapThreshold: MATERIAL_DIMENSION_SCORE_GAP,
+      improvement: round.corpuswire.improvement,
+      warning: round.corpuswire.warning,
+    },
+  });
+}
+
+function averageScore(scorecard) {
+  const values = Object.values(scorecard).filter(Number.isFinite);
+  return values.length > 0
+    ? values.reduce((sum, value) => sum + value, 0) / values.length
+    : null;
+}
+
+function roundNumber(value) {
+  return Number.isFinite(value) ? Number(value.toFixed(2)) : null;
+}
+
+function finiteScore(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function searchFailureMode({ result, hits, readPreparation }) {
+  // A disabled sync manager has no observed inventory state. Its initial
+  // `needsReconcile` value therefore means "unobserved", not that this
+  // successful backend response is known to be stale. Reporting it as a
+  // failure would make offline renderers non-deterministic and create a
+  // diagnostic on every search.
+  if (readPreparation?.enabled === true && readPreparation.freshness?.needsReconcile === true) {
+    return "index_needs_reconcile";
+  }
+  if (result.retrieval_not_found === true || hits.length === 0) {
+    return "no_retrieval_context";
+  }
+  return null;
+}
+
+function enhancementFailureMode({ result, enhancedPrompt, usedLocalFallback, readPreparation }) {
+  if (readPreparation?.enabled === true && readPreparation.freshness?.needsReconcile === true) {
+    return "index_needs_reconcile";
+  }
+  const packetCount = Array.isArray(result.agent_context_packets)
+    ? result.agent_context_packets.length
+    : 0;
+  const chunkCount = Array.isArray(result.retrieved_chunks) ? result.retrieved_chunks.length : 0;
+  if (result.retrieval_not_found === true || (packetCount === 0 && chunkCount === 0)) {
+    return "no_retrieval_context";
+  }
+  if (!enhancedPrompt) {
+    return "no_enhanced_prompt";
+  }
+  if (usedLocalFallback) {
+    return "generation_fallback";
+  }
+  return null;
+}
+
+function retrievedSourcePaths(values) {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  return [...new Set(values.map((value) => {
+    if (typeof value === "string") {
+      return value;
+    }
+    const record = asRecord(value);
+    const metadata = asRecord(record.metadata);
+    return optionalString(record.source_path ?? metadata.source_path);
+  }).filter(isSafeWorkspaceRelativePath))];
+}
+
+function isSafeWorkspaceRelativePath(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && !path.posix.isAbsolute(value)
+    && !value.split(/[\\/]+/).includes("..")
+    && !/^[A-Za-z]:/.test(value);
+}
+
+async function reportToolFailureSafely(toolName, args, error) {
+  const query = optionalString(args.query ?? args.prompt);
+  const workspaceId = optionalString(args.workspaceId ?? process.env.CORPUSWIRE_WORKSPACE_ID);
+  if (!query || !workspaceId) {
+    return null;
+  }
+  const errorMessage = error instanceof Error ? error.message : String(error ?? "");
+  const failureMode = /no enhanced prompt/i.test(errorMessage)
+    ? "no_enhanced_prompt"
+    : "mcp_request_error";
+  return writeRetrievalFailureReportSafely({
+    workspaceId,
+    workType: toolName === "corpuswire_enhance_prompt" ? "prompt_enhancement" : "semantic_retrieval",
+    toolName,
+    query,
+    roundId: optionalString(args.roundId),
+    failureMode,
+    scores: { corpuswire: { status: "failed" }, augment: { status: "not_compared" } },
+    resultPaths: [],
+    details: { errorCode: optionalString(error?.errorCode) ?? null },
+  });
+}
+
+async function writeRetrievalFailureReportSafely(report) {
+  try {
+    const workspaceRoot = optionalString(
+      report.workspaceRoot
+        ?? process.env.CORPUSWIRE_SYNC_ROOT
+        ?? process.env.CORPUSWIRE_REPO_PATH
+        ?? process.cwd(),
+    );
+    const workspaceId = optionalString(report.workspaceId);
+    if (!workspaceRoot || !workspaceId) {
+      return null;
+    }
+    const root = path.resolve(workspaceRoot);
+    const directory = path.join(root, RETRIEVAL_FAILURE_DIRECTORY);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const reportPath = path.join(directory, `${timestamp}-${randomUUID()}.json`);
+    const queryFields = diagnosticQueryFields(report.query);
+    const safeScores = isRecord(report.scores) ? report.scores : {};
+    const safeReport = {
+      schemaVersion: RETRIEVAL_FAILURE_SCHEMA,
+      createdAt: new Date().toISOString(),
+      roundId: optionalString(report.roundId),
+      workspaceId,
+      workType: optionalString(report.workType),
+      toolName: optionalString(report.toolName),
+      // Automatic diagnostics are written inside the workspace and may be
+      // picked up by other tools. Keep only a stable digest of the query;
+      // pattern redaction cannot reliably identify private evaluation text.
+      query: "[redacted: automatic retrieval diagnostic]",
+      queryRedacted: true,
+      querySha256: queryFields.sha256,
+      failureMode: optionalString(report.failureMode) ?? "unspecified_failure",
+      scores: safeScores,
+      resultPaths: retrievedSourcePaths(report.resultPaths),
+      details: sanitizeDiagnosticDetails(report.details),
+    };
+    await writeFile(reportPath, `${JSON.stringify(safeReport, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    return path.relative(root, reportPath).split(path.sep).join("/");
+  } catch {
+    return null;
+  }
+}
+
+function diagnosticQueryFields(value) {
+  const raw = optionalString(value) ?? "";
+  const sha256 = raw ? createHash("sha256").update(raw, "utf8").digest("hex") : null;
+  const privateContent = /\b(patient|diagnos(?:is|ed)|symptom|medication|prescription|medical history|date of birth|passport|social security|health record|my child|my baby)\b/i.test(raw);
+  let query = raw
+    .replace(/-----BEGIN [^-]+ PRIVATE KEY-----[\s\S]*?-----END [^-]+ PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
+    .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1[REDACTED]")
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{16,})\b/gi, "[REDACTED TOKEN]")
+    .replace(/\b(password|secret|api[_ -]?key|token|authorization)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]")
+    .replace(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/g, "[REDACTED EMAIL]")
+    .replace(/\+?\d[\d().\s-]{7,}\d/g, "[REDACTED PHONE]")
+    .trim()
+    .slice(0, 2000);
+  if (privateContent) {
+    query = "[redacted: likely personal or health-related content]";
+  }
+  return { query, redacted: privateContent || query !== raw, sha256 };
+}
+
+function sanitizeDiagnosticDetails(value) {
+  if (!isRecord(value)) {
+    return {};
+  }
+  const safe = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (item === null || typeof item === "boolean" || Number.isFinite(item)) {
+      safe[key] = item;
+    } else if (typeof item === "string") {
+      safe[key] = diagnosticQueryFields(item).query;
+    } else if (isRecord(item)) {
+      safe[key] = sanitizeDiagnosticDetails(item);
+    } else if (Array.isArray(item)) {
+      safe[key] = item.map((child) => (
+        typeof child === "string" ? diagnosticQueryFields(child).query : child
+      ));
+    }
+  }
+  return safe;
+}
+
+function appendFailureReportPath(text, reportPath) {
+  return reportPath ? `${text}\n\nDiagnostics:\n- failureReport: ${reportPath}` : text;
 }
 
 async function reviewQualityResults(args) {
@@ -4952,6 +6495,9 @@ function isSyncIndexableRelativePath(relativePath, context) {
 
 function classifySyncRelativePath(relativePath, context) {
   const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\/+/, "");
+  if (isProtectedDiagnosticPath(normalized)) {
+    return { accepted: false, reason: "protected_diagnostic" };
+  }
   if (isSensitiveTerraformRelativePath(normalized)) {
     return { accepted: false, reason: "sensitive_terraform_artifact" };
   }
@@ -5036,10 +6582,16 @@ function matchesAnySyncGlob(relativePath, patterns) {
 }
 
 function isExcludedDirectory(relativePath, excludeGlobs) {
-  if (!relativePath || !Array.isArray(excludeGlobs) || excludeGlobs.length === 0) {
+  if (!relativePath) {
     return false;
   }
   const normalized = relativePath.replaceAll("\\", "/").replace(/\/+$/, "");
+  if (isProtectedDiagnosticPath(normalized)) {
+    return true;
+  }
+  if (!Array.isArray(excludeGlobs) || excludeGlobs.length === 0) {
+    return false;
+  }
   return matchesAnyGlob(normalized, excludeGlobs)
     || matchesAnyGlob(`${normalized}/`, excludeGlobs)
     || matchesAnyGlob(`${normalized}/${DIRECTORY_GLOB_PROBE}`, excludeGlobs);
@@ -5097,6 +6649,9 @@ function escapeRegExp(value) {
 
 function isIndexableRelativePath(relativePath) {
   const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\/+/, "");
+  if (isProtectedDiagnosticPath(normalized)) {
+    return false;
+  }
   if (isSensitiveTerraformRelativePath(normalized)) {
     return false;
   }
@@ -5113,6 +6668,16 @@ function isIndexableRelativePath(relativePath) {
   const effectivePath = effectiveIndexableRelativePath(normalized);
   return INDEXABLE_EXTENSIONS.has(path.posix.extname(effectivePath).toLowerCase())
     || INDEXABLE_FILENAMES.has(path.posix.basename(effectivePath).toLowerCase());
+}
+
+function isProtectedDiagnosticPath(relativePath) {
+  const normalized = relativePath
+    .replaceAll("\\", "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+  const protectedDirectory = PROTECTED_DIAGNOSTIC_DIRECTORY.toLowerCase();
+  return normalized === protectedDirectory || normalized.startsWith(`${protectedDirectory}/`);
 }
 
 function isMissingFileError(error) {
@@ -5588,6 +7153,12 @@ function formatSyncSummary(summary, ordinal) {
     ...(compact?.detached ? ["   detached: true"] : []),
     ...(compact?.backendContinues ? ["   backendContinues: true"] : []),
     ...(compact?.sessionId ? [`   sessionId: ${compact.sessionId}`] : []),
+    ...(Number.isSafeInteger(compact?.manifestSkipped)
+      ? [`   manifestSkipped: ${compact.manifestSkipped}`]
+      : []),
+    ...(compact?.manifestErrors?.length > 0
+      ? [`   manifestErrors: ${compact.manifestErrors.join("; ")}`]
+      : []),
     ...(compact?.collection ? [`   collection: ${compact.collection}`] : []),
     ...(compact?.manifestRevision ? [`   manifestRevision: ${compact.manifestRevision}`] : []),
     ...(observability.schema_version === INDEX_OBSERVABILITY_SCHEMA_VERSION
@@ -5620,6 +7191,10 @@ function summarizeSyncResult(result) {
     detached: Boolean(result.detached),
     backendContinues: Boolean(result.backendContinues),
     sessionId: result.sessionId,
+    manifestErrors: boundedManifestErrors(result.manifestErrors),
+    manifestSkipped: Number.isSafeInteger(result.manifestSkipped)
+      ? result.manifestSkipped
+      : null,
     error: result.error,
     collection: responseResult.collection,
     documentsIndexed: responseResult.documents_indexed,
@@ -5648,9 +7223,40 @@ function formatToolError(error, operation = "request") {
     const suffix = guidance.length > 0
       ? ` Recovery guidance: ${guidance.join(" ")}`
       : "";
-    return `corpuswire rejected the ${operation}: ${error.errorMessage ?? message}${suffix}`;
+    const errorCode = boundedErrorMetadata(error.errorCode) ?? "unknown";
+    const requestId = boundedErrorMetadata(error.requestId) ?? "unknown";
+    const retryable = error.retryable === true;
+    const retryAfterSeconds = Number.isInteger(error.retryAfterSeconds)
+      && error.retryAfterSeconds >= 0
+      ? error.retryAfterSeconds
+      : "none";
+    return `corpuswire rejected the ${operation}: ${error.errorMessage ?? message}`
+      + ` [errorCode=${errorCode} requestId=${requestId} retryable=${retryable}`
+      + ` retryAfterSeconds=${retryAfterSeconds}]${suffix}`;
   }
   return `corpuswire ${operation} failed: ${message}`;
+}
+
+function boundedErrorMetadata(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 256
+    && !value.includes("\n")
+    && !value.includes("\r")
+    ? value
+    : null;
+}
+
+function boundedManifestErrors(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .slice(0, 20)
+    .map((entry) => boundedErrorMetadata(
+      typeof entry === "string" ? entry.replace(/[\r\n\t]+/g, " ").trim() : entry,
+    ))
+    .filter(Boolean);
 }
 
 function boundedRecoveryGuidance(value) {

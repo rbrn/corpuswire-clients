@@ -3,11 +3,27 @@ import type { InventoryScan, InventorySelectionPolicy, WorkspaceInventory } from
 const encoder = new TextEncoder();
 export const INVENTORY_VERSION = "workspace-inventory/v1" as const;
 
+export interface WorkspaceScanIncompleteDetails {
+  sessionId?: string;
+  manifestErrors?: readonly string[];
+  manifestSkipped?: number;
+}
+
 export class WorkspaceScanIncompleteError extends Error {
   readonly code = "scan_incomplete";
-  constructor(message = "Workspace scan did not complete") {
+  readonly sessionId?: string;
+  readonly manifestErrors: readonly string[];
+  readonly manifestSkipped?: number;
+
+  constructor(
+    message = "Workspace scan did not complete",
+    details: WorkspaceScanIncompleteDetails = {},
+  ) {
     super(message);
     this.name = "WorkspaceScanIncompleteError";
+    this.sessionId = details.sessionId;
+    this.manifestErrors = Object.freeze([...(details.manifestErrors ?? [])]);
+    this.manifestSkipped = details.manifestSkipped;
   }
 }
 
