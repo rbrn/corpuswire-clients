@@ -115,8 +115,8 @@ npm ci --prefix corpuswire-cli --offline --ignore-scripts --omit=dev
 npm pack ./corpuswire-sdk --pack-destination /tmp/corpuswire-snapshot
 npm pack ./corpuswire-cli --pack-destination /tmp/corpuswire-snapshot
 npm install --prefix /tmp/corpuswire-install \
-  /tmp/corpuswire-snapshot/corpuswire-sdk-0.1.3.tgz \
-  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.4-beta.5.tgz
+  /tmp/corpuswire-snapshot/corpuswire-sdk-0.1.4.tgz \
+  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.4-beta.6.tgz
 /tmp/corpuswire-install/node_modules/.bin/cw --version
 ```
 
