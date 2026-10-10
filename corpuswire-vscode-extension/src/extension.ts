@@ -36,7 +36,7 @@ type PromptRewriteResultWithCompatibilityFields = PromptRewriteResult & {
   rewritten_prompt?: unknown;
 };
 
-const INDEX_EXCLUDE_GLOB = "{**/.git/**,**/.vscode/**,**/node_modules/**,**/dist/**,**/build/**,**/target/**,**/__pycache__/**}";
+const INDEX_EXCLUDE_GLOB = "{**/.git/**,**/.vscode/**,**/node_modules/**,**/dist/**,**/build/**,**/target/**,**/__pycache__/**,**/reports/retrieval-failures,**/reports/retrieval-failures/**}";
 
 async function buildAuthenticatedServiceHeaders(
   settings: ExtensionSettings,
@@ -993,17 +993,23 @@ async function sendIncrementalIndexUpdate(
     throw new Error("Incremental indexing cannot mix workspace folders.");
   }
 
+  const admittedUris = changedUris.filter((uri) => {
+    const relativePath = relativePathForUri(uri);
+    return relativePath !== null && !isIndexExcludedPath(relativePath);
+  });
+  const admittedDeletedPaths = deletedPaths.map((path) => path.replaceAll("\\", "/"))
+    .filter((path) => !isIndexExcludedPath(path));
+  const collected = await collectUriFiles(admittedUris, settings.remoteIndexing.maxFileSizeBytes, false, signal);
+  if (signal?.aborted) throw new Error("Indexing cancelled before upload started.");
+  if (collected.files.length === 0 && admittedDeletedPaths.length === 0) {
+    return;
+  }
   const indexerService = settings.services.indexer;
   const client = new CorpusWireClient({
     baseUrl: indexerService.url,
     endpointMode: "v1-only",
     defaultHeaders: await buildAuthenticatedServiceHeaders(settings, indexerService),
   });
-  const collected = await collectUriFiles(changedUris, settings.remoteIndexing.maxFileSizeBytes, false, signal);
-  if (signal?.aborted) throw new Error("Indexing cancelled before upload started.");
-  if (collected.files.length === 0 && deletedPaths.length === 0) {
-    return;
-  }
   await client.indexWorkspace({
     workspace: {
       workspaceId: settings.remoteIndexing.workspaceId,
@@ -1019,7 +1025,7 @@ async function sendIncrementalIndexUpdate(
     batchBytes: settings.remoteIndexing.batchBytes,
     maxFileSizeBytes: settings.remoteIndexing.maxFileSizeBytes,
     files: collected.files,
-    deletedPaths,
+    deletedPaths: admittedDeletedPaths,
     signal,
   });
 }
@@ -1064,7 +1070,7 @@ async function collectWorkspaceFiles(
     return { ...collected, inventoryScan: {
       complete: true, startedAt, completedAt: new Date().toISOString(),
       excludedFileCount: collected.skippedLargeFiles + collected.skippedPolicyFiles + uris.length - rootUris.length, producer: "corpuswire-vscode-scan/v1",
-      ignoreDigest: createHash("sha256").update(JSON.stringify({ include: INDEX_INCLUDE_GLOB, exclude: INDEX_EXCLUDE_GLOB, hiddenPaths: "exclude", retrievalExclusions: "discovery-and-terraform/v1", workspaceRootIsolation: "v1" })).digest("hex"),
+      ignoreDigest: createHash("sha256").update(JSON.stringify({ include: INDEX_INCLUDE_GLOB, exclude: INDEX_EXCLUDE_GLOB, hiddenPaths: "exclude", retrievalExclusions: "discovery-terraform-and-retrieval-diagnostics/v2", workspaceRootIsolation: "v1" })).digest("hex"),
     } };
   } catch (cause) {
     throw Object.assign(new Error(signal?.aborted ? "Workspace scan incomplete: indexing cancelled during scan."
@@ -1122,9 +1128,11 @@ function relativePathForUri(uri: vscode.Uri): string | null {
 }
 
 function isIndexExcludedPath(relativePath: string): boolean {
-  const parts = relativePath.split("/");
+  const normalizedPath = relativePath.replaceAll("\\", "/");
+  const parts = normalizedPath.split("/");
   return parts.some((part) => part.startsWith(".") || ["node_modules", "dist", "build", "target", "__pycache__"].includes(part))
-    || isRetrievalExcludedPath(relativePath);
+    || parts.some((part, index) => part === "reports" && parts[index + 1] === "retrieval-failures")
+    || isRetrievalExcludedPath(normalizedPath);
 }
 
 async function enhanceSelectedPrompt(): Promise<void> {

@@ -126,6 +126,7 @@ function extensionHarness(folders, overrides = new Map()) {
   let nextTimer = 0;
   let watcherGlob;
   let capabilities = 0;
+  let clientConstructions = 0, authenticationCalls = 0;
   let upload = async () => ({ status: { coverage: { state: 'verified' } }, transfer: { files_transferred: 1 } });
   let diagnose = async () => readyDiagnosis();
   let codeStage = async (request) => {
@@ -172,7 +173,7 @@ function extensionHarness(folders, overrides = new Map()) {
     },
   };
   class Client {
-    constructor(options) { this.options = options; }
+    constructor(options) { this.options = options; clientConstructions += 1; }
     async getIndexCapabilities() { capabilities += 1; return { max_file_size_bytes: 100 }; }
     async indexWorkspace(request) { requests.push(request); return upload(request); }
     async indexWorkspaceCodeStage(request) { stageRequests.push(request); return codeStage(request); }
@@ -199,12 +200,13 @@ function extensionHarness(folders, overrides = new Map()) {
     function formatIndexingError(error) { return error.message; }
     function formatIndexProgressMessage() { return 'upload progress'; }
     const INDEX_INCLUDE_GLOB = ${JSON.stringify(includeGlob)};
-    return { indexCurrentWorkspace, rebuildCurrentWorkspaceIndex, registerRemoteIndexWatchers, relativePathForUri, runIndexStatusCheck, indexRootStatus };
-  `)(vscode, readSettings, Client, () => ({}), collectWorkspaceFiles, collectUriFiles, excludedPath,
+    return { indexCurrentWorkspace, rebuildCurrentWorkspaceIndex, registerRemoteIndexWatchers, sendIncrementalIndexUpdate, relativePathForUri, runIndexStatusCheck, indexRootStatus };
+  `)(vscode, readSettings, Client, () => { authenticationCalls += 1; return {}; }, collectWorkspaceFiles, collectUriFiles, excludedPath,
     (handler) => { const id = ++nextTimer; timers.set(id, handler); return id; }, (id) => timers.delete(id));
   return { ...functions, warnings, information, progress, requests, stageRequests, scans, diagnoses, callbacks, settings, subscriptions, confirmations,
     setConfirmation(selection) { confirmationSelection = selection; },
     get capabilities() { return capabilities; }, setUpload(handler) { upload = handler; },
+    get clientConstructions() { return clientConstructions; }, get authenticationCalls() { return authenticationCalls; },
     setCodeStage(handler) { codeStage = handler; }, setScan(handler) { scan = handler; },
     get watcherGlob() { return watcherGlob; },
     setDiagnosis(handler) { diagnose = handler; },
@@ -219,6 +221,78 @@ function readyDiagnosis(coverage = {}) {
     index: { indexed: true, readiness: coverage.state === 'pending' ? 'code_ready' : 'ready', health_status: 'ok', health_warnings: [], coverage: { state: 'verified', reason_codes: [], ...coverage } },
   };
 }
+
+const diagnosticPaths = [
+  'reports/retrieval-failures', 'reports/retrieval-failures/probe.json',
+  'nested/reports/retrieval-failures', 'nested/reports/retrieval-failures/deep/probe.json',
+  'reports\\retrieval-failures\\probe.json', 'nested\\reports\\retrieval-failures\\probe.json',
+];
+
+test('generated retrieval diagnostics are excluded before scanner IO with consistent inventory evidence', async () => {
+  const root = folder('diagnostic-scan');
+  const reads = [];
+  const collect = workspaceScanner(root, {
+    findFiles: () => [...diagnosticPaths, 'reports/retrieval-failures-summary.json', 'reports/quality.json', 'src/a.ts'].map((path) => file(root, path)),
+    readFile: (uri) => { reads.push(uri.toString()); return new Uint8Array(3); },
+  });
+  const result = await collect(root, 100);
+  assert.deepEqual(result.files.map((entry) => entry.relativePath), ['reports/retrieval-failures-summary.json', 'reports/quality.json', 'src/a.ts']);
+  assert.equal(reads.length, 3);
+  assert.equal(result.inventoryScan.excludedFileCount, diagnosticPaths.length);
+  assert.equal(result.inventoryScan.ignoreDigest, createHash('sha256').update(JSON.stringify({
+    include: includeGlob, exclude: excludeGlob, hiddenPaths: 'exclude',
+    retrievalExclusions: 'discovery-terraform-and-retrieval-diagnostics/v2', workspaceRootIsolation: 'v1',
+  })).digest('hex'));
+  for (const path of diagnosticPaths.filter((path) => !path.includes('\\'))) {
+    assert.equal(minimatch(path, excludeGlob, { dot: true }), true, path);
+  }
+  for (const path of ['reports/quality.json', 'reports/retrieval-failures-summary.json', 'src/a.ts']) {
+    assert.equal(excludedPath(path), false, path);
+  }
+  for (const path of ['src\\.private.json', 'build\\a.ts', 'infra\\private.tfvars.json', 'package.json']) {
+    assert.equal(excludedPath(path), true, path);
+  }
+});
+
+test('watcher create change and delete ignore root nested and Windows diagnostic paths', async () => {
+  for (const event of ['create', 'change', 'delete']) {
+    const root = folder(`diagnostic-${event}`);
+    const harness = extensionHarness([root]);
+    harness.registerRemoteIndexWatchers({ subscriptions: harness.subscriptions });
+    for (const path of diagnosticPaths) harness.callbacks[event](file(root, path));
+    harness.flushTimers();
+    await tick();
+    assert.equal(harness.requests.length, 0, event);
+    assert.equal(harness.clientConstructions, 0, event);
+    assert.equal(harness.authenticationCalls, 0, event);
+    assert.equal(harness.warnings.length, 0, event);
+    for (const path of diagnosticPaths) harness.callbacks[event](file(root, path));
+    harness.callbacks[event](file(root, 'reports/quality.json'));
+    harness.flushTimers();
+    await tick();
+    assert.equal(harness.requests.length, 1, event);
+    const request = harness.requests[0];
+    assert.deepEqual(request.deletedPaths, event === 'delete' ? ['reports/quality.json'] : []);
+    assert.deepEqual(request.files.map((entry) => entry.relativePath), event === 'delete' ? [] : ['reports/quality.json']);
+  }
+});
+
+test('direct incremental boundary filters diagnostic changes and deletes and retains mixed legitimate work', async () => {
+  const root = folder('direct-diagnostics'), other = folder('other');
+  const harness = extensionHarness([root, other]);
+  await harness.sendIncrementalIndexUpdate(root, diagnosticPaths.map((path) => file(root, path)), diagnosticPaths);
+  assert.equal(harness.requests.length, 0);
+  assert.equal(harness.clientConstructions, 0);
+  assert.equal(harness.authenticationCalls, 0);
+  await harness.sendIncrementalIndexUpdate(root,
+    [...diagnosticPaths, 'reports/quality.json'].map((path) => file(root, path)),
+    [...diagnosticPaths, 'src\\removed.ts', 'build\\ignored.ts', 'infra\\private.tfvars.json']);
+  assert.equal(harness.requests.length, 1);
+  assert.deepEqual(harness.requests[0].files.map((entry) => entry.relativePath), ['reports/quality.json']);
+  assert.deepEqual(harness.requests[0].deletedPaths, ['src/removed.ts']);
+  await assert.rejects(harness.sendIncrementalIndexUpdate(root, [file(other, 'src/a.ts')], []), /cannot mix workspace folders/);
+  assert.equal(harness.requests.length, 1);
+});
 
 test('full indexing handles every enabled root with at most two concurrent root jobs', async () => {
   const roots = Array.from({ length: 12 }, (_, index) => folder(`repo-${index}`));
