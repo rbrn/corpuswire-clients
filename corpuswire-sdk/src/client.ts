@@ -1068,6 +1068,13 @@ export class CorpusWireClient {
         basicAuth: this.basicAuth,
         init: { method: "POST", signal },
       });
+      const observed = response.result;
+      // Returned backend failure evidence takes precedence over caller races.
+      if (["failed", "incomplete", "expired"].includes(observed.phase)
+        || observed.errors.length > 0 || (observed.failed_batches ?? 0) > 0) {
+        throw new Error(`Remote index session ${sessionId} failed: ${observed.errors.join("; ") || observed.phase}`,
+          { cause: observed });
+      }
       if (signal.aborted) throw new DOMException("Code checkpoint aborted", "AbortError");
       if (options.deadline !== undefined && Date.now() >= options.deadline) throw new DOMException("Code checkpoint timeout elapsed", "TimeoutError");
       return response.result;
@@ -1626,13 +1633,17 @@ export class CorpusWireClient {
       phaseClock.pause();
       const originalError = error;
       const interruptionOnly = isInterruptionOnly(originalError);
+      // Cleanup can itself trigger caller abort callbacks. Preserve the reason
+      // observed on catch entry rather than reclassifying the primary failure.
+      const cancelledAtCatch = request.signal?.aborted === true;
+      const detachedAtCatch = request.detachSignal?.aborted === true;
       if (codeStageReleaseStarted) {
         if (error instanceof Error) Object.assign(error, { transfer });
         throw error;
       }
-      if (!(error instanceof IndexProcessingInterruptedError) && (request.signal?.aborted || request.detachSignal?.aborted
+      if (!(error instanceof IndexProcessingInterruptedError) && (cancelledAtCatch || detachedAtCatch
         || error instanceof RemoteIndexDetachedError)) {
-        error = new IndexProcessingInterruptedError(request.signal?.aborted ? "cancel" : "detach", lastProcessingStatus, error);
+        error = new IndexProcessingInterruptedError(cancelledAtCatch ? "cancel" : "detach", lastProcessingStatus, error);
       }
       if (clientOwnedCheckpoint || error instanceof IndexProcessingInterruptedError || error instanceof RemoteIndexCancelledError) {
         let terminal: RemoteIndexStatus | undefined;
@@ -1651,7 +1662,7 @@ export class CorpusWireClient {
               && (terminal.failed_batches === undefined || terminal.failed_batches === 0)
               && terminal.pending_batches === 0 && terminal.active_batches === 0);
         if ((interruptionOnly || error instanceof RemoteIndexCancelledError)
-          && (request.signal?.aborted || error instanceof RemoteIndexCancelledError
+          && (cancelledAtCatch || error instanceof RemoteIndexCancelledError
           || (error instanceof IndexProcessingInterruptedError && error.reason === "cancel")) && confirmed) {
           const cancelled = new RemoteIndexCancelledError(session.session_id, terminal!);
           Object.assign(cancelled, { transfer, cause: error });
@@ -1659,7 +1670,7 @@ export class CorpusWireClient {
         }
         // Genuine checkpoint/publication failures remain primary after cleanup;
         // only actual interruption evidence should receive an interruption label.
-        if (!request.signal?.aborted && !request.detachSignal?.aborted
+        if (!cancelledAtCatch && !detachedAtCatch
           && !(error instanceof RemoteIndexDetachedError) && !(error instanceof RemoteIndexCancelledError)
           && !(error instanceof IndexProcessingInterruptedError)
           && !(error instanceof Error && error.name === "TimeoutError")) {
@@ -1674,7 +1685,7 @@ export class CorpusWireClient {
           ? `${incompleteUploads ? "an abort was requested for the incomplete session; " : ""}the owned session abort was confirmed`
           : `an abort was requested${incompleteUploads ? " for the incomplete session" : ""} but release could not be confirmed`}. Start a new index operation to complete the inventory.`,
         error instanceof IndexProcessingInterruptedError ? error.reason
-          : request.signal?.aborted ? "cancel" : request.detachSignal?.aborted ? "detach" : "timeout",
+          : cancelledAtCatch ? "cancel" : detachedAtCatch ? "detach" : "timeout",
         { session_id: session.session_id, workspace_id: session.workspace_id,
           collection_name: session.collection_name, mode: session.mode },
         terminal ?? (originalError instanceof IndexProcessingInterruptedError ? originalError.status : lastProcessingStatus),

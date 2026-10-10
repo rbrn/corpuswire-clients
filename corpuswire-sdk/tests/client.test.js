@@ -3291,6 +3291,86 @@ test("final precommit drain callback cancellation uses one bounded cleanup reser
   assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
 });
 
+for (const race of ["cancel", "detach", "deadline"]) {
+  test(`returned failed checkpoint receipt survives ${race} race and clean abort`, async (t) => {
+    const controller = new AbortController();
+    const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+    const originalFetch = fixture.client.fetchFn;
+    let failedStatus, now = 0, readyCallbacks = 0;
+    t.mock.method(Date, "now", () => now);
+    fixture.client.fetchFn = async (url, init) => {
+      const response = await originalFetch(url, init);
+      if (!url.endsWith("/checkpoint/code")) return response;
+      const payload = await response.json();
+      failedStatus = { ...payload.result, phase: "failed", errors: ["Actual checkpoint publication failure"], failed_batches: 1 };
+      if (race === "deadline") now = 101;
+      else controller.abort();
+      return jsonResponse(200, { ...payload, result: failedStatus });
+    };
+    await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+      signal: race === "cancel" ? controller.signal : undefined,
+      detachSignal: race === "detach" ? controller.signal : undefined,
+      onCodeReady: () => { readyCallbacks += 1; },
+    }), (error) => {
+      assert.equal(error instanceof RemoteIndexCancelledError, false);
+      let cause = error;
+      while (cause instanceof Error && cause.cause !== undefined) cause = cause.cause;
+      assert.equal(cause, failedStatus);
+      assert.deepEqual(cause.errors, ["Actual checkpoint publication failure"]);
+      if (race !== "deadline") {
+        assert.ok(error instanceof RemoteIndexInterruptionError);
+        assert.equal(error.reason, race);
+        assert.equal(error.interruptionOnly, false);
+      }
+      assert.equal(error.transfer.complete, false);
+      return true;
+    });
+    assert.equal(readyCallbacks, 0);
+    assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+    assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+  });
+}
+
+for (const failureKind of ["HTTP", "transport"]) {
+  for (const interruption of ["cancel", "detach"]) {
+    test(`genuine checkpoint ${failureKind} failure stays primary when ${interruption} arrives during cleanup`, async () => {
+      const controller = new AbortController();
+      const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+      const failure = new TypeError("Actual checkpoint transport failure", { cause: new Error("Actual socket cause") });
+      const originalFetch = fixture.client.fetchFn;
+      const checkpoint = fixture.client.checkpointIndexSessionCode.bind(fixture.client);
+      let checkpointFailure;
+      fixture.client.checkpointIndexSessionCode = async (...args) => {
+        try { return await checkpoint(...args); }
+        catch (error) { checkpointFailure = error; throw error; }
+      };
+      fixture.client.fetchFn = async (url, init) => {
+        if (url.endsWith("/checkpoint/code")) {
+          if (failureKind === "transport") throw failure;
+          return jsonResponse(409, { error: "Actual checkpoint publication failure" });
+        }
+        if (init.method === "DELETE") controller.abort();
+        return originalFetch(url, init);
+      };
+      await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request,
+        signal: interruption === "cancel" ? controller.signal : undefined,
+        detachSignal: interruption === "detach" ? controller.signal : undefined,
+      }), (error) => {
+        assert.equal(error, checkpointFailure);
+        assert.equal(error instanceof RemoteIndexInterruptionError, false);
+        assert.equal(error.reason, undefined);
+        assert.equal(error.transfer.complete, false);
+        if (failureKind === "transport") assert.equal(error, failure);
+        else assert.equal(error.status, 409);
+        return true;
+      });
+      assert.equal(controller.signal.aborted, true);
+      assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
+      assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+    });
+  }
+}
+
 test("requestJson retains pure cancellation during retry backoff without issuing another attempt", async () => {
   for (const failureKind of ["transport", "HTTP", "error body", "AbortError"]) {
     const controller = new AbortController();
