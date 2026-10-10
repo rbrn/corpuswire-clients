@@ -310,7 +310,7 @@ test("main indexes the current folder with no arguments after printing the previ
 test("main prints the installed CLI version offline for command and flags", async () => {
   const metadata = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const lock = JSON.parse(await readFile(new URL("../package-lock.json", import.meta.url), "utf8"));
-  assert.equal(metadata.version, "0.1.4-beta.5");
+  assert.equal(metadata.version, "0.1.4-beta.6");
   assert.deepEqual(metadata.bin, { cw: "bin/corpuswire.js" });
   assert.equal(lock.version, metadata.version);
   assert.equal(lock.packages[""].version, metadata.version);
@@ -323,7 +323,7 @@ test("main prints the installed CLI version offline for command and flags", asyn
       fetchFn: () => { throw new Error("Version must not contact the backend"); },
       sdk: { CorpusWireClient: class { constructor() { throw new Error("Version must not load a client"); } } },
     });
-    assert.deepEqual(writes, ["0.1.4-beta.5"]);
+    assert.deepEqual(writes, ["0.1.4-beta.6"]);
   }
   const help = [];
   await main(["--help"], { write: (line) => help.push(line) });
