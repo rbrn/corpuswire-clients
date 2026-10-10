@@ -1,6 +1,6 @@
 {
   "name": "@corpuswire/cli",
-  "version": "0.1.4-beta.5",
+  "version": "0.1.4-beta.6",
   "description": "CorpusWire command-line client for health checks, semantic search, prompt enhancement, and index observability",
   "type": "module",
   "bin": {
