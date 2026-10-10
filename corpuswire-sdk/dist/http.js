@@ -76,7 +76,9 @@ export async function requestJson(options) {
                 });
             }
             catch (error) {
-                if (attempt < retryAttempts && isRetryableFetchError(error)) {
+                // Keep an observed transport failure primary when cancellation already
+                // raced it; an aborted retry delay would replace it with AbortError.
+                if (!options.init?.signal?.aborted && attempt < retryAttempts && isRetryableFetchError(error)) {
                     await waitForRetry(retryDelayMs, attempt, null, options.init?.signal);
                     options.onRetry?.();
                     continue;
@@ -94,7 +96,7 @@ export async function requestJson(options) {
                 }
                 catch (error) {
                     // Retain best-effort gateway-body handling for existing retries.
-                    if (attempt < retryAttempts && TRANSIENT_HTTP_STATUSES.has(response.status)
+                    if (!options.init?.signal?.aborted && attempt < retryAttempts && TRANSIENT_HTTP_STATUSES.has(response.status)
                         && (response.status !== 429 || options.retryHttp429 !== false)) {
                         await waitForRetry(retryDelayMs, attempt, responseRetryAfterSeconds(response), options.init?.signal);
                         options.onRetry?.();
@@ -105,7 +107,7 @@ export async function requestJson(options) {
                 const parsed = parseApiError(responseBody);
                 // Queue admission has its own finite, cancellation-aware budget in the
                 // uploader. Do not consume that budget inside generic HTTP retries.
-                if (attempt < retryAttempts && TRANSIENT_HTTP_STATUSES.has(response.status)
+                if (!options.init?.signal?.aborted && attempt < retryAttempts && TRANSIENT_HTTP_STATUSES.has(response.status)
                     && (response.status !== 429 || options.retryHttp429 !== false)
                     && parsed?.retryable !== false
                     && parsed?.errorCode !== "index_queue_full") {

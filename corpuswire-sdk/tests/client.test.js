@@ -3291,6 +3291,136 @@ test("final precommit drain callback cancellation uses one bounded cleanup reser
   assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
 });
 
+test("requestJson retains pure cancellation during retry backoff without issuing another attempt", async () => {
+  for (const failureKind of ["transport", "HTTP", "error body", "AbortError"]) {
+    const controller = new AbortController();
+    const abort = new DOMException("Actual transport cancellation", "AbortError");
+    let attempts = 0, retries = 0;
+    await assert.rejects(requestJson({ baseUrl: "http://fixture.test", paths: ["/retry"],
+      init: { signal: controller.signal }, retryDelayMs: 100, onRetry: () => { retries += 1; },
+      fetchFn: async () => {
+        attempts += 1;
+        if (failureKind === "AbortError") { controller.abort(); throw abort; }
+        setTimeout(() => controller.abort(), 5);
+        if (failureKind === "transport") throw new TypeError("fetch failed");
+        const response = jsonResponse(503, { error: "Transient unavailable" });
+        if (failureKind === "error body") response.text = async () => { throw new TypeError("fetch failed"); };
+        return response;
+      },
+    }), (error) => {
+      assert.equal(error.name, "AbortError");
+      if (failureKind === "AbortError") assert.equal(error, abort);
+      return true;
+    });
+    assert.equal(attempts, 1);
+    assert.equal(retries, 0);
+  }
+});
+
+for (const failureKind of ["transport", "HTTP", "error body"]) {
+  for (const cleanup of ["confirmed", "stalled"]) {
+    test(`retryable checkpoint ${failureKind} failure racing cancellation preserves observed failure with ${cleanup} cleanup`, { timeout: 2500 }, async () => {
+      const controller = new AbortController();
+      const fixture = priorityIndexFixture({ files: [{ relativePath: "main.py", content: "x" }] });
+      const socketCause = new Error("Actual socket cause");
+      const transportFailure = new TypeError("fetch failed", { cause: socketCause });
+      const originalFetch = fixture.client.fetchFn;
+      let checkpointRequests = 0, abortRequests = 0, cleanupSignal;
+      fixture.client.fetchFn = async (url, init) => {
+        if (url.endsWith("/checkpoint/code")) {
+          checkpointRequests += 1;
+          if (failureKind === "transport") { controller.abort(); throw transportFailure; }
+          const response = jsonResponse(503, { error: "Actual checkpoint unavailable" });
+          if (failureKind === "HTTP") controller.abort();
+          else response.text = async () => { controller.abort(); throw transportFailure; };
+          return response;
+        }
+        if (init.method === "DELETE") {
+          abortRequests += 1; cleanupSignal = init.signal;
+          if (cleanup === "stalled") return new Promise(() => {});
+        }
+        return originalFetch(url, init);
+      };
+      await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, signal: controller.signal }), (error) => {
+        assert.ok(error instanceof RemoteIndexInterruptionError);
+        assert.equal(error.reason, "cancel");
+        assert.equal(error.interruptionOnly, false);
+        assert.equal(error.releaseConfirmed, cleanup === "confirmed");
+        if (failureKind === "HTTP") {
+          assert.ok(error.cause instanceof CorpusWireHttpError);
+          assert.equal(error.cause.status, 503);
+          assert.match(error.cause.responseBody, /Actual checkpoint unavailable/);
+        } else {
+          assert.equal(error.cause, transportFailure);
+          assert.equal(error.cause.cause, socketCause);
+        }
+        assert.equal(error.transfer.complete, false);
+        assert.equal(error.transfer.files_transferred, 1);
+        return true;
+      });
+      assert.equal(checkpointRequests, 1);
+      assert.equal(abortRequests, 1);
+      if (cleanup === "stalled") assert.equal(cleanupSignal.aborted, true);
+      assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+    });
+  }
+}
+
+for (const failureKind of ["HTTP", "transport"]) {
+  for (const cleanup of ["confirmed", "stalled"]) {
+    test(`genuine checkpoint ${failureKind} failure survives ${cleanup} owned cleanup without fabricated timeout`, { timeout: 2500 }, async () => {
+      const fixture = priorityIndexFixture({ files: [
+        { relativePath: "main.py", content: "x" }, { relativePath: "README.md", content: "guide" },
+      ] });
+      const transportCause = new Error("Actual socket cause");
+      const transportFailure = new TypeError("Actual checkpoint transport failure", { cause: transportCause });
+      const originalFetch = fixture.client.fetchFn;
+      let cleanupSignal, checkpointFailure, readyCallbacks = 0, abortRequests = 0;
+      const checkpoint = fixture.client.checkpointIndexSessionCode.bind(fixture.client);
+      fixture.client.checkpointIndexSessionCode = async (...args) => {
+        try { return await checkpoint(...args); }
+        catch (error) { checkpointFailure = error; throw error; }
+      };
+      fixture.client.fetchFn = async (url, init) => {
+        if (url.endsWith("/checkpoint/code")) {
+          if (failureKind === "transport") throw transportFailure;
+          return jsonResponse(409, { error: "Actual checkpoint publication failure" });
+        }
+        if (init.method === "DELETE") {
+          abortRequests += 1;
+          cleanupSignal = init.signal;
+          if (cleanup === "stalled") return new Promise(() => {});
+        }
+        return originalFetch(url, init);
+      };
+      await assert.rejects(fixture.client.indexWorkspace({ ...fixture.request, processingTimeoutMs: undefined,
+        onCodeReady: () => { readyCallbacks += 1; },
+      }), (error) => {
+        assert.equal(error, checkpointFailure, "Owned cleanup must preserve the exact primary failure");
+        assert.equal(error instanceof RemoteIndexInterruptionError, false);
+        assert.equal(error.reason, undefined);
+        if (failureKind === "HTTP") {
+          assert.ok(error instanceof CorpusWireHttpError);
+          assert.equal(error.status, 409);
+          assert.match(error.message, /Actual checkpoint publication failure/);
+        } else {
+          assert.equal(error, transportFailure);
+          assert.equal(error.cause, transportCause);
+        }
+        assert.equal(error.transfer.complete, false);
+        assert.equal(error.transfer.files_transferred, 1);
+        return true;
+      });
+      assert.equal(abortRequests, 1);
+      if (cleanup === "stalled") assert.equal(cleanupSignal.aborted, true);
+      else assert.equal(fixture.calls.at(-1).type, "status");
+      assert.equal(readyCallbacks, 0);
+      assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
+      assert.deepEqual(fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths), [["main.py"]]);
+    });
+  }
+}
+
 for (const codeStage of [false, true]) {
   for (const stall of ["headers", "body"]) {
     for (const interruption of ["deadline", "cancel", "detach"]) {

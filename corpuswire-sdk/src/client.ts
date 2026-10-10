@@ -1058,7 +1058,7 @@ export class CorpusWireClient {
     options: { signal?: AbortSignal; deadline?: number } = {},
   ): Promise<RemoteIndexStatus> {
     const remainingMs = options.deadline === undefined ? 0 : options.deadline - Date.now();
-    if (options.deadline !== undefined && remainingMs <= 0) throw new Error("Code checkpoint timeout elapsed");
+    if (options.deadline !== undefined && remainingMs <= 0) throw new DOMException("Code checkpoint timeout elapsed", "TimeoutError");
     return withRequestBudget(async (signal) => {
       const response = await requestJson<{ ok: true; result: RemoteIndexStatus }>({
         baseUrl: this.baseUrl,
@@ -1069,9 +1069,9 @@ export class CorpusWireClient {
         init: { method: "POST", signal },
       });
       if (signal.aborted) throw new DOMException("Code checkpoint aborted", "AbortError");
-      if (options.deadline !== undefined && Date.now() >= options.deadline) throw new Error("Code checkpoint timeout elapsed");
+      if (options.deadline !== undefined && Date.now() >= options.deadline) throw new DOMException("Code checkpoint timeout elapsed", "TimeoutError");
       return response.result;
-    }, remainingMs, options.signal, () => new Error("Code checkpoint timeout elapsed"));
+    }, remainingMs, options.signal, () => new DOMException("Code checkpoint timeout elapsed", "TimeoutError"));
   }
 
   async commitIndexSession(sessionId: string): Promise<RemoteIndexCommitResponse> {
@@ -1383,7 +1383,6 @@ export class CorpusWireClient {
     const session = await this.startIndexSession(request);
     const uploadStop = new AbortController();
     let clientOwnedCheckpoint = false;
-    let checkpointRequestPending = false;
     let codeStageReleaseStarted = false;
     let lastProcessingStatus: RemoteIndexStatus | undefined;
     const stopUploads = (): void => uploadStop.abort();
@@ -1560,11 +1559,9 @@ export class CorpusWireClient {
           && session.mode === "full" && !request.snapshotScope && !request.evaluationInventoryAttestation
           && remoteFiles.some(({ file }) => ingestionPriority(file.relativePath) === 1)) {
           clientOwnedCheckpoint = true;
-          checkpointRequestPending = true;
           const status = await this.checkpointIndexSessionCode(session.session_id, {
             signal: uploadStop.signal, deadline: processingWaitDeadline() ?? undefined,
           });
-          checkpointRequestPending = false;
           if (status.coverage?.code_ready !== true) {
             throw new Error("Code checkpoint did not confirm code readiness");
           }
@@ -1660,7 +1657,9 @@ export class CorpusWireClient {
           Object.assign(cancelled, { transfer, cause: error });
           throw cancelled;
         }
-        if (!checkpointRequestPending && !request.signal?.aborted && !request.detachSignal?.aborted
+        // Genuine checkpoint/publication failures remain primary after cleanup;
+        // only actual interruption evidence should receive an interruption label.
+        if (!request.signal?.aborted && !request.detachSignal?.aborted
           && !(error instanceof RemoteIndexDetachedError) && !(error instanceof RemoteIndexCancelledError)
           && !(error instanceof IndexProcessingInterruptedError)
           && !(error instanceof Error && error.name === "TimeoutError")) {
