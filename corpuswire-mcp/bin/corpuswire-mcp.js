@@ -5323,7 +5323,8 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
   // Public readiness includes full verified indexes. Keep codeReady above as the
   // narrower pending-checkpoint predicate used by reconciliation admission.
   const fullCodeReady = index.indexed === true && index.readiness === "ready"
-    && coverage.state === "verified" && diagnosisStatus === "ready" && canRetrieve === true
+    && coverage.state === "verified" && canRetrieve === true && (diagnosisStatus === "ready"
+      || (diagnosisStatus === "degraded" && hasAdvisoryWarning && !hasHealthProblem))
     && collectionExists === true && Number.isInteger(pointCount) && pointCount > 0
     && indexHealthStatus === "ok" && healthWarnings.length === 0
     && !hasHealthProblem && !hasFreshnessProblem;

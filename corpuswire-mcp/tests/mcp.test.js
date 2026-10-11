@@ -4759,6 +4759,25 @@ test("MCP recognizes code readiness without certifying full inventory", async ()
   assert.equal(full.codeReady, false, 'full readiness must not become a partial-checkpoint admission');
   assert.equal(full.documentationPending, false);
   assert.equal(full.otherPending, false);
+  const advisoryChecks = [{name:'explicit_target',status:'warning',
+    message:'No repoPath or workspaceId was supplied; retrieval will use the backend default context.'}];
+  const advisoryFull = {...fullyReady,status:'degraded',checks:advisoryChecks};
+  const observedAdvisory = readBootstrap(advisoryFull, {});
+  assert.equal(observedAdvisory.publicCodeReady, true);
+  assert.equal(observedAdvisory.codeReady, false, 'advisory full readiness must not admit a partial checkpoint');
+  assert.equal(observedAdvisory.state, 'attention');
+  assert.equal(observedAdvisory.needsReconcile, false);
+  assert.equal(observedAdvisory.healthBlocked, false);
+  for (const change of [
+    {qdrant_error:'vector unavailable'},
+    {checks:[...advisoryChecks,{name:'vectors',status:'warning',message:'vector unavailable'}]},
+    {checks:[{name:'explicit_target',status:'warning',message:'Source inventory is stale.'}]},
+    {recovery_actions:['Reindex the workspace.']},
+    {index:{...fullyReady.index,indexed:false}},
+    {index:{...fullyReady.index,health_status:'error'}},
+    {index:{...fullyReady.index,coverage:{state:'invalidated'}}},
+    {index:{...fullyReady.index,readiness:'code_ready'}},
+  ]) assert.equal(readBootstrap({...advisoryFull,...change},{}).publicCodeReady, false);
   for (const change of [
     {status:'degraded'}, {status:'blocked'}, {status:'missing'}, {can_retrieve:false},
     {collection_exists:false}, {point_count:0}, {qdrant_error:'vector unavailable'},
@@ -4859,6 +4878,8 @@ test("MCP sync status distinguishes observed code readiness from unchecked boots
   const healthy = {status:'ready',can_retrieve:true,collection_exists:true,point_count:2,
     checks:[],index:{indexed:true,readiness:'ready',health_status:'ok',
       coverage:{state:'verified',code_ready:true,reason_codes:[]}}};
+  const advisory = {...healthy,status:'degraded',checks:[{name:'explicit_target',status:'warning',
+    message:'No repoPath or workspaceId was supplied; retrieval will use the backend default context.'}]};
   await writeFile(sdkPath, `import {readFileSync,appendFileSync} from 'node:fs';
     export class CorpusWireClient {
       async diagnoseWorkspace(){appendFileSync(process.env.MOCK_CALLS_PATH,'diagnose\\n');return JSON.parse(readFileSync(process.env.MOCK_DIAGNOSIS_PATH,'utf8'));}
@@ -4885,6 +4906,11 @@ test("MCP sync status distinguishes observed code readiness from unchecked boots
           if (!enabled) continue;
           for (const [diagnosis, expected] of [
             [healthy, true],
+            [advisory, true],
+            [{...advisory,qdrant_error:'vector unavailable'}, false],
+            [{...advisory,checks:[...advisory.checks,
+              {name:'vectors',status:'warning',message:'vector unavailable'}]}, false],
+            [{...advisory,recovery_actions:['Reindex the workspace.']}, false],
             [{...healthy,index:{...healthy.index,readiness:'code_ready',coverage:{state:'pending',
               code_ready:true,documentation_pending:true,other_pending:true,
               reason_codes:['background_ingestion_pending']}}}, true],

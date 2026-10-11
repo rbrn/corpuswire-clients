@@ -1877,49 +1877,61 @@ for (const endpoint of ["commit", "checkpoint/code"]) {
   });
 }
 
-test("watch publication has a finite ten-minute deadline and an unknown outcome", async (context) => {
+test("watch publication has a finite ten-minute deadline and an unknown outcome with service path prefixes", async (context) => {
   context.mock.timers.enable({ apis: ["setTimeout"] });
-  let transportSignal;
-  const wrapped = createWatchFetch(async (_input, init) => {
-    transportSignal = init.signal;
-    return new Promise((_resolve, reject) => {
-      init.signal.addEventListener("abort", () => reject(new DOMException("Synthetic abort", "AbortError")), { once: true });
+  for (const [baseUrl, endpoint] of [
+    ["http://127.0.0.1:18080", "commit"],
+    ["https://service.test/corpuswire/", "commit"],
+    ["https://service.test/gateway/corpuswire", "checkpoint/code"],
+  ]) {
+    let transportSignal;
+    const wrapped = createWatchFetch(async (_input, init) => {
+      transportSignal = init.signal;
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(new DOMException("Synthetic abort", "AbortError")), { once: true });
+      });
+    }, { baseUrl });
+    const pending = wrapped(`${baseUrl.replace(/\/+$/, "")}/v1/index/sessions/owned/${endpoint}`, { method: "POST" });
+    const rejection = assert.rejects(pending, (error) => {
+      assert.equal(error.name, "AbortError");
+      assert.equal(error.code, "watch_mutation_timeout");
+      assert.equal(error.sessionId, "owned");
+      assert.match(error.message, /backend work may still be running.*session owned/);
+      assert.match(error.message, /outcome is unknown/);
+      return true;
     });
-  });
-  const pending = wrapped("http://127.0.0.1:18080/v1/index/sessions/owned/commit", { method: "POST" });
-  const rejection = assert.rejects(pending, (error) => {
-    assert.equal(error.name, "AbortError");
-    assert.equal(error.code, "watch_mutation_timeout");
-    assert.equal(error.sessionId, "owned");
-    assert.match(error.message, /backend work may still be running.*session owned/);
-    assert.match(error.message, /outcome is unknown/);
-    return true;
-  });
-  context.mock.timers.tick(599_999);
-  assert.equal(transportSignal.aborted, false);
-  context.mock.timers.tick(1);
-  await rejection;
-  assert.equal(transportSignal.aborted, true);
+    context.mock.timers.tick(599_999);
+    assert.equal(transportSignal.aborted, false);
+    context.mock.timers.tick(1);
+    await rejection;
+    assert.equal(transportSignal.aborted, true);
+  }
 });
 
-test("watch publication response body can finish after the short request deadline", async (context) => {
-  context.mock.timers.enable({ apis: ["setTimeout"] });
-  let responseBody;
-  let transportSignal;
-  const wrapped = createWatchFetch(async (_input, init) => {
-    transportSignal = init.signal;
-    return new Response(new ReadableStream({ start(controller) {
-      responseBody = controller;
-      init.signal.addEventListener("abort", () => controller.error(new DOMException("Synthetic body abort", "AbortError")), { once: true });
-    } }), { headers: { "content-type": "application/json" } });
+for (const [baseUrl, endpoint] of [
+  ["http://127.0.0.1:18080", "commit"],
+  ["https://service.test/corpuswire/", "commit"],
+  ["https://service.test/gateway/corpuswire", "checkpoint/code"],
+]) {
+  test(`watch ${endpoint} response body can finish after the short request deadline at ${new URL(baseUrl).pathname}`, async (context) => {
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    let responseBody;
+    let transportSignal;
+    const wrapped = createWatchFetch(async (_input, init) => {
+      transportSignal = init.signal;
+      return new Response(new ReadableStream({ start(controller) {
+        responseBody = controller;
+        init.signal.addEventListener("abort", () => controller.error(new DOMException("Synthetic body abort", "AbortError")), { once: true });
+      } }), { headers: { "content-type": "application/json" } });
+    }, { baseUrl });
+    const pending = wrapped(`${baseUrl.replace(/\/+$/, "")}/v1/index/sessions/owned/${endpoint}`, { method: "POST" });
+    context.mock.timers.tick(235_000);
+    assert.equal(transportSignal.aborted, false);
+    responseBody.enqueue(new TextEncoder().encode('{"ok":true}'));
+    responseBody.close();
+    assert.deepEqual(await (await pending).json(), { ok: true });
   });
-  const pending = wrapped("http://127.0.0.1:18080/v1/index/sessions/owned/commit", { method: "POST" });
-  context.mock.timers.tick(235_000);
-  assert.equal(transportSignal.aborted, false);
-  responseBody.enqueue(new TextEncoder().encode('{"ok":true}'));
-  responseBody.close();
-  assert.deepEqual(await (await pending).json(), { ok: true });
-});
+}
 
 test("watch read-only preflight keeps the thirty-second request deadline", async (context) => {
   context.mock.timers.enable({ apis: ["setTimeout"] });
@@ -1964,6 +1976,46 @@ test("watch publication still honors upload cancellation and detach signals", as
   }
 });
 
+test("prefixed read-only preflight still stops on the first caller signal", async () => {
+  for (const endpoint of ["capabilities", "preview"]) {
+    const stop = new AbortController();
+    const wrapped = createWatchFetch(async (_input, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(new DOMException("Synthetic abort", "AbortError")), { once: true });
+    }), { baseUrl: "https://service.test/corpuswire/", signal: stop.signal });
+    const pending = wrapped(`https://service.test/corpuswire/v1/index/${endpoint}`, {
+      method: endpoint === "preview" ? "POST" : "GET",
+    });
+    const rejection = assert.rejects(pending, { name: "AbortError" });
+    stop.abort();
+    await rejection;
+  }
+});
+
+test("watch lifecycle classification preserves unrelated origins and paths", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  for (const url of [
+    "https://other.test/corpuswire/v1/index/sessions/owned/commit",
+    "https://service.test/elsewhere/v1/index/sessions/owned/commit",
+    "https://service.test/corpuswire-other/v1/index/sessions/owned/commit",
+    "https://service.test/corpuswire/v1/index/preview-more",
+  ]) {
+    const stop = new AbortController();
+    let transportSignal;
+    const wrapped = createWatchFetch(async (_input, init) => {
+      transportSignal = init.signal;
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(new DOMException("Synthetic abort", "AbortError")), { once: true });
+      });
+    }, { baseUrl: "https://service.test/corpuswire", signal: stop.signal });
+    const pending = wrapped(url, { method: "POST" });
+    const rejection = assert.rejects(pending, { name: "AbortError", code: "ETIMEDOUT" });
+    stop.abort();
+    assert.equal(transportSignal.aborted, false, "Unrelated paths are not read-only API preflight");
+    context.mock.timers.tick(30_000);
+    await rejection;
+  }
+});
+
 test("watch timeout flag overrides only the publication request budget", async (context) => {
   const root = await syntheticWorkspace();
   const stop = new AbortController();
@@ -1972,7 +2024,7 @@ test("watch timeout flag overrides only the publication request budget", async (
     constructor(options) { serviceFetch = options.fetchFn; throw new Error("Synthetic constructor stop"); }
   } };
   try {
-    await assert.rejects(main(["watch", "--timeout-ms", "45000"], {
+    await assert.rejects(main(["watch", "--api-base-url", "http://127.0.0.1:18080/corpuswire/", "--timeout-ms", "45000"], {
       cwd: root, homeDirectory: root, env: {}, sdk, signal: stop.signal, write: () => {}, platform: "linux",
       fetchFn: async (_input, init) => new Promise((_resolve, reject) => {
         init.signal.addEventListener("abort", () => reject(new DOMException("Synthetic abort", "AbortError")), { once: true });
@@ -1980,7 +2032,7 @@ test("watch timeout flag overrides only the publication request budget", async (
     }), /Synthetic constructor stop/);
     context.mock.timers.enable({ apis: ["setTimeout"] });
     for (const [endpoint, budget, code] of [["sessions/owned/commit", 45_000, "watch_mutation_timeout"], ["capabilities", 30_000, "ETIMEDOUT"]]) {
-      const pending = serviceFetch(`http://127.0.0.1:18080/v1/index/${endpoint}`, {
+      const pending = serviceFetch(`http://127.0.0.1:18080/corpuswire/v1/index/${endpoint}`, {
         method: endpoint === "capabilities" ? "GET" : "POST",
       });
       let settled = false;
@@ -2007,6 +2059,23 @@ test("watch stops after a mutation deadline without rescanning or another index"
   assert.equal(state.waits, 0);
   assert.equal(state.writes.some((line) => line.includes("retry")), false);
   assert.equal(state.writes.some((line) => line.includes("Index verified")), false);
+});
+
+test("prefixed publication timeouts stop watch without another index", async () => {
+  for (const endpoint of ["commit", "checkpoint/code"]) {
+    const wrapped = createWatchFetch(async (_input, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(new DOMException("Synthetic abort", "AbortError")), { once: true });
+    }), { baseUrl: "https://service.test/corpuswire", timeoutMs: 1, publicationTimeoutMs: 1 });
+    const state = await watchFixture({ onIndex: () => wrapped(
+      `https://service.test/corpuswire/v1/index/sessions/owned/${endpoint}`, { method: "POST" },
+    ) });
+    assert.equal(state.error?.code, "watch_mutation_timeout");
+    assert.equal(state.error?.sessionId, "owned");
+    assert.equal(state.requests.length, 1);
+    assert.equal(state.calls.preview, 1);
+    assert.equal(state.waits, 0);
+    assert.equal(state.writes.some((line) => line.includes("retry")), false);
+  }
 });
 
 test("verified empty backend diagnosis permits watching and a later source addition", { timeout: 5000 }, async () => {

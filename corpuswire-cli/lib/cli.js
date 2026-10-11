@@ -353,6 +353,7 @@ export async function runCliCommand(options, dependencies = {}) {
   const serviceFetch = createServiceFetch(dependencies.fetchFn ?? globalThis.fetch, options.apiBaseUrl);
   const fetchFn = options.watch
     ? createWatchFetch(serviceFetch, {
+      baseUrl: options.apiBaseUrl,
       signal: dependencies.signal, detachSignal: dependencies.detachSignal,
       timeoutMs: dependencies.watchRequestTimeoutMs ?? DEFAULT_WATCH_REQUEST_TIMEOUT_MS,
       publicationTimeoutMs: options.timeoutMs === undefined
@@ -511,21 +512,26 @@ export async function runCliCommand(options, dependencies = {}) {
 // Keep mutation calls alive long enough for the SDK to identify and cancel its own session.
 // Read-only preflight calls may stop immediately; a second interrupt aborts any request.
 export function createWatchFetch(fetchFn, {
-  signal, detachSignal, timeoutMs = DEFAULT_WATCH_REQUEST_TIMEOUT_MS,
+  baseUrl, signal, detachSignal, timeoutMs = DEFAULT_WATCH_REQUEST_TIMEOUT_MS,
   publicationTimeoutMs = DEFAULT_WATCH_PUBLICATION_TIMEOUT_MS,
 } = {}) {
+  const apiBaseUrl = baseUrl === undefined ? null : new URL(baseUrl);
+  const basePathname = apiBaseUrl?.pathname.replace(/\/+$/, "") ?? "";
   return async (input, init = {}) => {
     const controller = new AbortController();
-    const pathname = new URL(typeof input === "string" || input instanceof URL ? input : input.url).pathname;
+    const requestUrl = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+    const pathname = requestUrl.pathname;
+    const apiPathname = (!apiBaseUrl || requestUrl.origin === apiBaseUrl.origin)
+      && pathname.startsWith(`${basePathname}/`) ? pathname.slice(basePathname.length) : "";
     const method = String(init.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
     const publication = method === "POST"
-      && /^\/v1\/index\/sessions\/[^/]+\/(?:commit|checkpoint\/code)$/.test(pathname);
+      && /^\/v1\/index\/sessions\/[^/]+\/(?:commit|checkpoint\/code)$/.test(apiPathname);
     const mutation = ["POST", "DELETE"].includes(method)
-      && /^\/v1\/index\/sessions(?:\/|$)/.test(pathname);
-    const sessionId = /^\/v1\/index\/sessions\/([^/]+)(?:\/|$)/.exec(pathname)?.[1];
+      && /^\/v1\/index\/sessions(?:\/|$)/.test(apiPathname);
+    const sessionId = /^\/v1\/index\/sessions\/([^/]+)(?:\/|$)/.exec(apiPathname)?.[1];
     const requestTimeoutMs = publication ? publicationTimeoutMs : timeoutMs;
     const signals = [init.signal, detachSignal];
-    if (["/v1/index/capabilities", "/v1/index/preview"].includes(pathname)) signals.push(signal);
+    if (["/v1/index/capabilities", "/v1/index/preview"].includes(apiPathname)) signals.push(signal);
     const abort = () => controller.abort();
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; abort(); }, requestTimeoutMs);
