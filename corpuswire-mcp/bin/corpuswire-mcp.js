@@ -1039,7 +1039,7 @@ class SyncManager {
         coverageToken: previous.coverage.coverage_token,
         selectionPolicyDigest: previous.coverage.selection_policy_digest }
       : this.readableCheckpointBaseline;
-    const sameOwnedCheckpoint = baseline !== undefined
+    const sameOwnedIdentity = baseline !== undefined
       && typeof baseline.contextKey === "string" && baseline.contextKey === contextKey
       && baseline.contextKey === this.coverageContextKey
       && baseline.workspaceId === bootstrapStatus.workspaceId
@@ -1048,12 +1048,17 @@ class SyncManager {
       && baseline.resolvedContext === (bootstrapStatus.resolvedContext ?? null)
       && typeof baseline.coverageToken === "string" && baseline.coverageToken.length > 0
       && typeof baseline.selectionPolicyDigest === "string" && baseline.selectionPolicyDigest.length > 0
-      && bootstrapStatus.codeReady === true && bootstrapStatus.needsReconcile !== true
-      && this.lastError === null
+      && bootstrapStatus.needsReconcile !== true && this.lastError === null;
+    const sameOwnedCheckpoint = sameOwnedIdentity && bootstrapStatus.codeReady === true
       && (bootstrapStatus.coverage?.coverage_token == null
         || bootstrapStatus.coverage.coverage_token === baseline.coverageToken)
       && (bootstrapStatus.coverage?.selection_policy_digest == null
         || bootstrapStatus.coverage.selection_policy_digest === baseline.selectionPolicyDigest);
+    const completedOwnedCheckpoint = this.readableCheckpointBaseline !== undefined && sameOwnedIdentity
+      && bootstrapStatus.coverage?.state === "verified" && bootstrapStatus.publicCodeReady === true
+      && !isBootstrapHealthBlocked(bootstrapStatus)
+      && bootstrapStatus.coverage.coverage_token === baseline.coverageToken
+      && bootstrapStatus.coverage.selection_policy_digest === baseline.selectionPolicyDigest;
     if (this.observationGap === false && (
       previous.coverage?.coverage_token !== bootstrapStatus.coverage?.coverage_token
       || previous.coverage?.selection_policy_digest !== bootstrapStatus.coverage?.selection_policy_digest
@@ -1067,6 +1072,7 @@ class SyncManager {
       this.observationGap = true;
       this.readableCheckpointBaseline = undefined;
     }
+    if (completedOwnedCheckpoint) this.observationGap = false;
     this.readableCheckpointBaseline = sameOwnedCheckpoint ? baseline : undefined;
     this.recordBootstrapStatus(bootstrapStatus);
     return bootstrapStatus;

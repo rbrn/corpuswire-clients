@@ -5515,6 +5515,9 @@ test("review: first unchecked full reconciliation binds checkpoint identities to
       assert.equal(context.readFreshnessStatus().strictBlocked, false, "Ordinary search/enhance read retains the verified explicit selection");
       await context.refreshBootstrapStatus({ ...explicitFilters, root: "/local/repo" });
       assert.equal(context.readFreshnessStatus().strictBlocked, false, "Equivalent local root alias preserves the owned checkpoint");
+      diagnosis = { ...diagnosis, index: { ...diagnosis.index, readiness: "ready", coverage: { ...verified } } };
+      await context.prepareForRead({});
+      assert.equal(context.observationGap, false, "Verified completion restores observations after an unchecked or timed-out first baseline");
     }
   }
   }
@@ -5611,6 +5614,109 @@ test("review: legacy health fallback projects explicit workspace identity indepe
       assert.equal(context.readFreshnessStatus().strictBlocked, false, "Equivalent local root alias preserves the owned checkpoint");
     }
   }
+  }
+  assert.equal(backendRequests[0].repoPath, "/service/repo");
+  assert.equal(backendRequests[0].workspaceId, "requested-workspace");
+});
+
+test("review: owned pending checkpoint restores observations only after matching healthy verified completion", async () => {
+  const source = await readFile(SERVER_BIN, "utf8");
+  const section = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
+  const backendRequests = [];
+  let diagnosis;
+  let publication;
+  let diagnosisStalled = false;
+  let diagnosisError = false;
+  const helpers = new Function("path", "buildClient", "optionalBoolean", "optionalNonNegativeInteger", "optionalPositiveInteger", "optionalStringArray", "compactStringArray", "hasBootstrapFreshnessSignal", "asRecord", "isRecord", "createHash", "buildMcpIndexTrace", "removeUndefinedValues",
+    "const DEFAULT_BASE_URL='http://fixture', DEFAULT_SYNC_MAX_FILE_SIZE_BYTES=1000, DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS=50, DEFAULT_SYNC_FLUSH_TIMEOUT_MS=50, DEFAULT_SYNC_RECONCILE_MAX_FILES=100, SERVER_NAME='fixture'; const EXCLUDED_PATH_SEGMENTS=new Set();"
+    + section("function initialBootstrapStatus()", "function bootstrapStatusFromError(")
+    + section("function firstNonEmptyString(", "function requiredString(")
+    + section("function optionalString(", "function readOutputMode(")
+    + section("function resolveSyncGlobList(", "function isSyncIndexableRelativePath(")
+    + section("function isBootstrapHealthBlocked(", "function formatWorkspaceDiagnosis(")
+    + section("async function awaitWithTimeout(", "function formatPathProbePayload(")
+    + "return { syncContextKey, initialBootstrapStatus, methods: {"
+    + section("  async prepareForRead(args", "  readFreshnessStatus()") + ","
+    + section("  readFreshnessStatus()", "  async reconcileExplicit(") + ","
+    + section("  async checkBootstrapStatus(", "  async refreshBootstrapStatus(") + ","
+    + section("  async refreshBootstrapStatus(", "  async readBootstrapStatus(") + ","
+    + section("  async readBootstrapStatus(", "  applyBootstrapStatus(") + ","
+    + section("  applyBootstrapStatus(", "  async reconcileAll(") + ","
+    + section("  async runReconcile(", "  async readRemoteFile(") + ","
+    + section("  async applySyncCacheUploadResult(", "  async updateSyncCacheEntry(") + ","
+    + section("  resolveContext(", "  ensurePendingContext(") + "}};")(
+      path, () => ({ diagnoseWorkspace: async (request) => { backendRequests.push(request); if (diagnosisError) throw new Error("transport failure"); if (diagnosisStalled) await new Promise(() => {}); return diagnosis; }, indexWorkspace: async () => publication }),
+      (v, f) => v === undefined ? f : v === "true", (v, f) => v === undefined ? f : Number(v),
+      (v, f) => v === undefined ? f : Number(v),
+      (args, ...keys) => keys.map((key) => args[key]).find(Array.isArray) ?? [],
+      (values) => Array.isArray(values) ? values : [], () => false,
+      (value) => value ?? {}, (value) => value !== null && typeof value === "object", createHash, () => undefined, (value) => value);
+  const explicitFilters = { includeGlobs: ["src/**"], excludeGlobs: ["src/generated/**"] };
+  for (const changed of [{}, { coverageToken: "foreign-token" }, { selectionPolicyDigest: "foreign-policy" },
+    { missingCoverageToken: true }, { missingPolicy: true }, { resolvedWorkspaceId: "foreign-workspace" },
+    { resolvedContext: "foreign-context" }, { workspaceId: "foreign-workspace" }, { repoPath: "/service/foreign" },
+    { sourceRoot: "/local/foreign" }, { includeGlobs: ["docs/**"] }, { excludeGlobs: ["private/**"] },
+    { collection: "foreign-collection" }, { envService: "http://foreign" }, { registry: "foreign" }, { maxSize: "500" }, { unhealthy: true }, { unknown: true }, { unavailable: true },
+    { timeout: true }, { transport: true }]) {
+    const context = { ...helpers.methods, env: { CORPUSWIRE_SYNC_ROOT: "/local/repo", CORPUSWIRE_REPO_PATH: "/service/repo",
+      CORPUSWIRE_WORKSPACE_ID: "requested-workspace", CORPUSWIRE_SYNC_READ_STRICT: "true", CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK: "true", CORPUSWIRE_SYNC_BOOTSTRAP_TIMEOUT_MS: "5", CORPUSWIRE_SYNC_READ_FRESHNESS_TIMEOUT_MS: "5" },
+      observationGap: false, lastError: null, flushDurationSamplesMs: [],
+      flushAll: async () => ({}), collectWorkspaceFileEntries: async () => [{ relativePath: "src/a.js" }],
+      readRemoteFile: async () => ({ file: { relativePath: "src/a.js", content: Buffer.from("source"), sha256: createHash("sha256").update("source").digest("hex") } }),
+      readGitMetadata: async () => ({}), indexWorkspaceWithSessionConflictRetry: async (client, request) => {
+        assert.equal(request.workspace.workspaceId, "requested-workspace");
+        assert.equal(request.workspace.displayRoot, "/local/repo");
+        assert.equal(request.mode, "full");
+        return client.indexWorkspace(request);
+      }, recordResult: () => {},
+      isCacheEnabled: () => false, isEnabled: () => true, flushBeforeRead: async () => null, snapshot: () => ({}), recordBootstrapStatus(status) { this.bootstrapStatus = status; } };
+    const verified = { state: "verified", coverage_token: "owned-token", selection_policy_digest: "owned-policy" };
+    diagnosis = { status: "ready", can_retrieve: true, collection: "owned", collection_exists: true, point_count: 1,
+      resolved_workspace_id: "requested-workspace", resolved_context: "requested-workspace", checks: [],
+      index: { indexed: true, health_status: "ok", readiness: "ready", coverage: verified } };
+    context.bootstrapStatus = helpers.initialBootstrapStatus();
+    publication = { status: { workspace_id: "requested-workspace",
+      collection_name: "owned", coverage: verified }, transfer: { complete: true } };
+    await context.runReconcile(context.resolveContext(explicitFilters), explicitFilters);
+    assert.equal(context.bootstrapStatus.coverage.coverage_token, "owned-token");
+    diagnosis = { ...diagnosis, index: { ...diagnosis.index, readiness: "code_ready", coverage: {
+      state: "pending", code_ready: true, reason_codes: ["background_ingestion_pending"] } } };
+    await context.prepareForRead({});
+    assert.equal(context.observationGap, true, "Omitted pending lineage makes the observation incomplete");
+    assert.equal(context.readFreshnessStatus().strictBlocked, false, "Owned healthy checkpoint remains readable during completion");
+    if (changed.timeout || changed.transport) {
+      diagnosisStalled = changed.timeout === true;
+      diagnosisError = changed.transport === true;
+      await assert.rejects(context.prepareForRead({}), /strict mode blocked retrieval|transport failure/);
+      diagnosisStalled = false;
+      diagnosisError = false;
+      assert.equal(context.readableCheckpointBaseline, undefined, "Diagnosis failures permanently revoke this marker");
+    }
+    const terminal = { ...diagnosis, status: "ready", index: { ...diagnosis.index, readiness: "ready", coverage: { ...verified } } };
+    diagnosis = { ...terminal, ...(changed.resolvedWorkspaceId ? { resolved_workspace_id: changed.resolvedWorkspaceId } : {}),
+      ...(changed.resolvedContext ? { resolved_context: changed.resolvedContext } : {}),
+      ...(changed.collection ? { collection: changed.collection } : {}),
+      ...(changed.unavailable ? { can_retrieve: false } : {}),
+      ...(changed.unknown ? { status: "unknown" } : {}),
+      index: { ...terminal.index, ...(changed.unhealthy ? { health_status: "degraded" } : {}), coverage: {
+        ...verified, coverage_token: changed.missingCoverageToken ? undefined : changed.coverageToken ?? verified.coverage_token,
+        selection_policy_digest: changed.missingPolicy ? undefined : changed.selectionPolicyDigest ?? verified.selection_policy_digest } } };
+    if (changed.envService) context.env.CORPUSWIRE_BASE_URL = changed.envService;
+    if (changed.registry) context.supportedFileRegistryVersion = changed.registry;
+    if (changed.maxSize) context.env.CORPUSWIRE_SYNC_MAX_FILE_SIZE_BYTES = changed.maxSize;
+    const readArgs = { ...changed };
+    if (Object.keys(changed).length === 0) {
+      await context.prepareForRead(readArgs);
+      assert.equal(context.observationGap, false, "Exact healthy completion restores observations without another reconcile");
+      assert.equal(context.readFreshnessStatus().strictBlocked, false);
+      await context.prepareForRead({});
+      assert.equal(context.readFreshnessStatus().strictBlocked, false, "Ordinary reads stay available after completion");
+    } else {
+      await assert.rejects(context.prepareForRead(readArgs), /strict mode blocked retrieval/);
+      diagnosis = terminal;
+      await assert.rejects(context.prepareForRead({}), /strict mode blocked retrieval/,
+        "A later healthy terminal diagnosis cannot restore revoked ownership");
+    }
   }
   assert.equal(backendRequests[0].repoPath, "/service/repo");
   assert.equal(backendRequests[0].workspaceId, "requested-workspace");
