@@ -116,7 +116,7 @@ npm pack ./corpuswire-sdk --pack-destination /tmp/corpuswire-snapshot
 npm pack ./corpuswire-cli --pack-destination /tmp/corpuswire-snapshot
 npm install --prefix /tmp/corpuswire-install \
   /tmp/corpuswire-snapshot/corpuswire-sdk-0.1.4.tgz \
-  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.4-beta.6.tgz
+  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.4-beta.7.tgz
 /tmp/corpuswire-install/node_modules/.bin/cw --version
 ```
 
@@ -358,3 +358,5 @@ error code (for example `watch_limit_reached` / `ENOSPC`). Unknown codes become
 `native_watch_unavailable` with a null code. NDJSON adds these fields in `fallback`;
 raw exception messages, filenames, and stacks are omitted. Periodic complete
 scans continue with the configured bounded scan interval.
+
+Watch commit and code-checkpoint requests have a ten-minute default deadline; `--timeout-ms` overrides it. Short preflight requests retain a 30-second deadline. A timed-out indexing mutation has an unknown backend outcome: watch stops without rescanning, and `cw doctor` reports serving readiness before restart.

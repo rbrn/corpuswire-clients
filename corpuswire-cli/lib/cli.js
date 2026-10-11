@@ -10,6 +10,8 @@ import { createInterface } from "node:readline/promises";
 import { promisify } from "node:util";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:18080";
+const DEFAULT_WATCH_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_WATCH_PUBLICATION_TIMEOUT_MS = 600_000;
 const execFileAsync = promisify(execFile);
 const SUPPORTED_OUTPUT_MODES = new Set(["generic", "copilot", "claude-code", "sequential"]);
 const DEFAULT_EXCLUDED_DIRECTORIES = new Set([
@@ -26,7 +28,7 @@ const INDEX_TRACE_STAGES = new Set([
   "session_lock_wait", "session_lock_hold", "session_catalog",
   "writer_creation", "schema_preflight", "session_persistence",
 ]);
-const CLI_VERSION = "0.1.4-beta.6";
+const CLI_VERSION = "0.1.4-beta.7";
 
 export function printHelp(write = console.log) {
   write(`cw
@@ -351,8 +353,12 @@ export async function runCliCommand(options, dependencies = {}) {
   const serviceFetch = createServiceFetch(dependencies.fetchFn ?? globalThis.fetch, options.apiBaseUrl);
   const fetchFn = options.watch
     ? createWatchFetch(serviceFetch, {
+      baseUrl: options.apiBaseUrl,
       signal: dependencies.signal, detachSignal: dependencies.detachSignal,
-      timeoutMs: dependencies.watchRequestTimeoutMs ?? 30000,
+      timeoutMs: dependencies.watchRequestTimeoutMs ?? DEFAULT_WATCH_REQUEST_TIMEOUT_MS,
+      publicationTimeoutMs: options.timeoutMs === undefined
+        ? dependencies.watchPublicationTimeoutMs ?? DEFAULT_WATCH_PUBLICATION_TIMEOUT_MS
+        : Math.max(1, options.timeoutMs),
     }) : serviceFetch;
   const client =
     dependencies.client ??
@@ -505,15 +511,30 @@ export async function runCliCommand(options, dependencies = {}) {
 
 // Keep mutation calls alive long enough for the SDK to identify and cancel its own session.
 // Read-only preflight calls may stop immediately; a second interrupt aborts any request.
-export function createWatchFetch(fetchFn, { signal, detachSignal, timeoutMs = 30000 } = {}) {
+export function createWatchFetch(fetchFn, {
+  baseUrl, signal, detachSignal, timeoutMs = DEFAULT_WATCH_REQUEST_TIMEOUT_MS,
+  publicationTimeoutMs = DEFAULT_WATCH_PUBLICATION_TIMEOUT_MS,
+} = {}) {
+  const apiBaseUrl = baseUrl === undefined ? null : new URL(baseUrl);
+  const basePathname = apiBaseUrl?.pathname.replace(/\/+$/, "") ?? "";
   return async (input, init = {}) => {
     const controller = new AbortController();
-    const pathname = new URL(typeof input === "string" || input instanceof URL ? input : input.url).pathname;
+    const requestUrl = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+    const pathname = requestUrl.pathname;
+    const apiPathname = (!apiBaseUrl || requestUrl.origin === apiBaseUrl.origin)
+      && pathname.startsWith(`${basePathname}/`) ? pathname.slice(basePathname.length) : "";
+    const method = String(init.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+    const publication = method === "POST"
+      && /^\/v1\/index\/sessions\/[^/]+\/(?:commit|checkpoint\/code)$/.test(apiPathname);
+    const mutation = ["POST", "DELETE"].includes(method)
+      && /^\/v1\/index\/sessions(?:\/|$)/.test(apiPathname);
+    const sessionId = /^\/v1\/index\/sessions\/([^/]+)(?:\/|$)/.exec(apiPathname)?.[1];
+    const requestTimeoutMs = publication ? publicationTimeoutMs : timeoutMs;
     const signals = [init.signal, detachSignal];
-    if (["/v1/index/capabilities", "/v1/index/preview"].includes(pathname)) signals.push(signal);
+    if (["/v1/index/capabilities", "/v1/index/preview"].includes(apiPathname)) signals.push(signal);
     const abort = () => controller.abort();
     let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; abort(); }, timeoutMs);
+    const timer = setTimeout(() => { timedOut = true; abort(); }, requestTimeoutMs);
     for (const linked of signals.filter(Boolean)) {
       linked.addEventListener("abort", abort, { once: true });
       if (linked.aborted) abort();
@@ -525,7 +546,17 @@ export function createWatchFetch(fetchFn, { signal, detachSignal, timeoutMs = 30
         status: response.status, statusText: response.statusText, headers: response.headers,
       });
     } catch (error) {
-      if (timedOut) throw Object.assign(new Error("Watch HTTP request timed out."), { name: "AbortError", code: "ETIMEDOUT" });
+      if (timedOut) {
+        const message = mutation
+          ? `Watch ${publication ? "publication" : "indexing"} request timed out after ${formatDuration(requestTimeoutMs)}; `
+            + `backend work may still be running${sessionId ? ` for session ${sanitizeTerminalText(sessionId)}` : ""}. `
+            + "The outcome is unknown. Watch will stop without starting another reconciliation. Run cw doctor to check serving readiness before restarting."
+          : "Watch HTTP request timed out.";
+        throw Object.assign(new Error(message), {
+          name: "AbortError", code: mutation ? "watch_mutation_timeout" : "ETIMEDOUT",
+          ...(sessionId ? { sessionId } : {}),
+        });
+      }
       throw error;
     } finally {
       clearTimeout(timer);

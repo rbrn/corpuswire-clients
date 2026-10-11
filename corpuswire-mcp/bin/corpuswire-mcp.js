@@ -14,7 +14,7 @@ import { canonicalCoalescingDeliveryComplete, planSourceRootCoalescing } from ".
 const JSONRPC_VERSION = "2.0";
 const PROTOCOL_VERSION = "2024-11-05";
 const SERVER_NAME = "corpuswire-context-engine";
-const SERVER_VERSION = "0.1.4-beta.3";
+const SERVER_VERSION = "0.1.4-beta.4";
 const DEFAULT_BASE_URL = "http://127.0.0.1:18080";
 const DEFAULT_OUTPUT_MODE = "generic";
 const DEFAULT_TOP_K = 5;
@@ -2140,6 +2140,10 @@ class SyncManager {
 
   snapshot() {
     const syncCapability = this.syncCapability();
+    const observedCodeReady = this.bootstrapStatus.publicCodeReady ?? null;
+    const publicCodeReady = observedCodeReady === true && (
+      isBootstrapHealthBlocked(this.bootstrapStatus) || this.bootstrapStatus.needsReconcile === true
+    ) ? false : observedCodeReady;
     return {
       enabled: this.isEnabled(),
       capabilityAllowed: syncCapability.allowed,
@@ -2195,7 +2199,7 @@ class SyncManager {
       bootstrapReason: this.bootstrapStatus.reason,
       bootstrapStatus: this.bootstrapStatus.status,
       bootstrapCanRetrieve: this.bootstrapStatus.canRetrieve,
-      bootstrapCodeReady: this.bootstrapStatus.codeReady ?? false,
+      bootstrapCodeReady: publicCodeReady,
       documentationPending: this.bootstrapStatus.documentationPending ?? false,
       otherPending: this.bootstrapStatus.otherPending ?? false,
       bootstrapCollection: this.bootstrapStatus.collection,
@@ -5210,6 +5214,7 @@ function initialBootstrapStatus() {
     reason: "Bootstrap freshness check has not run.",
     status: null,
     canRetrieve: null,
+    publicCodeReady: null,
     repoPath: null,
     workspaceId: null,
     resolvedContext: null,
@@ -5315,6 +5320,14 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
     && collectionExists === true && Number.isInteger(pointCount) && pointCount > 0
     && indexHealthStatus === "ok" && healthWarnings.length === 0
     && !hasHealthProblem && !hasFreshnessProblem;
+  // Public readiness includes full verified indexes. Keep codeReady above as the
+  // narrower pending-checkpoint predicate used by reconciliation admission.
+  const fullCodeReady = index.indexed === true && index.readiness === "ready"
+    && coverage.state === "verified" && canRetrieve === true && (diagnosisStatus === "ready"
+      || (diagnosisStatus === "degraded" && hasAdvisoryWarning && !hasHealthProblem))
+    && collectionExists === true && Number.isInteger(pointCount) && pointCount > 0
+    && indexHealthStatus === "ok" && healthWarnings.length === 0
+    && !hasHealthProblem && !hasFreshnessProblem;
   const coverageUnknown = !["verified", "not_applicable"].includes(coverage.state);
   const needsReconcile = (coverageUnknown && !codeReady) || hasFreshnessProblem
     || collectionExists === false
@@ -5337,6 +5350,7 @@ function bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId }) {
     healthBlocked: statusLooksBlocked || hasHealthProblem || canRetrieve === false,
     emptyWriteReady,
     codeReady,
+    publicCodeReady: codeReady || fullCodeReady,
     documentationPending: codeReady && coverage.documentation_pending === true,
     otherPending: codeReady && coverage.other_pending === true,
     state,
@@ -7629,7 +7643,7 @@ function formatSyncPayload(payload) {
     `- bootstrapReason: ${status.bootstrapReason ?? "none"}`,
     `- bootstrapDiagnosisStatus: ${status.bootstrapStatus ?? "unknown"}`,
     `- bootstrapCanRetrieve: ${status.bootstrapCanRetrieve ?? "unknown"}`,
-    `- codeReady: ${status.bootstrapCodeReady ?? false}`,
+    `- codeReady: ${status.bootstrapCodeReady ?? "unknown"}`,
     `- documentationPending: ${status.documentationPending ?? false}`,
     `- otherPending: ${status.otherPending ?? false}`,
     `- bootstrapCollection: ${status.bootstrapCollection ?? "unknown"}`,
