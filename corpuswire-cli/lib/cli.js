@@ -318,6 +318,14 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
     }
   }
 
+  if (options.implicitIndex && options.promptParts.length) {
+    command = options.command = "enhance";
+    options.implicitIndex = false;
+  }
+  if (!["local", "hosted"].includes(options.profile)) throw new Error(`Unsupported profile: ${options.profile}`);
+  if (options.maxFileSizeBytes !== undefined && (!Number.isSafeInteger(options.maxFileSizeBytes) || options.maxFileSizeBytes <= 0)) {
+    throw new Error("max-file-size must be a positive safe integer.");
+  }
   if (command !== "init" && (options.indexAfterInit || options.verifyAfterInit)) {
     throw new Error("--index and --verify are only supported with init.");
   }
@@ -336,12 +344,16 @@ export async function runCliCommand(options, dependencies = {}) {
   const write = dependencies.write ?? console.log;
   const configurationInputs = { ...options };
   if (["index", "reconcile", "init", "doctor", "watch"].includes(options.command)) {
-    const sourceRoot = path.resolve(options.sourceRoot || process.cwd());
+    const requestedSourceRoot = path.resolve(options.sourceRoot || process.cwd());
+    const sourceRoot = await realpath(requestedSourceRoot);
     const sourceStats = await stat(sourceRoot);
     if (!sourceStats.isDirectory()) throw new Error(`Workspace root is not a directory: ${sourceRoot}`);
     const configuration = await resolveIndexConfiguration(options, sourceRoot, dependencies);
     validateIndexDestination(configuration);
-    options = { ...options, ...configuration, apiBaseUrl: configuration.baseUrl, sourceRoot, configuration };
+    options = { ...options, ...configuration, apiBaseUrl: configuration.baseUrl, sourceRoot, requestedSourceRoot, configuration };
+    const interactive = dependencies.isTTY ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    if (options.implicitIndex && configuration.profile === "local" && interactive
+      && !options.once && !options.nonInteractive && !options.json && !options.ndjson) options.watch = true;
     if (options.command === "init") {
       const result = await initializeWorkspace(options, dependencies);
       if (!options.indexAfterInit && !options.verifyAfterInit) return result;
@@ -531,7 +543,7 @@ export function createWatchFetch(fetchFn, {
     const sessionId = /^\/v1\/index\/sessions\/([^/]+)(?:\/|$)/.exec(apiPathname)?.[1];
     const requestTimeoutMs = publication ? publicationTimeoutMs : timeoutMs;
     const signals = [init.signal, detachSignal];
-    if (["/v1/index/capabilities", "/v1/index/preview"].includes(apiPathname)) signals.push(signal);
+    if (["/v1/index/capabilities", "/v1/index/preview", "/v1/health", "/v1/context/diagnose", "/health", "/context/diagnose"].includes(apiPathname)) signals.push(signal);
     const abort = () => controller.abort();
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; abort(); }, requestTimeoutMs);
@@ -646,8 +658,8 @@ export async function runWatchCommand(options, dependencies) {
       : `${message} Reason: ${fallback.reason}${fallback.error_code ? ` (${fallback.error_code})` : ""}.`);
   };
   const signal = dependencies.signal;
-  const requestedRoot = options.sourceRoot;
-  const root = await realpath(requestedRoot);
+  const requestedRoot = options.requestedSourceRoot ?? path.resolve(options.sourceRoot);
+  const root = options.requestedSourceRoot ? options.sourceRoot : await realpath(requestedRoot);
   const rootIdentity = await stat(root);
   const configurationInputs = dependencies.configurationInputs ?? options;
   const configurationIdentity = watchConfigurationIdentity(options.configuration);
@@ -703,7 +715,7 @@ export async function runWatchCommand(options, dependencies) {
     if (currentRoot !== root || currentIdentity.dev !== rootIdentity.dev || currentIdentity.ino !== rootIdentity.ino) {
       throw watchFailure("Workspace root was replaced. Restart cw to select the new folder.");
     }
-    const configuration = await resolveIndexConfiguration(configurationInputs, requestedRoot, dependencies);
+    const configuration = await resolveIndexConfiguration(configurationInputs, root, dependencies);
     if (watchConfigurationIdentity(configuration) !== configurationIdentity) {
       throw watchFailure("Workspace, service, or indexing filters changed. Restart cw to apply the new configuration.");
     }
@@ -755,7 +767,10 @@ export async function runWatchCommand(options, dependencies) {
         if (generation !== scanGeneration) continue;
         const digest = createHash("sha256").update(JSON.stringify(scan.files.map((file) => [file.relativePath, file.sha256]).sort((a, b) => a[0].localeCompare(b[0])))).digest("hex");
         if (digest !== publishedDigest) {
-          const result = await runIndexCommand({ ...options, sourceRoot: root, yes: true, nonInteractive: true }, {
+          const initialExplicitIndex = publications === 0 && ["index", "reconcile"].includes(options.command) && !options.implicitIndex;
+          const result = await runIndexCommand({ ...options, sourceRoot: root,
+            yes: initialExplicitIndex ? options.yes : true,
+            nonInteractive: initialExplicitIndex ? options.nonInteractive : true }, {
             ...dependencies, capabilities, preparedScan: scan,
             write: (line) => {
               if (!options.json && !options.ndjson) return output(line);
@@ -769,6 +784,7 @@ export async function runWatchCommand(options, dependencies) {
             },
           });
           if (signal?.aborted) break;
+          if (result.started === false) return { ...result, stopped: true, publications, exitCode: 0 };
           if (result.ok === false || result.cancelled || result.conflict || result.started === false || result.status?.phase !== "completed"
             || result.status?.coverage?.state !== "verified" || result.transfer?.complete !== true) {
             throw watchFailure("Reconciliation did not complete. Watch stopped; run cw doctor before restarting.");
@@ -822,7 +838,7 @@ export async function runIndexCommand(options, dependencies) {
   const write = dependencies.write ?? console.log;
   const writeRaw = dependencies.writeRaw ?? ((value) => process.stdout.write(value));
   const isTTY = dependencies.isTTY ?? Boolean(process.stdout.isTTY);
-  const sourceRoot = path.resolve(options.sourceRoot || process.cwd());
+  const sourceRoot = await realpath(path.resolve(options.sourceRoot || process.cwd()));
   const traceCollector = dependencies.traceCollector ?? createIndexTraceCollector();
   const sourceStats = await stat(sourceRoot);
   if (!sourceStats.isDirectory()) {
@@ -1322,6 +1338,7 @@ async function runDoctorCommand(options, dependencies) {
 }
 
 function validateIndexDestination(configuration) {
+  if (!["local", "hosted"].includes(configuration.profile)) throw new Error(`Unsupported profile: ${configuration.profile}`);
   let url;
   try {
     url = new URL(configuration.baseUrl);
@@ -2195,8 +2212,6 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     }
     return result;
   };
-  const interactive = dependencies.isTTY ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
-  if (options.implicitIndex && interactive && !options.once && !options.nonInteractive && !options.json && !options.ndjson) options.watch = true;
   const indexingCommand = ["index", "reconcile", "watch"].includes(options.command)
     || (options.command === "init" && options.indexAfterInit);
   if (!indexingCommand || dependencies.signal) {
