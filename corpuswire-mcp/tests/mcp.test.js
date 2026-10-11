@@ -4747,10 +4747,27 @@ test("MCP recognizes code readiness without certifying full inventory", async ()
       coverage:{state:'pending',code_ready:true,documentation_pending:true,
         other_pending:true,reason_codes:['background_ingestion_pending']}}};
   const ready = readBootstrap(diagnosis, {workspaceId:'fixture'});
+  assert.equal(ready.publicCodeReady, true);
   assert.equal(ready.state, 'ready');
   assert.equal(ready.documentationPending, true);
   assert.equal(ready.coverage.state, 'pending');
   assert.equal(ready.needsReconcile, false);
+  const fullyReady = {...diagnosis, index:{...diagnosis.index, readiness:'ready',
+    coverage:{state:'verified',code_ready:true,reason_codes:[]}}};
+  const full = readBootstrap(fullyReady, {});
+  assert.equal(full.publicCodeReady, true);
+  assert.equal(full.codeReady, false, 'full readiness must not become a partial-checkpoint admission');
+  assert.equal(full.documentationPending, false);
+  assert.equal(full.otherPending, false);
+  for (const change of [
+    {status:'degraded'}, {status:'blocked'}, {status:'missing'}, {can_retrieve:false},
+    {collection_exists:false}, {point_count:0}, {qdrant_error:'vector unavailable'},
+    {index:{...fullyReady.index,indexed:false}},
+    {index:{...fullyReady.index,health_status:'error'}},
+    {index:{...fullyReady.index,health_warnings:['vector unavailable']}},
+    {index:{...fullyReady.index,coverage:{state:'invalidated'}}},
+    {checks:[{name:'vectors',status:'warning',message:'vector unavailable'}]},
+  ]) assert.equal(readBootstrap({...fullyReady,...change},{}).publicCodeReady, false);
   for (const change of [
     {index:{...diagnosis.index,indexed:false}},
     {index:{...diagnosis.index,indexed:undefined}},
@@ -4790,11 +4807,100 @@ test("MCP recognizes code readiness without certifying full inventory", async ()
       const rejected = readBootstrap({...healthy, ...change}, {});
       assert.notEqual(rejected.state, 'ready', `${state}: ${JSON.stringify(change)}`);
       assert.equal(rejected.codeReady, false);
+      assert.equal(rejected.publicCodeReady, false);
     }
   }
   const legacy = {can_retrieve:true, index:{coverage:{state:'verified'}}};
   assert.equal(readBootstrap(legacy, {}).state, 'ready');
   assert.equal(readBootstrap({...legacy, status:'ready'}, {}).state, 'ready');
+});
+
+test("MCP public readiness projection suppresses stale positive observations after local trust overrides", async () => {
+  const source = await readFile(SERVER_BIN, 'utf8');
+  const start = source.indexOf('  snapshot() {');
+  const end = source.indexOf('\n}\n\nconst syncManager', start);
+  assert.ok(start >= 0 && end > start);
+  const snapshot = new Function('isBootstrapHealthBlocked', 'summarizeSyncResult',
+    `return ({${source.slice(start, end)}}).snapshot;`)(
+      (status) => status.healthBlocked === true || ['blocked','error'].includes(status.state),
+      () => null);
+  const context = {syncCapability:() => ({}),isEnabled:() => true,
+    isCacheEnabled:() => false,isCacheUsable:() => false,
+    pendingChangedPaths:new Map(),pendingDeletedPaths:new Set(),pendingRetryBatches:[],
+    pendingSize:() => 0,pendingOldestAgeMs:() => 0,averageFlushDurationMs:() => null,
+    recentEvents:[]};
+  for (const [override, expected] of [
+    [{}, true], [{state:'blocked'}, false], [{healthBlocked:true}, false],
+    [{needsReconcile:true}, false], [{state:'error',publicCodeReady:null}, null],
+    [{state:'unknown',healthBlocked:true,publicCodeReady:null}, null],
+    [{state:'not_checked',publicCodeReady:null}, null],
+  ]) {
+    context.bootstrapStatus = {state:'ready',publicCodeReady:true,codeReady:true,
+      needsReconcile:false,...override};
+    assert.equal(snapshot.call(context).bootstrapCodeReady, expected);
+    assert.equal(context.bootstrapStatus.codeReady, true, 'public projection must not alter admission');
+    assert.equal(context.bootstrapStatus.publicCodeReady, override.publicCodeReady === null ? null : true,
+      'public projection must not rewrite the observed diagnosis');
+  }
+});
+
+test("MCP sync status distinguishes observed code readiness from unchecked bootstrap without probing", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'cw-public-code-ready-'));
+  const sourceRoot = path.join(root, 'repo'), sdkPath = path.join(root, 'sdk.mjs');
+  const diagnosisPath = path.join(root, 'diagnosis.json'), callsPath = path.join(root, 'calls.jsonl');
+  await mkdir(sourceRoot);
+  // The standalone clients repository has no Codex plugin checkout. Exercise
+  // its thin import host in the private fixture without requiring that layout.
+  let wrapperPath = WRAPPER_BIN;
+  if (!(await lstat(wrapperPath).catch(() => null))) {
+    wrapperPath = path.join(root, 'wrapper.mjs');
+    await writeFile(wrapperPath, `import ${JSON.stringify(new URL('../bin/corpuswire-mcp.js', import.meta.url).href)};`);
+  }
+  const healthy = {status:'ready',can_retrieve:true,collection_exists:true,point_count:2,
+    checks:[],index:{indexed:true,readiness:'ready',health_status:'ok',
+      coverage:{state:'verified',code_ready:true,reason_codes:[]}}};
+  await writeFile(sdkPath, `import {readFileSync,appendFileSync} from 'node:fs';
+    export class CorpusWireClient {
+      async diagnoseWorkspace(){appendFileSync(process.env.MOCK_CALLS_PATH,'diagnose\\n');return JSON.parse(readFileSync(process.env.MOCK_DIAGNOSIS_PATH,'utf8'));}
+      async indexWorkspace(){throw new Error('status must not upload');}
+      async queryRaw(){throw new Error('status must not retrieve');}
+    }`);
+  try {
+    for (const entrypoint of [SERVER_BIN, wrapperPath]) {
+      for (const enabled of [false, true]) {
+        await writeFile(callsPath, '');
+        const child = spawn('node', [entrypoint], {stdio:['pipe','pipe','pipe'],env:{...process.env,
+          CORPUSWIRE_BASE_URL:'http://127.0.0.1:8000',CORPUSWIRE_SDK_PATH:sdkPath,
+          CORPUSWIRE_SYNC_ENABLED:String(enabled),CORPUSWIRE_SYNC_BOOTSTRAP_CHECK:'false',
+          CORPUSWIRE_SYNC_WATCH:'false',CORPUSWIRE_SYNC_RECONCILE_INTERVAL_MS:'0',
+          CORPUSWIRE_RETRIEVAL_LOG_DIR:'',CORPUSWIRE_SYNC_ROOT:sourceRoot,
+          CORPUSWIRE_WORKSPACE_ID:'fixture',MOCK_DIAGNOSIS_PATH:diagnosisPath,MOCK_CALLS_PATH:callsPath}});
+        const rpc = createRpc(child);
+        let id = 0;
+        const invoke = (name) => rpc({jsonrpc:'2.0',id:++id,method:'tools/call',params:{name,arguments:{}}});
+        try {
+          const unknown = await invoke('corpuswire_sync_status');
+          assert.match(unknown.result.content[0].text, /codeReady: unknown/);
+          assert.equal(await readFile(callsPath,'utf8'), '', 'status must not diagnose an unchecked backend');
+          if (!enabled) continue;
+          for (const [diagnosis, expected] of [
+            [healthy, true],
+            [{...healthy,index:{...healthy.index,readiness:'code_ready',coverage:{state:'pending',
+              code_ready:true,documentation_pending:true,other_pending:true,
+              reason_codes:['background_ingestion_pending']}}}, true],
+            [{...healthy,status:'degraded'}, false],
+          ]) {
+            await writeFile(diagnosisPath, JSON.stringify(diagnosis));
+            await invoke('corpuswire_sync_bootstrap');
+            const before = await readFile(callsPath,'utf8');
+            const status = await invoke('corpuswire_sync_status');
+            assert.match(status.result.content[0].text, new RegExp(`codeReady: ${expected}`));
+            assert.equal(await readFile(callsPath,'utf8'), before, 'status must use its existing observation');
+          }
+        } finally { child.kill(); }
+      }
+    }
+  } finally { await rm(root,{recursive:true,force:true}); }
 });
 
 test("verified MCP health failures block strict reads, incremental sync and doctor without forcing reconcile", async () => {
