@@ -1524,7 +1524,9 @@ class SyncManager {
 
     this.observationGap = response.status?.coverage?.state !== "verified";
     this.readableCheckpointBaseline = undefined;
-    await this.applySyncCacheUploadResult(context, files.map((file) => ({
+    await this.applySyncCacheUploadResult({ ...context,
+      diagnosisRepoPath: firstNonEmptyString(args.repoPath, args.repo_path, this.env.CORPUSWIRE_REPO_PATH, context.sourceRoot),
+    }, files.map((file) => ({
       relativePath: file.relativePath, size: file.content.length, mtimeNs: file.mtimeNs, sha256: file.sha256,
     })), new Set(), response, true);
     const durationMs = Date.now() - startedAt;
@@ -1684,6 +1686,21 @@ class SyncManager {
     if (evidence?.state === "verified" && response.transfer?.complete) {
       const firstNonemptyPublication = this.bootstrapStatus.emptyWriteReady === true
         && evidence.eligible_file_count > 0;
+      if (fullBaseline && this.bootstrapStatus.state === "not_checked"
+        && this.bootstrapStatus.workspaceId == null && this.bootstrapStatus.repoPath == null
+        && this.bootstrapStatus.resolvedWorkspaceId == null && this.bootstrapStatus.resolvedContext == null) {
+        const receiptWorkspaceId = response.status.workspace_id;
+        if (typeof receiptWorkspaceId === "string" && receiptWorkspaceId.length > 0
+          && receiptWorkspaceId === context.workspaceId && response.status.collection_name
+          && evidence.coverage_token && evidence.selection_policy_digest) {
+          this.bootstrapStatus = { ...this.bootstrapStatus, workspaceId: context.workspaceId,
+            repoPath: context.diagnosisRepoPath ?? this.env.CORPUSWIRE_REPO_PATH ?? context.sourceRoot,
+            resolvedWorkspaceId: receiptWorkspaceId, resolvedContext: receiptWorkspaceId };
+        } else {
+          this.observationGap = true;
+          this.readableCheckpointBaseline = undefined;
+        }
+      }
       this.coverageContextKey = syncContextKey(context);
       this.coverageSelectionContext = { includeGlobs: [...(context.includeGlobs ?? [])], excludeGlobs: [...(context.excludeGlobs ?? [])] };
       this.coverageSelectionEnvironment = {

@@ -4606,12 +4606,12 @@ test("verified cache rehashes content and refuses lineage adopted from another c
   await writeFile(sdkPath, `import {appendFileSync,existsSync} from 'node:fs';
     let token='baseline';
     export class CorpusWireClient {
-      async diagnoseWorkspace() { return {status:'ready',can_retrieve:true,collection:'fixture',collection_exists:true,point_count:1,
+      async diagnoseWorkspace() { return {status:'ready',can_retrieve:true,resolved_workspace_id:'fixture',resolved_context:'fixture',collection:'fixture',collection_exists:true,point_count:1,
         index:{health_status:'ok',coverage:{state:'verified',coverage_token:existsSync(process.env.FOREIGN_MARKER)?'foreign':token,selection_policy_digest:'policy'}},checks:[],recovery_actions:[]}; }
       async indexWorkspace(request) {
         appendFileSync(process.env.MOCK_REQUESTS_PATH,JSON.stringify({mode:request.mode,token:request.baseCoverageToken,policy:request.selectionPolicyDigest,files:request.files.map(f=>f.relativePath)})+'\\n');
         token+='x';
-        return {ok:true,result:{collection:'fixture'},status:{collection_name:'fixture',coverage:{state:'verified',coverage_token:token,selection_policy_digest:'policy'}},
+        return {ok:true,result:{collection:'fixture'},status:{workspace_id:request.workspace.workspaceId,collection_name:'fixture',coverage:{state:'verified',coverage_token:token,selection_policy_digest:'policy'}},
           transfer:{complete:true,files_submitted:request.files.length,files_transferred:request.files.length,files_reused:0,
             acknowledged_files:request.files.map(f=>({relative_path:f.relativePath,sha256:f.sha256,disposition:'uploaded'}))}};
       }
@@ -4935,7 +4935,7 @@ test("verified MCP health failures block strict reads, incremental sync and doct
   const diagnosisPath = path.join(root, "diagnosis.json"), callsPath = path.join(root, "calls.jsonl");
   await mkdir(sourceRoot);
   await writeFile(path.join(sourceRoot, "a.py"), "baseline");
-  const healthy = {status:"ready",can_retrieve:true,collection:"fixture",collection_exists:true,point_count:1,
+  const healthy = {status:"ready",can_retrieve:true,resolved_workspace_id:"fixture",resolved_context:"fixture",collection:"fixture",collection_exists:true,point_count:1,
     checks:[],index:{indexed:true,health_status:"ok",coverage:{state:"verified",coverage_token:"baseline",selection_policy_digest:"policy"}}};
   await writeFile(diagnosisPath, JSON.stringify(healthy));
   await writeFile(sdkPath, `import {readFileSync,appendFileSync} from 'node:fs';
@@ -4945,7 +4945,7 @@ test("verified MCP health failures block strict reads, incremental sync and doct
       async listIndexSessions(){return [];}
       async getIndexActivity(){return {gap_detected:false,consecutive_failures:0};}
       async queryRaw(){appendFileSync(process.env.MOCK_CALLS_PATH,'query\\n');return {result:{retrieved_chunks:[],agent_context_packets:[]}};}
-      async indexWorkspace(request){appendFileSync(process.env.MOCK_CALLS_PATH,'index\\n');return {ok:true,result:{collection:'fixture'},status:{collection_name:'fixture',coverage:{state:'verified',coverage_token:'baseline',selection_policy_digest:'policy'}},transfer:{complete:true,files_submitted:request.files.length,files_transferred:request.files.length,files_reused:0,acknowledged_files:request.files.map(f=>({relative_path:f.relativePath,sha256:f.sha256,disposition:'uploaded'}))}};}
+      async indexWorkspace(request){appendFileSync(process.env.MOCK_CALLS_PATH,'index\\n');return {ok:true,result:{collection:'fixture'},status:{workspace_id:request.workspace.workspaceId,collection_name:'fixture',coverage:{state:'verified',coverage_token:'baseline',selection_policy_digest:'policy'}},transfer:{complete:true,files_submitted:request.files.length,files_transferred:request.files.length,files_reused:0,acknowledged_files:request.files.map(f=>({relative_path:f.relativePath,sha256:f.sha256,disposition:'uploaded'}))}};}
     }`);
   const launch = (enabled) => spawn("node", [SERVER_BIN], {stdio:["pipe","pipe","pipe"],env:{...process.env,
     CORPUSWIRE_BASE_URL:"http://127.0.0.1:8000",CORPUSWIRE_SDK_PATH:sdkPath,CORPUSWIRE_WORKSPACE_ID:"fixture",CORPUSWIRE_REPO_PATH:sourceRoot,
@@ -5065,7 +5065,7 @@ test("verified empty MCP baseline admits its first source file while genuine hea
   await mkdir(sourceRoot);
   const emptyWarning = "No indexed Qdrant points were found for this context.";
   const coverage = {state:"verified",eligible_file_count:0,coverage_token:"empty-baseline",selection_policy_digest:"policy"};
-  const empty = {status:"blocked",can_retrieve:false,collection:"fixture",collection_exists:collectionExists,point_count:0,
+  const empty = {status:"blocked",can_retrieve:false,resolved_workspace_id:"fixture",resolved_context:"fixture",collection:"fixture",collection_exists:collectionExists,point_count:0,
     checks:[...(collectionExists ? [] : [{name:"collection",status:"error",message:"Collection does not exist: fixture"}]),{name:"points",status:"error",message:"Collection has no indexed points."},
       {name:"index_health",status:"warning",message:emptyWarning}],
     index:{indexed:false,health_status:"degraded",health_warnings:[emptyWarning],coverage}};
@@ -5075,8 +5075,8 @@ test("verified empty MCP baseline admits its first source file while genuine hea
       async diagnoseWorkspace(){const diagnosis=JSON.parse(readFileSync(process.env.MOCK_DIAGNOSIS_PATH,'utf8'));if(diagnosis.unavailable)throw new Error('diagnosis unavailable');if(diagnosis.stalled)await new Promise(()=>{});if(diagnosis.late)await new Promise(resolve=>setTimeout(resolve,120));return diagnosis;}
       async indexWorkspace(request){appendFileSync(process.env.MOCK_CALLS_PATH,JSON.stringify({mode:request.mode,token:request.baseCoverageToken,policy:request.selectionPolicyDigest,files:request.files.map(f=>f.relativePath)})+'\\n');
         const coverage={...${JSON.stringify(coverage)},...(request.mode==='incremental'?{eligible_file_count:1,coverage_token:'nonempty-published'}:{})};
-        if(request.mode==='incremental')writeFileSync(process.env.MOCK_DIAGNOSIS_PATH,JSON.stringify({status:'ready',can_retrieve:true,collection:'fixture',collection_exists:true,point_count:1,checks:[],index:{indexed:true,health_status:'ok',health_warnings:[],coverage},...(process.env.MOCK_POST_HEALTH==='vector_failure'?{qdrant_error:'vector unavailable'}:{}),...(process.env.MOCK_POST_HEALTH==='unavailable'?{unavailable:true}:{}),...(process.env.MOCK_POST_HEALTH==='wrong_collection'?{collection:'other'}:{}),...(process.env.MOCK_POST_HEALTH==='stale_coverage'?{index:{indexed:true,health_status:'ok',health_warnings:[],coverage:{...coverage,coverage_token:'stale-token'}}}:{}),...(process.env.MOCK_POST_HEALTH==='missing_health'?{status:undefined,can_retrieve:undefined,index:{indexed:true,coverage}}:{}),...(process.env.MOCK_POST_HEALTH==='stalled_health'?{stalled:true}:{}),...(process.env.MOCK_POST_HEALTH==='late_health'?{late:true}:{})}));
-        return {ok:true,result:{collection:'fixture'},status:{collection_name:'fixture',coverage},transfer:{complete:true,files_submitted:request.files.length,files_transferred:request.files.length,files_reused:0,acknowledged_files:request.files.map(f=>({relative_path:f.relativePath,sha256:f.sha256,disposition:'uploaded'}))}};}
+        if(request.mode==='incremental')writeFileSync(process.env.MOCK_DIAGNOSIS_PATH,JSON.stringify({status:'ready',can_retrieve:true,resolved_workspace_id:'fixture',resolved_context:'fixture',collection:'fixture',collection_exists:true,point_count:1,checks:[],index:{indexed:true,health_status:'ok',health_warnings:[],coverage},...(process.env.MOCK_POST_HEALTH==='vector_failure'?{qdrant_error:'vector unavailable'}:{}),...(process.env.MOCK_POST_HEALTH==='unavailable'?{unavailable:true}:{}),...(process.env.MOCK_POST_HEALTH==='wrong_collection'?{collection:'other'}:{}),...(process.env.MOCK_POST_HEALTH==='stale_coverage'?{index:{indexed:true,health_status:'ok',health_warnings:[],coverage:{...coverage,coverage_token:'stale-token'}}}:{}),...(process.env.MOCK_POST_HEALTH==='missing_health'?{status:undefined,can_retrieve:undefined,index:{indexed:true,coverage}}:{}),...(process.env.MOCK_POST_HEALTH==='stalled_health'?{stalled:true}:{}),...(process.env.MOCK_POST_HEALTH==='late_health'?{late:true}:{})}));
+        return {ok:true,result:{collection:'fixture'},status:{workspace_id:request.workspace.workspaceId,collection_name:'fixture',coverage},transfer:{complete:true,files_submitted:request.files.length,files_transferred:request.files.length,files_reused:0,acknowledged_files:request.files.map(f=>({relative_path:f.relativePath,sha256:f.sha256,disposition:'uploaded'}))}};}
       async queryRaw(){appendFileSync(process.env.MOCK_CALLS_PATH,'query\\n');return {result:{retrieved_chunks:[]}};}
     }`);
   const child = spawn('node',[SERVER_BIN],{stdio:['pipe','pipe','pipe'],env:{...process.env,
@@ -5426,6 +5426,80 @@ test("review: checkpoint keys preserve local sync roots distinct from diagnosed 
     await context.refreshBootstrapStatus(readArgs);
     assert.equal(context.bootstrapStatus.repoPath, changed.repoPath ?? "/service/repo");
     assert.equal(context.bootstrapStatus.resolvedContext, "/canonical/remote");
+    assert.equal(context.readFreshnessStatus().strictBlocked, Object.keys(changed).length > 0, JSON.stringify(changed));
+    if (Object.keys(changed).length === 0) {
+      await context.prepareForRead({});
+      assert.equal(context.readFreshnessStatus().strictBlocked, false, "Ordinary search/enhance read retains the verified explicit selection");
+      await context.refreshBootstrapStatus({ ...explicitFilters, root: "/local/repo" });
+      assert.equal(context.readFreshnessStatus().strictBlocked, false, "Equivalent local root alias preserves the owned checkpoint");
+    }
+  }
+  assert.equal(backendRequests[0].repoPath, "/service/repo");
+  assert.equal(backendRequests[0].workspaceId, "requested-workspace");
+});
+
+test("review: first unchecked full reconciliation binds checkpoint identities to its publication receipt", async () => {
+  const source = await readFile(SERVER_BIN, "utf8");
+  const section = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
+  const backendRequests = [];
+  let diagnosis;
+  let publication;
+  const helpers = new Function("path", "buildClient", "optionalBoolean", "optionalNonNegativeInteger", "optionalPositiveInteger", "optionalStringArray", "compactStringArray", "hasBootstrapFreshnessSignal", "asRecord", "isRecord", "createHash", "buildMcpIndexTrace", "removeUndefinedValues",
+    "const DEFAULT_BASE_URL='http://fixture', DEFAULT_SYNC_MAX_FILE_SIZE_BYTES=1000, DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS=50, DEFAULT_SYNC_FLUSH_TIMEOUT_MS=50, DEFAULT_SYNC_RECONCILE_MAX_FILES=100, SERVER_NAME='fixture'; const EXCLUDED_PATH_SEGMENTS=new Set();"
+    + section("function initialBootstrapStatus()", "function bootstrapStatusForTimeout(")
+    + section("function firstNonEmptyString(", "function requiredString(")
+    + section("function optionalString(", "function readOutputMode(")
+    + section("function resolveSyncGlobList(", "function isSyncIndexableRelativePath(")
+    + section("function isBootstrapHealthBlocked(", "function formatWorkspaceDiagnosis(")
+    + section("async function awaitWithTimeout(", "function formatPathProbePayload(")
+    + "return { syncContextKey, initialBootstrapStatus, methods: {"
+    + section("  async prepareForRead(args", "  readFreshnessStatus()") + ","
+    + section("  readFreshnessStatus()", "  async reconcileExplicit(") + ","
+    + section("  async checkBootstrapStatus(", "  async refreshBootstrapStatus(") + ","
+    + section("  async refreshBootstrapStatus(", "  async readBootstrapStatus(") + ","
+    + section("  async readBootstrapStatus(", "  applyBootstrapStatus(") + ","
+    + section("  applyBootstrapStatus(", "  async reconcileAll(") + ","
+    + section("  async runReconcile(", "  async readRemoteFile(") + ","
+    + section("  async applySyncCacheUploadResult(", "  async updateSyncCacheEntry(") + ","
+    + section("  resolveContext(", "  ensurePendingContext(") + "}};")(
+      path, () => ({ diagnoseWorkspace: async (request) => { backendRequests.push(request); return diagnosis; }, indexWorkspace: async () => publication }),
+      (v, f) => v === undefined ? f : v === "true", (v, f) => v === undefined ? f : Number(v),
+      (v, f) => v === undefined ? f : Number(v),
+      (args, ...keys) => keys.map((key) => args[key]).find(Array.isArray) ?? [],
+      (values) => Array.isArray(values) ? values : [], () => false,
+      (value) => value ?? {}, (value) => value !== null && typeof value === "object", createHash, () => undefined, (value) => value);
+  const explicitFilters = { includeGlobs: ["src/**"], excludeGlobs: ["src/generated/**"] };
+  for (const changed of [{}, { sourceRoot: "/local/foreign" }, { repoPath: "/service/foreign" },
+    { receiptWorkspaceId: "foreign-workspace" }, { receiptWorkspaceId: null },
+    { resolvedWorkspaceId: "foreign-workspace" }, { resolvedContext: "foreign-workspace" },
+    { coverageToken: "foreign-token" }]) {
+    const context = { ...helpers.methods, env: { CORPUSWIRE_SYNC_ROOT: "/local/repo", CORPUSWIRE_REPO_PATH: "/service/repo",
+      CORPUSWIRE_WORKSPACE_ID: "requested-workspace", CORPUSWIRE_SYNC_READ_STRICT: "true", CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK: "true" },
+      observationGap: false, lastError: null, flushDurationSamplesMs: [],
+      flushAll: async () => ({}), collectWorkspaceFileEntries: async () => [{ relativePath: "src/a.js" }],
+      readRemoteFile: async () => ({ file: { relativePath: "src/a.js", content: Buffer.from("source"), sha256: createHash("sha256").update("source").digest("hex") } }),
+      readGitMetadata: async () => ({}), indexWorkspaceWithSessionConflictRetry: async (client, request) => {
+        assert.equal(request.workspace.workspaceId, "requested-workspace");
+        assert.equal(request.workspace.displayRoot, "/local/repo");
+        assert.equal(request.mode, "full");
+        return client.indexWorkspace(request);
+      }, recordResult: () => {},
+      isCacheEnabled: () => false, isEnabled: () => true, flushBeforeRead: async () => null, snapshot: () => ({}), recordBootstrapStatus(status) { this.bootstrapStatus = status; } };
+    const verified = { state: "verified", coverage_token: "owned-token", selection_policy_digest: "owned-policy" };
+    diagnosis = { status: "ready", can_retrieve: true, collection: "owned", collection_exists: true, point_count: 1,
+      resolved_workspace_id: changed.resolvedWorkspaceId ?? "requested-workspace", resolved_context: changed.resolvedContext ?? "requested-workspace", checks: [],
+      index: { indexed: true, health_status: "ok", readiness: "ready", coverage: verified } };
+    context.bootstrapStatus = helpers.initialBootstrapStatus();
+    publication = { status: { workspace_id: Object.hasOwn(changed, "receiptWorkspaceId") ? changed.receiptWorkspaceId : "requested-workspace",
+      collection_name: "owned", coverage: verified }, transfer: { complete: true } };
+    await context.runReconcile(context.resolveContext(explicitFilters), explicitFilters);
+    assert.equal(context.bootstrapStatus.coverage.coverage_token, "owned-token");
+    diagnosis = { ...diagnosis, index: { ...diagnosis.index, readiness: "code_ready", coverage: {
+      state: "pending", code_ready: true, ...(changed.coverageToken ? { coverage_token: changed.coverageToken } : {}), reason_codes: ["background_ingestion_pending"] } } };
+    const readArgs = { ...explicitFilters, ...changed };
+    await context.refreshBootstrapStatus(readArgs);
+    assert.equal(context.bootstrapStatus.repoPath, changed.repoPath ?? "/service/repo");
+    assert.equal(context.bootstrapStatus.resolvedContext, changed.resolvedContext ?? "requested-workspace");
     assert.equal(context.readFreshnessStatus().strictBlocked, Object.keys(changed).length > 0, JSON.stringify(changed));
     if (Object.keys(changed).length === 0) {
       await context.prepareForRead({});
