@@ -5721,3 +5721,123 @@ test("review: owned pending checkpoint restores observations only after matching
   assert.equal(backendRequests[0].repoPath, "/service/repo");
   assert.equal(backendRequests[0].workspaceId, "requested-workspace");
 });
+
+test("review: legacy context-only health attests public identities and collections without hiding conflicts", async () => {
+  const source = await readFile(SERVER_BIN, "utf8");
+  const section = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
+  const backendRequests = [];
+  let diagnosis;
+  let publication;
+  let diagnosisStalled = false;
+  let healthOverrides = {};
+  const helpers = new Function("path", "buildClient", "optionalBoolean", "optionalNonNegativeInteger", "optionalPositiveInteger", "optionalStringArray", "compactStringArray", "hasBootstrapFreshnessSignal", "asRecord", "isRecord", "createHash", "buildMcpIndexTrace", "removeUndefinedValues",
+    "const DEFAULT_BASE_URL='http://fixture', DEFAULT_SYNC_MAX_FILE_SIZE_BYTES=1000, DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS=50, DEFAULT_SYNC_FLUSH_TIMEOUT_MS=50, DEFAULT_SYNC_RECONCILE_MAX_FILES=100, SERVER_NAME='fixture'; const EXCLUDED_PATH_SEGMENTS=new Set();"
+    + section("function diagnosisFromHealth(", "function initialBootstrapStatus()")
+    + section("function initialBootstrapStatus()", "function bootstrapStatusFromError(")
+    + section("function firstNonEmptyString(", "function requiredString(")
+    + section("function optionalString(", "function readOutputMode(")
+    + section("function resolveSyncGlobList(", "function isSyncIndexableRelativePath(")
+    + section("function isBootstrapHealthBlocked(", "function formatWorkspaceDiagnosis(")
+    + section("async function awaitWithTimeout(", "function formatPathProbePayload(")
+    + "return { syncContextKey, initialBootstrapStatus, diagnosisFromHealth, methods: {"
+    + section("  async prepareForRead(args", "  readFreshnessStatus()") + ","
+    + section("  readFreshnessStatus()", "  async reconcileExplicit(") + ","
+    + section("  async checkBootstrapStatus(", "  async refreshBootstrapStatus(") + ","
+    + section("  async refreshBootstrapStatus(", "  async readBootstrapStatus(") + ","
+    + section("  async readBootstrapStatus(", "  applyBootstrapStatus(") + ","
+    + section("  applyBootstrapStatus(", "  async reconcileAll(") + ","
+    + section("  async runReconcile(", "  async readRemoteFile(") + ","
+    + section("  async applySyncCacheUploadResult(", "  async updateSyncCacheEntry(") + ","
+    + section("  resolveContext(", "  ensurePendingContext(") + "}};")(
+      path, () => ({ health: async (request) => {
+        backendRequests.push(request);
+        if (diagnosisStalled) await new Promise(() => {});
+        return { ok: true,
+          context: { workspace_id: diagnosis.resolved_workspace_id, storage_workspace_id: "tenant://owner/requested", ...healthOverrides.context },
+          index: { ...diagnosis.index, collection: diagnosis.collection, workspace_id: "tenant://owner/requested", ...healthOverrides.index },
+          active_project: { path: "tenant://storage/opaque/internal", collection: diagnosis.collection, ...healthOverrides.active_project },
+          qdrant: { collection: diagnosis.collection, collection_exists: diagnosis.collection_exists, point_count: diagnosis.point_count, ...healthOverrides.qdrant },
+          ...(healthOverrides.ok === false ? { ok: false } : {}),
+          ...(healthOverrides.omitActive ? { active_project: undefined } : {}) };
+      }, indexWorkspace: async () => publication }),
+      (v, f) => v === undefined ? f : v === "true", (v, f) => v === undefined ? f : Number(v),
+      (v, f) => v === undefined ? f : Number(v),
+      (args, ...keys) => keys.map((key) => args[key]).find(Array.isArray) ?? [],
+      (values) => Array.isArray(values) ? values : [], () => false,
+      (value) => value ?? {}, (value) => value !== null && typeof value === "object", createHash, () => undefined, (value) => value);
+  const repoOnly = helpers.diagnosisFromHealth({ active_project: { path: "/service/repo", collection: "owned" },
+    qdrant: { collection_exists: true, point_count: 1 } }, { repoPath: "/service/repo" });
+  assert.equal(repoOnly.resolved_context, "/service/repo", "Repo-only health diagnosis retains its service path");
+  assert.equal(repoOnly.resolved_workspace_id, null, "Absent backend workspace evidence cannot be invented");
+  const explicitFilters = { includeGlobs: ["src/**"], excludeGlobs: ["src/generated/**"] };
+  for (const initialTimeout of [false, true]) {
+  for (const changed of [{}, { healthy: true, active_project: { workspace_id: "requested-workspace" } },
+    { healthy: true, omitActive: true },
+    { healthy: true, active_project: { collection: null }, qdrant: { collection: null } },
+    { healthy: true, active_project: { collection: null }, index: { collection: null } },
+    { healthy: true, qdrant: { collection: null }, index: { collection: null } },
+    { healthy: true, context: { storage_workspace_id: undefined } }, { context: { workspace_id: "foreign" } }, { context: { workspace_id: null } },
+    { context: { workspace_id: "foreign" }, active_project: { workspace_id: "requested-workspace" } },
+    { active_project: { workspace_id: "foreign" } },
+    { context: { storage_workspace_id: "foreign-storage" } }, { index: { workspace_id: "foreign-storage" } },
+    { active_project: { collection: "foreign" } }, { qdrant: { collection: "foreign" } }, { index: { collection: "foreign" } },
+    { active_project: { collection: null }, qdrant: { collection: null }, index: { collection: null } },
+    { ok: false }]) {
+    healthOverrides = changed;
+    const healthyResponse = changed.healthy === true || Object.keys(changed).length === 0;
+    const context = { ...helpers.methods, env: { CORPUSWIRE_SYNC_ROOT: "/local/repo", CORPUSWIRE_REPO_PATH: "/service/repo",
+      CORPUSWIRE_WORKSPACE_ID: "requested-workspace", CORPUSWIRE_SYNC_READ_STRICT: "true", CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK: "true", CORPUSWIRE_SYNC_BOOTSTRAP_TIMEOUT_MS: "5", CORPUSWIRE_SYNC_READ_FRESHNESS_TIMEOUT_MS: "5" },
+      observationGap: false, lastError: null, flushDurationSamplesMs: [],
+      flushAll: async () => ({}), collectWorkspaceFileEntries: async () => [{ relativePath: "src/a.js" }],
+      readRemoteFile: async () => ({ file: { relativePath: "src/a.js", content: Buffer.from("source"), sha256: createHash("sha256").update("source").digest("hex") } }),
+      readGitMetadata: async () => ({}), indexWorkspaceWithSessionConflictRetry: async (client, request) => {
+        assert.equal(request.workspace.workspaceId, "requested-workspace");
+        assert.equal(request.workspace.displayRoot, "/local/repo");
+        assert.equal(request.mode, "full");
+        return client.indexWorkspace(request);
+      }, recordResult: () => {},
+      isCacheEnabled: () => false, isEnabled: () => true, flushBeforeRead: async () => null, snapshot: () => ({}), recordBootstrapStatus(status) { this.bootstrapStatus = status; } };
+    const verified = { state: "verified", coverage_token: "owned-token", selection_policy_digest: "owned-policy" };
+    diagnosis = { status: "ready", can_retrieve: true, collection: "owned", collection_exists: true, point_count: 1,
+      resolved_workspace_id: Object.hasOwn(changed, "resolvedWorkspaceId") ? changed.resolvedWorkspaceId : "requested-workspace", resolved_context: changed.resolvedContext ?? "requested-workspace", checks: [],
+      index: { indexed: true, health_status: "ok", readiness: "ready", coverage: verified } };
+    context.bootstrapStatus = helpers.initialBootstrapStatus();
+    if (initialTimeout) {
+      diagnosisStalled = true;
+      await assert.rejects(context.prepareForRead({}), /strict mode blocked retrieval/);
+      diagnosisStalled = false;
+      assert.equal(context.bootstrapStatus.state, "unknown");
+      assert.equal(context.observationGap, true);
+    }
+    publication = { status: { workspace_id: Object.hasOwn(changed, "receiptWorkspaceId") ? changed.receiptWorkspaceId : "requested-workspace",
+      collection_name: "owned", coverage: verified }, transfer: { complete: true } };
+    await context.runReconcile(context.resolveContext(explicitFilters), explicitFilters);
+    assert.equal(context.bootstrapStatus.coverage.coverage_token, "owned-token");
+    diagnosis = { ...diagnosis, index: { ...diagnosis.index, readiness: "code_ready", coverage: {
+      state: "pending", code_ready: true, ...(changed.coverageToken ? { coverage_token: changed.coverageToken } : {}), reason_codes: ["background_ingestion_pending"] } } };
+    const readArgs = { ...explicitFilters, ...changed };
+    await context.refreshBootstrapStatus(readArgs);
+    assert.equal(context.readFreshnessStatus().strictBlocked, !healthyResponse, JSON.stringify(changed));
+    assert.equal(context.bootstrapStatus.repoPath, changed.repoPath ?? "/service/repo");
+    if (healthyResponse) assert.equal(context.bootstrapStatus.resolvedContext, "requested-workspace");
+    else assert.equal(context.bootstrapStatus.canRetrieve, false, "Contradictory or missing health attestation must not advertise retrieval readiness");
+    if (healthyResponse) {
+      await context.prepareForRead({});
+      assert.equal(context.readFreshnessStatus().strictBlocked, false, "Ordinary search/enhance read retains the verified explicit selection");
+      await context.refreshBootstrapStatus({ ...explicitFilters, root: "/local/repo" });
+      assert.equal(context.readFreshnessStatus().strictBlocked, false, "Equivalent local root alias preserves the owned checkpoint");
+      diagnosis = { ...diagnosis, index: { ...diagnosis.index, readiness: "ready", coverage: { ...verified } } };
+      await context.prepareForRead({});
+      assert.equal(context.observationGap, false, "Context-only terminal verification restores owned observations");
+      await context.prepareForRead({});
+    } else {
+      healthOverrides = {};
+      diagnosis = { ...diagnosis, index: { ...diagnosis.index, readiness: "ready", coverage: { ...verified } } };
+      await assert.rejects(context.prepareForRead({}), /strict mode blocked retrieval/,
+        "A later healthy health response cannot restore revoked ownership");
+    }
+  }
+  }
+  assert.equal(backendRequests[0].repoPath, "/service/repo");
+  assert.equal(backendRequests[0].workspaceId, "requested-workspace");
+});

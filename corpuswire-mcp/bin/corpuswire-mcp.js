@@ -5278,30 +5278,43 @@ async function diagnoseWorkspace(args) {
 function diagnosisFromHealth(response, { repoPath, workspaceId }) {
   const index = response.index ?? {};
   const activeProject = response.active_project ?? {};
+  const context = response.context ?? {};
   const qdrant = response.qdrant ?? {};
+  const contextWorkspaceId = optionalString(context.workspace_id);
+  const activeWorkspaceId = optionalString(activeProject.workspace_id);
+  const workspaceConflict = contextWorkspaceId && activeWorkspaceId && contextWorkspaceId !== activeWorkspaceId;
+  const resolvedWorkspaceId = workspaceConflict ? null : contextWorkspaceId ?? activeWorkspaceId ?? null;
+  const collections = [activeProject.collection, qdrant.collection, index.collection].map(optionalString).filter(Boolean);
+  const collectionConflict = new Set(collections).size > 1;
+  const storageWorkspaceId = optionalString(context.storage_workspace_id);
+  const indexWorkspaceId = optionalString(index.workspace_id);
+  const storageConflict = storageWorkspaceId && indexWorkspaceId && storageWorkspaceId !== indexWorkspaceId;
+  const identityProblem = Boolean(workspaceConflict || storageConflict || collectionConflict || collections.length === 0
+    || (workspaceId && resolvedWorkspaceId !== workspaceId));
+  const healthProblem = identityProblem || response.ok === false;
   const collectionExists = typeof qdrant.collection_exists === "boolean" ? qdrant.collection_exists : undefined;
   const pointCount = Number.isInteger(qdrant.point_count) ? qdrant.point_count : undefined;
-  const canRetrieve = collectionExists === true && (pointCount ?? 0) > 0;
+  const canRetrieve = !healthProblem && collectionExists === true && (pointCount ?? 0) > 0;
   return {
     status: canRetrieve ? "ready" : "blocked",
     can_retrieve: canRetrieve,
     requested_repo_path: repoPath ?? null,
     requested_workspace_id: workspaceId ?? null,
     resolved_context: workspaceId
-      ? activeProject.workspace_id ?? null
+      ? resolvedWorkspaceId
       : activeProject.path ?? response.docs_source_dir ?? "unknown",
-    resolved_workspace_id: activeProject.workspace_id ?? null,
+    resolved_workspace_id: resolvedWorkspaceId,
     resolution_mode: workspaceId ? "remote" : "local",
-    collection: activeProject.collection ?? qdrant.collection ?? "unknown",
+    collection: collectionConflict ? null : collections[0] ?? "unknown",
     collection_exists: collectionExists,
     point_count: pointCount,
-    qdrant_error: qdrant.error ?? null,
+    qdrant_error: qdrant.error ?? (healthProblem ? "Health response does not attest the requested workspace and collection." : null),
     index,
     active_backend: {
       default_repo_path: response.docs_source_dir,
       default_collection: qdrant.collection,
       requested_context: activeProject.path ?? response.docs_source_dir,
-      matches_requested_context: true,
+      matches_requested_context: !identityProblem,
     },
     checks: [],
     recovery_actions: [],
