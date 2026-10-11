@@ -5289,8 +5289,15 @@ function diagnosisFromHealth(response, { repoPath, workspaceId }) {
   const storageWorkspaceId = optionalString(context.storage_workspace_id);
   const indexWorkspaceId = optionalString(index.workspace_id);
   const storageConflict = storageWorkspaceId && indexWorkspaceId && storageWorkspaceId !== indexWorkspaceId;
+  // Health defaults do not prove which repository was selected. Compare service paths
+  // lexically; resolving them on the client would confuse remote and local roots.
+  const selectedPaths = [activeProject.path, index.path].map(optionalString).filter(Boolean);
+  const normalizeServicePath = (value) => (value.split("/").includes("..") ? value : path.posix.normalize(value)).replace(/\/$/, "") || "/";
+  const selectedPathConflict = !workspaceId && new Set(selectedPaths.map(normalizeServicePath)).size > 1;
+  const requestedPathMismatch = !workspaceId && repoPath
+    && (selectedPaths.length === 0 || normalizeServicePath(selectedPaths[0]) !== normalizeServicePath(repoPath));
   const identityProblem = Boolean(workspaceConflict || storageConflict || collectionConflict || collections.length === 0
-    || (workspaceId && resolvedWorkspaceId !== workspaceId));
+    || selectedPathConflict || requestedPathMismatch || (workspaceId && resolvedWorkspaceId !== workspaceId));
   const healthProblem = identityProblem || response.ok === false;
   const collectionExists = typeof qdrant.collection_exists === "boolean" ? qdrant.collection_exists : undefined;
   const pointCount = Number.isInteger(qdrant.point_count) ? qdrant.point_count : undefined;
@@ -5302,13 +5309,13 @@ function diagnosisFromHealth(response, { repoPath, workspaceId }) {
     requested_workspace_id: workspaceId ?? null,
     resolved_context: workspaceId
       ? resolvedWorkspaceId
-      : activeProject.path ?? index.path ?? response.docs_source_dir ?? "unknown",
+      : selectedPathConflict ? null : selectedPaths[0] ?? response.docs_source_dir ?? "unknown",
     resolved_workspace_id: resolvedWorkspaceId,
     resolution_mode: workspaceId ? "remote" : "local",
     collection: collectionConflict ? null : collections[0] ?? "unknown",
     collection_exists: collectionExists,
     point_count: pointCount,
-    qdrant_error: qdrant.error ?? (healthProblem ? "Health response does not attest the requested workspace and collection." : null),
+    qdrant_error: qdrant.error ?? (healthProblem ? "Health response does not attest the requested workspace, repository, and collection." : null),
     index,
     active_backend: {
       default_repo_path: response.docs_source_dir,

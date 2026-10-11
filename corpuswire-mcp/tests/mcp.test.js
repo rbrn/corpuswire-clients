@@ -5844,3 +5844,58 @@ test("review: legacy context-only health attests public identities and collectio
   assert.equal(backendRequests[0].repoPath, "/service/repo");
   assert.equal(backendRequests[0].workspaceId, "requested-workspace");
 });
+
+test("review: legacy repo-only doctor and diagnose require selected service path evidence", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cw-legacy-selected-path-"));
+  const healthPath = path.join(root, "health.json");
+  const sdkPath = path.join(root, "sdk.mjs");
+  await writeFile(sdkPath, `import { readFile } from "node:fs/promises";
+    export class CorpusWireClient {
+      constructor(options) { this.baseUrl = options.baseUrl; }
+      async health() { return JSON.parse(await readFile(process.env.MOCK_HEALTH_PATH, "utf8")); }
+    }`);
+  const child = spawn("node", [SERVER_BIN], { stdio: ["pipe", "pipe", "pipe"], env: {
+    ...process.env, CORPUSWIRE_SDK_PATH: sdkPath, MOCK_HEALTH_PATH: healthPath,
+    CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000", CORPUSWIRE_WORKSPACE_ID: "", CORPUSWIRE_REPO_PATH: "",
+    CORPUSWIRE_SYNC_ENABLED: "false", CORPUSWIRE_RETRIEVAL_LOG_DIR: "",
+  } });
+  try {
+    const rpc = createRpc(child);
+    let id = 0;
+    const cases = [
+      { name: "matching selected paths", active: "/service/selected", index: "/service/selected", ready: true },
+      { name: "active-only evidence", active: "/service/selected", ready: true },
+      { name: "index-only evidence", index: "/service/selected", ready: true },
+      { name: "lexically equivalent service paths", active: "/service/./selected/", index: "/service/selected", ready: true },
+      { name: "parent traversal cannot attest an equivalent remote path", active: "/service/alias/../selected" },
+      { name: "foreign selected paths", active: "/service/foreign", index: "/service/foreign" },
+      { name: "missing selected evidence" },
+      { name: "matching default is not selected evidence", defaultPath: "/service/selected" },
+      { name: "active matches but index conflicts", active: "/service/selected", index: "/service/foreign" },
+      { name: "index matches but active conflicts", active: "/service/foreign", index: "/service/selected" },
+      { name: "explicit workspace governs distinct paths", workspaceId: "public-workspace", active: "/tenant/active", index: "/tenant/index", ready: true },
+    ];
+    for (const scenario of cases) {
+      await writeFile(healthPath, JSON.stringify({ ok: true, docs_source_dir: scenario.defaultPath ?? "/backend/default",
+        context: scenario.workspaceId ? { workspace_id: scenario.workspaceId, storage_workspace_id: "internal-storage" } : undefined,
+        active_project: { path: scenario.active, workspace_id: scenario.workspaceId, collection: "owned" },
+        index: { path: scenario.index, workspace_id: scenario.workspaceId ? "internal-storage" : undefined,
+          collection: "owned", indexed: true, health_status: "ok", readiness: "ready",
+          coverage: { state: "verified", coverage_token: "owned-token", selection_policy_digest: "owned-policy" } },
+        qdrant: { collection: "owned", collection_exists: true, point_count: 1 },
+      }));
+      const args = { repoPath: "/service/selected", ...(scenario.workspaceId ? { workspaceId: scenario.workspaceId } : {}) };
+      for (const tool of ["corpuswire_diagnose_workspace", "corpuswire_doctor"]) {
+        const result = await rpc({ jsonrpc: "2.0", id: ++id, method: "tools/call", params: { name: tool, arguments: args } });
+        assert.equal(result.result.isError, false, scenario.name);
+        const output = result.result.content[0].text;
+        assert.match(output, new RegExp(`- canRetrieve: ${scenario.ready === true}`), `${tool}: ${scenario.name}`);
+        if (tool === "corpuswire_doctor") assert.match(output, new RegExp(`- verdict: ${scenario.ready ? "ready" : "blocked"}`), scenario.name);
+        else {
+          assert.match(output, new RegExp(`- status: ${scenario.ready ? "ready" : "blocked"}`), scenario.name);
+          assert.match(output, new RegExp(`- backendMatchesRequestedContext: ${scenario.ready === true}`), scenario.name);
+        }
+      }
+    }
+  } finally { child.kill(); await rm(root, { recursive: true, force: true }); }
+});
