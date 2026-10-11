@@ -201,7 +201,5 @@ export type {
   UnresolvedRelationshipFactV2,
 } from "./types.js";
 
-export { INVENTORY_VERSION, WorkspaceScanIncompleteError, canonicalInventoryPath, inventoryDigest, inventorySha256, selectionPolicyDigest, buildWorkspaceInventory } from "./inventory.js";
+export { INVENTORY_VERSION, WorkspaceScanIncompleteError, canonicalInventoryPath, inventoryDigest, inventorySha256, selectionPolicyDigest, buildWorkspaceInventory, isRetrievalExcludedPath } from "./inventory.js";
 export type { InventoryScan, InventorySelectionPolicy, WorkspaceInventory, WorkspaceCoverage, IndexTransferSummary } from "./types.js";
-
-export { isRetrievalExcludedPath } from "./inventory.js";
