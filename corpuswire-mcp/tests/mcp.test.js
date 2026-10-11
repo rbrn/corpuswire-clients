@@ -5027,7 +5027,7 @@ test("MCP cache and upload completion preserve an explicit health block", async 
   const cache = new Function("isBootstrapHealthBlocked","return ({"+method("  isCacheUsable() {","  async probePaths(")+"}).isCacheUsable;")(helper);
   const apply = new Function("isBootstrapHealthBlocked","syncContextKey","return ({"+method("  async applySyncCacheUploadResult(","  async updateSyncCacheEntry(")+"}).applySyncCacheUploadResult;")(helper,()=>"fixture");
   // Cache usability is tested with matching verified lineage, rather than an observation gap.
-  const context = {isCacheEnabled:()=>true,observationGap:false,activeBootstrapCheck:null,
+  const context = {env:{},isCacheEnabled:()=>true,observationGap:false,activeBootstrapCheck:null,
     bootstrapStatus:{state:"blocked",needsReconcile:false,coverage:{state:"verified",coverage_token:"baseline"}}};
   assert.equal(cache.call(context),false);
   context.isCacheEnabled=()=>false;
@@ -5245,7 +5245,7 @@ test("review: actual bootstrap transitions bind partial checkpoint reads to the 
       const context = { ...methods, env: { CORPUSWIRE_SYNC_READ_STRICT: "true", CORPUSWIRE_SYNC_READ_STRICT_STALE_AFTER_MS: grace },
         lastError: null, observationGap: false, flushDurationSamplesMs: [],
         coverageContextKey: change.invalidContextKey ? "previous-context" : JSON.stringify(ownedContext),
-        resolveContext: (args) => ({ sourceRoot: args.sourceRoot, workspaceId: args.workspaceId }),
+        resolveContext: (args) => ({ sourceRoot: args.sourceRoot ?? healthy.repoPath, workspaceId: args.workspaceId ?? healthy.workspaceId }),
         recordBootstrapStatus(status) { this.bootstrapStatus = status; },
         bootstrapStatus: { ...healthy, codeReady: false,
           coverage: { state: "verified", coverage_token: "owned-token", selection_policy_digest: "owned-policy" } } };
@@ -5308,7 +5308,7 @@ test("review: actual read and bootstrap diagnosis failures revoke checkpoint tru
         coverageContextKey: JSON.stringify({ sourceRoot: healthy.repoPath, workspaceId: healthy.workspaceId }),
         bootstrapStatus: { ...healthy, codeReady: false,
           coverage: { state: "verified", coverage_token: "owned-token", selection_policy_digest: "owned-policy" } },
-        resolveContext: (args) => ({ sourceRoot: args.sourceRoot, workspaceId: args.workspaceId }),
+        resolveContext: (args) => ({ sourceRoot: args.sourceRoot ?? healthy.repoPath, workspaceId: args.workspaceId ?? healthy.workspaceId }),
         isEnabled: () => true, flushBeforeRead: async () => null, snapshot: () => ({}),
         readBootstrapStatus: async () => {
           if (response === "timeout") return new Promise(() => {});
@@ -5374,4 +5374,66 @@ test("review: explicit selection filters bind a verified full baseline to later 
       assert.equal(context.readFreshnessStatus().strictBlocked, true, "Returning to old filters cannot restore lost observations");
     }
   }
+});
+
+test("review: checkpoint keys preserve local sync roots distinct from diagnosed service paths", async () => {
+  const source = await readFile(SERVER_BIN, "utf8");
+  const section = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
+  const backendRequests = [];
+  let diagnosis;
+  const helpers = new Function("path", "buildClient", "optionalBoolean", "optionalNonNegativeInteger", "optionalPositiveInteger", "optionalStringArray", "compactStringArray", "hasBootstrapFreshnessSignal", "asRecord", "isRecord",
+    "const DEFAULT_BASE_URL='http://fixture', DEFAULT_SYNC_MAX_FILE_SIZE_BYTES=1000, DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS=50;"
+    + section("function firstNonEmptyString(", "function requiredString(")
+    + section("function optionalString(", "function readOutputMode(")
+    + section("function resolveSyncGlobList(", "function isSyncIndexableRelativePath(")
+    + section("function isBootstrapHealthBlocked(", "function formatWorkspaceDiagnosis(")
+    + section("async function awaitWithTimeout(", "function formatPathProbePayload(")
+    + "return { syncContextKey, methods: {"
+    + section("  async prepareForRead(args", "  readFreshnessStatus()") + ","
+    + section("  readFreshnessStatus()", "  async reconcileExplicit(") + ","
+    + section("  async checkBootstrapStatus(", "  async refreshBootstrapStatus(") + ","
+    + section("  async refreshBootstrapStatus(", "  async readBootstrapStatus(") + ","
+    + section("  async readBootstrapStatus(", "  applyBootstrapStatus(") + ","
+    + section("  applyBootstrapStatus(", "  async reconcileAll(") + ","
+    + section("  async applySyncCacheUploadResult(", "  async updateSyncCacheEntry(") + ","
+    + section("  resolveContext(", "  ensurePendingContext(") + "}};")(
+      path, () => ({ diagnoseWorkspace: async (request) => { backendRequests.push(request); return diagnosis; } }),
+      (v, f) => v === undefined ? f : v === "true", (v, f) => v === undefined ? f : Number(v),
+      (v, f) => v === undefined ? f : Number(v),
+      (args, ...keys) => keys.map((key) => args[key]).find(Array.isArray) ?? [],
+      (values) => Array.isArray(values) ? values : [], () => false,
+      (value) => value ?? {}, (value) => value !== null && typeof value === "object");
+  const explicitFilters = { includeGlobs: ["src/**"], excludeGlobs: ["src/generated/**"] };
+  for (const changed of [{}, { sourceRoot: "/local/foreign" }, { root: "/local/foreign" },
+    { envInclude: "docs/**" }, { envExclude: "private/**" },
+    { repoPath: "/service/foreign" }, { includeGlobs: ["docs/**"] }, { excludeGlobs: ["private/**"] }]) {
+    const context = { ...helpers.methods, env: { CORPUSWIRE_SYNC_ROOT: "/local/repo", CORPUSWIRE_REPO_PATH: "/service/repo",
+      CORPUSWIRE_WORKSPACE_ID: "requested-workspace", CORPUSWIRE_SYNC_READ_STRICT: "true", CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK: "true" },
+      observationGap: false, lastError: null, flushDurationSamplesMs: [],
+      isCacheEnabled: () => false, isEnabled: () => true, flushBeforeRead: async () => null, snapshot: () => ({}), recordBootstrapStatus(status) { this.bootstrapStatus = status; } };
+    const verified = { state: "verified", coverage_token: "owned-token", selection_policy_digest: "owned-policy" };
+    diagnosis = { status: "ready", can_retrieve: true, collection: "owned", collection_exists: true, point_count: 1,
+      resolved_workspace_id: "resolved-workspace", resolved_context: "/canonical/remote", checks: [],
+      index: { indexed: true, health_status: "ok", readiness: "ready", coverage: verified } };
+    context.bootstrapStatus = await context.readBootstrapStatus(explicitFilters);
+    await context.applySyncCacheUploadResult(context.resolveContext(explicitFilters), [], [], {
+      status: { collection_name: "owned", coverage: verified }, transfer: { complete: true } }, true);
+    diagnosis = { ...diagnosis, index: { ...diagnosis.index, readiness: "code_ready", coverage: {
+      state: "pending", code_ready: true, reason_codes: ["background_ingestion_pending"] } } };
+    if (changed.envInclude) context.env.CORPUSWIRE_SYNC_INCLUDE_GLOBS = changed.envInclude;
+    if (changed.envExclude) context.env.CORPUSWIRE_SYNC_EXCLUDE_GLOBS = changed.envExclude;
+    const readArgs = changed.envInclude || changed.envExclude ? {} : { ...explicitFilters, ...changed };
+    await context.refreshBootstrapStatus(readArgs);
+    assert.equal(context.bootstrapStatus.repoPath, changed.repoPath ?? "/service/repo");
+    assert.equal(context.bootstrapStatus.resolvedContext, "/canonical/remote");
+    assert.equal(context.readFreshnessStatus().strictBlocked, Object.keys(changed).length > 0, JSON.stringify(changed));
+    if (Object.keys(changed).length === 0) {
+      await context.prepareForRead({});
+      assert.equal(context.readFreshnessStatus().strictBlocked, false, "Ordinary search/enhance read retains the verified explicit selection");
+      await context.refreshBootstrapStatus({ ...explicitFilters, root: "/local/repo" });
+      assert.equal(context.readFreshnessStatus().strictBlocked, false, "Equivalent local root alias preserves the owned checkpoint");
+    }
+  }
+  assert.equal(backendRequests[0].repoPath, "/service/repo");
+  assert.equal(backendRequests[0].workspaceId, "requested-workspace");
 });

@@ -986,9 +986,17 @@ class SyncManager {
         error.code = "CORPUSWIRE_HEALTH_TIMEOUT";
         throw error;
       }
-      return this.applyBootstrapStatus(checked.value, this.resolveContext({
-        ...args, sourceRoot: checked.value.repoPath, workspaceId: checked.value.workspaceId,
-      }));
+      const selectionArgs = { ...args };
+      for (const [field, alias, envKey] of [
+        ["includeGlobs", "include_globs", "CORPUSWIRE_SYNC_INCLUDE_GLOBS"],
+        ["excludeGlobs", "exclude_globs", "CORPUSWIRE_SYNC_EXCLUDE_GLOBS"],
+      ]) {
+        if (this.coverageSelectionContext && !Object.hasOwn(args, field) && !Object.hasOwn(args, alias)
+          && this.coverageSelectionEnvironment?.[envKey] === this.env[envKey]) {
+          selectionArgs[field] = this.coverageSelectionContext[field];
+        }
+      }
+      return this.applyBootstrapStatus(checked.value, this.resolveContext(selectionArgs));
     } catch (error) {
       this.observationGap = true;
       this.readableCheckpointBaseline = undefined;
@@ -1020,7 +1028,7 @@ class SyncManager {
     let contextKey;
     try {
       contextKey = syncContextKey(selectionContext ?? this.resolveContext({
-        sourceRoot: bootstrapStatus.repoPath, workspaceId: bootstrapStatus.workspaceId,
+        workspaceId: bootstrapStatus.workspaceId,
       }));
     } catch { /* Missing identity cannot authorize a checkpoint exception. */ }
     const baseline = this.observationGap === false && previous.coverage?.state === "verified"
@@ -1677,6 +1685,11 @@ class SyncManager {
       const firstNonemptyPublication = this.bootstrapStatus.emptyWriteReady === true
         && evidence.eligible_file_count > 0;
       this.coverageContextKey = syncContextKey(context);
+      this.coverageSelectionContext = { includeGlobs: [...(context.includeGlobs ?? [])], excludeGlobs: [...(context.excludeGlobs ?? [])] };
+      this.coverageSelectionEnvironment = {
+        CORPUSWIRE_SYNC_INCLUDE_GLOBS: this.env.CORPUSWIRE_SYNC_INCLUDE_GLOBS,
+        CORPUSWIRE_SYNC_EXCLUDE_GLOBS: this.env.CORPUSWIRE_SYNC_EXCLUDE_GLOBS,
+      };
       this.bootstrapStatus = { ...this.bootstrapStatus, coverage: evidence,
         checkedAt: new Date().toISOString(), collection: response.status.collection_name,
         state: isBootstrapHealthBlocked(this.bootstrapStatus) ? "blocked" : "ready", needsReconcile: false };
