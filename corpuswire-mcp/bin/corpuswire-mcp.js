@@ -1686,14 +1686,16 @@ class SyncManager {
     if (evidence?.state === "verified" && response.transfer?.complete) {
       const firstNonemptyPublication = this.bootstrapStatus.emptyWriteReady === true
         && evidence.eligible_file_count > 0;
-      if (fullBaseline && this.bootstrapStatus.state === "not_checked"
+      if (fullBaseline && (this.bootstrapStatus.state === "not_checked"
+        || (this.bootstrapStatus.state === "unknown" && this.bootstrapStatus.diagnosisTimedOut === true))
         && this.bootstrapStatus.workspaceId == null && this.bootstrapStatus.repoPath == null
         && this.bootstrapStatus.resolvedWorkspaceId == null && this.bootstrapStatus.resolvedContext == null) {
         const receiptWorkspaceId = response.status.workspace_id;
         if (typeof receiptWorkspaceId === "string" && receiptWorkspaceId.length > 0
           && receiptWorkspaceId === context.workspaceId && response.status.collection_name
           && evidence.coverage_token && evidence.selection_policy_digest) {
-          this.bootstrapStatus = { ...this.bootstrapStatus, workspaceId: context.workspaceId,
+          this.bootstrapStatus = { ...this.bootstrapStatus, state: "ready", healthBlocked: false,
+            diagnosisTimedOut: false, workspaceId: context.workspaceId,
             repoPath: context.diagnosisRepoPath ?? this.env.CORPUSWIRE_REPO_PATH ?? context.sourceRoot,
             resolvedWorkspaceId: receiptWorkspaceId, resolvedContext: receiptWorkspaceId };
         } else {
@@ -5279,8 +5281,10 @@ function diagnosisFromHealth(response, { repoPath, workspaceId }) {
     can_retrieve: canRetrieve,
     requested_repo_path: repoPath ?? null,
     requested_workspace_id: workspaceId ?? null,
-    resolved_context: activeProject.path ?? response.docs_source_dir ?? "unknown",
-    resolved_workspace_id: activeProject.workspace_id ?? workspaceId ?? null,
+    resolved_context: workspaceId
+      ? activeProject.workspace_id ?? null
+      : activeProject.path ?? response.docs_source_dir ?? "unknown",
+    resolved_workspace_id: activeProject.workspace_id ?? null,
     resolution_mode: workspaceId ? "remote" : "local",
     collection: activeProject.collection ?? qdrant.collection ?? "unknown",
     collection_exists: collectionExists,
@@ -5328,6 +5332,7 @@ function bootstrapStatusForTimeout(maxWaitMs) {
   return {
     ...initialBootstrapStatus(),
     state: "unknown",
+    diagnosisTimedOut: true,
     needsReconcile: true,
     healthBlocked: true,
     canRetrieve: false,
