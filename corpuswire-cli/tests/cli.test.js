@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm, writeFile, readFile, readdir, chmod, symlink, rename } from "node:fs/promises";
 import { EventEmitter } from "node:events";
+import { rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
@@ -1407,7 +1408,7 @@ test("CLI complete scan carries inventory evidence and cancellation cannot reach
   } finally { await rm(fixture, { recursive: true, force: true }); }
 });
 
-async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, onPreview, onDiagnosis, onSetup, onConfirm, watcherUnavailable = false, watcherError } = {}) {
+async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, onPreview, onDiagnosis, onSetup, onConfirm, onClientSetup, watcherUnavailable = false, watcherError } = {}) {
   const root = await syntheticWorkspace();
   const controller = new AbortController();
   const state = {
@@ -1446,10 +1447,14 @@ async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, 
   });
   try {
     await onSetup?.(state);
+    const selectedArgs = state.sourceRoot ? [...argv, "--source-root", state.sourceRoot] : argv;
     const args = argv.includes("watch") || argv.includes("--watch")
-      ? [...argv, "--poll-ms", "100", "--debounce-ms", "10"] : argv;
+      ? [...selectedArgs, "--poll-ms", "100", "--debounce-ms", "10"] : selectedArgs;
     state.result = await main(args, {
-      cwd: root, homeDirectory: root, env: {}, client, signal: controller.signal, isTTY,
+      cwd: state.cwd ?? root, homeDirectory: root, env: {}, platform: "linux",
+      client: onClientSetup ? undefined : client,
+      sdk: onClientSetup ? { CorpusWireClient: class { constructor() { onClientSetup(state); return client; } } } : undefined,
+      signal: controller.signal, isTTY,
       write: (line) => state.writes.push(line), writeRaw: () => {},
       confirm: async (prompt) => { if (onConfirm) return onConfirm(state, prompt); throw new Error("Local watch must not request indexing confirmation"); },
       watchFactory: (sourceRoot, options, callback) => {
@@ -2293,4 +2298,58 @@ test("review: first stop aborts stalled health and diagnosis beneath base path",
     controller.abort();
     await assert.rejects(result, /stopped/);
   }
+});
+
+test("review: explicit and implicit watches fence removed or retargeted source-root aliases", { timeout: 10000 }, async () => {
+  for (const implicit of [false, true]) {
+    for (const action of ["remove", "retarget"]) {
+      let changed = false;
+      const state = await watchFixture({ argv: implicit ? [] : ["watch"], isTTY: implicit,
+        onSetup: async (current) => {
+          current.alias = `${current.root}-watch-alias`;
+          current.extraPaths.push(current.alias);
+          await symlink(current.root, current.alias);
+          if (implicit) current.cwd = current.alias;
+          else current.sourceRoot = current.alias;
+          current.replacement = await syntheticWorkspace();
+          current.extraPaths.push(current.replacement);
+        },
+        onIndex: async (current, request) => {
+          assert.equal(request.workspace.displayRoot, current.root, "Publication must use the selected canonical root");
+        },
+        onWait: async (current) => {
+          if (changed) return;
+          changed = true;
+          await rm(current.alias);
+          if (action === "retarget") await symlink(current.replacement, current.alias);
+          // The selected canonical target is still intact and changed; losing
+          // the alias fence would incorrectly publish this second generation.
+          await writeFile(path.join(current.root, "README.md"), "# Changed after alias loss\n");
+          assert.equal(await readFile(path.join(current.root, "README.md"), "utf8"), "# Changed after alias loss\n");
+          current.notify("README.md");
+        },
+      });
+      assert.equal(state.requests.length, 1, `${implicit ? "implicit" : "explicit"} ${action}: alias drift must prevent follow-up publication`);
+      assert.equal(state.error?.code, "watch_fence");
+      assert.match(state.error.message, action === "remove" ? /disappeared/ : /replaced/);
+      assert.ok(state.waits < 50, "Alias drift must stop promptly");
+    }
+  }
+});
+
+test("review: watch does not adopt an alias retargeted during client setup", async () => {
+  const state = await watchFixture({ onSetup: async (current) => {
+    current.alias = `${current.root}-setup-alias`;
+    current.extraPaths.push(current.alias);
+    current.sourceRoot = current.alias;
+    await symlink(current.root, current.alias);
+    current.replacement = await syntheticWorkspace();
+    current.extraPaths.push(current.replacement);
+  }, onClientSetup: (current) => {
+    rmSync(current.alias);
+    symlinkSync(current.replacement, current.alias);
+  } });
+  assert.equal(state.requests.length, 0, "Pre-publication fence must detect alias retargeting during setup");
+  assert.equal(state.error?.code, "watch_fence");
+  assert.match(state.error.message, /replaced/);
 });

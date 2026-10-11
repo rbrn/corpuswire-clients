@@ -344,12 +344,13 @@ export async function runCliCommand(options, dependencies = {}) {
   const write = dependencies.write ?? console.log;
   const configurationInputs = { ...options };
   if (["index", "reconcile", "init", "doctor", "watch"].includes(options.command)) {
-    const sourceRoot = await realpath(path.resolve(options.sourceRoot || process.cwd()));
+    const requestedSourceRoot = path.resolve(options.sourceRoot || process.cwd());
+    const sourceRoot = await realpath(requestedSourceRoot);
     const sourceStats = await stat(sourceRoot);
     if (!sourceStats.isDirectory()) throw new Error(`Workspace root is not a directory: ${sourceRoot}`);
     const configuration = await resolveIndexConfiguration(options, sourceRoot, dependencies);
     validateIndexDestination(configuration);
-    options = { ...options, ...configuration, apiBaseUrl: configuration.baseUrl, sourceRoot, configuration };
+    options = { ...options, ...configuration, apiBaseUrl: configuration.baseUrl, sourceRoot, requestedSourceRoot, configuration };
     const interactive = dependencies.isTTY ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
     if (options.implicitIndex && configuration.profile === "local" && interactive
       && !options.once && !options.nonInteractive && !options.json && !options.ndjson) options.watch = true;
@@ -657,8 +658,8 @@ export async function runWatchCommand(options, dependencies) {
       : `${message} Reason: ${fallback.reason}${fallback.error_code ? ` (${fallback.error_code})` : ""}.`);
   };
   const signal = dependencies.signal;
-  const requestedRoot = options.sourceRoot;
-  const root = await realpath(requestedRoot);
+  const requestedRoot = options.requestedSourceRoot ?? path.resolve(options.sourceRoot);
+  const root = options.requestedSourceRoot ? options.sourceRoot : await realpath(requestedRoot);
   const rootIdentity = await stat(root);
   const configurationInputs = dependencies.configurationInputs ?? options;
   const configurationIdentity = watchConfigurationIdentity(options.configuration);
@@ -714,7 +715,7 @@ export async function runWatchCommand(options, dependencies) {
     if (currentRoot !== root || currentIdentity.dev !== rootIdentity.dev || currentIdentity.ino !== rootIdentity.ino) {
       throw watchFailure("Workspace root was replaced. Restart cw to select the new folder.");
     }
-    const configuration = await resolveIndexConfiguration(configurationInputs, requestedRoot, dependencies);
+    const configuration = await resolveIndexConfiguration(configurationInputs, root, dependencies);
     if (watchConfigurationIdentity(configuration) !== configurationIdentity) {
       throw watchFailure("Workspace, service, or indexing filters changed. Restart cw to apply the new configuration.");
     }
