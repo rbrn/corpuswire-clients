@@ -987,6 +987,10 @@ class SyncManager {
         throw error;
       }
       return this.applyBootstrapStatus(checked.value);
+    } catch (error) {
+      this.observationGap = true;
+      this.readableCheckpointBaseline = undefined;
+      throw error;
     } finally {
       healthStop.abort();
     }
@@ -1020,6 +1024,8 @@ class SyncManager {
     const baseline = this.observationGap === false && previous.coverage?.state === "verified"
       ? { contextKey: this.coverageContextKey, workspaceId: previous.workspaceId,
         repoPath: previous.repoPath, collection: previous.collection,
+        resolvedWorkspaceId: previous.resolvedWorkspaceId ?? null,
+        resolvedContext: previous.resolvedContext ?? null,
         coverageToken: previous.coverage.coverage_token,
         selectionPolicyDigest: previous.coverage.selection_policy_digest }
       : this.readableCheckpointBaseline;
@@ -1028,6 +1034,8 @@ class SyncManager {
       && baseline.contextKey === this.coverageContextKey
       && baseline.workspaceId === bootstrapStatus.workspaceId
       && baseline.repoPath === bootstrapStatus.repoPath && baseline.collection === bootstrapStatus.collection
+      && baseline.resolvedWorkspaceId === (bootstrapStatus.resolvedWorkspaceId ?? null)
+      && baseline.resolvedContext === (bootstrapStatus.resolvedContext ?? null)
       && typeof baseline.coverageToken === "string" && baseline.coverageToken.length > 0
       && typeof baseline.selectionPolicyDigest === "string" && baseline.selectionPolicyDigest.length > 0
       && bootstrapStatus.codeReady === true && bootstrapStatus.needsReconcile !== true
@@ -1039,6 +1047,12 @@ class SyncManager {
     if (this.observationGap === false && (
       previous.coverage?.coverage_token !== bootstrapStatus.coverage?.coverage_token
       || previous.coverage?.selection_policy_digest !== bootstrapStatus.coverage?.selection_policy_digest
+      || ((previous.workspaceId != null || previous.repoPath != null) && (
+        (previous.resolvedWorkspaceId ?? null) !== (bootstrapStatus.resolvedWorkspaceId ?? null)
+        || (previous.resolvedContext ?? null) !== (bootstrapStatus.resolvedContext ?? null)
+        || previous.workspaceId !== bootstrapStatus.workspaceId || previous.repoPath !== bootstrapStatus.repoPath
+        || previous.collection !== bootstrapStatus.collection))
+      || (bootstrapStatus.codeReady === true && !sameOwnedCheckpoint)
     )) {
       this.observationGap = true;
       this.readableCheckpointBaseline = undefined;
@@ -2096,6 +2110,10 @@ class SyncManager {
   }
 
   recordBootstrapStatus(status) {
+    if (status.healthBlocked === true || ["blocked", "unknown", "error"].includes(status.state)) {
+      this.readableCheckpointBaseline = undefined;
+      if (["unknown", "error"].includes(status.state)) this.observationGap = true;
+    }
     this.bootstrapStatus = {
       ...initialBootstrapStatus(),
       ...status,
@@ -5278,6 +5296,7 @@ function bootstrapStatusForTimeout(maxWaitMs) {
   return {
     ...initialBootstrapStatus(),
     state: "unknown",
+    needsReconcile: true,
     healthBlocked: true,
     canRetrieve: false,
     checkedAt: new Date().toISOString(),

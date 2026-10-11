@@ -5230,12 +5230,18 @@ test("review: actual bootstrap transitions bind partial checkpoint reads to the 
     (context) => JSON.stringify(context));
   const ownedContext = { sourceRoot: "/fixture/repo", workspaceId: "fixture" };
   const healthy = { codeReady: true, needsReconcile: false, workspaceId: "fixture", repoPath: "/fixture/repo", collection: "owned",
+    resolvedWorkspaceId: "resolved-owned", resolvedContext: "tenant://owned",
     checkedAt: new Date().toISOString(), coverage: { state: "pending", code_ready: true } };
   for (const grace of ["0", "600000"]) {
     for (const change of [{}, { coverage: { ...healthy.coverage, coverage_token: "foreign-token" } },
       { coverage: { ...healthy.coverage, selection_policy_digest: "foreign-policy" } },
       { workspaceId: "foreign-workspace" }, { repoPath: "/foreign/root" }, { collection: "foreign-collection" },
-      { invalidContextKey: true }]) {
+      { invalidContextKey: true }, { resolvedWorkspaceId: "resolved-foreign" }, { resolvedContext: "tenant://foreign" },
+      { resolvedWorkspaceId: null }, { resolvedContext: null },
+      ...[{ resolvedWorkspaceId: "resolved-foreign" }, { resolvedContext: "tenant://foreign" },
+        { workspaceId: "foreign-workspace" }, { repoPath: "/foreign/root" }, { collection: "foreign-collection" },
+        { invalidContextKey: true }].map((identity) => ({ ...identity,
+          coverage: { ...healthy.coverage, coverage_token: "owned-token", selection_policy_digest: "owned-policy" } }))]) {
       const context = { ...methods, env: { CORPUSWIRE_SYNC_READ_STRICT: "true", CORPUSWIRE_SYNC_READ_STRICT_STALE_AFTER_MS: grace },
         lastError: null, observationGap: false, flushDurationSamplesMs: [],
         coverageContextKey: change.invalidContextKey ? "previous-context" : JSON.stringify(ownedContext),
@@ -5267,6 +5273,61 @@ test("review: actual bootstrap transitions bind partial checkpoint reads to the 
         context.applyBootstrapStatus({ ...healthy });
         assert.equal(context.readFreshnessStatus().strictBlocked, true, "Later healthy diagnosis cannot restore a failed local lineage");
       }
+    }
+  }
+});
+
+
+test("review: actual read and bootstrap diagnosis failures revoke checkpoint trust through healthy recovery", async () => {
+  const source = await readFile(SERVER_BIN, "utf8");
+  const section = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
+  const methods = new Function("optionalBoolean", "optionalNonNegativeInteger", "optionalPositiveInteger", "syncContextKey",
+    "const DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS = 50;"
+    + section("function initialBootstrapStatus()", "function bootstrapStatusFromError(")
+    + section("function isBootstrapHealthBlocked(", "function bootstrapStatusFromDiagnosis(")
+    + section("async function awaitWithTimeout(", "function formatPathProbePayload(")
+    + "return {" + section("  async prepareForRead(args", "  readFreshnessStatus()") + ","
+    + section("  readFreshnessStatus()", "  async reconcileExplicit(") + ","
+    + section("  async bootstrapExplicit(", "  async checkBootstrapStatus(") + ","
+    + section("  async checkBootstrapStatus(", "  async refreshBootstrapStatus(") + ","
+    + section("  async refreshBootstrapStatus(", "  async readBootstrapStatus(") + ","
+    + section("  applyBootstrapStatus(", "  async reconcileAll(") + ","
+    + section("  recordBootstrapStatus(", "  recordCacheDecision(") + "};")(
+    (value, fallback) => value === undefined ? fallback : value === "true",
+    (value, fallback) => value === undefined ? fallback : Number(value),
+    (value, fallback) => value === undefined ? fallback : Number(value), JSON.stringify);
+  const healthy = { state: "ready", codeReady: true, needsReconcile: false, workspaceId: "fixture",
+    repoPath: "/fixture/repo", collection: "owned", resolvedWorkspaceId: "resolved-owned", resolvedContext: "tenant://owned",
+    coverage: { state: "pending", code_ready: true }, checkedAt: new Date().toISOString() };
+  for (const entrypoint of ["prepareForRead", "bootstrapExplicit"]) {
+    for (const failure of ["timeout", "transport"]) {
+      let response = "healthy";
+      const context = { ...methods, env: { CORPUSWIRE_SYNC_READ_STRICT: "true", CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK: "true",
+        CORPUSWIRE_SYNC_BOOTSTRAP_TIMEOUT_MS: "10", CORPUSWIRE_SYNC_READ_FRESHNESS_TIMEOUT_MS: "10" },
+        observationGap: false, lastError: null,
+        coverageContextKey: JSON.stringify({ sourceRoot: healthy.repoPath, workspaceId: healthy.workspaceId }),
+        bootstrapStatus: { ...healthy, codeReady: false,
+          coverage: { state: "verified", coverage_token: "owned-token", selection_policy_digest: "owned-policy" } },
+        resolveContext: (args) => ({ sourceRoot: args.sourceRoot, workspaceId: args.workspaceId }),
+        isEnabled: () => true, flushBeforeRead: async () => null, snapshot: () => ({}),
+        readBootstrapStatus: async () => {
+          if (response === "timeout") return new Promise(() => {});
+          if (response === "transport") throw new Error("diagnosis transport failed");
+          return { ...healthy };
+        } };
+      context.applyBootstrapStatus({ ...healthy });
+      assert.equal(context.readFreshnessStatus().strictBlocked, false);
+      response = failure;
+      if (entrypoint === "bootstrapExplicit" && failure === "timeout") {
+        assert.equal((await context[entrypoint]({ maxWaitMs: 10 })).timedOut, true);
+      } else await assert.rejects(context[entrypoint]({ maxWaitMs: 10 }), /blocked retrieval|diagnosis transport failed/);
+      assert.equal(context.observationGap, true);
+      assert.equal(context.readableCheckpointBaseline, undefined);
+      response = "healthy";
+      await context.refreshBootstrapStatus({});
+      assert.equal(context.readFreshnessStatus().strictBlocked, true,
+        `${entrypoint} ${failure}: healthy pending diagnosis cannot restore lost observations`);
+      await assert.rejects(context.prepareForRead({}), /blocked retrieval/);
     }
   }
 });
