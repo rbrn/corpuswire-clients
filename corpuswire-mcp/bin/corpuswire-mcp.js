@@ -986,7 +986,9 @@ class SyncManager {
         error.code = "CORPUSWIRE_HEALTH_TIMEOUT";
         throw error;
       }
-      return this.applyBootstrapStatus(checked.value);
+      return this.applyBootstrapStatus(checked.value, this.resolveContext({
+        ...args, sourceRoot: checked.value.repoPath, workspaceId: checked.value.workspaceId,
+      }));
     } catch (error) {
       this.observationGap = true;
       this.readableCheckpointBaseline = undefined;
@@ -1013,11 +1015,11 @@ class SyncManager {
     return bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId });
   }
 
-  applyBootstrapStatus(bootstrapStatus) {
+  applyBootstrapStatus(bootstrapStatus, selectionContext = undefined) {
     const previous = this.bootstrapStatus;
     let contextKey;
     try {
-      contextKey = syncContextKey(this.resolveContext({
+      contextKey = syncContextKey(selectionContext ?? this.resolveContext({
         sourceRoot: bootstrapStatus.repoPath, workspaceId: bootstrapStatus.workspaceId,
       }));
     } catch { /* Missing identity cannot authorize a checkpoint exception. */ }

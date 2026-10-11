@@ -5222,7 +5222,7 @@ test("review: actual bootstrap transitions bind partial checkpoint reads to the 
   const method = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
   const methods = new Function("optionalBoolean", "optionalNonNegativeInteger", "isBootstrapHealthBlocked", "syncContextKey",
     "return ({" + method("  readFreshnessStatus() {", "  async reconcileExplicit(") + ","
-      + method("  applyBootstrapStatus(bootstrapStatus) {", "  async reconcileAll(") + ","
+      + method("  applyBootstrapStatus(bootstrapStatus,", "  async reconcileAll(") + ","
       + method("  recordResult(result, operation", "  recordError(error, operation") + ","
       + method("  recordError(error, operation", "  recordBootstrapStatus(status)") + "});")(
     (value, fallback) => value === undefined ? fallback : value === "true",
@@ -5328,6 +5328,50 @@ test("review: actual read and bootstrap diagnosis failures revoke checkpoint tru
       assert.equal(context.readFreshnessStatus().strictBlocked, true,
         `${entrypoint} ${failure}: healthy pending diagnosis cannot restore lost observations`);
       await assert.rejects(context.prepareForRead({}), /blocked retrieval/);
+    }
+  }
+});
+
+test("review: explicit selection filters bind a verified full baseline to later healthy checkpoint reads", async () => {
+  const source = await readFile(SERVER_BIN, "utf8");
+  const section = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
+  const contextKey = new Function("DEFAULT_BASE_URL", "DEFAULT_SYNC_MAX_FILE_SIZE_BYTES",
+    section("function syncContextKey(", "function isSyncIndexableRelativePath(") + "return syncContextKey;")("http://fixture", 1000);
+  const methods = new Function("optionalBoolean", "optionalNonNegativeInteger", "optionalPositiveInteger", "syncContextKey", "isBootstrapHealthBlocked",
+    "const DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS = 50;"
+    + section("async function awaitWithTimeout(", "function formatPathProbePayload(")
+    + "return {" + section("  readFreshnessStatus()", "  async reconcileExplicit(") + ","
+    + section("  async refreshBootstrapStatus(", "  async readBootstrapStatus(") + ","
+    + section("  applyBootstrapStatus(", "  async reconcileAll(") + ","
+    + section("  async applySyncCacheUploadResult(", "  async updateSyncCacheEntry(") + "};")(
+      (value, fallback) => value === undefined ? fallback : value === "true",
+      (value, fallback) => value === undefined ? fallback : Number(value),
+      (value, fallback) => value === undefined ? fallback : Number(value), contextKey, () => false);
+  const args = { sourceRoot: "/fixture/repo", workspaceId: "fixture", includeGlobs: ["src/**", "docs/**"], excludeGlobs: ["src/generated/**"] };
+  const healthy = { state: "ready", codeReady: true, needsReconcile: false, repoPath: args.sourceRoot, workspaceId: args.workspaceId,
+    collection: "owned", resolvedWorkspaceId: "resolved-owned", resolvedContext: "tenant://owned",
+    checkedAt: new Date().toISOString(), coverage: { state: "pending", code_ready: true } };
+  for (const changed of [{}, { includeGlobs: ["docs/**"] }, { excludeGlobs: [] },
+    { selectionIdentity: "different-registry" }, { effectiveMaxFileSizeBytes: 500 }]) {
+    const resolveContext = (input) => ({ serviceBaseUrl: "http://fixture", selectionIdentity: "registry-1", effectiveMaxFileSizeBytes: 1000,
+      sourceRoot: input.sourceRoot, workspaceId: input.workspaceId,
+      includeGlobs: input.includeGlobs ?? [], excludeGlobs: input.excludeGlobs ?? [], ...input });
+    const context = { ...methods, env: { CORPUSWIRE_SYNC_READ_STRICT: "true" }, observationGap: false, lastError: null,
+      flushDurationSamplesMs: [], resolveContext, bootstrapStatus: { ...healthy, codeReady: false },
+      recordBootstrapStatus(status) { this.bootstrapStatus = status; }, isCacheEnabled: () => false,
+      readBootstrapStatus: async () => ({ ...healthy }) };
+    await context.applySyncCacheUploadResult(resolveContext(args), [], [], {
+      status: { collection_name: "owned", coverage: { state: "verified", coverage_token: "owned-token", selection_policy_digest: "owned-policy" } },
+      transfer: { complete: true } }, true);
+    assert.equal(context.coverageContextKey, contextKey(resolveContext(args)), "Full publication must own the explicit filter identity");
+    await context.refreshBootstrapStatus({ ...args, ...changed });
+    assert.equal(context.readFreshnessStatus().strictBlocked, Object.keys(changed).length > 0, JSON.stringify(changed));
+    if (Object.keys(changed).length === 0) {
+      await context.refreshBootstrapStatus(args);
+      assert.equal(context.readFreshnessStatus().strictBlocked, false, "Repeated matching per-call selection retains checkpoint trust");
+    } else {
+      await context.refreshBootstrapStatus(args);
+      assert.equal(context.readFreshnessStatus().strictBlocked, true, "Returning to old filters cannot restore lost observations");
     }
   }
 });
