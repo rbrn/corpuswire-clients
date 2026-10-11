@@ -5302,7 +5302,7 @@ function diagnosisFromHealth(response, { repoPath, workspaceId }) {
     requested_workspace_id: workspaceId ?? null,
     resolved_context: workspaceId
       ? resolvedWorkspaceId
-      : activeProject.path ?? response.docs_source_dir ?? "unknown",
+      : activeProject.path ?? index.path ?? response.docs_source_dir ?? "unknown",
     resolved_workspace_id: resolvedWorkspaceId,
     resolution_mode: workspaceId ? "remote" : "local",
     collection: collectionConflict ? null : collections[0] ?? "unknown",
@@ -5313,7 +5313,7 @@ function diagnosisFromHealth(response, { repoPath, workspaceId }) {
     active_backend: {
       default_repo_path: response.docs_source_dir,
       default_collection: qdrant.collection,
-      requested_context: activeProject.path ?? response.docs_source_dir,
+      requested_context: activeProject.path ?? index.path ?? response.docs_source_dir,
       matches_requested_context: !identityProblem,
     },
     checks: [],

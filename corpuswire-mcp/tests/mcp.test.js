@@ -5769,6 +5769,9 @@ test("review: legacy context-only health attests public identities and collectio
     qdrant: { collection_exists: true, point_count: 1 } }, { repoPath: "/service/repo" });
   assert.equal(repoOnly.resolved_context, "/service/repo", "Repo-only health diagnosis retains its service path");
   assert.equal(repoOnly.resolved_workspace_id, null, "Absent backend workspace evidence cannot be invented");
+  const indexPathOnly = helpers.diagnosisFromHealth({ docs_source_dir: "/backend/default", index: { path: "/service/selected", collection: "owned" },
+    qdrant: { collection: "owned", collection_exists: true, point_count: 1 } }, { repoPath: "/service/selected" });
+  assert.equal(indexPathOnly.resolved_context, "/service/selected", "Repo-only diagnosis uses the scoped index path before backend defaults");
   const explicitFilters = { includeGlobs: ["src/**"], excludeGlobs: ["src/generated/**"] };
   for (const initialTimeout of [false, true]) {
   for (const changed of [{}, { healthy: true, active_project: { workspace_id: "requested-workspace" } },
