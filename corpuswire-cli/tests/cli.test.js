@@ -1407,7 +1407,7 @@ test("CLI complete scan carries inventory evidence and cancellation cannot reach
   } finally { await rm(fixture, { recursive: true, force: true }); }
 });
 
-async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, onPreview, onDiagnosis, onSetup, watcherUnavailable = false, watcherError } = {}) {
+async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, onPreview, onDiagnosis, onSetup, onConfirm, watcherUnavailable = false, watcherError } = {}) {
   const root = await syntheticWorkspace();
   const controller = new AbortController();
   const state = {
@@ -1451,7 +1451,7 @@ async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, 
     state.result = await main(args, {
       cwd: root, homeDirectory: root, env: {}, client, signal: controller.signal, isTTY,
       write: (line) => state.writes.push(line), writeRaw: () => {},
-      confirm: () => { throw new Error("Local watch must not request indexing confirmation"); },
+      confirm: async (prompt) => { if (onConfirm) return onConfirm(state, prompt); throw new Error("Local watch must not request indexing confirmation"); },
       watchFactory: (sourceRoot, options, callback) => {
         assert.equal(sourceRoot, root);
         assert.equal(options.recursive, true);
@@ -2205,4 +2205,92 @@ test("runtime watcher failure reports safe reason and closes its handle once", {
   assert.deepEqual(fallback, { stage: "runtime", reason: "watch_permission_denied", error_code: "EPERM" });
   assert.equal(state.closed, 1);
   assert.ok(state.writes.every((line) => !line.includes("secret") && !line.includes("/private/path")));
+});
+
+
+test("review: unknown environment profiles and nonpositive or unsafe file limits fail before requests", async () => {
+  let requests = 0;
+  const client = { getIndexCapabilities: async () => { requests += 1; } };
+  await assert.rejects(main(["index"], { env: { CORPUSWIRE_PROFILE: "hostd" }, client }), /Unsupported profile/);
+  for (const limit of ["0", "0.5", "9007199254740992"]) {
+    await assert.rejects(main(["index", "--max-file-size", limit], { env: {}, client }), /positive safe integer/);
+  }
+  assert.equal(requests, 0);
+  assert.equal(parseCliArgs(["index", "--profile", "local"], { CORPUSWIRE_PROFILE: "hostd" }).profile, "local");
+});
+
+test("review: option-first bare prompts retain enhancement dispatch", () => {
+  for (const args of [["--json", "explain this"], ["--output-mode", "copilot", "prompt"]]) {
+    const result = parseCliArgs(args, {});
+    assert.equal(result.command, "enhance");
+    assert.equal(result.implicitIndex, false);
+    assert.equal(result.promptParts.length, 1);
+  }
+  assert.throws(() => parseCliArgs(["index", "prompt"], {}), /Unexpected argument/);
+});
+
+test("review: one-shot scans accept canonical aliases and source-root symlinks", async () => {
+  const root = await syntheticWorkspace();
+  const link = `${root}-alias`;
+  await symlink(root, link);
+  try {
+    let request;
+    const result = await main(["index", "--source-root", link, "--yes"], {
+      cwd: root, homeDirectory: root, env: {}, write: () => {}, writeRaw: () => {},
+      client: fakeIndexClient({ indexWorkspace: async (value) => { request = value; return { ok: true, result: {}, status: {} }; } }),
+    });
+    assert.equal(result.ok, true);
+    assert.equal(request.workspace.displayRoot, root);
+    assert.ok(request.files.length > 0);
+  } finally { await rm(link, { force: true }); await rm(root, { recursive: true, force: true }); }
+});
+
+test("review: interactive hosted implicit indexing preserves one-shot confirmation", async () => {
+  const root = await syntheticWorkspace();
+  let confirmations = 0, mutations = 0;
+  try {
+    const result = await main([], {
+      cwd: root, homeDirectory: root, isTTY: true,
+      env: { CORPUSWIRE_PROFILE: "hosted", CORPUSWIRE_BASE_URL: "https://example.invalid" },
+      client: fakeIndexClient({ indexWorkspace: async () => { mutations += 1; } }),
+      confirm: async () => { confirmations += 1; return ""; }, write: () => {}, writeRaw: () => {},
+      watchFactory: () => { throw new Error("Hosted implicit indexing must not watch"); },
+    });
+    assert.equal(result.started, false);
+    assert.equal(confirmations, 1);
+    assert.equal(mutations, 0);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("review: explicit index/reconcile watches confirm once and refusal makes no mutation", async () => {
+  for (const command of ["index", "reconcile"]) {
+    let confirmations = 0;
+    const refused = await watchFixture({ argv: [command, "--watch"], onConfirm: () => { confirmations += 1; return ""; } });
+    assert.ifError(refused.error);
+    assert.equal(confirmations, 1);
+    assert.equal(refused.requests.length, 0);
+    assert.equal(refused.result.started, false);
+    confirmations = 0;
+    const accepted = await watchFixture({ argv: [command, "--watch"], onConfirm: () => { confirmations += 1; return "y"; },
+      onWait: async (state) => {
+        if (state.requests.length === 1) { await writeFile(path.join(state.root, "README.md"), "# second\n"); state.notify(); }
+        else if (state.requests.length === 2) state.controller.abort();
+      },
+    });
+    assert.ifError(accepted.error);
+    assert.equal(confirmations, 1);
+    assert.equal(accepted.requests.length, 2);
+  }
+});
+
+test("review: first stop aborts stalled health and diagnosis beneath base path", async () => {
+  for (const endpoint of ["/v1/health", "/v1/context/diagnose", "/health", "/context/diagnose"]) {
+    const controller = new AbortController();
+    const fetch = createWatchFetch(async (_url, init) => new Promise((_, reject) => {
+      init.signal.addEventListener("abort", () => reject(new DOMException("stopped", "AbortError")), { once: true });
+    }), { baseUrl: "https://example.invalid/cw", signal: controller.signal, timeoutMs: 5000 });
+    const result = fetch(`https://example.invalid/cw${endpoint}`);
+    controller.abort();
+    await assert.rejects(result, /stopped/);
+  }
 });

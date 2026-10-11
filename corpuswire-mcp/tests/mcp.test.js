@@ -5184,3 +5184,89 @@ test("bootstrap and read freshness preserve timeout receipts and reject late hea
     }
   }
 });
+
+
+test("review: observation gaps block strict reads regardless of stale grace", async () => {
+  const source = await readFile(SERVER_BIN, "utf8");
+  const method = source.slice(source.indexOf("  readFreshnessStatus() {"), source.indexOf("  async reconcileExplicit(", source.indexOf("  readFreshnessStatus() {")));
+  const status = new Function("optionalBoolean", "optionalNonNegativeInteger", "isBootstrapHealthBlocked",
+    "return ({" + method + "}).readFreshnessStatus;")((value, fallback) => value === undefined ? fallback : value === "true", (value, fallback) => value === undefined ? fallback : Number(value), () => false);
+  for (const grace of ["0", "600000"]) {
+    const context = { env: { CORPUSWIRE_SYNC_READ_STRICT: "true", CORPUSWIRE_SYNC_READ_STRICT_STALE_AFTER_MS: grace },
+      bootstrapStatus: { state: "ready", needsReconcile: false, checkedAt: new Date().toISOString() } };
+    for (const gap of [undefined, true, false]) {
+      context.observationGap = gap;
+      assert.equal(status.call(context).strictBlocked, gap !== false);
+    }
+    context.bootstrapStatus.codeReady = true;
+    context.observationGap = true;
+    assert.equal(status.call(context).strictBlocked, true, "Startup partial checkpoint lacks a locally observed baseline");
+    context.coverageContextKey = "locally-observed-baseline";
+    context.readableCheckpointBaseline = { contextKey: context.coverageContextKey };
+    context.lastError = null;
+    assert.equal(status.call(context).strictBlocked, false, "Healthy explicit code checkpoint remains readable");
+    context.lastError = "watcher failed";
+    assert.equal(status.call(context).strictBlocked, true, "Watcher failure cannot be excused by a code checkpoint");
+    context.lastError = null;
+    context.bootstrapStatus.needsReconcile = true;
+    assert.equal(status.call(context).strictBlocked, true, "Code checkpoint cannot excuse a local reconciliation gap");
+    context.env.CORPUSWIRE_SYNC_READ_STRICT = "false";
+    context.observationGap = true;
+    assert.equal(status.call(context).strictBlocked, false);
+  }
+});
+
+
+test("review: actual bootstrap transitions bind partial checkpoint reads to the locally observed baseline", async () => {
+  const source = await readFile(SERVER_BIN, "utf8");
+  const method = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
+  const methods = new Function("optionalBoolean", "optionalNonNegativeInteger", "isBootstrapHealthBlocked", "syncContextKey",
+    "return ({" + method("  readFreshnessStatus() {", "  async reconcileExplicit(") + ","
+      + method("  applyBootstrapStatus(bootstrapStatus) {", "  async reconcileAll(") + ","
+      + method("  recordResult(result, operation", "  recordError(error, operation") + ","
+      + method("  recordError(error, operation", "  recordBootstrapStatus(status)") + "});")(
+    (value, fallback) => value === undefined ? fallback : value === "true",
+    (value, fallback) => value === undefined ? fallback : Number(value), () => false,
+    (context) => JSON.stringify(context));
+  const ownedContext = { sourceRoot: "/fixture/repo", workspaceId: "fixture" };
+  const healthy = { codeReady: true, needsReconcile: false, workspaceId: "fixture", repoPath: "/fixture/repo", collection: "owned",
+    checkedAt: new Date().toISOString(), coverage: { state: "pending", code_ready: true } };
+  for (const grace of ["0", "600000"]) {
+    for (const change of [{}, { coverage: { ...healthy.coverage, coverage_token: "foreign-token" } },
+      { coverage: { ...healthy.coverage, selection_policy_digest: "foreign-policy" } },
+      { workspaceId: "foreign-workspace" }, { repoPath: "/foreign/root" }, { collection: "foreign-collection" },
+      { invalidContextKey: true }]) {
+      const context = { ...methods, env: { CORPUSWIRE_SYNC_READ_STRICT: "true", CORPUSWIRE_SYNC_READ_STRICT_STALE_AFTER_MS: grace },
+        lastError: null, observationGap: false, flushDurationSamplesMs: [],
+        coverageContextKey: change.invalidContextKey ? "previous-context" : JSON.stringify(ownedContext),
+        resolveContext: (args) => ({ sourceRoot: args.sourceRoot, workspaceId: args.workspaceId }),
+        recordBootstrapStatus(status) { this.bootstrapStatus = status; },
+        bootstrapStatus: { ...healthy, codeReady: false,
+          coverage: { state: "verified", coverage_token: "owned-token", selection_policy_digest: "owned-policy" } } };
+      context.applyBootstrapStatus({ ...healthy, ...change });
+      assert.equal(context.readFreshnessStatus().strictBlocked, Object.keys(change).length > 0, JSON.stringify(change));
+      if (Object.keys(change).length === 0) {
+        context.applyBootstrapStatus({ ...healthy });
+        assert.equal(context.readFreshnessStatus().strictBlocked, false, "Repeated owned pending checkpoint remains readable");
+        context.applyBootstrapStatus({ ...healthy, coverage: { ...healthy.coverage, coverage_token: null, selection_policy_digest: null } });
+        assert.equal(context.readFreshnessStatus().strictBlocked, false, "Explicit null pending lineage remains absent rather than foreign");
+        context.applyBootstrapStatus({ ...healthy, coverage: { ...healthy.coverage, coverage_token: "foreign-token" } });
+        assert.equal(context.readFreshnessStatus().strictBlocked, true, "Later lineage drift revokes the exception");
+        context.applyBootstrapStatus({ ...healthy });
+        assert.equal(context.readFreshnessStatus().strictBlocked, true, "Returning to an anonymous checkpoint cannot regain trust");
+        context.observationGap = false;
+        context.bootstrapStatus = { ...healthy, codeReady: false,
+          coverage: { state: "verified", coverage_token: "owned-token", selection_policy_digest: "owned-policy" } };
+        context.applyBootstrapStatus({ ...healthy });
+        assert.equal(context.readFreshnessStatus().strictBlocked, false);
+        context.recordError(new Error("watcher failed"));
+        assert.equal(context.readFreshnessStatus().strictBlocked, true);
+        context.recordResult({ ok: true, noOp: true });
+        assert.equal(context.lastError, null);
+        assert.equal(context.readFreshnessStatus().strictBlocked, true, "A no-op cannot restore observation trust lost to an error");
+        context.applyBootstrapStatus({ ...healthy });
+        assert.equal(context.readFreshnessStatus().strictBlocked, true, "Later healthy diagnosis cannot restore a failed local lineage");
+      }
+    }
+  }
+});

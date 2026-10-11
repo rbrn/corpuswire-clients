@@ -742,8 +742,15 @@ class SyncManager {
     const checkedAt = this.bootstrapStatus.checkedAt;
     const checkedAtMs = checkedAt ? Date.parse(checkedAt) : NaN;
     const freshnessAgeMs = Number.isFinite(checkedAtMs) ? Math.max(0, Date.now() - checkedAtMs) : null;
-    const isStaleForStrict = this.bootstrapStatus.needsReconcile === true
-      && (staleAfterMs === 0 || (freshnessAgeMs !== null && freshnessAgeMs >= staleAfterMs));
+    // A healthy code checkpoint can replace a full baseline observed by this
+    // process. Startup and local observation failures still require reconcile.
+    const readableCodeCheckpoint = this.bootstrapStatus.codeReady === true
+      && this.bootstrapStatus.needsReconcile !== true
+      && this.readableCheckpointBaseline?.contextKey === this.coverageContextKey
+      && this.readableCheckpointBaseline !== undefined && this.lastError === null;
+    const unprovenObservationGap = this.observationGap !== false && !readableCodeCheckpoint;
+    const isStaleForStrict = unprovenObservationGap || (this.bootstrapStatus.needsReconcile === true
+      && (staleAfterMs === 0 || (freshnessAgeMs !== null && freshnessAgeMs >= staleAfterMs)));
     return {
       state: this.bootstrapStatus.state,
       needsReconcile: this.observationGap !== false || this.bootstrapStatus.needsReconcile,
@@ -1003,13 +1010,40 @@ class SyncManager {
   }
 
   applyBootstrapStatus(bootstrapStatus) {
+    const previous = this.bootstrapStatus;
+    let contextKey;
+    try {
+      contextKey = syncContextKey(this.resolveContext({
+        sourceRoot: bootstrapStatus.repoPath, workspaceId: bootstrapStatus.workspaceId,
+      }));
+    } catch { /* Missing identity cannot authorize a checkpoint exception. */ }
+    const baseline = this.observationGap === false && previous.coverage?.state === "verified"
+      ? { contextKey: this.coverageContextKey, workspaceId: previous.workspaceId,
+        repoPath: previous.repoPath, collection: previous.collection,
+        coverageToken: previous.coverage.coverage_token,
+        selectionPolicyDigest: previous.coverage.selection_policy_digest }
+      : this.readableCheckpointBaseline;
+    const sameOwnedCheckpoint = baseline !== undefined
+      && typeof baseline.contextKey === "string" && baseline.contextKey === contextKey
+      && baseline.contextKey === this.coverageContextKey
+      && baseline.workspaceId === bootstrapStatus.workspaceId
+      && baseline.repoPath === bootstrapStatus.repoPath && baseline.collection === bootstrapStatus.collection
+      && typeof baseline.coverageToken === "string" && baseline.coverageToken.length > 0
+      && typeof baseline.selectionPolicyDigest === "string" && baseline.selectionPolicyDigest.length > 0
+      && bootstrapStatus.codeReady === true && bootstrapStatus.needsReconcile !== true
+      && this.lastError === null
+      && (bootstrapStatus.coverage?.coverage_token == null
+        || bootstrapStatus.coverage.coverage_token === baseline.coverageToken)
+      && (bootstrapStatus.coverage?.selection_policy_digest == null
+        || bootstrapStatus.coverage.selection_policy_digest === baseline.selectionPolicyDigest);
     if (this.observationGap === false && (
-      this.bootstrapStatus.coverage?.coverage_token !== bootstrapStatus.coverage?.coverage_token
-      || this.bootstrapStatus.coverage?.selection_policy_digest
-        !== bootstrapStatus.coverage?.selection_policy_digest
+      previous.coverage?.coverage_token !== bootstrapStatus.coverage?.coverage_token
+      || previous.coverage?.selection_policy_digest !== bootstrapStatus.coverage?.selection_policy_digest
     )) {
       this.observationGap = true;
+      this.readableCheckpointBaseline = undefined;
     }
+    this.readableCheckpointBaseline = sameOwnedCheckpoint ? baseline : undefined;
     this.recordBootstrapStatus(bootstrapStatus);
     return bootstrapStatus;
   }
@@ -1024,6 +1058,7 @@ class SyncManager {
     this.activeReconcile = this.runReconcile(context, args, onProgress)
       .catch((error) => {
         this.observationGap = true;
+        this.readableCheckpointBaseline = undefined;
         this.recordError(error, "reconcile");
         this.lastReconcileFinishedAt = new Date().toISOString();
         return {
@@ -1200,7 +1235,7 @@ class SyncManager {
     this.lastFlushStartedAt = new Date(startedAt).toISOString();
     if (this.observationGap === false) {
       try { await this.refreshBootstrapStatus(batch); }
-      catch { this.observationGap = true; }
+      catch { this.observationGap = true; this.readableCheckpointBaseline = undefined; }
     }
     if (isBootstrapHealthBlocked(this.bootstrapStatus) && this.bootstrapStatus.emptyWriteReady !== true) {
       this.requeueBatch(batch);
@@ -1282,6 +1317,7 @@ class SyncManager {
       || !coverage.selection_policy_digest
       || this.coverageContextKey !== syncContextKey(batch)) {
       this.observationGap = true;
+      this.readableCheckpointBaseline = undefined;
       this.bootstrapStatus = {
         ...this.bootstrapStatus,
         state: "needs_reconcile",
@@ -1463,6 +1499,7 @@ class SyncManager {
     }, { operation: "reconcile" });
 
     this.observationGap = response.status?.coverage?.state !== "verified";
+    this.readableCheckpointBaseline = undefined;
     await this.applySyncCacheUploadResult(context, files.map((file) => ({
       relativePath: file.relativePath, size: file.content.length, mtimeNs: file.mtimeNs, sha256: file.sha256,
     })), new Set(), response, true);
@@ -1638,12 +1675,14 @@ class SyncManager {
             || fresh.coverage.coverage_token !== evidence.coverage_token
             || fresh.coverage.selection_policy_digest !== evidence.selection_policy_digest) {
             this.observationGap = true;
+            this.readableCheckpointBaseline = undefined;
             this.bootstrapStatus = { ...fresh, state: "blocked", healthBlocked: true,
               emptyWriteReady: false, canRetrieve: false, needsReconcile: true,
               reason: "The fresh health diagnosis does not match the completed publication." };
           }
         } catch (error) {
           this.observationGap = true;
+          this.readableCheckpointBaseline = undefined;
           this.bootstrapStatus = { ...this.bootstrapStatus, state: "blocked", healthBlocked: true,
             emptyWriteReady: false, canRetrieve: null, needsReconcile: true,
             reason: "The first nonempty publication needs a fresh health diagnosis." };
@@ -1652,6 +1691,7 @@ class SyncManager {
       }
     } else {
       this.observationGap = true;
+      this.readableCheckpointBaseline = undefined;
     }
     if (!this.isCacheEnabled()) {
       return;
@@ -1665,6 +1705,7 @@ class SyncManager {
       cacheState.data.collection = response.status?.collection_name ?? null;
       if (coverage?.state !== "verified" || !response.transfer?.complete) {
         this.observationGap = true;
+        this.readableCheckpointBaseline = undefined;
         await this.saveSyncCache(cacheState);
         return;
       }
@@ -2032,6 +2073,7 @@ class SyncManager {
 
   recordError(error, operation = "flush") {
     this.observationGap = true;
+    this.readableCheckpointBaseline = undefined;
     this.lastError = error instanceof Error ? error.message : String(error);
     const finishedAt = new Date().toISOString();
     if (operation === "reconcile") {
