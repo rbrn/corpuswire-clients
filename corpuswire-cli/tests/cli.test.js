@@ -2,7 +2,9 @@ import test from "node:test";
 import { CorpusWireClient } from "@corpuswire/sdk";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm, writeFile, readFile, readdir, chmod, symlink, rename } from "node:fs/promises";
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
+import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
@@ -2208,7 +2210,7 @@ test("runtime watcher failure reports safe reason and closes its handle once", {
   assert.ok(state.writes.every((line) => !line.includes("secret") && !line.includes("/private/path")));
 });
 
-async function existingSessionSdkFixture({ command = 'index', phase = 'completed', interrupt = false, onStatus, preflight, race = false, noList = false, timeoutMs, interruptEvent, ndjson = false, unreadable = false } = {}) {
+async function existingSessionSdkFixture({ command = 'index', phase = 'completed', interrupt = false, onStatus, preflight, race = false, noList = false, timeoutMs, interruptEvent, ndjson = false, unreadable = false, readTimeoutMs, hanging = false } = {}) {
   const root = await syntheticWorkspace();
   const workspaceId = 'demo://existing-session#main';
   const controller = new AbortController();
@@ -2225,6 +2227,7 @@ async function existingSessionSdkFixture({ command = 'index', phase = 'completed
       body = { ok: true, sessions: preflight ?? (race ? [] : [{ session_id: 'existing', workspace_id: workspaceId, phase: 'committing' }]) };
     } else if (url.pathname === '/v1/index/sessions/existing/status') {
       statusCalls++;
+      if(hanging) return new Promise(()=>{});
       await onStatus?.({root,controller,statusCalls});
       body = { ok: true, result: {session_id:'existing',workspace_id:workspaceId,phase:interrupt || timeoutMs ? 'committing' : phase,
         coverage:{state:'pending',code_ready:true,documentation_pending:true}} };
@@ -2253,14 +2256,14 @@ async function existingSessionSdkFixture({ command = 'index', phase = 'completed
     if(command==='bare') args.splice(args.indexOf('--non-interactive'),1);
     if(ndjson) args.push("--ndjson");
     if(timeoutMs) args.push('--timeout-ms',String(timeoutMs));
-    result=await main(args,{client,cwd:root,homeDirectory:root,env:{},isTTY:command==='bare',...(interruptEvent ? {process:runtimeProcess,writeError:line=>errorWrites.push(line)} : {signal:controller.signal}),
+    result=await main(args,{client,cwd:root,homeDirectory:root,env:{},isTTY:command==='bare',process:runtimeProcess,writeError:line=>errorWrites.push(line),watchRequestTimeoutMs:readTimeoutMs,...(interruptEvent ? {} : {signal:controller.signal}),
       write:line=>writes.push(line),writeRaw:()=>{},
       watchFactory:()=>{const watcher=new EventEmitter();watcher.close=()=>{};return watcher;},
       waitForWatch:async()=>controller.abort(),
     });
   } catch(caught) {error=caught;}
   finally {await rm(root,{recursive:true,force:true});}
-  return {result,error,calls,writes,errorWrites,starts,previews,reads,listCalls,statusCalls};
+  return {result,error,calls,writes,errorWrites,starts,previews,reads,listCalls,statusCalls,processExitCode:runtimeProcess.exitCode};
 }
 
 test('existing workspace sessions are observed before file reads in index, watch and bare cw', async()=>{
@@ -2387,7 +2390,8 @@ test('borrowed SDK observation timeout interrupts even an unresponsive status tr
     const start=Date.now();
     const result=await main(['index','--workspace-id','demo://hang#main','--source-root',root,'--timeout-ms','10'],{client,cwd:root,homeDirectory:root,env:{},isTTY:false,signal:new AbortController().signal,write:line=>writes.push(line),writeRaw:()=>{}});
     assert.equal(result.detached,true);assert.ok(Date.now()-start<500);assert.ok(calls.every(method=>method==='GET'));
-    assert.match(writes.join('\n'),/backend work continues/);
+    assert.match(writes.join('\n'),/completion is unverified/);
+    assert.equal(result.ok,false);assert.equal(result.exitCode,1);assert.equal(result.reason,'observation_timeout');
   } finally {await rm(root,{recursive:true,force:true});}
 });
 
@@ -2426,7 +2430,62 @@ test('explicit attachment keeps its unbounded total wait unless caller requests 
 test('unbounded explicit attachment still detaches safely on a hanging status request', async()=>{
   const start=Date.now();const state=await explicitAttachSdkFixture({hanging:true,readTimeoutMs:5});
   assert.equal(state.result.detached,true);assert.deepEqual(state.budgets,[undefined]);
+  assert.equal(state.result.ok,false);assert.equal(state.result.exitCode,1);assert.equal(state.result.reason,'status_request_timeout');
   assert.ok(Date.now()-start<500);assert.equal(state.readSignal.aborted,true);
   assert.ok(state.methods.every(method=>method==='GET'));
   assert.match(state.writes.join('\n'),/Status request timed out.*Backend work may continue/);
+});
+
+
+test('borrowed observation deadlines and status timeouts propagate unsuccessful main process outcomes', async()=>{
+  for(const options of [{timeoutMs:5},{hanging:true,readTimeoutMs:5}]) {
+    const state=await existingSessionSdkFixture({...options,ndjson:true});
+    assert.ifError(state.error);assert.equal(state.result.ok,false);assert.equal(state.result.exitCode,1);assert.equal(state.processExitCode,1);
+    const expected=options.hanging?'status_request_timeout':'observation_timeout';
+    assert.equal(state.result.reason,expected);assert.equal(state.starts,0);assert.equal(state.reads,0);
+    const event=state.writes.map(line=>JSON.parse(line)).find(event=>event.outcome==='timeout');
+    assert.equal(event.reason,expected);assert.equal(event.exit_code,1);
+    assert.equal(state.calls.some(call=>call.method==='DELETE'),false);
+  }
+  const interrupted=await existingSessionSdkFixture({interrupt:true,interruptEvent:'SIGINT'});
+  assert.ifError(interrupted.error);assert.equal(interrupted.result.ok,true);assert.equal(interrupted.result.exitCode,0);
+  assert.equal(interrupted.result.reason,'caller_interrupted');assert.equal(interrupted.processExitCode,0);
+});
+
+test('session preflight deadline and SIGINT abort the real SDK lookup transport without DELETE', async()=>{
+  for(const interrupt of [false,true]) {
+    const root=await syntheticWorkspace();const runtimeProcess=new EventEmitter();const methods=[];let receivedSignal;
+    const client=new CorpusWireClient({baseUrl:'http://fixture.test',fetchFn:async(input,init)=>{
+      methods.push(init.method??'GET');assert.equal(new URL(input).pathname,'/v1/index/sessions');
+      receivedSignal=init.signal;
+      if(interrupt) setTimeout(()=>runtimeProcess.emit('SIGINT'),1);
+      return new Promise((_,reject)=>{
+        init.signal.addEventListener('abort',()=>reject(new DOMException('Synthetic interrupted lookup','AbortError')),{once:true});
+        if(init.signal.aborted) reject(new DOMException('Synthetic interrupted lookup','AbortError'));
+      });
+    }});
+    try {
+      await assert.rejects(main(['index','--workspace-id','demo://lookup#main','--source-root',root],{client,cwd:root,homeDirectory:root,env:{},isTTY:false,process:runtimeProcess,watchRequestTimeoutMs:interrupt?500:5,write:()=>{},writeRaw:()=>{},writeError:()=>{}}),error=>error.code==='session_preflight_unavailable');
+      assert.equal(receivedSignal.aborted,true);assert.deepEqual(methods,['GET']);
+    } finally {await rm(root,{recursive:true,force:true});}
+  }
+});
+
+test('actual CLI binary exits unsuccessfully when borrowed indexing exceeds the caller deadline', async()=>{
+  const root=await syntheticWorkspace();const methods=[];
+  const server=createServer((request,response)=>{
+    methods.push(request.method);response.setHeader('content-type','application/json');
+    if(new URL(request.url,'http://fixture.test').pathname==='/v1/index/sessions') response.end(JSON.stringify({ok:true,sessions:[{session_id:'binary',workspace_id:'demo://binary#main',phase:'committing'}]}));
+    else response.end(JSON.stringify({ok:true,result:{session_id:'binary',workspace_id:'demo://binary#main',phase:'committing'}}));
+  });
+  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+  let child;
+  try {
+    const address=server.address();
+    child=spawn(process.execPath,[new URL('../bin/corpuswire.js',import.meta.url).pathname,'index','--source-root',root,'--workspace-id','demo://binary#main','--api-base-url',`http://127.0.0.1:${address.port}`,'--timeout-ms','10','--ndjson'],{cwd:root,env:{PATH:process.env.PATH,CORPUSWIRE_BEARER_TOKEN:'synthetic-regression-fixture'},stdio:['ignore','pipe','pipe']});
+    let output='';child.stdout.on('data',chunk=>{output+=chunk;});
+    const [code]=await once(child,'exit');assert.equal(code,1);assert.ok(methods.length>=2);assert.ok(methods.every(method=>method==='GET'));
+    const event=output.trim().split('\n').map(line=>JSON.parse(line)).find(event=>event.outcome==='timeout');
+    assert.equal(event.reason,'observation_timeout');assert.equal(event.exit_code,1);
+  } finally {child?.kill();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await rm(root,{recursive:true,force:true});}
 });

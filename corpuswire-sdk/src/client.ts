@@ -871,14 +871,17 @@ export class CorpusWireClient {
     return response.activity;
   }
 
-  async listIndexSessions(request: IndexSessionQuery = {}): Promise<RemoteIndexStatus[]> {
+  async listIndexSessions(
+    request: IndexSessionQuery = {},
+    options: { signal?: AbortSignal } = {},
+  ): Promise<RemoteIndexStatus[]> {
     const response = await requestJson<RemoteIndexSessionsResponse>({
       baseUrl: this.baseUrl,
       paths: [`/v1/index/sessions${toQueryString(toIndexSessionQueryParams(request))}`],
       fetchFn: this.fetchFn,
       defaultHeaders: this.defaultHeaders,
       basicAuth: this.basicAuth,
-      init: { method: "GET" },
+      init: { method: "GET", signal: options.signal },
     });
     return response.sessions;
   }

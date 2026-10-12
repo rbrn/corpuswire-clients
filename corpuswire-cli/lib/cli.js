@@ -1964,14 +1964,21 @@ async function preflightExistingSession(options, dependencies, renderer, write) 
   let lookupTimer;
   let stopLookup;
   const lookupSignal = dependencies.signal;
+  const lookupController = new AbortController();
   try {
     const interrupted = new Promise((_, reject) => {
-      stopLookup = () => reject(Object.assign(new Error("Indexing startup interrupted before scanning"), { name: "AbortError" }));
+      stopLookup = () => {
+        reject(Object.assign(new Error("Indexing startup interrupted before scanning"), { name: "AbortError" }));
+        lookupController.abort();
+      };
       lookupSignal?.addEventListener("abort", stopLookup, { once: true });
       if (lookupSignal?.aborted) stopLookup();
-      lookupTimer = setTimeout(() => reject(new Error("Active-session lookup timed out")), DEFAULT_WATCH_REQUEST_TIMEOUT_MS);
+      lookupTimer = setTimeout(() => {
+        reject(new Error("Active-session lookup timed out"));
+        lookupController.abort();
+      }, dependencies.watchRequestTimeoutMs ?? DEFAULT_WATCH_REQUEST_TIMEOUT_MS);
     });
-    sessions = await Promise.race([client.listIndexSessions({ workspaceId: options.workspaceId }), interrupted]);
+    sessions = await Promise.race([client.listIndexSessions({ workspaceId: options.workspaceId }, { signal: lookupController.signal }), interrupted]);
   }
   catch (cause) {
     if (cause?.serviceUnavailable) {
@@ -2008,7 +2015,8 @@ async function followExistingSession(client, sessionId, renderer, options, depen
     ? JSON.stringify({ type: "session_observation", session_id: sessionId, message, ...extra }) : message);
   const detach = new AbortController();
   const signals = [dependencies.signal, dependencies.detachSignal].filter(Boolean);
-  const onDetach = () => detach.abort();
+  let detachReason = null;
+  const onDetach = () => { detachReason ??= "caller_interrupted"; detach.abort(); };
   for (const signal of signals) {
     signal.addEventListener("abort", onDetach, { once: true });
     if (signal.aborted) onDetach();
@@ -2017,7 +2025,7 @@ async function followExistingSession(client, sessionId, renderer, options, depen
   const observationTimeoutMs = options.timeoutMs
     ?? (options.attachSessionId && !options.watch ? undefined : DEFAULT_WATCH_PUBLICATION_TIMEOUT_MS);
   const observationTimer = observationTimeoutMs === undefined
-    ? undefined : setTimeout(onDetach, Math.max(1, observationTimeoutMs));
+    ? undefined : setTimeout(() => { detachReason ??= "observation_timeout"; detach.abort(); }, Math.max(1, observationTimeoutMs));
   dependencies.onObservationChange?.(true);
   let codeReadyShown = false;
   const getStatus = async (id, statusOptions = {}) => {
@@ -2035,10 +2043,11 @@ async function followExistingSession(client, sessionId, renderer, options, depen
         detach.signal.addEventListener("abort", stopRead, { once: true });
         if (detach.signal.aborted) stopRead();
         readTimer = setTimeout(() => {
-          readController.abort();
+          detachReason ??= "status_request_timeout";
           reject(Object.assign(new Error("Existing indexing status request timed out"), {
             name: "RemoteIndexDetachedError", code: "session_observation_read_timeout",
           }));
+          readController.abort();
         }, dependencies.watchRequestTimeoutMs ?? DEFAULT_WATCH_REQUEST_TIMEOUT_MS);
       });
       status = await Promise.race([client.getIndexSessionStatus(id, { ...statusOptions, signal: readController.signal }), interrupted]);
@@ -2092,11 +2101,16 @@ async function followExistingSession(client, sessionId, renderer, options, depen
     emit(`Existing indexing ${sanitizeTerminalText(status.phase)}. Run cw doctor to check serving readiness.`, { phase: status.phase });
     return { ...status, status, observedExisting: true, ok: status.phase === "completed", exitCode: status.phase === "completed" ? 0 : 1 };
   } catch (error) {
-    if (error?.name === "RemoteIndexDetachedError" || (detach.signal.aborted && error?.name === "AbortError")) {
-      emit(error.code === "session_observation_read_timeout"
+    if (error?.name === "RemoteIndexDetachedError" || ((detach.signal.aborted || detachReason === "status_request_timeout") && error?.name === "AbortError")) {
+      const reason = detachReason ?? "observation_timeout";
+      const timedOut = reason !== "caller_interrupted";
+      const message = reason === "status_request_timeout"
         ? "Status request timed out; detached from existing indexing. Backend work may continue. Run cw doctor to check serving readiness."
-        : "Detached from existing indexing; backend work continues. Run cw doctor to check serving readiness.", { detached: true });
-      return { ok: true, observedExisting: true, detached: true, phase: "observing_detached" };
+        : timedOut
+        ? "Observation deadline elapsed; indexing completion is unverified. Detached without cancelling backend work. Run cw doctor to check serving readiness."
+        : "Detached from existing indexing; backend work continues. Run cw doctor to check serving readiness.";
+      emit(message, { detached: true, reason, outcome: timedOut ? "timeout" : "caller_interrupted", exit_code: timedOut ? 1 : 0 });
+      return { ok: !timedOut, exitCode: timedOut ? 1 : 0, reason, observedExisting: true, detached: true, phase: "observing_detached" };
     }
     throw error;
   } finally {

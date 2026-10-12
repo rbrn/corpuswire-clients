@@ -678,14 +678,14 @@ export class CorpusWireClient {
         });
         return response.activity;
     }
-    async listIndexSessions(request = {}) {
+    async listIndexSessions(request = {}, options = {}) {
         const response = await requestJson({
             baseUrl: this.baseUrl,
             paths: [`/v1/index/sessions${toQueryString(toIndexSessionQueryParams(request))}`],
             fetchFn: this.fetchFn,
             defaultHeaders: this.defaultHeaders,
             basicAuth: this.basicAuth,
-            init: { method: "GET" },
+            init: { method: "GET", signal: options.signal },
         });
         return response.sessions;
     }
