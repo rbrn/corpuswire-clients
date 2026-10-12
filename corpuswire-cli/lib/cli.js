@@ -580,7 +580,7 @@ function createServiceFetch(fetchFn, baseUrl) {
       throw Object.assign(new Error(
         `CorpusWire API unavailable at ${displayServiceUrl(baseUrl)} (fetch failed).\n${guidance}\nIf this URL is unexpected, check CORPUSWIRE_BASE_URL, workspace .vscode/settings.json, .vscode/mcp.json or .mcp.json, and your CorpusWire user profile. Use --api-base-url <url> to explicitly select the intended service.`,
         { cause: error },
-      ), { name: error.name, code });
+      ), { name: error.name, code, serviceUnavailable: true });
     }
   };
 }
@@ -724,6 +724,15 @@ export async function runWatchCommand(options, dependencies) {
     } catch (error) {
       reportWatcherFallback(error, "startup");
     }
+    await assertFence();
+    const observationRenderer = createProgressRenderer({ write: output, writeRaw: dependencies.writeRaw ?? (() => {}),
+      isTTY: dependencies.isTTY ?? Boolean(process.stdout.isTTY), ndjson: options.ndjson || options.json });
+    const existing = await preflightExistingSession(options, { ...dependencies, assertObserveFence: assertFence }, observationRenderer, write);
+    if (existing?.detached && !signal?.aborted) throw watchFailure("Stopped following existing indexing; backend work may continue. Run cw doctor before restarting.");
+    if (existing && !existing.detached && existing.phase !== "completed") {
+      throw watchFailure(`Existing indexing ended as ${existing.phase}; run cw doctor to check serving readiness.`);
+    }
+    await assertFence();
     let capabilities;
     for (let attempt = 0; ; attempt += 1) {
       try { capabilities = await dependencies.client.getIndexCapabilities(); break; }
@@ -756,7 +765,7 @@ export async function runWatchCommand(options, dependencies) {
         const digest = createHash("sha256").update(JSON.stringify(scan.files.map((file) => [file.relativePath, file.sha256]).sort((a, b) => a[0].localeCompare(b[0])))).digest("hex");
         if (digest !== publishedDigest) {
           const result = await runIndexCommand({ ...options, sourceRoot: root, yes: true, nonInteractive: true }, {
-            ...dependencies, capabilities, preparedScan: scan,
+            ...dependencies, capabilities, preparedScan: scan, assertObserveFence: assertFence,
             write: (line) => {
               if (!options.json && !options.ndjson) return output(line);
               try { JSON.parse(line); } catch { return write(line); }
@@ -769,6 +778,11 @@ export async function runWatchCommand(options, dependencies) {
             },
           });
           if (signal?.aborted) break;
+          if (result.observedExisting && result.phase === "completed") {
+            // A borrowed publication cannot attest this process's local inventory.
+            publishedDigest = null;
+            continue;
+          }
           if (result.ok === false || result.cancelled || result.conflict || result.started === false || result.status?.phase !== "completed"
             || result.status?.coverage?.state !== "verified" || result.transfer?.complete !== true) {
             throw watchFailure("Reconciliation did not complete. Watch stopped; run cw doctor before restarting.");
@@ -877,6 +891,11 @@ export async function runIndexCommand(options, dependencies) {
     });
     emitTrace({ status });
     return status;
+  }
+
+  if (!dependencies.preparedScan) {
+    const existing = await preflightExistingSession(options, dependencies, renderer, write);
+    if (existing) return existing;
   }
 
   const capabilities = dependencies.capabilities ?? await dependencies.client.getIndexCapabilities();
@@ -1891,6 +1910,9 @@ async function handleSessionConflict({ conflict, client, renderer, options, depe
     `Age: ${conflict.age_seconds ?? "unknown"}s; phase: ${conflict.progress?.phase ?? conflict.phase ?? "unknown"}; last progress: ${conflict.last_progress_seconds ?? "unknown"}s ago.`,
     "Safe choices: attach/follow, cancel with confirmation, or exit.",
   ].join("\n"));
+  if (options.configuration?.profile === "local" && conflict.workspace_id === options.workspaceId) {
+    return followExistingSession(client, conflict.session_id, renderer, options, dependencies);
+  }
   if (options.nonInteractive) {
     return { ok: false, conflict, attached: false };
   }
@@ -1930,25 +1952,138 @@ async function readChoice(dependencies, prompt) {
   }
 }
 
-async function followExistingSession(client, sessionId, renderer, options, dependencies) {
-  if (typeof client.followIndexSession === "function") {
-    return client.followIndexSession(sessionId, {
-      timeoutMs: options.timeoutMs,
-      pollMs: options.processingPollMs ?? 250,
-      signal: dependencies.signal,
-      detachSignal: dependencies.detachSignal,
-      onProgress: renderer.render,
-    });
+async function preflightExistingSession(options, dependencies, renderer, write) {
+  const client = dependencies.client;
+  if (typeof client.listIndexSessions !== "function") {
+    write(options.ndjson || options.json
+      ? JSON.stringify({ type: "session_preflight_unavailable", reason: "client_method_missing" })
+      : "Active-session lookup is unavailable in this client; the service lock will guard indexing.");
+    return null;
   }
-  for (;;) {
-    const status = await client.getIndexSessionStatus(sessionId);
-    if (status.progress) {
-      renderer.render(status.progress);
+  let sessions;
+  let lookupTimer;
+  let stopLookup;
+  const lookupSignal = dependencies.signal;
+  try {
+    const interrupted = new Promise((_, reject) => {
+      stopLookup = () => reject(Object.assign(new Error("Indexing startup interrupted before scanning"), { name: "AbortError" }));
+      lookupSignal?.addEventListener("abort", stopLookup, { once: true });
+      if (lookupSignal?.aborted) stopLookup();
+      lookupTimer = setTimeout(() => reject(new Error("Active-session lookup timed out")), DEFAULT_WATCH_REQUEST_TIMEOUT_MS);
+    });
+    sessions = await Promise.race([client.listIndexSessions({ workspaceId: options.workspaceId }), interrupted]);
+  }
+  catch (cause) {
+    if (cause?.serviceUnavailable) {
+      cause.message += "\nExisting indexing could not be checked; no files were scanned.";
+      throw cause;
     }
-    if (["completed", "aborted", "failed", "expired"].includes(status.phase)) {
-      return status;
+    throw Object.assign(new Error("Could not check existing indexing; no files were scanned. Check service/authentication and retry.", { cause }), { code: "session_preflight_unavailable" });
+  } finally {
+    clearTimeout(lookupTimer);
+    lookupSignal?.removeEventListener("abort", stopLookup);
+  }
+  if (!Array.isArray(sessions) || sessions.some((session) => !session || typeof session.session_id !== "string"
+    || !session.session_id || session.workspace_id !== options.workspaceId || typeof session.phase !== "string")) {
+    throw Object.assign(new Error("Active-session lookup returned unexpected workspace data; no files were scanned."), { code: "session_preflight_invalid" });
+  }
+  const active = sessions.filter((session) => !["completed", "aborted", "failed", "expired"].includes(session.phase));
+  if (active.length > 1) {
+    throw Object.assign(new Error("Multiple indexing sessions are active; run cw doctor before selecting one with --attach. No files were scanned."), { code: "session_preflight_ambiguous" });
+  }
+  if (!active.length) return null;
+  if (options.configuration?.profile !== "local") {
+    write(options.ndjson || options.json
+      ? JSON.stringify({ type: "session_conflict", session_id: active[0].session_id, attached: false })
+      : `Indexing is already running. Follow it with: cw index --attach ${sanitizeTerminalText(active[0].session_id)}`);
+    return { ok: false, conflict: active[0], attached: false };
+  }
+  return followExistingSession(client, active[0].session_id, renderer, options, dependencies);
+}
+
+// Observing a session never transfers ownership: interruption must detach, not abort.
+async function followExistingSession(client, sessionId, renderer, options, dependencies) {
+  const write = dependencies.write ?? console.log;
+  const emit = (message, extra = {}) => write(options.ndjson || options.json
+    ? JSON.stringify({ type: "session_observation", session_id: sessionId, message, ...extra }) : message);
+  const detach = new AbortController();
+  const signals = [dependencies.signal, dependencies.detachSignal].filter(Boolean);
+  const onDetach = () => detach.abort();
+  for (const signal of signals) {
+    signal.addEventListener("abort", onDetach, { once: true });
+    if (signal.aborted) onDetach();
+  }
+  const observationTimer = setTimeout(onDetach, Math.max(1, options.timeoutMs ?? DEFAULT_WATCH_PUBLICATION_TIMEOUT_MS));
+  dependencies.onObservationChange?.(true);
+  let codeReadyShown = false;
+  const getStatus = async (id, statusOptions = {}) => {
+    await dependencies.assertObserveFence?.();
+    let stopRead;
+    let status;
+    try {
+      const interrupted = new Promise((_, reject) => {
+        stopRead = () => reject(Object.assign(new Error("Observation detached"), { name: "RemoteIndexDetachedError" }));
+        detach.signal.addEventListener("abort", stopRead, { once: true });
+        if (detach.signal.aborted) stopRead();
+      });
+      status = await Promise.race([client.getIndexSessionStatus(id, { ...statusOptions, signal: detach.signal }), interrupted]);
+    } finally { detach.signal.removeEventListener("abort", stopRead); }
+    if (status.workspace_id && status.workspace_id !== options.workspaceId) {
+      throw Object.assign(new Error("Observed indexing belongs to another workspace; stopped without cancelling it."), { code: "session_preflight_invalid" });
     }
-    await new Promise((resolve) => setTimeout(resolve, options.processingPollMs ?? 250));
+    if (!codeReadyShown && status.coverage?.code_ready === true) {
+      codeReadyShown = true;
+      const pending = [status.coverage.documentation_pending ? "documentation pending" : null,
+        status.coverage.other_pending ? "other files pending" : null].filter(Boolean);
+      const sessionState = ["completed", "failed", "aborted", "expired"].includes(status.phase)
+        ? `Existing indexing ${sanitizeTerminalText(status.phase)}.` : "Existing indexing continues.";
+      emit(`Code ready${pending.length ? `; ${pending.join("; ")}` : ""}. ${sessionState}`, { code_ready: true,
+        documentation_pending: status.coverage.documentation_pending === true, other_pending: status.coverage.other_pending === true });
+    }
+    return status;
+  };
+  emit(`Following existing indexing session ${sanitizeTerminalText(sessionId)}; no local files are being scanned. Ctrl+C detaches and leaves indexing running.`);
+  try {
+    let status;
+    if (typeof client.followIndexSession === "function") {
+      // Preserve the SDK's status/deadline machinery, with fenced, cancellable GETs.
+      const observer = Object.create(client);
+      if (typeof client.getIndexSessionStatus === "function") observer.getIndexSessionStatus = getStatus;
+      status = await observer.followIndexSession(sessionId, {
+        timeoutMs: options.timeoutMs ?? DEFAULT_WATCH_PUBLICATION_TIMEOUT_MS,
+        pollMs: options.processingPollMs ?? 250,
+        detachSignal: detach.signal,
+        onProgress: renderer.render,
+      });
+    } else {
+      const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_WATCH_PUBLICATION_TIMEOUT_MS);
+      for (;;) {
+        if (detach.signal.aborted || Date.now() >= deadline) throw Object.assign(new Error("Observation detached"), { name: "RemoteIndexDetachedError" });
+        status = await getStatus(sessionId);
+        if (status.progress) renderer.render(status.progress);
+        if (["completed", "aborted", "failed", "expired"].includes(status.phase)) break;
+        await new Promise((resolve) => {
+          const finish = () => { clearTimeout(timer); detach.signal.removeEventListener("abort", finish); resolve(); };
+          const timer = setTimeout(finish, Math.min(options.processingPollMs ?? 250, Math.max(1, deadline - Date.now())));
+          detach.signal.addEventListener("abort", finish, { once: true });
+          if (detach.signal.aborted) finish();
+        });
+      }
+    }
+    await dependencies.assertObserveFence?.();
+    emit(`Existing indexing ${sanitizeTerminalText(status.phase)}. Run cw doctor to check serving readiness.`, { phase: status.phase });
+    return { ...status, status, observedExisting: true, ok: status.phase === "completed", exitCode: status.phase === "completed" ? 0 : 1 };
+  } catch (error) {
+    if (error?.name === "RemoteIndexDetachedError" || (detach.signal.aborted && error?.name === "AbortError")) {
+      emit("Detached from existing indexing; backend work continues. Run cw doctor to check serving readiness.", { detached: true });
+      return { ok: true, observedExisting: true, detached: true, phase: "observing_detached" };
+    }
+    throw error;
+  } finally {
+    clearTimeout(observationTimer);
+    renderer.finish?.();
+    dependencies.onObservationChange?.(false);
+    for (const signal of signals) signal.removeEventListener("abort", onDetach);
   }
 }
 
@@ -2206,12 +2341,14 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const controller = new AbortController();
   const detachController = new AbortController();
   let interrupts = 0;
+  let observingExisting = false;
   const runtimeProcess = dependencies.process ?? process;
   const onInterrupt = () => {
     interrupts += 1;
     if (interrupts === 1) {
       (dependencies.writeError ?? console.error)(
-        options.watch ? "Stopping watch; cancelling any indexing owned by this process…" : "Cancelling: requesting backend abort and waiting for acknowledgement…",
+        observingExisting ? "Detaching from existing indexing; backend work continues…"
+          : options.watch ? "Stopping watch; cancelling any indexing owned by this process…" : "Cancelling: requesting backend abort and waiting for acknowledgement…",
       );
       controller.abort();
       return;
@@ -2228,6 +2365,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       ...dependencies,
       signal: controller.signal,
       detachSignal: detachController.signal,
+      onObservationChange: (value) => { observingExisting = value; dependencies.onObservationChange?.(value); },
       output: options.ndjson || options.json ? runtimeProcess.stderr : dependencies.output,
     }));
   } finally {

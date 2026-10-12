@@ -1,4 +1,5 @@
 import test from "node:test";
+import { CorpusWireClient } from "@corpuswire/sdk";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm, writeFile, readFile, readdir, chmod, symlink, rename } from "node:fs/promises";
 import { EventEmitter } from "node:events";
@@ -360,7 +361,7 @@ test("one-shot startup explains a failed connection at the resolved or explicitl
         return true;
       });
       assert.equal(requests.length, 3); // Existing SDK retry policy remains active.
-      assert.ok(requests.every((input) => input === `${selectedUrl}/v1/index/capabilities`));
+      assert.ok(requests.every((input) => { const url = new URL(input); return url.origin === selectedUrl && url.pathname === "/v1/index/sessions" && url.searchParams.has("workspace_id"); }));
       assert.equal(await readFile(settingsPath, "utf8"), settings);
     }
   } finally { await rm(fixture, { recursive: true, force: true }); }
@@ -2205,4 +2206,187 @@ test("runtime watcher failure reports safe reason and closes its handle once", {
   assert.deepEqual(fallback, { stage: "runtime", reason: "watch_permission_denied", error_code: "EPERM" });
   assert.equal(state.closed, 1);
   assert.ok(state.writes.every((line) => !line.includes("secret") && !line.includes("/private/path")));
+});
+
+async function existingSessionSdkFixture({ command = 'index', phase = 'completed', interrupt = false, onStatus, preflight, race = false, noList = false, timeoutMs, interruptEvent, ndjson = false, unreadable = false } = {}) {
+  const root = await syntheticWorkspace();
+  const workspaceId = 'demo://existing-session#main';
+  const controller = new AbortController();
+  const runtimeProcess = new EventEmitter();
+  const errorWrites = [];
+  const calls = []; const writes = []; let starts = 0; let previews = 0; let reads = 0;
+  let listCalls = 0; let statusCalls = 0;
+  const client = new CorpusWireClient({ baseUrl: 'http://fixture.test', fetchFn: async (input, init) => {
+    const url = new URL(input); calls.push({ method: init.method ?? 'GET', path: url.pathname });
+    assert.equal(init.method ?? 'GET', 'GET', 'Borrowed observation must never mutate');
+    let body;
+    if (url.pathname === '/v1/index/sessions') {
+      listCalls++;
+      body = { ok: true, sessions: preflight ?? (race ? [] : [{ session_id: 'existing', workspace_id: workspaceId, phase: 'committing' }]) };
+    } else if (url.pathname === '/v1/index/sessions/existing/status') {
+      statusCalls++;
+      await onStatus?.({root,controller,statusCalls});
+      body = { ok: true, result: {session_id:'existing',workspace_id:workspaceId,phase:interrupt || timeoutMs ? 'committing' : phase,
+        coverage:{state:'pending',code_ready:true,documentation_pending:true}} };
+      if(interrupt) setTimeout(()=>interruptEvent ? runtimeProcess.emit(interruptEvent) : controller.abort(),1);
+    } else throw new Error(`Unexpected HTTP endpoint ${url.pathname}`);
+    return new Response(JSON.stringify(body),{status:200,headers:{'content-type':'application/json'}});
+  }});
+  const other = fakeIndexClient({
+    previewIndexWorkspace: async request => { previews++; reads += request.files.length; return {workspace_id:workspaceId,collection_name:'synthetic',requested_mode:'full',expected_mode:'full',included:request.files.length,candidates:request.files.length,changed:0,unchanged:request.files.length,deleted:0,excluded:0,candidate_bytes:0,destructive_risk:false}; },
+    indexWorkspace: async () => {
+      starts++;
+      if (race && starts === 1) throw Object.assign(new Error('Synthetic race'),{status:409,errorDetail:{active_session:{session_id:'existing',workspace_id:workspaceId,phase:'committing'}}});
+      return {ok:true,status:{phase:'completed',coverage:{state:'verified'}},transfer:{complete:true}};
+    },
+    health: async()=>({ok:true,index:{coverage:{state:'verified'}}}),
+    diagnoseWorkspace: async()=>({status:'ready',can_retrieve:true,resolved_workspace_id:workspaceId,index:{health_status:'ok',coverage:{state:'verified'}}}),
+  });
+  Object.assign(client,other);
+  if(noList) client.listIndexSessions=undefined;
+  let result; let error;
+  try {
+    if(unreadable) await chmod(path.join(root,"README.md"),0);
+    const args=command==='bare' ? [] : [command];
+    args.push('--workspace-id',workspaceId,'--source-root',root,'--yes','--non-interactive');
+    // Bare interactive invocation must remain implicit; noninteractive would select one-shot.
+    if(command==='bare') args.splice(args.indexOf('--non-interactive'),1);
+    if(ndjson) args.push("--ndjson");
+    if(timeoutMs) args.push('--timeout-ms',String(timeoutMs));
+    result=await main(args,{client,cwd:root,homeDirectory:root,env:{},isTTY:command==='bare',...(interruptEvent ? {process:runtimeProcess,writeError:line=>errorWrites.push(line)} : {signal:controller.signal}),
+      write:line=>writes.push(line),writeRaw:()=>{},
+      watchFactory:()=>{const watcher=new EventEmitter();watcher.close=()=>{};return watcher;},
+      waitForWatch:async()=>controller.abort(),
+    });
+  } catch(caught) {error=caught;}
+  finally {await rm(root,{recursive:true,force:true});}
+  return {result,error,calls,writes,errorWrites,starts,previews,reads,listCalls,statusCalls};
+}
+
+test('existing workspace sessions are observed before file reads in index, watch and bare cw', async()=>{
+  for(const command of ['index','watch','bare']) {
+    const state=await existingSessionSdkFixture({command,interrupt:true});
+    assert.ifError(state.error);
+    assert.equal(state.listCalls,1);assert.ok(state.statusCalls>=1);
+    assert.equal(state.starts,0);assert.equal(state.previews,0);assert.equal(state.reads,0);
+    assert.equal(state.calls.some(call=>call.method==='DELETE'),false);
+    assert.match(state.writes.join('\n'),/Detached from existing indexing; backend work continues/);
+    assert.match(state.writes.join('\n'),/Code ready; documentation pending/);
+  }
+});
+
+test('two restarts observing the same session do no repeated scans or competing starts', async()=>{
+  for(let restart=0;restart<2;restart++) {
+    const state=await existingSessionSdkFixture({interrupt:true});
+    assert.ifError(state.error);assert.equal(state.reads,0);assert.equal(state.starts,0);
+  }
+});
+
+test('existing terminal sessions are reported truthfully without claiming local inventory', async()=>{
+  for(const phase of ['completed','failed','aborted','expired']) {
+    for(const ndjson of [false,true]) {
+      const state=await existingSessionSdkFixture({phase,ndjson});
+      assert.ifError(state.error);assert.equal(state.result.phase,phase);
+      assert.equal(state.result.ok,phase==='completed');assert.equal(state.result.exitCode,phase==='completed'?0:1);
+      assert.equal(state.reads,0);assert.match(state.writes.join('\n'),new RegExp(`Existing indexing ${phase}`));
+      assert.equal(state.writes.some(line=>line.includes('Index verified')),false);
+      assert.equal(state.writes.some(line=>line.includes('Existing indexing continues')),false);
+      assert.equal(state.result.coverage.code_ready,true);
+      assert.equal(state.result.coverage.documentation_pending,true);
+      assert.equal(state.result.coverage.state,'pending');
+      assert.match(state.writes.join('\n'),/Code ready; documentation pending/);
+      if(ndjson) assert.ok(state.writes.map(line=>JSON.parse(line)).some(event=>event.code_ready&&event.documentation_pending));
+    }
+  }
+});
+
+test('watch scans once after borrowed completion before claiming verified local inventory', async()=>{
+  const state=await existingSessionSdkFixture({command:'watch'});
+  assert.ifError(state.error);assert.equal(state.previews,1);assert.equal(state.starts,1);assert.equal(state.reads,2);
+  assert.equal(state.result.publications,1);
+  assert.ok(state.writes.findIndex(line=>line.includes('Existing indexing completed')) < state.writes.findIndex(line=>line.includes('CorpusWire indexing preview')));
+});
+
+test('the preflight-to-start conflict race follows safely then watch rescans', async()=>{
+  const state=await existingSessionSdkFixture({command:'watch',race:true});
+  assert.ifError(state.error);assert.equal(state.starts,2);assert.equal(state.previews,2);
+  assert.equal(state.calls.some(call=>call.method==='DELETE'),false);assert.equal(state.result.publications,1);
+});
+
+test('ambiguous and mismatched preflight sessions fail before reads or indexing', async()=>{
+  for(const preflight of [[{session_id:'other',workspace_id:'wrong',phase:'committing'}],
+    [{session_id:'one',workspace_id:'demo://existing-session#main',phase:'committing'},{session_id:'two',workspace_id:'demo://existing-session#main',phase:'committing'}],{}]) {
+    const state=await existingSessionSdkFixture({preflight});
+    assert.ok(state.error);assert.equal(state.reads,0);assert.equal(state.starts,0);
+    assert.match(state.error.code,/session_preflight_(invalid|ambiguous)/);
+  }
+});
+
+test('clients without a session-list API retain lock-guarded compatibility with explicit wording', async()=>{
+  const state=await existingSessionSdkFixture({noList:true});
+  assert.ifError(state.error);assert.equal(state.starts,1);
+  assert.match(state.writes.join('\n'),/lookup is unavailable.*service lock will guard/);
+});
+
+test('borrowed watch timeout detaches without scanning or cancelling existing indexing', async()=>{
+  const state=await existingSessionSdkFixture({command:'watch',timeoutMs:5});
+  assert.equal(state.error?.code,'watch_fence');assert.equal(state.reads,0);assert.equal(state.starts,0);
+  assert.equal(state.calls.some(call=>call.method==='DELETE'),false);
+});
+
+test('watch destination changes during borrowed observation stop without backend cancellation', async()=>{
+  const state=await existingSessionSdkFixture({command:'watch',onStatus:async({root})=>{
+    await mkdir(path.join(root,'.vscode'),{recursive:true});
+    await writeFile(path.join(root,'.vscode','settings.json'),JSON.stringify({'corpuswire.serviceDefaults.url':'http://127.0.0.1:19999'}));
+  }});
+  assert.equal(state.error?.code,'watch_fence');assert.equal(state.reads,0);assert.equal(state.starts,0);
+  assert.equal(state.calls.some(call=>call.method==='DELETE'),false);
+});
+
+test('unavailable session lookup fails closed without exposing server details or scanning', async()=>{
+  const fixture=await syntheticWorkspace();let scans=0;
+  try {
+    await assert.rejects(runCliCommand({...indexOptions(fixture),yes:true},{client:fakeIndexClient({listIndexSessions:async()=>{throw Object.assign(new Error('private detail'),{status:403});},previewIndexWorkspace:()=>{scans++;}}),write:()=>{},writeRaw:()=>{},isTTY:false}),error=>error.code==='session_preflight_unavailable'&&!error.message.includes('private detail'));
+    assert.equal(scans,0);
+  } finally {await rm(fixture,{recursive:true,force:true});}
+});
+
+
+test('real CLI SIGINT and SIGTERM detach borrowed SDK observation without DELETE', async()=>{
+  for (const interruptEvent of ['SIGINT','SIGTERM']) {
+    const state=await existingSessionSdkFixture({interrupt:true,interruptEvent});
+    assert.ifError(state.error);assert.equal(state.reads,0);assert.equal(state.starts,0);
+    assert.equal(state.calls.some(call=>call.method==='DELETE'),false);
+    assert.match(state.errorWrites.join('\n'),/Detaching from existing indexing; backend work continues/);
+    assert.equal(state.errorWrites.some(line=>line.includes('requesting backend abort')),false);
+  }
+});
+
+test('borrowed session observation NDJSON stays parseable and reports pending documentation', async()=>{
+  const state=await existingSessionSdkFixture({interrupt:true,ndjson:true});
+  assert.ifError(state.error);
+  const events=state.writes.map(line=>JSON.parse(line));
+  assert.ok(events.some(event=>event.type==='session_observation'&&event.code_ready&&event.documentation_pending));
+  assert.ok(events.some(event=>event.type==='session_observation'&&event.detached));
+});
+
+
+test('known session observation never reads an unreadable eligible source file', async()=>{
+  const state=await existingSessionSdkFixture({interrupt:true,unreadable:true});
+  assert.ifError(state.error);assert.equal(state.previews,0);assert.equal(state.starts,0);assert.ok(state.statusCalls>=1);
+});
+
+test('borrowed SDK observation timeout interrupts even an unresponsive status transport', async()=>{
+  const root=await syntheticWorkspace();const calls=[];const writes=[];
+  const client=new CorpusWireClient({baseUrl:'http://fixture.test',fetchFn:async(input,init)=>{
+    calls.push(init.method??'GET');
+    if(new URL(input).pathname==='/v1/index/sessions') return new Response(JSON.stringify({ok:true,sessions:[{session_id:'hang',workspace_id:'demo://hang#main',phase:'committing'}]}),{headers:{'content-type':'application/json'}});
+    return new Promise(()=>{});
+  }});
+  try {
+    const start=Date.now();
+    const result=await main(['index','--workspace-id','demo://hang#main','--source-root',root,'--timeout-ms','10'],{client,cwd:root,homeDirectory:root,env:{},isTTY:false,signal:new AbortController().signal,write:line=>writes.push(line),writeRaw:()=>{}});
+    assert.equal(result.detached,true);assert.ok(Date.now()-start<500);assert.ok(calls.every(method=>method==='GET'));
+    assert.match(writes.join('\n'),/backend work continues/);
+  } finally {await rm(root,{recursive:true,force:true});}
 });
