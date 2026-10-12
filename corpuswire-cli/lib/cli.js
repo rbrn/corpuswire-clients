@@ -82,7 +82,7 @@ Options:
   --timeout-ms <number>    Explicit caller wait budget; backend continues on expiry
   --rebuild                Allow destructive collection recreation (second confirmation)
   --confirm-rebuild <id>   Required in non-interactive mode; must equal workspace ID
-  --attach <session-id>    Follow an existing index session
+  --attach <session-id>    Follow an existing session; no total deadline unless --timeout-ms
   -V, --version            Show the installed CLI version
   -h, --help               Show this help
 
@@ -2013,21 +2013,39 @@ async function followExistingSession(client, sessionId, renderer, options, depen
     signal.addEventListener("abort", onDetach, { once: true });
     if (signal.aborted) onDetach();
   }
-  const observationTimer = setTimeout(onDetach, Math.max(1, options.timeoutMs ?? DEFAULT_WATCH_PUBLICATION_TIMEOUT_MS));
+  // Explicit attachment retains its existing unbounded total wait; automatic observation stays bounded.
+  const observationTimeoutMs = options.timeoutMs
+    ?? (options.attachSessionId && !options.watch ? undefined : DEFAULT_WATCH_PUBLICATION_TIMEOUT_MS);
+  const observationTimer = observationTimeoutMs === undefined
+    ? undefined : setTimeout(onDetach, Math.max(1, observationTimeoutMs));
   dependencies.onObservationChange?.(true);
   let codeReadyShown = false;
   const getStatus = async (id, statusOptions = {}) => {
     await dependencies.assertObserveFence?.();
     let stopRead;
+    let readTimer;
+    const readController = new AbortController();
     let status;
     try {
       const interrupted = new Promise((_, reject) => {
-        stopRead = () => reject(Object.assign(new Error("Observation detached"), { name: "RemoteIndexDetachedError" }));
+        stopRead = () => {
+          readController.abort();
+          reject(Object.assign(new Error("Observation detached"), { name: "RemoteIndexDetachedError" }));
+        };
         detach.signal.addEventListener("abort", stopRead, { once: true });
         if (detach.signal.aborted) stopRead();
+        readTimer = setTimeout(() => {
+          readController.abort();
+          reject(Object.assign(new Error("Existing indexing status request timed out"), {
+            name: "RemoteIndexDetachedError", code: "session_observation_read_timeout",
+          }));
+        }, dependencies.watchRequestTimeoutMs ?? DEFAULT_WATCH_REQUEST_TIMEOUT_MS);
       });
-      status = await Promise.race([client.getIndexSessionStatus(id, { ...statusOptions, signal: detach.signal }), interrupted]);
-    } finally { detach.signal.removeEventListener("abort", stopRead); }
+      status = await Promise.race([client.getIndexSessionStatus(id, { ...statusOptions, signal: readController.signal }), interrupted]);
+    } finally {
+      clearTimeout(readTimer);
+      detach.signal.removeEventListener("abort", stopRead);
+    }
     if (status.workspace_id && status.workspace_id !== options.workspaceId) {
       throw Object.assign(new Error("Observed indexing belongs to another workspace; stopped without cancelling it."), { code: "session_preflight_invalid" });
     }
@@ -2050,21 +2068,21 @@ async function followExistingSession(client, sessionId, renderer, options, depen
       const observer = Object.create(client);
       if (typeof client.getIndexSessionStatus === "function") observer.getIndexSessionStatus = getStatus;
       status = await observer.followIndexSession(sessionId, {
-        timeoutMs: options.timeoutMs ?? DEFAULT_WATCH_PUBLICATION_TIMEOUT_MS,
+        timeoutMs: observationTimeoutMs,
         pollMs: options.processingPollMs ?? 250,
         detachSignal: detach.signal,
         onProgress: renderer.render,
       });
     } else {
-      const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_WATCH_PUBLICATION_TIMEOUT_MS);
+      const deadline = observationTimeoutMs === undefined ? null : Date.now() + observationTimeoutMs;
       for (;;) {
-        if (detach.signal.aborted || Date.now() >= deadline) throw Object.assign(new Error("Observation detached"), { name: "RemoteIndexDetachedError" });
+        if (detach.signal.aborted || (deadline !== null && Date.now() >= deadline)) throw Object.assign(new Error("Observation detached"), { name: "RemoteIndexDetachedError" });
         status = await getStatus(sessionId);
         if (status.progress) renderer.render(status.progress);
         if (["completed", "aborted", "failed", "expired"].includes(status.phase)) break;
         await new Promise((resolve) => {
           const finish = () => { clearTimeout(timer); detach.signal.removeEventListener("abort", finish); resolve(); };
-          const timer = setTimeout(finish, Math.min(options.processingPollMs ?? 250, Math.max(1, deadline - Date.now())));
+          const timer = setTimeout(finish, deadline === null ? options.processingPollMs ?? 250 : Math.min(options.processingPollMs ?? 250, Math.max(1, deadline - Date.now())));
           detach.signal.addEventListener("abort", finish, { once: true });
           if (detach.signal.aborted) finish();
         });
@@ -2075,7 +2093,9 @@ async function followExistingSession(client, sessionId, renderer, options, depen
     return { ...status, status, observedExisting: true, ok: status.phase === "completed", exitCode: status.phase === "completed" ? 0 : 1 };
   } catch (error) {
     if (error?.name === "RemoteIndexDetachedError" || (detach.signal.aborted && error?.name === "AbortError")) {
-      emit("Detached from existing indexing; backend work continues. Run cw doctor to check serving readiness.", { detached: true });
+      emit(error.code === "session_observation_read_timeout"
+        ? "Status request timed out; detached from existing indexing. Backend work may continue. Run cw doctor to check serving readiness."
+        : "Detached from existing indexing; backend work continues. Run cw doctor to check serving readiness.", { detached: true });
       return { ok: true, observedExisting: true, detached: true, phase: "observing_detached" };
     }
     throw error;

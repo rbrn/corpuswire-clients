@@ -2390,3 +2390,43 @@ test('borrowed SDK observation timeout interrupts even an unresponsive status tr
     assert.match(writes.join('\n'),/backend work continues/);
   } finally {await rm(root,{recursive:true,force:true});}
 });
+
+async function explicitAttachSdkFixture({ timeoutMs, hanging = false, readTimeoutMs } = {}) {
+  const root=await syntheticWorkspace();const timers=[];const budgets=[];const methods=[];const writes=[];
+  let statuses=0;let readSignal;
+  const originalSetTimeout=globalThis.setTimeout;
+  const client=new CorpusWireClient({baseUrl:'http://fixture.test',fetchFn:async(input,init)=>{
+    methods.push(init.method??'GET');
+    assert.equal(new URL(input).pathname,'/v1/index/sessions/explicit/status','Explicit attach must not preflight or scan');
+    readSignal=init.signal;
+    if(hanging) return new Promise(()=>{});
+    return new Response(JSON.stringify({ok:true,result:{session_id:'explicit',workspace_id:'demo://cli-synthetic#main',phase:++statuses===1?'committing':'completed'}}),{headers:{'content-type':'application/json'}});
+  }});
+  const originalFollow=client.followIndexSession;
+  client.followIndexSession=function(id,options) {budgets.push(options.timeoutMs);return originalFollow.call(this,id,options);};
+  globalThis.setTimeout=(callback,delay,...args)=>{timers.push(delay);return originalSetTimeout(callback,delay,...args);};
+  let result;
+  try {
+    result=await runCliCommand({...indexOptions(root),attachSessionId:'explicit',timeoutMs,processingPollMs:1},{client,env:{},homeDirectory:root,isTTY:false,write:line=>writes.push(line),writeRaw:()=>{},watchRequestTimeoutMs:readTimeoutMs});
+  } finally {globalThis.setTimeout=originalSetTimeout;await rm(root,{recursive:true,force:true});}
+  return {result,timers,budgets,methods,writes,readSignal};
+}
+
+test('explicit attachment keeps its unbounded total wait unless caller requests a deadline', async()=>{
+  const unbounded=await explicitAttachSdkFixture();
+  assert.equal(unbounded.result.phase,'completed');assert.deepEqual(unbounded.budgets,[undefined]);
+  assert.equal(unbounded.timers.includes(600000),false,'Do not inject the automatic observation deadline');
+  assert.ok(unbounded.timers.includes(30000),'Individual status requests remain bounded');
+  assert.ok(unbounded.methods.every(method=>method==='GET'));
+  const requested=await explicitAttachSdkFixture({timeoutMs:1250});
+  assert.equal(requested.result.phase,'completed');assert.deepEqual(requested.budgets,[1250]);
+  assert.ok(requested.timers.includes(1250));assert.equal(requested.timers.includes(600000),false);
+});
+
+test('unbounded explicit attachment still detaches safely on a hanging status request', async()=>{
+  const start=Date.now();const state=await explicitAttachSdkFixture({hanging:true,readTimeoutMs:5});
+  assert.equal(state.result.detached,true);assert.deepEqual(state.budgets,[undefined]);
+  assert.ok(Date.now()-start<500);assert.equal(state.readSignal.aborted,true);
+  assert.ok(state.methods.every(method=>method==='GET'));
+  assert.match(state.writes.join('\n'),/Status request timed out.*Backend work may continue/);
+});
