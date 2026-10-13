@@ -4725,3 +4725,32 @@ test("code-stage release proof cannot confirm another session or conflicting sco
     assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
   }
 });
+
+
+test('listIndexSessions signal preserves GET query serialization and aborts without retries', async()=>{
+  const calls=[];const controller=new AbortController();
+  const client=new CorpusWireClient({baseUrl:'http://fixture.test',fetchFn:async(input,init)=>{
+    calls.push({input,method:init.method,signal:init.signal,body:init.body});
+    return new Promise((_,reject)=>{
+      init.signal.addEventListener('abort',()=>reject(new DOMException('Synthetic session lookup abort','AbortError')),{once:true});
+      if(init.signal.aborted) reject(new DOMException('Synthetic session lookup abort','AbortError'));
+    });
+  }});
+  const pending=client.listIndexSessions({workspaceId:'local-docker://signal-test#main'},{signal:controller.signal});
+  controller.abort();await assert.rejects(pending,{name:'AbortError'});
+  assert.equal(calls.length,1);assert.equal(calls[0].method,'GET');assert.equal(calls[0].signal,controller.signal);assert.equal(calls[0].body,undefined);
+  const url=new URL(calls[0].input);assert.equal(url.pathname,'/v1/index/sessions');
+  assert.deepEqual([...url.searchParams.entries()],[['workspace_id','local-docker://signal-test#main']]);
+});
+
+
+test('followIndexSession observes incomplete as terminal with one GET and no cancellation', async()=>{
+  const calls=[];
+  const client=new CorpusWireClient({baseUrl:'http://fixture.test',fetchFn:async(input,init)=>{
+    calls.push({input,method:init.method??'GET'});
+    return jsonResponse(200,{ok:true,result:{session_id:'historical',workspace_id:'workspace-1',phase:'incomplete',errors:['Synthetic historical failure'],queue_depth:0,files_indexed:0}});
+  }});
+  const result=await client.followIndexSession('historical',{timeoutMs:30,pollMs:1});
+  assert.equal(result.phase,'incomplete');assert.deepEqual(result.errors,['Synthetic historical failure']);
+  assert.deepEqual(calls,[{input:'http://fixture.test/v1/index/sessions/historical/status',method:'GET'}]);
+});
