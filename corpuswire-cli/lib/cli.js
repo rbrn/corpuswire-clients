@@ -18,6 +18,7 @@ const DEFAULT_EXCLUDED_DIRECTORIES = new Set([
   ".git", ".mypy_cache", ".pytest_cache", ".qdrant", ".ruff_cache", ".venv",
   "__pycache__", "build", "dist", "node_modules", "target", "venv",
 ]);
+const TERMINAL_INDEX_SESSION_PHASES = new Set(["completed", "aborted", "failed", "expired", "incomplete"]);
 const INDEX_PROGRESS_SCHEMA_VERSION = "index-progress/v1";
 const INDEX_OBSERVABILITY_SCHEMA_VERSION = "index-observability/v1";
 const INDEX_OBSERVABILITY_HEADER = "X-CorpusWire-Index-Observability";
@@ -888,6 +889,7 @@ export async function runIndexCommand(options, dependencies) {
       preview: null,
       scan: null,
       wallTimeMs: Date.now() - startedAt,
+      ndjson: options.ndjson || options.json,
     });
     emitTrace({ status });
     return status;
@@ -1994,7 +1996,7 @@ async function preflightExistingSession(options, dependencies, renderer, write) 
     || !session.session_id || session.workspace_id !== options.workspaceId || typeof session.phase !== "string")) {
     throw Object.assign(new Error("Active-session lookup returned unexpected workspace data; no files were scanned."), { code: "session_preflight_invalid" });
   }
-  const active = sessions.filter((session) => !["completed", "aborted", "failed", "expired"].includes(session.phase));
+  const active = sessions.filter((session) => !TERMINAL_INDEX_SESSION_PHASES.has(session.phase));
   if (active.length > 1) {
     throw Object.assign(new Error("Multiple indexing sessions are active; run cw doctor before selecting one with --attach. No files were scanned."), { code: "session_preflight_ambiguous" });
   }
@@ -2062,7 +2064,7 @@ async function followExistingSession(client, sessionId, renderer, options, depen
       codeReadyShown = true;
       const pending = [status.coverage.documentation_pending ? "documentation pending" : null,
         status.coverage.other_pending ? "other files pending" : null].filter(Boolean);
-      const sessionState = ["completed", "failed", "aborted", "expired"].includes(status.phase)
+      const sessionState = TERMINAL_INDEX_SESSION_PHASES.has(status.phase)
         ? `Existing indexing ${sanitizeTerminalText(status.phase)}.` : "Existing indexing continues.";
       emit(`Code ready${pending.length ? `; ${pending.join("; ")}` : ""}. ${sessionState}`, { code_ready: true,
         documentation_pending: status.coverage.documentation_pending === true, other_pending: status.coverage.other_pending === true });
@@ -2088,7 +2090,7 @@ async function followExistingSession(client, sessionId, renderer, options, depen
         if (detach.signal.aborted || (deadline !== null && Date.now() >= deadline)) throw Object.assign(new Error("Observation detached"), { name: "RemoteIndexDetachedError" });
         status = await getStatus(sessionId);
         if (status.progress) renderer.render(status.progress);
-        if (["completed", "aborted", "failed", "expired"].includes(status.phase)) break;
+        if (TERMINAL_INDEX_SESSION_PHASES.has(status.phase)) break;
         await new Promise((resolve) => {
           const finish = () => { clearTimeout(timer); detach.signal.removeEventListener("abort", finish); resolve(); };
           const timer = setTimeout(finish, deadline === null ? options.processingPollMs ?? 250 : Math.min(options.processingPollMs ?? 250, Math.max(1, deadline - Date.now())));

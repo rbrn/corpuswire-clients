@@ -1128,7 +1128,7 @@ export class CorpusWireClient {
     for (;;) {
       const status = await this.getIndexSessionStatus(sessionId);
       const pollDelay = observeStatus(status);
-      if (["completed", "aborted", "failed", "expired"].includes(status.phase)) {
+      if (["completed", "aborted", "failed", "expired", "incomplete"].includes(status.phase)) {
         return status;
       }
       if (options.signal?.aborted && !abortSent) {

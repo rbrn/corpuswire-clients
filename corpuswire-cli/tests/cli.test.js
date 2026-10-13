@@ -2286,7 +2286,7 @@ test('two restarts observing the same session do no repeated scans or competing 
 });
 
 test('existing terminal sessions are reported truthfully without claiming local inventory', async()=>{
-  for(const phase of ['completed','failed','aborted','expired']) {
+  for(const phase of ['completed','failed','aborted','expired','incomplete']) {
     for(const ndjson of [false,true]) {
       const state=await existingSessionSdkFixture({phase,ndjson});
       assert.ifError(state.error);assert.equal(state.result.phase,phase);
@@ -2395,7 +2395,7 @@ test('borrowed SDK observation timeout interrupts even an unresponsive status tr
   } finally {await rm(root,{recursive:true,force:true});}
 });
 
-async function explicitAttachSdkFixture({ timeoutMs, hanging = false, readTimeoutMs } = {}) {
+async function explicitAttachSdkFixture({ timeoutMs, hanging = false, readTimeoutMs, terminalPhase = "completed", fallback = false, ndjson = false } = {}) {
   const root=await syntheticWorkspace();const timers=[];const budgets=[];const methods=[];const writes=[];
   let statuses=0;let readSignal;
   const originalSetTimeout=globalThis.setTimeout;
@@ -2404,14 +2404,15 @@ async function explicitAttachSdkFixture({ timeoutMs, hanging = false, readTimeou
     assert.equal(new URL(input).pathname,'/v1/index/sessions/explicit/status','Explicit attach must not preflight or scan');
     readSignal=init.signal;
     if(hanging) return new Promise(()=>{});
-    return new Response(JSON.stringify({ok:true,result:{session_id:'explicit',workspace_id:'demo://cli-synthetic#main',phase:++statuses===1?'committing':'completed'}}),{headers:{'content-type':'application/json'}});
+    return new Response(JSON.stringify({ok:true,result:{session_id:'explicit',workspace_id:'demo://cli-synthetic#main',phase:terminalPhase==='incomplete' ? terminalPhase : ++statuses===1?'committing':terminalPhase}}),{headers:{'content-type':'application/json'}});
   }});
   const originalFollow=client.followIndexSession;
   client.followIndexSession=function(id,options) {budgets.push(options.timeoutMs);return originalFollow.call(this,id,options);};
+  if(fallback) client.followIndexSession=undefined;
   globalThis.setTimeout=(callback,delay,...args)=>{timers.push(delay);return originalSetTimeout(callback,delay,...args);};
   let result;
   try {
-    result=await runCliCommand({...indexOptions(root),attachSessionId:'explicit',timeoutMs,processingPollMs:1},{client,env:{},homeDirectory:root,isTTY:false,write:line=>writes.push(line),writeRaw:()=>{},watchRequestTimeoutMs:readTimeoutMs});
+    result=await runCliCommand({...indexOptions(root),attachSessionId:'explicit',timeoutMs,processingPollMs:1,ndjson},{client,env:{},homeDirectory:root,isTTY:false,write:line=>writes.push(line),writeRaw:()=>{},watchRequestTimeoutMs:readTimeoutMs});
   } finally {globalThis.setTimeout=originalSetTimeout;await rm(root,{recursive:true,force:true});}
   return {result,timers,budgets,methods,writes,readSignal};
 }
@@ -2488,4 +2489,35 @@ test('actual CLI binary exits unsuccessfully when borrowed indexing exceeds the 
     const event=output.trim().split('\n').map(line=>JSON.parse(line)).find(event=>event.outcome==='timeout');
     assert.equal(event.reason,'observation_timeout');assert.equal(event.exit_code,1);
   } finally {child?.kill();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await rm(root,{recursive:true,force:true});}
+});
+
+
+test('historical incomplete sessions do not block a fresh local index or watch baseline', async()=>{
+  for(const command of ['index','watch']) {
+    const state=await existingSessionSdkFixture({command,preflight:[{session_id:'existing',workspace_id:'demo://existing-session#main',phase:'incomplete'}]});
+    assert.ifError(state.error);assert.equal(state.statusCalls,0);assert.equal(state.starts,1);assert.equal(state.previews,1);assert.equal(state.reads,2);
+    assert.equal(state.writes.some(line=>line.includes('Following existing indexing')),false);
+    assert.equal(state.calls.some(call=>call.method==='DELETE'),false);
+  }
+});
+
+test('historical incomplete entries do not make a genuine live session ambiguous', async()=>{
+  const state=await existingSessionSdkFixture({interrupt:true,preflight:[
+    {session_id:'historic',workspace_id:'demo://existing-session#main',phase:'incomplete'},
+    {session_id:'existing',workspace_id:'demo://existing-session#main',phase:'committing'},
+  ]});
+  assert.ifError(state.error);assert.equal(state.starts,0);assert.equal(state.reads,0);assert.ok(state.statusCalls>=1);
+});
+
+test('explicit incomplete attachment returns terminal failure immediately through SDK and fallback paths', async()=>{
+  for(const fallback of [false,true]) {
+    for(const ndjson of [false,true]) {
+      const start=Date.now();const state=await explicitAttachSdkFixture({terminalPhase:'incomplete',fallback,ndjson});
+      assert.equal(state.result.phase,'incomplete');assert.equal(state.result.ok,false);assert.equal(state.result.exitCode,1);
+      assert.equal(state.methods.length,1);assert.deepEqual(state.methods,['GET']);assert.ok(Date.now()-start<500);
+      assert.equal(state.result.detached,undefined);assert.match(state.writes.join('\n'),/Existing indexing incomplete/);
+      assert.equal(state.writes.some(line=>line.includes('Existing indexing continues')),false);
+      if(ndjson) assert.ok(state.writes.map(line=>JSON.parse(line)).some(event=>event.type==='session_observation'&&event.phase==='incomplete'));
+    }
+  }
 });

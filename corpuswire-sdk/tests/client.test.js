@@ -4742,3 +4742,15 @@ test('listIndexSessions signal preserves GET query serialization and aborts with
   const url=new URL(calls[0].input);assert.equal(url.pathname,'/v1/index/sessions');
   assert.deepEqual([...url.searchParams.entries()],[['workspace_id','local-docker://signal-test#main']]);
 });
+
+
+test('followIndexSession observes incomplete as terminal with one GET and no cancellation', async()=>{
+  const calls=[];
+  const client=new CorpusWireClient({baseUrl:'http://fixture.test',fetchFn:async(input,init)=>{
+    calls.push({input,method:init.method??'GET'});
+    return jsonResponse(200,{ok:true,result:{session_id:'historical',workspace_id:'workspace-1',phase:'incomplete',errors:['Synthetic historical failure'],queue_depth:0,files_indexed:0}});
+  }});
+  const result=await client.followIndexSession('historical',{timeoutMs:30,pollMs:1});
+  assert.equal(result.phase,'incomplete');assert.deepEqual(result.errors,['Synthetic historical failure']);
+  assert.deepEqual(calls,[{input:'http://fixture.test/v1/index/sessions/historical/status',method:'GET'}]);
+});
