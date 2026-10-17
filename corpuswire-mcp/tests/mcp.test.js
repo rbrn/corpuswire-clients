@@ -2695,6 +2695,156 @@ test("corpuswire-mcp keeps empty search output focused on recovery instead of pa
   }
 });
 
+test("corpuswire_enhance_prompt maps session arguments to the SDK session and omits it when absent", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-session-"));
+  try {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        CORPUSWIRE_WORKSPACE_ID: "workspace-from-env",
+        CORPUSWIRE_REPO_PATH: "/workspace/project",
+        CORPUSWIRE_SYNC_ROOT: "",
+        CORPUSWIRE_RETRIEVAL_LOG_DIR: "",
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+
+    try {
+      const tools = await rpc({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+      const schema = tools.result.tools.find((tool) => tool.name === "corpuswire_enhance_prompt").inputSchema;
+      assert.deepEqual(
+        ["conversation", "activeFile", "selection", "recentEdits"].filter((key) => key in schema.properties),
+        ["conversation", "activeFile", "selection", "recentEdits"],
+      );
+      assert.deepEqual(schema.properties.selection.required, ["path", "startLine", "endLine"]);
+      assert.deepEqual(schema.required, ["prompt"]);
+
+      const plain = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/call", params: {
+        name: "corpuswire_enhance_prompt",
+        arguments: { prompt: "plain prompt", localOnly: true },
+      } });
+      assert.equal(plain.result.isError, false);
+
+      const withSession = await rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: {
+        name: "corpuswire_enhance_prompt",
+        arguments: {
+          prompt: "why does this fail",
+          localOnly: true,
+          conversation: [{ role: "user", text: "the login test fails" }],
+          activeFile: "src/auth/login.ts",
+          selection: { path: "src/auth/login.ts", startLine: 4, endLine: 9, text: "login()" },
+          recentEdits: ["src/auth/session.ts"],
+        },
+      } });
+      assert.equal(withSession.result.isError, false);
+
+      const empty = await rpc({ jsonrpc: "2.0", id: 4, method: "tools/call", params: {
+        name: "corpuswire_enhance_prompt",
+        arguments: { prompt: "empty session", localOnly: true, conversation: [], recentEdits: [] },
+      } });
+      assert.equal(empty.result.isError, false);
+
+      const invalid = await rpc({ jsonrpc: "2.0", id: 5, method: "tools/call", params: {
+        name: "corpuswire_enhance_prompt",
+        arguments: { prompt: "bad selection", selection: { path: "a.ts", startLine: 5, endLine: 2 } },
+      } });
+      assert.ok(invalid.error || invalid.result?.isError, "an inverted selection must be rejected");
+    } finally {
+      child.kill();
+    }
+
+    const requests = (await readFile(requestsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(requests.length, 3);
+    assert.equal("session" in requests[0], false);
+    assert.deepEqual(requests[1].session, {
+      conversation: [{ role: "user", text: "the login test fails" }],
+      activeFile: "src/auth/login.ts",
+      selection: { path: "src/auth/login.ts", startLine: 4, endLine: 9, text: "login()" },
+      recentEdits: ["src/auth/session.ts"],
+      workspaceRoot: "/workspace/project",
+    });
+    assert.equal("session" in requests[2], false);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("corpuswire_enhance_prompt sends a capped snake_case session through the vendored SDK", async () => {
+  const bodies = [];
+  const server = createServer((request, response) => {
+    let raw = "";
+    request.on("data", (chunk) => { raw += chunk; });
+    request.on("end", () => {
+      if (request.url === "/v1/enhance") bodies.push(JSON.parse(raw));
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        ok: true,
+        request_id: "req-session",
+        duration_ms: 1,
+        result: {
+          user_prompt: "p", retrieval_query: "p", retrieval_backend: "mock", retrieval_warning: null,
+          retrieved_chunks: [], task_type: "bug_fix", task_type_source: "heuristic",
+          task_type_classification_error: null, output_mode: "generic", context_summary: "",
+          summary_generation_error: null, enhancement_prompt: "p", citations: [],
+          enhanced_prompt: "Enhanced with session", enhancement_backend: "local-deterministic",
+          generation_error: null,
+        },
+      }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const child = spawn("node", [SERVER_BIN], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: {
+      ...globalThis.process.env,
+      CORPUSWIRE_BASE_URL: `http://127.0.0.1:${server.address().port}`,
+      CORPUSWIRE_SDK_PATH: "",
+      CORPUSWIRE_REPO_PATH: "/workspace/project",
+      CORPUSWIRE_SYNC_ROOT: "",
+      CORPUSWIRE_WORKSPACE_ID: "workspace-session",
+      CORPUSWIRE_RETRIEVAL_LOG_DIR: "",
+    },
+  });
+  try {
+    const rpc = createRpc(child);
+    const result = await rpc({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+      name: "corpuswire_enhance_prompt",
+      arguments: {
+        prompt: "explain this",
+        localOnly: true,
+        conversation: Array.from({ length: 22 }, (_, index) => ({ role: "user", text: `turn ${index}` })),
+        activeFile: "/workspace/project/src/main.ts",
+        selection: { path: "/workspace/project/src/main.ts", startLine: 2, endLine: 3, text: "z".repeat(9000) },
+        recentEdits: ["/elsewhere/secret.ts", "../escape.ts", "src/util.ts"],
+      },
+    } });
+    assert.equal(result.result.isError, false);
+    assert.match(result.result.content[0].text, /Enhanced with session/);
+    assert.equal(bodies.length, 1);
+    const { session } = bodies[0];
+    assert.equal(session.conversation.length, 20);
+    assert.equal(session.conversation[0].text, "turn 2");
+    assert.equal(session.active_file, "src/main.ts");
+    assert.equal(session.selection.path, "src/main.ts");
+    assert.equal(session.selection.start_line, 2);
+    assert.equal(session.selection.end_line, 3);
+    assert.equal(session.selection.text.length, 8000);
+    assert.deepEqual(session.recent_edits, ["src/util.ts"]);
+    assert.deepEqual(Object.keys(session).sort(), ["active_file", "conversation", "recent_edits", "selection"]);
+  } finally {
+    child.kill();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test("corpuswire-mcp retries prompt enhancement with localOnly when generation setup is unavailable", async () => {
   const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
   try {

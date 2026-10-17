@@ -1467,7 +1467,174 @@ export function toEnhancePayload(request) {
         output_mode: normalizedRequest.outputMode ?? DEFAULT_OUTPUT_MODE,
         local_only: normalizedRequest.localOnly ?? false,
         source_filter: normalizedRequest.sourceFilter,
+        session: toEnhanceSessionPayload(normalizedRequest.session, normalizedRequest.session?.workspaceRoot ?? normalizedRequest.repoPath),
     });
+}
+/** Server caps for `EnhanceRequest.session` (see corpuswire `EnhanceSessionContext`). */
+export const ENHANCE_SESSION_LIMITS = Object.freeze({
+    conversationTurns: 20,
+    textChars: 8_000,
+    pathChars: 1_024,
+    recentEdits: 50,
+});
+const WINDOWS_DRIVE_PATTERN = /^[A-Za-z]:/;
+/**
+ * Normalizes a session path to the workspace-relative POSIX form the server
+ * accepts. Absolute paths are made relative to `workspaceRoot` when they sit
+ * under it. Returns null for anything that cannot be made relative (outside
+ * the root, home-relative, escaping with `..`, too long or empty).
+ */
+export function toWorkspaceRelativeSessionPath(path, workspaceRoot) {
+    if (typeof path !== "string") {
+        return null;
+    }
+    const trimmed = path.trim();
+    if (!trimmed || trimmed.includes("\0") || trimmed.startsWith("~")) {
+        return null;
+    }
+    const slashed = trimmed.replace(/\\/g, "/");
+    let relative;
+    if (slashed.startsWith("/") || WINDOWS_DRIVE_PATTERN.test(slashed)) {
+        const absolute = normalizeAbsoluteSessionPath(slashed);
+        const root = typeof workspaceRoot === "string" && workspaceRoot.trim()
+            ? normalizeAbsoluteSessionPath(workspaceRoot.trim().replace(/\\/g, "/"))
+            : null;
+        if (!absolute || !root) {
+            return null;
+        }
+        const caseInsensitive = WINDOWS_DRIVE_PATTERN.test(root);
+        const comparablePath = caseInsensitive ? absolute.toLowerCase() : absolute;
+        const comparableRoot = caseInsensitive ? root.toLowerCase() : root;
+        const prefix = comparableRoot.endsWith("/") ? comparableRoot : `${comparableRoot}/`;
+        if (!comparablePath.startsWith(prefix)) {
+            return null;
+        }
+        relative = absolute.slice(prefix.length);
+    }
+    else {
+        relative = slashed;
+    }
+    const segments = [];
+    for (const segment of relative.split("/")) {
+        if (segment === "" || segment === ".") {
+            continue;
+        }
+        if (segment === "..") {
+            if (segments.length === 0) {
+                return null;
+            }
+            segments.pop();
+            continue;
+        }
+        segments.push(segment);
+    }
+    const normalized = segments.join("/");
+    if (!normalized || normalized.length > ENHANCE_SESSION_LIMITS.pathChars || WINDOWS_DRIVE_PATTERN.test(normalized)) {
+        return null;
+    }
+    return normalized;
+}
+function normalizeAbsoluteSessionPath(path) {
+    const driveMatch = WINDOWS_DRIVE_PATTERN.exec(path);
+    const head = driveMatch ? driveMatch[0] : "";
+    const rest = path.slice(head.length);
+    if (driveMatch && !rest.startsWith("/")) {
+        return null;
+    }
+    const segments = [];
+    for (const segment of rest.split("/")) {
+        if (segment === "" || segment === ".") {
+            continue;
+        }
+        if (segment === "..") {
+            if (segments.length === 0) {
+                return null;
+            }
+            segments.pop();
+            continue;
+        }
+        segments.push(segment);
+    }
+    return `${head}/${segments.join("/")}`;
+}
+function truncateSessionText(text) {
+    const limit = ENHANCE_SESSION_LIMITS.textChars;
+    if (text.length <= limit) {
+        return text;
+    }
+    const code = text.charCodeAt(limit - 1);
+    const cut = code >= 0xd800 && code <= 0xdbff ? limit - 1 : limit;
+    return text.slice(0, cut);
+}
+function toPositiveLine(value) {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+        return null;
+    }
+    const line = Math.trunc(value);
+    return line >= 1 ? line : null;
+}
+/**
+ * Converts caller session state into the capped snake_case wire payload.
+ * Returns undefined when nothing usable remains, so `session` is omitted.
+ */
+export function toEnhanceSessionPayload(session, workspaceRoot) {
+    if (!session || typeof session !== "object") {
+        return undefined;
+    }
+    const payload = {};
+    if (Array.isArray(session.conversation)) {
+        const turns = [];
+        for (const turn of session.conversation) {
+            if (!turn || (turn.role !== "user" && turn.role !== "assistant") || typeof turn.text !== "string") {
+                continue;
+            }
+            if (!turn.text.trim()) {
+                continue;
+            }
+            turns.push({ role: turn.role, text: truncateSessionText(turn.text) });
+        }
+        const kept = turns.slice(-ENHANCE_SESSION_LIMITS.conversationTurns);
+        if (kept.length > 0) {
+            payload.conversation = kept;
+        }
+    }
+    const activeFile = toWorkspaceRelativeSessionPath(session.activeFile, workspaceRoot);
+    if (activeFile) {
+        payload.active_file = activeFile;
+    }
+    if (session.selection && typeof session.selection === "object") {
+        const path = toWorkspaceRelativeSessionPath(session.selection.path, workspaceRoot);
+        const startLine = toPositiveLine(session.selection.startLine);
+        const endLine = toPositiveLine(session.selection.endLine);
+        if (path && startLine !== null && endLine !== null) {
+            const selection = {
+                path,
+                start_line: Math.min(startLine, endLine),
+                end_line: Math.max(startLine, endLine),
+            };
+            if (typeof session.selection.text === "string" && session.selection.text.length > 0) {
+                selection.text = truncateSessionText(session.selection.text);
+            }
+            payload.selection = selection;
+        }
+    }
+    if (Array.isArray(session.recentEdits)) {
+        const seen = new Set();
+        for (const candidate of session.recentEdits) {
+            const path = toWorkspaceRelativeSessionPath(candidate, workspaceRoot);
+            if (!path || seen.has(path)) {
+                continue;
+            }
+            seen.add(path);
+            if (seen.size >= ENHANCE_SESSION_LIMITS.recentEdits) {
+                break;
+            }
+        }
+        if (seen.size > 0) {
+            payload.recent_edits = [...seen];
+        }
+    }
+    return Object.keys(payload).length > 0 ? payload : undefined;
 }
 export function toQueryPayload(request) {
     const normalizedRequest = typeof request === "string" ? { query: request } : request;

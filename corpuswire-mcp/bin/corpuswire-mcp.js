@@ -3186,6 +3186,40 @@ function toolDefinitions() {
             items: { type: "string" },
             description: "Optional list of source-system identifiers (e.g. plugin names) used to restrict retrieval. Plugins translate these via RetrieverHooks.extra_filters().",
           },
+          conversation: {
+            type: "array",
+            description: "Optional prior chat turns, oldest first, used only to resolve references such as \"this\" or \"that test\". Only the last 20 turns are sent; each text is capped at 8000 characters.",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                role: { type: "string", enum: ["user", "assistant"] },
+                text: { type: "string" },
+              },
+              required: ["role", "text"],
+            },
+          },
+          activeFile: {
+            type: "string",
+            description: "Optional file open in the editor: a workspace-relative path, or an absolute path under the workspace root (made relative before sending; other paths are dropped).",
+          },
+          selection: {
+            type: "object",
+            additionalProperties: false,
+            description: "Optional editor selection with 1-based inclusive lines. Text is capped at 8000 characters.",
+            properties: {
+              path: { type: "string" },
+              startLine: { type: "integer", minimum: 1 },
+              endLine: { type: "integer", minimum: 1 },
+              text: { type: "string" },
+            },
+            required: ["path", "startLine", "endLine"],
+          },
+          recentEdits: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional recently edited files, most recent first. Only the first 50 workspace-relative paths are sent.",
+          },
         },
         required: ["prompt"],
       },
@@ -6206,6 +6240,7 @@ async function enhancePrompt(args, observation = undefined) {
   const localOnly = optionalBoolean(args.localOnly ?? process.env.CORPUSWIRE_LOCAL_ONLY, true);
   const sourceFilterRaw = optionalStringArray(args, "sourceFilter");
   const sourceFilter = sourceFilterRaw.length > 0 ? sourceFilterRaw : undefined;
+  const session = readEnhanceSession(args, repoPath);
 
   const readPreparation = await syncManager.prepareForRead(args);
   const client = buildClient();
@@ -6218,6 +6253,7 @@ async function enhancePrompt(args, observation = undefined) {
     minScore,
     localOnly,
     sourceFilter,
+    ...(session ? { session } : {}),
   };
   const { result, usedLocalFallback } = await enhanceWithLocalFallback(client, request);
   if (observation) {
@@ -6785,6 +6821,59 @@ function formatAgentContextPackets(packets) {
     return [];
   }
   return ["", "Agent context packets:", ...packets.map(formatAgentContextPacket)];
+}
+
+/**
+ * Maps the optional camelCase session arguments of corpuswire_enhance_prompt
+ * to the SDK's EnhanceSessionContext. Returns undefined when the caller sent
+ * none, so the request never carries an empty `session` (older servers reject
+ * the key). Capping and path relativization happen in the SDK.
+ */
+function readEnhanceSession(args, repoPath) {
+  const session = {};
+  if (args.conversation !== undefined && args.conversation !== null) {
+    if (!Array.isArray(args.conversation)) {
+      throw new JsonRpcError(-32602, "conversation must be an array of { role, text } turns.");
+    }
+    const turns = args.conversation.map((turn, index) => {
+      if (!turn || typeof turn !== "object" || !["user", "assistant"].includes(turn.role) || typeof turn.text !== "string") {
+        throw new JsonRpcError(-32602, `conversation[${index}] must be { role: "user" | "assistant", text: string }.`);
+      }
+      return { role: turn.role, text: turn.text };
+    });
+    if (turns.length > 0) session.conversation = turns;
+  }
+  if (args.activeFile !== undefined && args.activeFile !== null && typeof args.activeFile !== "string") {
+    throw new JsonRpcError(-32602, "activeFile must be a string path.");
+  }
+  const activeFile = optionalString(args.activeFile);
+  if (activeFile) session.activeFile = activeFile;
+  if (args.selection !== undefined && args.selection !== null) {
+    const selection = args.selection;
+    const selectionPath = typeof selection === "object" ? optionalString(selection.path) : undefined;
+    const startLine = typeof selection === "object" ? selection.startLine : undefined;
+    const endLine = typeof selection === "object" ? selection.endLine : undefined;
+    if (!selectionPath || !Number.isInteger(startLine) || !Number.isInteger(endLine) || startLine < 1 || endLine < startLine) {
+      throw new JsonRpcError(-32602, "selection must be { path, startLine >= 1, endLine >= startLine, text? }.");
+    }
+    if (selection.text !== undefined && selection.text !== null && typeof selection.text !== "string") {
+      throw new JsonRpcError(-32602, "selection.text must be a string.");
+    }
+    session.selection = {
+      path: selectionPath,
+      startLine,
+      endLine,
+      ...(typeof selection.text === "string" && selection.text ? { text: selection.text } : {}),
+    };
+  }
+  const recentEdits = optionalStringArray(args, "recentEdits");
+  if (recentEdits.length > 0) session.recentEdits = recentEdits;
+  if (Object.keys(session).length === 0) {
+    return undefined;
+  }
+  const workspaceRoot = firstNonEmptyString(process.env.CORPUSWIRE_SYNC_ROOT, repoPath, process.cwd());
+  if (workspaceRoot) session.workspaceRoot = workspaceRoot;
+  return session;
 }
 
 async function enhanceWithLocalFallback(client, request) {
