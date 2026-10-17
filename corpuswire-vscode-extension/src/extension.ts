@@ -7,6 +7,7 @@ import {
 } from "@corpuswire/sdk";
 import type {
   EnhancePromptRequest,
+  EnhanceSessionContext,
   IndexWorkspaceRequest,
   PromptRewriteResult,
   RemoteWorkspaceFile,
@@ -26,6 +27,12 @@ import {
 } from "./enhancement-quality.js";
 import { hasAuthorizationHeader, resolveCliBearerToken } from "./service-auth.js";
 import { INDEX_INCLUDE_GLOB } from "./index-discovery.js";
+import {
+  RecentEditsTracker,
+  buildEditorSession,
+  isLegacySessionRejection,
+  workspaceRelativePath,
+} from "./session-context.js";
 import type {
   EnhancementQuality,
   EnhancementQualityStatus,
@@ -35,6 +42,8 @@ type PromptRewriteResultWithCompatibilityFields = PromptRewriteResult & {
   augmented_prompt?: unknown;
   rewritten_prompt?: unknown;
 };
+
+const recentEdits = new RecentEditsTracker();
 
 const INDEX_EXCLUDE_GLOB = "{**/.git/**,**/.vscode/**,**/node_modules/**,**/dist/**,**/build/**,**/target/**,**/__pycache__/**,**/reports/retrieval-failures,**/reports/retrieval-failures/**}";
 
@@ -361,7 +370,7 @@ async function runPromptEnhancement(
     endpointMode: "v1-only",
     defaultHeaders: await buildAuthenticatedServiceHeaders(settings, enhancerService),
   });
-  const request = buildEnhancementRequest(prompt, settings);
+  const request = buildEnhancementRequest(prompt, settings, collectEditorSession(prompt));
 
   post({ type: "loading", value: true });
   try {
@@ -625,6 +634,7 @@ export function activate(context: vscode.ExtensionContext): void {
     viewDisposable,
     focusPanelDisposable,
     statusBar,
+    vscode.workspace.onDidSaveTextDocument(recordSavedDocument),
   );
   registerRemoteIndexWatchers(context);
 }
@@ -1160,7 +1170,7 @@ async function enhanceSelectedPrompt(): Promise<void> {
     endpointMode: "v1-only",
     defaultHeaders: await buildAuthenticatedServiceHeaders(settings, enhancerService),
   });
-  const request = buildEnhancementRequest(selectedText, settings);
+  const request = buildEnhancementRequest(selectedText, settings, collectEditorSession(selectedText));
 
   let outcome: PromptEnhancementOutcome | undefined;
 
@@ -1201,7 +1211,11 @@ async function enhanceSelectedPrompt(): Promise<void> {
   }
 }
 
-function buildEnhancementRequest(prompt: string, settings: ExtensionSettings): EnhancePromptRequest {
+function buildEnhancementRequest(
+  prompt: string,
+  settings: ExtensionSettings,
+  session?: EnhanceSessionContext,
+): EnhancePromptRequest {
   const request: EnhancePromptRequest = {
     prompt,
     outputMode: settings.outputMode,
@@ -1214,8 +1228,74 @@ function buildEnhancementRequest(prompt: string, settings: ExtensionSettings): E
   } else if (settings.repoPath) {
     request.repoPath = settings.repoPath;
   }
+  if (session) {
+    request.session = session;
+  }
 
   return request;
+}
+
+/**
+ * Editor state for the enhance `session`: the active file and selection as
+ * workspace-relative paths with 1-based lines, plus files recently saved in
+ * the same workspace folder. When the selection is the prompt itself (the
+ * selection-as-prompt command), it is not repeated as a selection. Text from
+ * index-excluded files (dotfiles such as `.env`, build output) is never sent.
+ */
+function collectEditorSession(prompt: string): EnhanceSessionContext | undefined {
+  const editor = vscode.window.activeTextEditor;
+  const folder = editor
+    ? vscode.workspace.getWorkspaceFolder(editor.document.uri)
+    : vscode.workspace.workspaceFolders?.[0];
+  if (!folder) {
+    return undefined;
+  }
+  const activeFile = editor ? workspaceRelativePath(folder.uri.path, editor.document.uri.path) : undefined;
+  let selection: Parameters<typeof buildEditorSession>[0]["selection"];
+  if (editor && activeFile && !editor.selection.isEmpty) {
+    const selectedText = editor.document.getText(editor.selection);
+    if (selectedText.trim() !== prompt.trim()) {
+      selection = {
+        startLine: editor.selection.start.line,
+        endLine: editor.selection.end.line,
+        endCharacter: editor.selection.end.character,
+        text: isIndexExcludedPath(activeFile) ? "" : selectedText,
+      };
+    }
+  }
+  return buildEditorSession({
+    activeFile,
+    selection,
+    recentEdits: recentEdits.list(folder.uri.toString()),
+  });
+}
+
+function recordSavedDocument(document: vscode.TextDocument): void {
+  const folder = vscode.workspace.getWorkspaceFolder(document.uri);
+  if (!folder) {
+    return;
+  }
+  const relativePath = workspaceRelativePath(folder.uri.path, document.uri.path);
+  if (relativePath && !isIndexExcludedPath(relativePath)) {
+    recentEdits.record(folder.uri.toString(), relativePath);
+  }
+}
+
+/** Retries once without `session` when the server predates that field. */
+async function enhanceAllowingLegacyServer(
+  client: CorpusWireClient,
+  request: EnhancePromptRequest,
+): Promise<PromptRewriteResult> {
+  try {
+    return await client.enhance(request);
+  } catch (error) {
+    if (!request.session || !(error instanceof CorpusWireHttpError)
+      || !isLegacySessionRejection(error.status, error.responseBody)) {
+      throw error;
+    }
+    const { session: _session, ...withoutSession } = request;
+    return client.enhance(withoutSession);
+  }
 }
 
 async function enhancePromptWithFallback(
@@ -1224,13 +1304,13 @@ async function enhancePromptWithFallback(
 ): Promise<PromptEnhancementOutcome> {
   let result: PromptRewriteResult;
   try {
-    result = await client.enhance(request);
+    result = await enhanceAllowingLegacyServer(client, request);
   } catch (error) {
     if (request.localOnly || !isGenerationSetupRejection(error)) {
       throw error;
     }
 
-    const localResult = await client.enhance({ ...request, localOnly: true });
+    const localResult = await enhanceAllowingLegacyServer(client, { ...request, localOnly: true });
     const localReplacement = resolveReplacementPrompt(localResult);
     if (localReplacement) {
       return {
@@ -1253,7 +1333,7 @@ async function enhancePromptWithFallback(
   }
 
   if (!request.localOnly && result.generation_error) {
-    const localResult = await client.enhance({ ...request, localOnly: true });
+    const localResult = await enhanceAllowingLegacyServer(client, { ...request, localOnly: true });
     const localReplacement = resolveReplacementPrompt(localResult);
     if (localReplacement) {
       return {
