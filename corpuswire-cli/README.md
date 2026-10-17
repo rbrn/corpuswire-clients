@@ -13,6 +13,7 @@ The Node CLI defaults to the existing local Docker service at
 From any repository folder:
 
 ```bash
+cw rewrite              # Enter/edit a draft; Ctrl+P rewrites, Enter accepts
 cw init                 # Save reusable, secret-free local workspace settings
 cw doctor               # Read-only readiness and inventory checks
 cw                      # Index, then watch this folder until Ctrl+C
@@ -66,7 +67,7 @@ The CLI supports:
 - `health` for backend and active index status.
 - `version` (or `--version` / `-V`) for the installed CLI version, offline.
 - `search` and `query` for `POST /query` retrieval.
-- `enhance` or a bare prompt for `POST /v1/enhance`.
+- `rewrite`, `enhance` or a bare prompt for `POST /v1/enhance`.
 - `index-events` for `GET /v1/index/events`.
 - `index-activity` for `GET /v1/index/activity`.
 - `index` and `reconcile` for previewed, confirmed workspace indexing with live
@@ -141,9 +142,13 @@ Command-line flags override environment defaults.
 | `--min-score` | Retrieval threshold | For search/enhance |
 | `--output-mode` | Prompt style | `generic`, `copilot`, `claude-code`, or `sequential` |
 | `--local-only` | Deterministic rewrite | Disables backend LLM generation for enhancement |
+| `--stdin` or `-` | Prompt input | Reads UTF-8 stdin for enhance/rewrite |
+| `--prompt-file` | Prompt input | Reads a UTF-8 file for enhance/rewrite |
+| `--clarification` | Additional intent | Answers a scope question alongside the original prompt |
+| `--source-root` | Workspace root | Selects context configuration or indexing source |
 | `--json` | Raw response output | Useful for automation and debugging |
 
-Index-specific controls include `--source-root`, `--profile local|hosted`,
+Index-specific controls include `--profile local|hosted`,
 repeatable `--include` and `--exclude`, `--mode full|incremental`, `--yes`,
 `--non-interactive`, `--timeout-ms`, `--attach`, `--ndjson`, and `--trace`. The local
 profile accepts only a loopback service; the hosted profile requires HTTPS.
@@ -205,7 +210,75 @@ cw search "where is remote indexing committed?" \
   --top-k 5
 ```
 
-Enhance a prompt:
+Rewrite a prompt using indexed workspace context:
+
+```bash
+cw rewrite --local-only
+cw rewrite "continue the remaining P2 tasks" --local-only
+cw rewrite --prompt-file task.txt --local-only > rewritten-task.txt
+cat task.txt | cw rewrite --stdin --local-only
+```
+
+In an interactive terminal, `cw rewrite` (or `cw enhance`) without a prompt
+opens an editable draft. Type your task, then press **Ctrl+P** to replace it
+with a context-grounded rewrite. Keep editing or enhance again; **Enter**
+accepts the final draft and prints it to stdout. **Ctrl+C** cancels. The editor
+and status messages use stderr so stdout stays ready for copying or piping.
+Interactive entry requires a terminal. Ordinary Enter submits the draft; use
+`--stdin` or `--prompt-file` to import a task containing literal newlines.
+`--json` and `--non-interactive` require an explicit input source.
+
+Broad requests such as `How does logging work?`, `Explain caching`, or
+`Improve logging` ask for scope before enhancement. In the editor, Ctrl+P
+displays one focused question; type your answer and press Enter to continue.
+The original prompt is preserved, followed by a labeled `User clarification`
+section. An explicit workspace-wide overview is a valid choice. Blank or
+unresolved answers keep the question open; Ctrl+C cancels without a rewrite.
+A broad quoted prompt also opens this question when a terminal is available.
+
+Without interactive input, the CLI emits no rewritten prompt and exits with
+status **2**. Text mode prints the question on stderr; `--json` returns
+`ok: false`, `status: "needs_clarification"`, `source: "heuristic"`,
+`original_prompt`, and `questions`. Supply a more specific prompt or answer
+the question explicitly:
+
+```bash
+cw rewrite "How does logging work?" --json
+cw rewrite "How does logging work?" \
+  --clarification "HTTP access logs: configuration, emission, and Docker output" \
+  --local-only
+```
+
+This check conservatively recognizes broad English explanation/change requests
+and missing targets; it is not a semantic completeness guarantee. Explicit
+components, source references and overview scope avoid redundant questions.
+It runs locally before retrieval/generation, so a service outage does not
+prevent asking for intent. Unavailable source evidence remains a separate
+backend warning, rather than a reason to invent a scope or ask for repository
+facts the user may not know.
+
+`rewrite` is an alias for `enhance`. Both commands and bare prompts resolve
+the workspace identity and service from the same workspace/MCP/user settings
+used by indexing, with `corpuswire.services.enhancer.url` selecting the prompt
+service. Search uses that service too. Explicit flags and environment selectors
+take precedence; an explicit `--repo-path` without a workspace ID keeps the
+service-local path selector. Use `--source-root /path/to/repo` to select a
+different workspace's configuration without changing directories.
+
+Prompt files and stdin preserve line breaks and whitespace. `-` is shorthand
+for `--stdin`; choose exactly one input source. Relative prompt-file paths are
+resolved from the current directory. File/stdin input requires an explicit
+`rewrite` or `enhance` command; bare `cw` keeps its indexing/watch behavior.
+
+The command prints only the resulting prompt to stdout, ready to copy or pipe
+to another agent. It does not execute the task or index/sync files. Retrieval
+and generation-fallback warnings go to stderr, including backend warnings about
+incomplete context. `--json` preserves the full response with source paths,
+citations, context packets, and retrieval metadata when supplied by the service.
+`--local-only` uses deterministic rewriting without a generation provider;
+omit it to use the backend's configured generation behavior.
+
+Enhance with explicit selectors:
 
 ```bash
 cw enhance "document the VS Code index watcher" \

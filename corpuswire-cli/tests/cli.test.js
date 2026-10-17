@@ -5,6 +5,8 @@ import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
+import { editPrompt } from "../lib/prompt-editor.js";
+import { appendPromptClarification, assessPromptSufficiency } from "../lib/prompt-clarification.js";
 
 import {
   createIndexTraceCollector,
@@ -81,6 +83,439 @@ test("parseCliArgs handles remote workspace selectors", () => {
   assert.deepEqual(parsed.promptParts, ["remote", "indexer"]);
 });
 
+test("rewrite supports one explicit prompt source and retains bare indexing", () => {
+  assert.equal(parseCliArgs(["rewrite", "fix it"], {}).command, "rewrite");
+  assert.equal(parseCliArgs(["rewrite", "--stdin"], {}).stdin, true);
+  assert.equal(parseCliArgs(["enhance", "-"], {}).stdin, true);
+  assert.equal(parseCliArgs(["rewrite", "--prompt-file", "task.txt"], {}).promptFile, "task.txt");
+  assert.equal(parseCliArgs([], {}).command, "index");
+  for (const args of [
+    ["rewrite", "task", "--stdin"],
+    ["rewrite", "task", "--prompt-file", "task.txt"],
+    ["rewrite", "--stdin", "--prompt-file", "task.txt"],
+  ]) assert.throws(() => parseCliArgs(args, {}), /Choose one prompt source/);
+  for (const command of ["index", "health", "search"]) {
+    assert.throws(() => parseCliArgs([command, "--stdin"], {}), /require enhance or rewrite/);
+  }
+  assert.throws(() => parseCliArgs(["rewrite", "--prompt-file"], {}), /Missing value/);
+});
+
+test("broad explanation and missing-target requests need scope, while explicit targets do not", () => {
+  for (const prompt of ["How does logging work?", "Explain logging", "How is authentication implemented?",
+    "How does caching work?", "How does service logging work?", "Fix it", "fix the bug", "logging", "Improve logging",
+    "Please explain logging", "Can you explain logging?", "How does logging work exactly?", "How does logging work in this project?"]) {
+    const assessment = assessPromptSufficiency(prompt);
+    assert.equal(assessment?.status, "needs_clarification", prompt);
+    assert.equal(assessment.source, "heuristic");
+    assert.equal(assessment.original_prompt, prompt);
+    assert.equal(assessment.questions.length, 1);
+  }
+  assert.match(assessPromptSufficiency("How does logging work?").questions[0].question, /HTTP access logs/);
+  for (const prompt of ["Give a workspace-wide overview of logging", "How does logging work in src/api.py?",
+    "Explain HTTP request access logging", "How does RemoteIndexService work?", "Explain authentication in CorpusWire",
+    "Fix #137", "Explain `verify_service_token`", "How does logging work during a failed request?",
+    "Explain audit logging", "How does audit logging work?", "Explain HTTP logging", "Explain logging configuration",
+    "Explain logging levels", "Describe authentication flow"]) {
+    assert.equal(assessPromptSufficiency(prompt), null, prompt);
+  }
+});
+
+test("non-interactive insufficient input returns questions and exit 2 without constructing a client", async () => {
+  const root = await syntheticWorkspace();
+  const original = "How does logging work?";
+  await writeFile(path.join(root, "task.txt"), original);
+  try {
+    for (const args of [["rewrite", original], ["enhance", original], [original],
+      ["rewrite", "--prompt-file", "task.txt"], ["rewrite", "--stdin"], ["rewrite", original, "--non-interactive"]]) {
+      const writes = [], errors = [], runtime = {};
+      const result = await main(args, { cwd: root, homeDirectory: root, env: {}, isTTY: args.includes("--non-interactive") || args.includes("--stdin"),
+        input: Readable.from([original]), process: runtime,
+        sdk: { CorpusWireClient: class { constructor() { assert.fail("insufficient prompt reached client construction"); } } },
+        write: (line) => writes.push(line), writeError: (line) => errors.push(line),
+      });
+      assert.equal(result.status, "needs_clarification");
+      assert.equal(runtime.exitCode, 2);
+      assert.deepEqual(writes, []);
+      assert.match(errors.join("\n"), /Which part of logging/);
+    }
+    const writes = [], runtime = {};
+    await main(["rewrite", original, "--json"], { env: {}, isTTY: true, process: runtime,
+      write: (line) => writes.push(line), writeError: () => assert.fail("JSON clarification wrote stderr"),
+      editPrompt: () => assert.fail("JSON command opened editor"),
+    });
+    const payload = JSON.parse(writes[0]);
+    assert.equal(payload.ok, false);
+    assert.equal(payload.status, "needs_clarification");
+    assert.equal(payload.original_prompt, original);
+    assert.equal(payload.source, "heuristic");
+    assert.equal(runtime.exitCode, 2);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("explicit user clarification preserves the original question and proceeds once", async () => {
+  const root = await syntheticWorkspace();
+  const original = "How does logging work?";
+  const answer = "HTTP access logs in local Docker: where they are configured and emitted.";
+  const requests = [], writes = [];
+  try {
+    await main(["rewrite", original, "--clarification", answer, "--non-interactive", "--local-only"], {
+      cwd: root, env: {}, homeDirectory: root, isTTY: true,
+      client: { enhanceRaw: async (request) => { requests.push(request); return { result: { enhanced_prompt: "Grounded HTTP logging explanation prompt" } }; } },
+      write: (line) => writes.push(line), editPrompt: () => assert.fail("non-interactive command opened editor"),
+    });
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].prompt, `${original}\n\nUser clarification:\n${answer}`);
+    assert.equal(requests[0].localOnly, true);
+    assert.deepEqual(writes, ["Grounded HTTP logging explanation prompt"]);
+    for (const invalid of ["", " ", "yes", "not sure", "???", "logging", original]) {
+      assert.throws(() => appendPromptClarification(original, invalid), /intended scope/);
+    }
+    assert.equal(assessPromptSufficiency(appendPromptClarification(original, "A workspace-wide overview")), null);
+    assert.equal(assessPromptSufficiency(`${original}\n\nUser clarification:\nwhatever`).status, "needs_clarification");
+    assert.throws(() => parseCliArgs(["search", "logging", "--clarification", "overview"], {}), /requires enhance or rewrite/);
+    assert.throws(() => parseCliArgs(["rewrite", original, "--clarification", "one", "--clarification", "two"], {}), /only once/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("interactive Ctrl+P asks before rewriting, keeps the original, and rejects blank or vague answers", async () => {
+  const terminal = promptTerminal();
+  const original = "How does logging work?";
+  const requests = [];
+  const accepted = editPrompt({ ...terminal, assessPrompt: assessPromptSufficiency,
+    enhance: async (draft) => { requests.push(draft); return "Explain only the requested access-log flow."; },
+  });
+  terminal.input.write(original + "\x10");
+  assert.match(terminal.screen(), /Which part of logging/);
+  assert.deepEqual(requests, []);
+  terminal.input.write("\rnot sure\r");
+  assert.deepEqual(requests, []);
+  terminal.input.write("HTTP access logs\r");
+  await new Promise(setImmediate);
+  assert.deepEqual(requests, [`${original}\n\nUser clarification:\nHTTP access logs`]);
+  terminal.input.write("\r");
+  assert.equal(await accepted, "Explain only the requested access-log flow.");
+  assert.equal(terminal.input.isRaw, false);
+  terminal.input.destroy();
+});
+
+test("a positional broad prompt opens clarification automatically and cancellation sends no request", async () => {
+  const root = await syntheticWorkspace();
+  const terminal = promptTerminal();
+  try {
+    const cancelled = assert.rejects(main(["rewrite", "How does logging work?"], {
+      cwd: root, homeDirectory: root, env: {}, isTTY: true, input: terminal.input, output: terminal.output,
+      client: { enhanceRaw: () => assert.fail("cancelled clarification called backend") },
+      write: () => assert.fail("cancelled clarification emitted a prompt"),
+    }), { code: "PROMPT_CANCELLED" });
+    // Configuration resolution is asynchronous; wait until the editor displays its question.
+    const deadline = Date.now() + 2000;
+    while (!terminal.screen().includes("Which part of logging")) {
+      assert.ok(Date.now() < deadline, "editor did not ask for scope");
+      await new Promise(setImmediate);
+    }
+    terminal.input.write("\x03");
+    await cancelled;
+    assert.equal(terminal.input.isRaw, false);
+  } finally { terminal.input.destroy(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("failed rewriting after clarification preserves intent and retries without asking again", async () => {
+  const terminal = promptTerminal();
+  const original = "How does logging work?";
+  const calls = [];
+  const accepted = editPrompt({ ...terminal, assessPrompt: assessPromptSufficiency,
+    initialPrompt: original, clarifyOnStart: true,
+    enhance: async (draft) => {
+      calls.push(draft);
+      if (calls.length === 1) throw new Error("Synthetic outage");
+      return "Access-log explanation prompt";
+    },
+  });
+  terminal.input.write("HTTP access logs\r");
+  await new Promise(setImmediate);
+  assert.match(terminal.screen(), /Rewriting failed/);
+  terminal.input.write("\x10");
+  await new Promise(setImmediate);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0], `${original}\n\nUser clarification:\nHTTP access logs`);
+  assert.equal(calls[1], calls[0]);
+  assert.equal((terminal.screen().match(/Which part of logging/g) ?? []).length, 1);
+  terminal.input.write("\r");
+  assert.equal(await accepted, "Access-log explanation prompt");
+  terminal.input.destroy();
+});
+
+test("rewrite preserves file input and selects the source-root enhancer and workspace", async () => {
+  const root = await syntheticWorkspace();
+  const workspace = path.join(root, "context");
+  const prompt = "  Continue P2 on `e626ccc`.\n\nKeep docs/plan.md:206 and cățeluș 🐕.\n";
+  await mkdir(path.join(workspace, ".vscode"), { recursive: true });
+  await writeFile(path.join(root, "task.txt"), prompt);
+  await writeFile(path.join(workspace, ".vscode", "settings.json"), JSON.stringify({
+    "corpuswire.remoteIndexing.workspaceId": "local-docker://configured#branch",
+    "corpuswire.services.indexer.url": "http://127.0.0.1:19101",
+    "corpuswire.services.enhancer.url": "http://127.0.0.1:19102",
+    "corpuswire.remoteIndexing.includeGlobs": 17,
+  }));
+  const calls = [], writes = [], credentials = [];
+  class Client {
+    constructor(options) { calls.push(options); }
+    async enhanceRaw(request) { calls.push(request); return { ok: true, result: { enhanced_prompt: "rewritten" } }; }
+  }
+  try {
+    await main(["rewrite", "--prompt-file", "task.txt", "--source-root", workspace,
+      "--top-k", "6", "--min-score", "0.2", "--output-mode", "claude-code", "--local-only"], {
+      cwd: root, env: {}, homeDirectory: root, sdk: { CorpusWireClient: Client },
+      platform: "darwin", execFile: async (...args) => { credentials.push(args); return { stdout: "synthetic-token" }; },
+      write: (line) => writes.push(line),
+    });
+    assert.equal(calls[0].baseUrl, "http://127.0.0.1:19102");
+    assert.equal(calls[0].bearerToken, "synthetic-token");
+    assert.equal(credentials[0][1][4], "http://127.0.0.1:19102");
+    assert.deepEqual(calls[1], { prompt, workspaceId: "local-docker://configured#branch", repoPath: undefined,
+      topK: 6, minScore: 0.2, outputMode: "claude-code", localOnly: true });
+    assert.deepEqual(writes, ["rewritten"]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("enhancement and bare prompts preserve argument and UTF-8 stdin content", async () => {
+  const root = await syntheticWorkspace();
+  const prompt = "  Retain lines\nși 🐕\n";
+  const bytes = Buffer.from(prompt);
+  try {
+    for (const args of [["rewrite", "--stdin"], ["enhance", "-"], ["enhance", prompt], [prompt]]) {
+      const calls = [];
+      await main(args, { cwd: root, homeDirectory: root, env: {},
+        input: Readable.from([bytes.subarray(0, 20), bytes.subarray(20, 22), bytes.subarray(22)]),
+        client: { enhanceRaw: async (request) => { calls.push(request); return { result: { enhancement_prompt: "local rewrite" } }; } },
+        write: () => {},
+      });
+      assert.equal(calls[0].prompt, prompt);
+      assert.match(calls[0].workspaceId, /^local-docker:\/\//);
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("missing, blank, unreadable, and failed prompt inputs stop before client construction", async () => {
+  const root = await syntheticWorkspace();
+  await writeFile(path.join(root, "empty.txt"), " \n\t");
+  const dependencies = { cwd: root, homeDirectory: root, env: {}, isTTY: false,
+    sdk: { CorpusWireClient: class { constructor() { assert.fail("invalid input reached client construction"); } } },
+  };
+  try {
+    for (const args of [["rewrite"], ["rewrite", " "], ["rewrite", "--prompt-file", "empty.txt"], ["rewrite", "--stdin"]]) {
+      await assert.rejects(main(args, { ...dependencies, input: Readable.from([" \n"]) }), /Missing prompt/);
+    }
+    await assert.rejects(main(["rewrite", "--prompt-file", "missing.txt"], dependencies), { code: "ENOENT" });
+    async function* failedInput() { throw new Error("Input failed"); }
+    await assert.rejects(main(["rewrite", "--stdin"], { ...dependencies, input: failedInput() }), /Input failed/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("prompt commands discover MCP configuration and honor environment and flag overrides", async () => {
+  const task = "Inspect the synthetic request pipeline";
+  const root = await syntheticWorkspace();
+  await writeFile(path.join(root, ".mcp.json"), JSON.stringify({ mcpServers: {
+    "corpuswire-context-engine": { env: {
+      CORPUSWIRE_WORKSPACE_ID: "local-docker://mcp#main", CORPUSWIRE_BASE_URL: "http://127.0.0.1:19201",
+    } },
+  } }));
+  const calls = [];
+  class Client {
+    constructor(options) { calls.push(options); }
+    async enhanceRaw(request) { calls.push(request); return { result: { enhanced_prompt: "rewrite" } }; }
+    async queryRaw(request) { calls.push(request); return { result: { retrieved_chunks: [] } }; }
+  }
+  const dependencies = { cwd: root, homeDirectory: root, env: {}, platform: "linux",
+    sdk: { CorpusWireClient: Client }, write: () => {},
+  };
+  try {
+    for (const command of ["rewrite", "enhance", "search", "query"]) {
+      calls.length = 0;
+      await main([command, task], dependencies);
+      assert.equal(calls[0].baseUrl, "http://127.0.0.1:19201");
+      assert.equal(calls[1].workspaceId, "local-docker://mcp#main");
+    }
+    const env = { CORPUSWIRE_BASE_URL: "http://127.0.0.1:19202", CORPUSWIRE_WORKSPACE_ID: "env://workspace" };
+    calls.length = 0;
+    await main(["rewrite", task], { ...dependencies, env });
+    assert.equal(calls[0].baseUrl, env.CORPUSWIRE_BASE_URL);
+    assert.equal(calls[1].workspaceId, env.CORPUSWIRE_WORKSPACE_ID);
+    calls.length = 0;
+    await main(["rewrite", task, "--workspace-id", "flag://workspace", "--api-base-url", "http://127.0.0.1:19203"], { ...dependencies, env });
+    assert.equal(calls[0].baseUrl, "http://127.0.0.1:19203");
+    assert.equal(calls[1].workspaceId, "flag://workspace");
+    calls.length = 0;
+    await main(["rewrite", task, "--repo-path", "/service/repo"], dependencies);
+    assert.equal(calls[1].workspaceId, undefined);
+    assert.equal(calls[1].repoPath, "/service/repo");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("malformed workspace configuration blocks rewriting before requests", async () => {
+  const root = await syntheticWorkspace();
+  await writeFile(path.join(root, ".mcp.json"), "{broken");
+  try {
+    await assert.rejects(main(["rewrite", "Inspect the synthetic request pipeline"], { cwd: root, env: {}, homeDirectory: root,
+      client: { enhanceRaw: async () => assert.fail("malformed config reached backend") },
+    }), /Cannot read CorpusWire configuration/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("rewrite warnings stay on stderr and JSON retains the backend response", async () => {
+  const root = await syntheticWorkspace();
+  const response = { ok: true, request_id: "request-1", result: {
+    enhancement_prompt: "deterministic rewrite", retrieval_warning: "Index incomplete\ncheck local source",
+    generation_error: "Generation unavailable", retrieval_not_found: true, citations: ["src/index.js"],
+    agent_context_packets: [{ source_path: "src/index.js", role: "implementation" }],
+  } };
+  try {
+    for (const json of [false, true]) {
+      const writes = [], errors = [];
+      await main(["rewrite", "Inspect the synthetic request pipeline", ...(json ? ["--json"] : [])], { cwd: root, homeDirectory: root, env: {},
+        client: { enhanceRaw: async () => response }, write: (line) => writes.push(line), writeError: (line) => errors.push(line),
+      });
+      assert.equal(errors.length, 3);
+      assert.match(errors[0], /Index incomplete check local source/);
+      assert.match(errors[2], /not grounded/);
+      if (json) assert.deepEqual(JSON.parse(writes[0]), response);
+      else assert.deepEqual(writes, ["deterministic rewrite"]);
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("interactive rewrite enhances the draft on request and prints only the accepted prompt", async () => {
+  const root = await syntheticWorkspace();
+  const calls = [], writes = [];
+  try {
+    await main(["rewrite", "--local-only"], { cwd: root, env: {}, homeDirectory: root, isTTY: true,
+      client: { enhanceRaw: async (request) => { calls.push(request); return { result: { enhanced_prompt: "contextual draft" } }; } },
+      editPrompt: async ({ enhance }) => {
+        const enhanced = await enhance("original draft");
+        assert.equal(enhanced, "contextual draft");
+        return `${enhanced} with my final edits`;
+      },
+      write: (line) => writes.push(line),
+    });
+    assert.equal(calls[0].prompt, "original draft");
+    assert.equal(calls[0].localOnly, true);
+    assert.deepEqual(writes, ["contextual draft with my final edits"]);
+    assert.match(calls[0].workspaceId, /^local-docker:\/\//);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("non-interactive rewriting never opens the editor even on a terminal", async () => {
+  await assert.rejects(main(["rewrite", "--non-interactive"], { env: {}, isTTY: true,
+    editPrompt: async () => assert.fail("non-interactive command opened editor"),
+    client: { enhanceRaw: async () => assert.fail("missing prompt reached service") },
+  }), /Missing prompt/);
+});
+
+test("cancelling interactive prompt entry aborts the in-flight enhancement transport", async () => {
+  const root = await syntheticWorkspace();
+  let request, signal, requestStarted;
+  const started = new Promise((resolve) => { requestStarted = resolve; });
+  try {
+    await assert.rejects(main(["rewrite"], { cwd: root, homeDirectory: root, env: {}, platform: "linux", isTTY: true,
+      fetchFn: async (_url, init) => {
+        signal = init.signal;
+        requestStarted();
+        return new Promise((_resolve, reject) => signal.addEventListener("abort", () => {
+          reject(new DOMException("Cancelled", "AbortError"));
+        }, { once: true }));
+      },
+      editPrompt: async ({ enhance }) => {
+        request = enhance("draft");
+        request.catch(() => {});
+        await started;
+        throw Object.assign(new Error("Prompt entry cancelled."), { code: "PROMPT_CANCELLED" });
+      },
+      write: () => assert.fail("cancelled editor wrote a prompt"),
+    }), { code: "PROMPT_CANCELLED" });
+    assert.equal(signal.aborted, true);
+    await assert.rejects(request, { name: "AbortError" });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+function promptTerminal() {
+  const input = new PassThrough();
+  input.isTTY = true;
+  input.isRaw = false;
+  input.setRawMode = (raw) => { input.isRaw = raw; return input; };
+  const output = new PassThrough();
+  output.columns = 80;
+  let screen = "";
+  output.on("data", (chunk) => { screen += chunk; });
+  return { input, output, screen: () => screen };
+}
+
+test("real readline Ctrl+P replaces multiline drafts and Enter returns them without execution", async () => {
+  const terminal = promptTerminal();
+  const baseline = terminal.input.listenerCount("keypress");
+  const calls = [];
+  const accepted = editPrompt({ ...terminal, enhance: async (draft) => {
+    calls.push(draft); return "First grounded line\nSecond grounded line 🐕";
+  } });
+  terminal.input.write("task");
+  terminal.input.write("\x10");
+  await new Promise(setImmediate);
+  assert.deepEqual(calls, ["task"]);
+  terminal.input.write("\r");
+  assert.equal(await accepted, "First grounded line\nSecond grounded line 🐕");
+  assert.equal(terminal.input.isRaw, false);
+  assert.equal(terminal.input.listenerCount("keypress"), baseline);
+  terminal.input.destroy();
+});
+
+test("prompt editor preserves concurrent edits and supports enhancement retry after failure", async () => {
+  const terminal = promptTerminal();
+  let complete;
+  let calls = 0;
+  const accepted = editPrompt({ ...terminal, enhance: async () => {
+    calls += 1;
+    if (calls === 1) return new Promise((resolve) => { complete = resolve; });
+    if (calls === 2) throw new Error("Synthetic service failure");
+    return "retry succeeded";
+  } });
+  terminal.input.write("task\x10");
+  terminal.input.write(" with edits");
+  complete("stale rewrite");
+  await new Promise(setImmediate);
+  assert.match(terminal.screen(), /draft changed/);
+  terminal.input.write("\x10");
+  await new Promise(setImmediate);
+  assert.match(terminal.screen(), /Rewriting failed/);
+  terminal.input.write("\x10");
+  await new Promise(setImmediate);
+  terminal.input.write("\r");
+  assert.equal(await accepted, "retry succeeded");
+  assert.equal(calls, 3);
+  terminal.input.destroy();
+});
+
+test("Enter during an enhancement accepts its completed rewrite, and cancellation cleans up", async () => {
+  for (const cancel of [false, true]) {
+    const terminal = promptTerminal();
+    let complete;
+    const accepted = editPrompt({ ...terminal, enhance: () => new Promise((resolve) => { complete = resolve; }) });
+    terminal.input.write("task\x10");
+    if (cancel) {
+      const cancelled = assert.rejects(accepted, { code: "PROMPT_CANCELLED" });
+      terminal.input.write("\x03");
+      await cancelled;
+      complete("ignored after cancellation");
+    } else {
+      terminal.input.write("\r");
+      complete("accepted rewrite");
+      assert.equal(await accepted, "accepted rewrite");
+    }
+    await new Promise(setImmediate);
+    assert.equal(terminal.input.isRaw, false);
+    assert.equal(terminal.input.listenerCount("keypress"), 0);
+    terminal.input.destroy();
+  }
+});
+
 test("parseCliArgs handles index event filters", () => {
   const parsed = parseCliArgs([
     "index-events",
@@ -132,7 +567,7 @@ test("runCliCommand prints the enhanced prompt by default", async () => {
       localOnly: false,
       json: false,
       basicAuth: "",
-      promptParts: ["fix", "the", "bug"],
+      promptParts: ["fix", "remote", "index", "retries"],
     },
     {
       client: fakeClient,

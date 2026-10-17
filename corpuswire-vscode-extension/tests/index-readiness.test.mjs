@@ -414,6 +414,21 @@ test('full workspace scanner partitions nested roots and keeps exclusion evidenc
   assert.equal(result.inventoryScan.excludedFileCount, 1);
 });
 
+test('discovery glob stays within the native VS Code non-nested brace contract', () => {
+  // minimatch accepts nested braces, unlike the native VS Code watcher matcher.
+  let depth = 0;
+  for (const character of includeGlob) {
+    if (character === '{') {
+      depth += 1;
+      assert.ok(depth <= 1, 'Nested alternatives silently prevent native watcher matches');
+    } else if (character === '}') {
+      depth -= 1;
+      assert.ok(depth >= 0, 'Unbalanced discovery alternatives');
+    }
+  }
+  assert.equal(depth, 0);
+});
+
 test('production scanner and watcher include canonical code extensions and wrappers without crossing exclusions', async () => {
   const extensions = ['bat', 'scala', 'sh', 'cjs', 'js', 'jsx', 'mjs', 'cts', 'mts', 'ts', 'tsx', 'java', 'kt', 'kts', 'py', 'pyi', 'hcl', 'tf', 'html', 'htm'];
   const codePaths = [...extensions.flatMap((extension) => [`src/example.${extension}`, `src/Main.${extension.toUpperCase()}`]), 'mvnw', 'tools/gradlew', 'tools/MvNw', 'tools/GradleW', 'infra/main.tf.json', 'infra/main.TF.JSON'];

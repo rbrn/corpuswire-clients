@@ -8,6 +8,8 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline/promises";
 import { promisify } from "node:util";
+import { editPrompt } from "./prompt-editor.js";
+import { appendPromptClarification, assessPromptSufficiency } from "./prompt-clarification.js";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:18080";
 const execFileAsync = promisify(execFile);
@@ -40,6 +42,10 @@ Usage:
   cw reconcile [options]     Full workspace indexing with confirmation
   cw "<prompt>" [options]
   cw enhance "<prompt>" [options]
+  cw rewrite "<prompt>" [options]  Rewrite using this workspace's indexed context
+  cw rewrite [options]          Interactive entry; Ctrl+P rewrites, Enter accepts
+  cw rewrite --stdin [options]   Read a multiline prompt from standard input
+  cw rewrite --prompt-file <path> [options]
   cw search "<query>" [options]
   cw health [options]
   cw index-events [options]
@@ -59,11 +65,14 @@ Options:
   --operation <operation>  Filter index events by operation
   --limit <number>         Maximum index events to print
   --local-only             Use deterministic local rewrite on the backend
+  --stdin                  Read prompt from stdin (enhance/rewrite only; also accepts -)
+  --prompt-file <path>     Read a UTF-8 prompt file (enhance/rewrite only)
+  --clarification <text>  Answer a scope question without interactive input
   --basic-auth <user:pass> Send HTTP Basic auth credentials
   --json                   Print the full JSON payload
   --ndjson                 Stream index-progress/v1 events as NDJSON
   --trace                  Add a content-free index-observability/v1 breakdown
-  --source-root <path>     Workspace to index. Default: current folder
+  --source-root <path>     Workspace for indexing or prompt context. Default: current folder
   --profile <name>         local | hosted. Default: local
   --mode <name>            full | incremental. Default: full
   --include <glob>         Include glob; repeatable
@@ -120,6 +129,7 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
   let command = argv.length === 0 || argv[0]?.startsWith("-") ? "index" : "enhance";
   if (
     args[0] === "enhance" ||
+    args[0] === "rewrite" ||
     args[0] === "search" ||
     args[0] === "query" ||
     args[0] === "health" ||
@@ -149,6 +159,9 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
     json: false,
     basicAuth: env.CORPUSWIRE_BASIC_AUTH || "",
     promptParts: [],
+    stdin: false,
+    promptFile: undefined,
+    clarification: undefined,
     ndjson: false,
     sourceRoot: currentFolder,
     profile: env.CORPUSWIRE_PROFILE ?? "local",
@@ -223,6 +236,19 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
         break;
       case "--local-only":
         options.localOnly = true;
+        break;
+      case "--stdin":
+      case "-":
+        options.stdin = true;
+        break;
+      case "--prompt-file":
+        options.promptFile = requireValue(args, index, arg);
+        index += 1;
+        break;
+      case "--clarification":
+        if (options.clarification !== undefined) throw new Error("Pass --clarification only once.");
+        options.clarification = requireValue(args, index, arg);
+        index += 1;
         break;
       case "--basic-auth":
         options.basicAuth = requireValue(args, index, arg);
@@ -319,8 +345,19 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
   if (command !== "init" && (options.indexAfterInit || options.verifyAfterInit)) {
     throw new Error("--index and --verify are only supported with init.");
   }
-  if (!["enhance", "search", "query"].includes(command) && options.promptParts.length) {
+  if (!["enhance", "rewrite", "search", "query"].includes(command) && options.promptParts.length) {
     throw new Error(`Unexpected argument for ${command}: ${options.promptParts[0]}`);
+  }
+  if (options.stdin || options.promptFile) {
+    if (!["enhance", "rewrite"].includes(command)) {
+      throw new Error("--stdin and --prompt-file require enhance or rewrite.");
+    }
+    if (Number(options.stdin) + Number(Boolean(options.promptFile)) + Number(options.promptParts.length > 0) > 1) {
+      throw new Error("Choose one prompt source: arguments, --stdin, or --prompt-file.");
+    }
+  }
+  if (options.clarification !== undefined && !["enhance", "rewrite"].includes(command)) {
+    throw new Error("--clarification requires enhance or rewrite.");
   }
   if (command === "reconcile" && options.mode !== "full") {
     throw new Error("reconcile requires --mode full.");
@@ -333,11 +370,38 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
 export async function runCliCommand(options, dependencies = {}) {
   const write = dependencies.write ?? console.log;
   const configurationInputs = { ...options };
+  const promptCommand = ["enhance", "rewrite", "search", "query"].includes(options.command);
+  const enhancementCommand = ["enhance", "rewrite"].includes(options.command);
+  const canInteract = enhancementCommand && !options.stdin && !options.json && !options.nonInteractive
+    && (dependencies.isTTY ?? Boolean((dependencies.input ?? process.stdin).isTTY
+      && (dependencies.output ?? process.stderr).isTTY));
+  const hasPromptSource = options.stdin || options.promptFile || options.promptParts?.length;
+  let prompt = promptCommand && (!canInteract || hasPromptSource) ? await readPrompt(options, dependencies) : undefined;
+  if (options.clarification !== undefined) {
+    if (prompt === undefined) throw new Error("--clarification requires an original prompt argument, file, or stdin.");
+    prompt = appendPromptClarification(prompt, options.clarification);
+  }
+  const assessment = enhancementCommand && prompt !== undefined ? assessPromptSufficiency(prompt) : null;
+  if (assessment && !canInteract) {
+    if (options.json) write(JSON.stringify({ ok: false, ...assessment }, null, 2));
+    else {
+      const writeError = dependencies.writeError ?? console.error;
+      writeError(`More detail needed before rewriting:\n${assessment.questions[0].question}`);
+      writeError('Rerun with --clarification "<your answer>" or provide a more specific prompt.');
+    }
+    return { exitCode: 2, ...assessment };
+  }
+  const interactivePrompt = canInteract && (!hasPromptSource || assessment !== null);
+  if (promptCommand) {
+    const sourceRoot = path.resolve(options.sourceRoot || dependencies.cwd || process.cwd());
+    const configuration = await resolveWorkspaceConfiguration(options, sourceRoot, dependencies, { retrieval: true });
+    options = { ...options, ...configuration, apiBaseUrl: configuration.baseUrl, sourceRoot };
+  }
   if (["index", "reconcile", "init", "doctor", "watch"].includes(options.command)) {
     const sourceRoot = path.resolve(options.sourceRoot || process.cwd());
     const sourceStats = await stat(sourceRoot);
     if (!sourceStats.isDirectory()) throw new Error(`Workspace root is not a directory: ${sourceRoot}`);
-    const configuration = await resolveIndexConfiguration(options, sourceRoot, dependencies);
+    const configuration = await resolveWorkspaceConfiguration(options, sourceRoot, dependencies);
     validateIndexDestination(configuration);
     options = { ...options, ...configuration, apiBaseUrl: configuration.baseUrl, sourceRoot, configuration };
     if (options.command === "init") {
@@ -348,12 +412,15 @@ export async function runCliCommand(options, dependencies = {}) {
   const sdk = dependencies.client ? undefined : dependencies.sdk ?? await loadSdk();
   const authorization = dependencies.client ? {} : await resolveServiceAuthorization(options, dependencies);
   const traceCollector = createIndexTraceCollector();
+  const promptController = interactivePrompt ? new AbortController() : undefined;
   const serviceFetch = createServiceFetch(dependencies.fetchFn ?? globalThis.fetch, options.apiBaseUrl);
   const fetchFn = options.watch
     ? createWatchFetch(serviceFetch, {
       signal: dependencies.signal, detachSignal: dependencies.detachSignal,
       timeoutMs: dependencies.watchRequestTimeoutMs ?? 30000,
-    }) : serviceFetch;
+    }) : promptController
+      ? (input, init = {}) => serviceFetch(input, { ...init, signal: promptController.signal })
+      : serviceFetch;
   const client =
     dependencies.client ??
     new sdk.CorpusWireClient({
@@ -367,6 +434,36 @@ export async function runCliCommand(options, dependencies = {}) {
         ? traceCollector.wrapFetch(fetchFn ?? globalThis.fetch)
         : fetchFn,
     });
+
+  if (interactivePrompt) {
+    try {
+      const finalPrompt = await (dependencies.editPrompt ?? editPrompt)({
+        input: dependencies.input ?? process.stdin,
+        output: dependencies.output ?? process.stderr,
+        createInterface: dependencies.createPromptInterface,
+        initialPrompt: prompt ?? "",
+        assessPrompt: assessPromptSufficiency,
+        clarifyOnStart: assessment !== null,
+        enhance: async (draft) => {
+          try {
+            const response = await enhancePrompt(draft, options, client, dependencies);
+            return (sdk?.requireEnhancedPrompt ?? requireEnhancedPromptFallback)(response.result);
+          } catch (error) {
+            if (!promptController.signal.aborted) {
+              (dependencies.writeError ?? console.error)(
+                `Enhancement failed: ${sanitizeTerminalText(error instanceof Error ? error.message : String(error))}`,
+              );
+            }
+            throw error;
+          }
+        },
+      });
+      write(finalPrompt);
+    } finally {
+      promptController.abort();
+    }
+    return;
+  }
 
   if (options.watch) return runWatchCommand(options, { ...dependencies, client, sdk, write, traceCollector, configurationInputs });
 
@@ -449,11 +546,6 @@ export async function runCliCommand(options, dependencies = {}) {
     return;
   }
 
-  const prompt = options.promptParts.join(" ").trim();
-  if (!prompt) {
-    throw new Error("Missing prompt. Pass a prompt directly or use the enhance/search command.");
-  }
-
   if (options.command === "search" || options.command === "query") {
     const response = await client.queryRaw({
       query: prompt,
@@ -485,6 +577,17 @@ export async function runCliCommand(options, dependencies = {}) {
     return;
   }
 
+  const response = await enhancePrompt(prompt, options, client, dependencies);
+
+  if (options.json) {
+    write(JSON.stringify(response, null, 2));
+    return;
+  }
+
+  write((sdk?.requireEnhancedPrompt ?? requireEnhancedPromptFallback)(response.result));
+}
+
+async function enhancePrompt(prompt, options, client, dependencies) {
   const response = await client.enhanceRaw({
     prompt,
     repoPath: options.repoPath || undefined,
@@ -495,12 +598,34 @@ export async function runCliCommand(options, dependencies = {}) {
     localOnly: options.localOnly,
   });
 
-  if (options.json) {
-    write(JSON.stringify(response, null, 2));
-    return;
+  const writeError = dependencies.writeError ?? console.error;
+  const warnings = [response.result?.retrieval_warning, response.result?.generation_error];
+  if (response.result?.retrieval_not_found === true) {
+    warnings.push("No repository context was found; the rewrite is not grounded in retrieved sources.");
+  }
+  for (const warning of new Set(warnings.filter(Boolean))) {
+    writeError(`Warning: ${sanitizeTerminalText(warning)}`);
   }
 
-  write((sdk?.requireEnhancedPrompt ?? requireEnhancedPromptFallback)(response.result));
+  return response;
+}
+
+async function readPrompt(options, dependencies) {
+  let prompt;
+  if (options.promptFile) {
+    prompt = await readFile(path.resolve(dependencies.cwd ?? process.cwd(), options.promptFile), "utf8");
+  } else if (options.stdin) {
+    const input = dependencies.input ?? process.stdin;
+    const chunks = [];
+    for await (const chunk of input) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    prompt = Buffer.concat(chunks).toString("utf8");
+  } else {
+    prompt = (options.promptParts ?? []).join(" ");
+  }
+  if (!prompt.trim()) {
+    throw new Error("Missing prompt. Pass a prompt argument, --stdin, or --prompt-file <path> to enhance/rewrite.");
+  }
+  return prompt;
 }
 
 // Keep mutation calls alive long enough for the SDK to identify and cancel its own session.
@@ -672,7 +797,7 @@ export async function runWatchCommand(options, dependencies) {
     if (currentRoot !== root || currentIdentity.dev !== rootIdentity.dev || currentIdentity.ino !== rootIdentity.ino) {
       throw watchFailure("Workspace root was replaced. Restart cw to select the new folder.");
     }
-    const configuration = await resolveIndexConfiguration(configurationInputs, requestedRoot, dependencies);
+    const configuration = await resolveWorkspaceConfiguration(configurationInputs, requestedRoot, dependencies);
     if (watchConfigurationIdentity(configuration) !== configurationIdentity) {
       throw watchFailure("Workspace, service, or indexing filters changed. Restart cw to apply the new configuration.");
     }
@@ -798,7 +923,7 @@ export async function runIndexCommand(options, dependencies) {
     throw new Error(`Index source root is not a directory: ${sourceRoot}`);
   }
 
-  const configuration = options.configuration ?? await resolveIndexConfiguration(options, sourceRoot, dependencies);
+  const configuration = options.configuration ?? await resolveWorkspaceConfiguration(options, sourceRoot, dependencies);
   options = { ...options, ...configuration };
   validateIndexDestination(configuration);
   const renderer = createProgressRenderer({
@@ -1019,7 +1144,7 @@ export async function runIndexCommand(options, dependencies) {
   }
 }
 
-async function resolveIndexConfiguration(options, sourceRoot, dependencies = {}) {
+async function resolveWorkspaceConfiguration(options, sourceRoot, dependencies = {}, { retrieval = false } = {}) {
   const env = dependencies.env ?? process.env;
   const workspaceSettings = await readJsonIfPresent(path.join(sourceRoot, ".vscode", "settings.json"));
   const mcpConfigurations = await Promise.all([
@@ -1038,22 +1163,27 @@ async function resolveIndexConfiguration(options, sourceRoot, dependencies = {})
   const configuredWorkspaceId = nestedString(workspaceSettings, "corpuswire.remoteIndexing.workspaceId")
     || mcpValue("CORPUSWIRE_WORKSPACE_ID")
     || nestedString(userSettings, "remoteIndexing.workspaceId");
-  const configuredBaseUrl = nestedString(workspaceSettings, "corpuswire.services.indexer.url")
+  const service = retrieval ? "enhancer" : "indexer";
+  const configuredBaseUrl = nestedString(workspaceSettings, `corpuswire.services.${service}.url`)
     || nestedString(workspaceSettings, "corpuswire.serviceDefaults.url")
     || nestedString(workspaceSettings, "corpuswire.baseUrl")
     || mcpValue("CORPUSWIRE_BASE_URL")
-    || nestedString(userSettings, "services.indexer.url")
+    || nestedString(userSettings, `services.${service}.url`)
     || nestedString(userSettings, "serviceDefaults.url")
     || nestedString(userSettings, "baseUrl");
-  return {
+  const configuration = {
     profile: options.profile ?? "local",
     workspaceId: options.workspaceIdExplicit || options.workspaceId
       ? options.workspaceId || deriveWorkspaceId(sourceRoot)
-      : configuredWorkspaceId || deriveWorkspaceId(sourceRoot),
+      : retrieval && options.repoPath ? "" : configuredWorkspaceId || deriveWorkspaceId(sourceRoot),
     baseUrl: options.apiBaseUrlExplicit
       ? options.apiBaseUrl
       : configuredBaseUrl || options.apiBaseUrl || DEFAULT_BASE_URL,
     source: configuredWorkspaceId || configuredBaseUrl ? "workspace/profile configuration" : "folder defaults",
+  };
+  if (retrieval) return configuration;
+  return {
+    ...configuration,
     includeGlobs: options.includeGlobs?.length ? options.includeGlobs : globList(
       env.CORPUSWIRE_SYNC_INCLUDE_GLOBS
       ?? nestedValue(workspaceSettings, "corpuswire.remoteIndexing.includeGlobs")
