@@ -361,6 +361,57 @@ export interface EnhancePromptRequest {
   outputMode?: PromptOutputMode;
   localOnly?: boolean;
   sourceFilter?: string[];
+  /**
+   * Optional editor and chat state used by the server for retrieval and
+   * rewriting only. It is sent as `session` only when it holds at least one
+   * usable value, so older servers that reject the key keep working.
+   */
+  session?: EnhanceSessionContext;
+}
+
+export type EnhanceConversationRole = "user" | "assistant";
+
+export interface EnhanceConversationTurn {
+  role: EnhanceConversationRole;
+  text: string;
+}
+
+export interface EnhanceSelection {
+  /** Workspace-relative POSIX path, or an absolute path under the workspace root. */
+  path: string;
+  /** 1-based first line of the selection. */
+  startLine: number;
+  /** 1-based last line of the selection; must not precede startLine. */
+  endLine: number;
+  text?: string | null;
+}
+
+export interface EnhanceSessionContext {
+  /** Prior chat turns, oldest first. Only the last 20 are sent. */
+  conversation?: EnhanceConversationTurn[];
+  activeFile?: string | null;
+  selection?: EnhanceSelection | null;
+  /** Recently edited files, most recent first. Only the first 50 are sent. */
+  recentEdits?: string[];
+  /**
+   * Client-side only: the root used to turn absolute paths into
+   * workspace-relative ones. Defaults to the request's repoPath. Never sent.
+   */
+  workspaceRoot?: string;
+}
+
+export interface EnhanceSelectionPayload {
+  path: string;
+  start_line: number;
+  end_line: number;
+  text?: string;
+}
+
+export interface EnhanceSessionContextPayload {
+  conversation?: EnhanceConversationTurn[];
+  active_file?: string;
+  selection?: EnhanceSelectionPayload;
+  recent_edits?: string[];
 }
 
 export interface QueryPromptRequest {
@@ -468,6 +519,7 @@ export interface EnhancePromptPayload {
   output_mode: PromptOutputMode;
   local_only: boolean;
   source_filter?: string[];
+  session?: EnhanceSessionContextPayload;
 }
 
 export interface QueryPromptPayload {

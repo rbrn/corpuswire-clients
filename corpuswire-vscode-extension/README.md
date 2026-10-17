@@ -323,13 +323,20 @@ The command:
 4. If remote indexing is enabled and a `workspaceId` is configured, sends
    `workspaceId`.
 5. Otherwise, sends `repoPath` when available.
-6. Calls `/v1/enhance`.
-7. Replaces the selection with `enhanced_prompt`, `rewritten_prompt`, or
+6. Adds a `session` with the active editor's workspace-relative path and
+   the files saved recently in the same workspace folder (the last 50 saves,
+   kept in memory only). The panel also sends the editor selection as
+   1-based lines with its text capped at 8,000 characters; when the selection
+   is the prompt itself it is not repeated, and text from dotfiles and other
+   index-excluded files is never sent. No `session` is sent when there is
+   nothing to report.
+7. Calls `/v1/enhance`.
+8. Replaces the selection with `enhanced_prompt`, `rewritten_prompt`, or
    `augmented_prompt`.
-8. If generation failed and `localOnly` was not already set, retries with
+9. If generation failed and `localOnly` was not already set, retries with
    `localOnly: true` and uses the deterministic `enhancement_prompt`. This
    also covers HTTP rejections caused by missing backend generation setup.
-9. Assesses the returned retrieval metadata and labels the result as:
+10. Assesses the returned retrieval metadata and labels the result as:
    - **grounded** when workspace chunks and citations are present with no
      retrieval warning;
    - **degraded** when the index reports a warning, confidence is below 35%,

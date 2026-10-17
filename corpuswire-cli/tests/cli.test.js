@@ -2206,3 +2206,107 @@ test("runtime watcher failure reports safe reason and closes its handle once", {
   assert.equal(state.closed, 1);
   assert.ok(state.writes.every((line) => !line.includes("secret") && !line.includes("/private/path")));
 });
+
+test("cw rewrite --context-file sends the camelCase session through enhanceRaw", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cw-context-file-"));
+  try {
+    const contextFile = path.join(root, "context.json");
+    await writeFile(contextFile, JSON.stringify({
+      conversation: [{ role: "user", text: "the parser drops comments" }],
+      activeFile: path.join(root, "src", "parser.js"),
+      selection: { path: "src/parser.js", startLine: 3, endLine: 8, text: "function parse() {}" },
+      recentEdits: ["src/lexer.js", "  "],
+    }));
+    const parsed = parseCliArgs(["rewrite", "fix", "it", "--context-file", contextFile], {}, root);
+    assert.equal(parsed.command, "enhance");
+    assert.equal(parsed.contextFile, contextFile);
+    assert.deepEqual(parsed.promptParts, ["fix", "it"]);
+
+    const calls = [];
+    const client = {
+      enhanceRaw: async (request) => {
+        calls.push(request);
+        return { ok: true, result: { enhanced_prompt: "enhanced" } };
+      },
+    };
+    const writes = [];
+    await runCliCommand(parsed, { client, write: (line) => writes.push(line) });
+    assert.deepEqual(writes, ["enhanced"]);
+    assert.deepEqual(calls[0].session, {
+      conversation: [{ role: "user", text: "the parser drops comments" }],
+      activeFile: path.join(root, "src", "parser.js"),
+      selection: { path: "src/parser.js", startLine: 3, endLine: 8, text: "function parse() {}" },
+      recentEdits: ["src/lexer.js"],
+      workspaceRoot: root,
+    });
+
+    await runCliCommand(parseCliArgs(["rewrite", "fix", "it"], {}, root), { client, write: () => {} });
+    assert.equal("session" in calls[1], false);
+
+    await writeFile(contextFile, JSON.stringify({ conversation: [], recentEdits: [] }));
+    await runCliCommand(parsed, { client, write: () => {} });
+    assert.equal("session" in calls[2], false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cw rewrite --context-file reaches the wire as a capped snake_case session", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cw-context-wire-"));
+  try {
+    const contextFile = path.join(root, "context.json");
+    await writeFile(contextFile, JSON.stringify({
+      conversation: Array.from({ length: 21 }, (_, index) => ({ role: "assistant", text: `t${index}` })),
+      activeFile: path.join(root, "src", "a.js"),
+      recentEdits: ["/outside/secret.js", "src/b.js"],
+    }));
+    const bodies = [];
+    const sdk = await import("../../corpuswire-sdk/dist/index.js");
+    const fetchFn = async (_input, init) => {
+      bodies.push(JSON.parse(init.body));
+      const body = { ok: true, result: { enhanced_prompt: "wire enhanced" } };
+      return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    const writes = [];
+    await runCliCommand(
+      parseCliArgs(["rewrite", "explain", "--context-file", contextFile, "--api-base-url", "http://127.0.0.1:9"], {}, root),
+      { sdk, fetchFn, env: { CORPUSWIRE_BEARER_TOKEN: "test-token" }, write: (line) => writes.push(line) },
+    );
+    assert.deepEqual(writes, ["wire enhanced"]);
+    const { session } = bodies[0];
+    assert.equal(session.conversation.length, 20);
+    assert.equal(session.conversation[0].text, "t1");
+    assert.equal(session.active_file, "src/a.js");
+    assert.deepEqual(session.recent_edits, ["src/b.js"]);
+    assert.equal("workspaceRoot" in session, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("--context-file rejects malformed documents and non-enhance commands", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cw-context-invalid-"));
+  try {
+    assert.throws(() => parseCliArgs(["search", "x", "--context-file", "c.json"], {}, root), /only supported with enhance/);
+    assert.throws(() => parseCliArgs(["rewrite", "x", "--context-file"], {}, root), /Missing value for --context-file/);
+    const client = { enhanceRaw: async () => ({ ok: true, result: { enhanced_prompt: "x" } }) };
+    const cases = [
+      ["[]", /JSON object/],
+      ["{\"activeFile\": 3}", /activeFile must be a string/],
+      ["{\"session\": {}}", /unsupported keys: session/],
+      ["{\"selection\": {\"path\": \"a.js\", \"startLine\": 5, \"endLine\": 2}}", /selection must be/],
+      ["{\"conversation\": [{\"role\": \"system\", \"text\": \"x\"}]}", /conversation\[0\]/],
+      ["not json", /Could not read --context-file/],
+    ];
+    for (const [content, pattern] of cases) {
+      const contextFile = path.join(root, "context.json");
+      await writeFile(contextFile, content);
+      await assert.rejects(
+        runCliCommand(parseCliArgs(["rewrite", "x", "--context-file", contextFile], {}, root), { client, write: () => {} }),
+        pattern,
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

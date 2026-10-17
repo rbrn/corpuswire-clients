@@ -142,6 +142,7 @@ Command-line flags override environment defaults.
 | `--output-mode` | Prompt style | `generic`, `copilot`, `claude-code`, or `sequential` |
 | `--local-only` | Deterministic rewrite | Disables backend LLM generation for enhancement |
 | `--json` | Raw response output | Useful for automation and debugging |
+| `--context-file` | Session context JSON | For `cw rewrite`/`cw enhance`: `{ "conversation": [{ "role": "user", "text": "..." }], "activeFile": "src/a.ts", "selection": { "path": "src/a.ts", "startLine": 3, "endLine": 9, "text": "..." }, "recentEdits": ["src/b.ts"] }`. Sent as the request `session` only when non-empty; texts are capped at 8,000 characters, the last 20 turns and first 50 recent edits are kept, and absolute paths outside `--source-root` (default: current folder) are dropped |
 
 Index-specific controls include `--source-root`, `--profile local|hosted`,
 repeatable `--include` and `--exclude`, `--mode full|incremental`, `--yes`,
