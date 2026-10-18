@@ -9,6 +9,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { planSelectedNeighbor } from "../lib/selected-neighbor.mjs";
+import { groupServerSpans, renderServerSpans, shouldUseServerPacking } from "../lib/server-packed.mjs";
 import { canonicalCoalescingDeliveryComplete, planSourceRootCoalescing } from "../lib/source-root-coalescing.mjs";
 import { SERVER_INSTRUCTIONS, decorateTools, detectHost, negotiateProtocolVersion, readToolProfile } from "../lib/host-profile.mjs";
 import { createWorkspaceScope, formatIdentityLines } from "../lib/workspace-scope.mjs";
@@ -3298,6 +3299,11 @@ function toolDefinitions() {
             default: 12000,
             description: "Maximum characters of hit text to include in the tool response.",
           },
+          max_evidence_chars: {
+            type: "integer",
+            minimum: 1,
+            description: "Optional server evidence budget in characters, sent only when set. Defaults to CORPUSWIRE_EVIDENCE_BUDGET_CHARS, then to the server default. Requires a server that accepts max_evidence_chars.",
+          },
           sourceFilter: {
             type: "array",
             items: { type: "string" },
@@ -3353,6 +3359,11 @@ function toolDefinitions() {
             type: "array",
             items: { type: "string" },
             description: "Optional list of source-system identifiers (e.g. plugin names) used to restrict retrieval. Plugins translate these via RetrieverHooks.extra_filters().",
+          },
+          max_evidence_chars: {
+            type: "integer",
+            minimum: 1,
+            description: "Optional server evidence budget in characters, sent only when set. Defaults to CORPUSWIRE_EVIDENCE_BUDGET_CHARS, then to the server default. Requires a server that accepts max_evidence_chars.",
           },
           conversation: {
             type: "array",
@@ -5086,6 +5097,8 @@ async function searchContextCore(args, telemetry) {
     50000,
   );
 
+  const maxEvidenceChars = optionalEvidenceBudget(args);
+
   const readPreparation = await syncManager.prepareForRead(args);
   const client = buildClient();
   const request = {
@@ -5096,6 +5109,7 @@ async function searchContextCore(args, telemetry) {
     minScore,
     includeAnswer: false,
     sourceFilter,
+    ...(maxEvidenceChars !== undefined ? { maxEvidenceChars } : {}),
   };
   let response;
   if (typeof client.queryRaw === "function") {
@@ -5111,13 +5125,15 @@ async function searchContextCore(args, telemetry) {
   const result = response.result ?? response;
   const context = response.context ?? {};
   const hits = Array.isArray(result.retrieved_chunks) ? result.retrieved_chunks : [];
+  // Complete server-packed spans replace the client-side widening below.
+  const serverEvidence = serverPackedEvidence(result);
 
   // The personal local default is v2; explicit off/unknown values retain the
   // original renderer and provide an immediate per-host rollback.
   const selectedNeighborPolicy = process.env.CORPUSWIRE_SELECTED_NEIGHBOR_POLICY
     || "selected-neighbor-v2";
-  const observeNeighbor = selectedNeighborPolicy === "selected-neighbor-v1"
-    || selectedNeighborPolicy === "selected-neighbor-v2";
+  const observeNeighbor = !serverEvidence && (selectedNeighborPolicy === "selected-neighbor-v1"
+    || selectedNeighborPolicy === "selected-neighbor-v2");
   const deliveredControl = [];
   const formatInput = {
     baseUrl: client.baseUrl,
@@ -5135,6 +5151,7 @@ async function searchContextCore(args, telemetry) {
   };
   const formatted = formatSearchResult({
     ...formatInput,
+    ...(serverEvidence ? { serverEvidence } : {}),
     ...(observeNeighbor ? { onRenderedHit: (item) => deliveredControl.push(item) } : {}),
   });
   let neighborAccepted = null;
@@ -5147,7 +5164,8 @@ async function searchContextCore(args, telemetry) {
       onAccepted: (accepted) => { neighborAccepted = accepted; },
     })
     : formatted;
-  const coalesced = process.env.CORPUSWIRE_SOURCE_ROOT_COALESCING === "per-file-v1"
+  const coalesced = !serverEvidence
+    && process.env.CORPUSWIRE_SOURCE_ROOT_COALESCING === "per-file-v1"
     && selectedNeighborPolicy === "selected-neighbor-v2"
     ? await sourceRootCoalescingResult({
       formatInput,
@@ -5925,7 +5943,7 @@ function formatIndexActivity({ baseUrl, workspaceId, collection, windowHours, li
   return lines.join("\n");
 }
 
-function formatSearchResult({ baseUrl, query, repoPath, workspaceId, identity, topK, minScore, maxChars, result, context, hits, readPreparation, onRenderedHit }) {
+function formatSearchResult({ baseUrl, query, repoPath, workspaceId, identity, topK, minScore, maxChars, result, context, hits, readPreparation, onRenderedHit, serverEvidence = null }) {
   const index = asRecord(context.index);
   const retrievalWarning = optionalString(result.retrieval_warning);
   const lines = compactResultHeader([
@@ -5954,6 +5972,7 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, identity, t
     `- retrievalNotFound: ${result.retrieval_not_found ?? hits.length === 0}`,
     `- scoreSemantics: ${result.score_semantics ?? "backend-specific rank score"}`,
     `- hits: ${hits.length}`,
+    ...formatServerPackingLines(serverEvidence),
     ...(retrievalWarning ? [`- retrievalWarning: ${retrievalWarning}`] : []),
     ...formatWarnings(index.health_warnings),
     ...formatReadPreparation(readPreparation),
@@ -5969,6 +5988,23 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, identity, t
   }
 
   const packets = Array.isArray(result.agent_context_packets) ? result.agent_context_packets : [];
+  if (serverEvidence) {
+    if (packets.length > 0) {
+      lines.push("", "Agent context packets:");
+      for (const packet of packets) {
+        const sourcePath = optionalString(packet?.source_path);
+        lines.push(formatAgentContextPacket(packet, {
+          lineRanges: sourcePath ? serverEvidence.rangesByPath.get(sourcePath) ?? [] : [],
+        }));
+      }
+    }
+    lines.push("", "Hits:", ...hits.map((hit, index) => formatServerPackedHit(hit, index + 1)));
+    lines.push("", "Evidence:", serverEvidence.text.replace(/\n$/, ""));
+    if (serverEvidence.citations.length > 0) {
+      lines.push("", "Citations:", ...serverEvidence.citations.map((citation) => `- ${citation}`));
+    }
+    return lines.join("\n");
+  }
   if (optionalString(result.retrieval_evidence_policy) !== "generic-v2") {
     const partialPaths = new Set(hits.filter(hasPartialSourceLine)
       .map((hit) => asRecord(hit.metadata).source_path));
@@ -6098,6 +6134,53 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, identity, t
   }
 
   return lines.join("\n");
+}
+
+// Server-packed evidence (CRP-003): used only when shouldUseServerPacking holds
+// and every span validates; otherwise null keeps the client-side path.
+function serverPackedEvidence(result) {
+  if (!shouldUseServerPacking(result, process.env)) return null;
+  const text = renderServerSpans(result.evidence_spans);
+  const groups = groupServerSpans(result.evidence_spans);
+  if (text === null || !groups) return null;
+  const rangesByPath = new Map(groups.map((group) => [group.sourcePath,
+    group.spans.map((span) => `${span.start_line}-${span.end_line}`)]));
+  return {
+    text,
+    rangesByPath,
+    citations: groups.flatMap((group) => rangesByPath.get(group.sourcePath)
+      .map((range) => `${group.sourcePath}:${range}`)),
+    spanCount: result.evidence_spans.length,
+    fileCount: groups.length,
+    packing: asRecord(result.packing),
+  };
+}
+
+function formatServerPackingLines(serverEvidence) {
+  if (!serverEvidence) return [];
+  const { packing } = serverEvidence;
+  const count = (value) => Number.isSafeInteger(value) ? value : "unknown";
+  return [
+    `- evidencePacking: ${optionalString(packing.policy) ?? "unknown"}`,
+    `- evidenceSpans: ${serverEvidence.spanCount} in ${serverEvidence.fileCount} file(s)`,
+    `- evidenceBudget: used ${count(packing.used_chars)} of ${count(packing.budget_chars)} chars; ${
+      count(packing.spans_dropped_budget)} span(s) dropped`,
+  ];
+}
+
+function formatServerPackedHit(hit, ordinal) {
+  const metadata = asRecord(hit?.metadata);
+  const chunkIndex = Number.isInteger(metadata.chunk_index) ? metadata.chunk_index : "unknown";
+  const heading = optionalString(metadata.section_heading);
+  return [
+    `\n${ordinal}. ${optionalString(metadata.source_path) ?? "unknown"}`,
+    `   score: ${typeof hit?.score === "number" ? hit.score.toFixed(4) : "unknown"}`,
+    `   chunk: ${chunkIndex}`,
+    ...(heading ? [`   heading: ${heading}`] : []),
+    ...(Number.isInteger(metadata.start_line) && Number.isInteger(metadata.end_line)
+      ? [`   lines: ${metadata.start_line}-${metadata.end_line}`] : []),
+    ...(hit?.chunk_id ? [`   chunkId: ${hit.chunk_id}`] : []),
+  ].join("\n");
 }
 
 function formatReadPreparation(readPreparation) {
@@ -6466,6 +6549,7 @@ async function enhancePrompt(args, observation = undefined) {
   const sourceFilterRaw = optionalStringArray(args, "sourceFilter");
   const sourceFilter = sourceFilterRaw.length > 0 ? sourceFilterRaw : undefined;
   const session = readEnhanceSession(args, repoPath);
+  const maxEvidenceChars = optionalEvidenceBudget(args);
 
   const readPreparation = await syncManager.prepareForRead(args);
   const client = buildClient();
@@ -6478,6 +6562,7 @@ async function enhancePrompt(args, observation = undefined) {
     minScore,
     localOnly,
     sourceFilter,
+    ...(maxEvidenceChars !== undefined ? { maxEvidenceChars } : {}),
     ...(session ? { session } : {}),
   };
   const { result, usedLocalFallback } = await enhanceWithLocalFallback(client, request);
@@ -6504,6 +6589,7 @@ async function enhancePrompt(args, observation = undefined) {
     })
     : [];
 
+  const serverEvidence = serverPackedEvidence(result);
   const formatted = compactResultHeader([
     "Prompt augmentation preview",
     "",
@@ -6515,6 +6601,7 @@ async function enhancePrompt(args, observation = undefined) {
     "",
     "Context used:",
     ...(contextUsed.length > 0 ? contextUsed : ["- No repository context was selected."]),
+    ...(serverEvidence ? ["", "Evidence:", serverEvidence.text.replace(/\n$/, "")] : []),
     "",
     "Retrieval metadata:",
     `- baseUrl: ${client.baseUrl}`,
@@ -6532,6 +6619,7 @@ async function enhancePrompt(args, observation = undefined) {
     `- retrievalConfidence: ${result.retrieval_confidence ?? "unknown"}`,
     `- retrievalNotFound: ${result.retrieval_not_found ?? false}`,
     `- scoreSemantics: ${result.score_semantics ?? "backend-specific rank score"}`,
+    ...formatServerPackingLines(serverEvidence),
     ...(result.retrieval_warning ? [`- retrievalWarning: ${result.retrieval_warning}`] : []),
     `- enhancementBackend: ${result.enhancement_backend ?? "unknown"}`,
     ...(usedLocalFallback ? ["- localFallback: retried with localOnly=true after generation setup failed"] : []),
@@ -7335,6 +7423,19 @@ function readOutputMode(value) {
     return normalized;
   }
   throw new JsonRpcError(-32602, `Invalid outputMode: ${value}. Expected one of: ${[...OUTPUT_MODES].join(", ")}.`);
+}
+
+// max_evidence_chars for the server packer; undefined (never sent) when unset.
+function optionalEvidenceBudget(args) {
+  const value = args.max_evidence_chars ?? process.env.CORPUSWIRE_EVIDENCE_BUDGET_CHARS;
+  if (value === undefined || value === null || (typeof value === "string" && value.trim() === "")) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new JsonRpcError(-32602, `Invalid max_evidence_chars: ${value}. Expected a positive integer.`);
+  }
+  return parsed;
 }
 
 function optionalPositiveInteger(value, fallback) {

@@ -1467,6 +1467,7 @@ export function toEnhancePayload(request) {
         output_mode: normalizedRequest.outputMode ?? DEFAULT_OUTPUT_MODE,
         local_only: normalizedRequest.localOnly ?? false,
         source_filter: normalizedRequest.sourceFilter,
+        max_evidence_chars: normalizedRequest.maxEvidenceChars,
         session: toEnhanceSessionPayload(normalizedRequest.session, normalizedRequest.session?.workspaceRoot ?? normalizedRequest.repoPath),
     });
 }
@@ -1650,6 +1651,7 @@ export function toQueryPayload(request) {
         min_score: normalizedRequest.minScore,
         include_answer: normalizedRequest.includeAnswer ?? false,
         source_filter: normalizedRequest.sourceFilter,
+        max_evidence_chars: normalizedRequest.maxEvidenceChars,
     });
 }
 export function toGitHubProviderBindingPayload(request) {

@@ -66,6 +66,24 @@ falls back byte-for-byte on any failed check. Unset the variable or set it to
 `off` to disable this experimental path. This proves displayed file bytes,
 not the identity of the whole published index.
 
+When the server packs evidence (`RETRIEVAL_EVIDENCE_PACKING=server-v1`,
+CRP-003), `/query` and `/v1/enhance` responses also carry `evidence_spans`
+and a `packing` report. With the default `CORPUSWIRE_SERVER_PACKING=auto`,
+the client uses those spans only when `packing.complete` is `true`, no
+`packing.fallback_reason` is set, `evidence_spans` is non-empty and every span
+validates (relative path, sha256 `source_hash`, line count matching `text`, one
+hash per file, no overlap). Search then lists the hits with scores, renders an
+`Evidence:` block in the engine harness layout (`Path: <path>` then
+`<line>\t<source line>` rows, grouped by path in received order) and cites the
+span ranges; `selected-neighbor`, the heading prefix and source-root
+coalescing do not run. Enhancement adds the same `Evidence:` block after
+`Context used:`. In every other case, including `CORPUSWIRE_SERVER_PACKING=off`
+or any value other than `auto`, output is byte-identical to a response without
+packing. `max_evidence_chars` (tool argument, else
+`CORPUSWIRE_EVIDENCE_BUDGET_CHARS`, a positive integer) is sent to the server
+only when set; servers that predate evidence packing reject the field. The
+pure helpers live in `lib/server-packed.mjs`.
+
 ## Build And Test
 
 ```bash
@@ -300,6 +318,8 @@ Recommended prompt settings:
 - `CORPUSWIRE_WORKSPACE_ID`: local API workspace id for retrieval and sync
 - `CORPUSWIRE_REPO_PATH`: service-local repository path for retrieval
 - `CORPUSWIRE_OUTPUT_MODE`: `generic`, `copilot`, `claude-code`, or `sequential`
+- `CORPUSWIRE_SERVER_PACKING`: `auto` (default) uses complete server-packed `evidence_spans` for search and enhancement; `off` (or any other value) keeps the client-side selected-neighbor path
+- `CORPUSWIRE_EVIDENCE_BUDGET_CHARS`: optional positive integer sent as `max_evidence_chars` on search and enhancement; unset sends nothing and the server default applies (older servers reject the field)
 - `CORPUSWIRE_TOP_K`: retrieval chunk count
 - `CORPUSWIRE_LOCAL_ONLY`: deterministic rewrite mode, default `true`
 - `CORPUSWIRE_BASIC_AUTH`: optional `username:password`
