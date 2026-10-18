@@ -9,6 +9,7 @@ import {
   RemoteIndexCancelledError,
   RemoteIndexDetachedError,
   RemoteIndexInterruptionError,
+  RemoteIndexLeaseLostError,
   ReviewContextPollingCancelledError,
   ReviewContextPollingTimeoutError,
   WorkspaceScanIncompleteError,
@@ -26,6 +27,9 @@ import {
   toStartIndexSessionPayload,
   assertReviewContextV2Result,
   ingestionPriority,
+  createLeaseHolderId,
+  isWorkspaceLeaseHeldError,
+  isWorkspaceLeaseLostError,
 } from "../dist/index.js";
 
 const REVIEW_CONTEXT_V2_SCHEMA = JSON.parse(readFileSync(
@@ -4724,4 +4728,205 @@ test("code-stage release proof cannot confirm another session or conflicting sco
     assert.equal(callbacks, 1, "Owned publication may precede failed release proof; it never becomes stage success");
     assert.equal(fixture.calls.some((call) => call.type === "commit"), false);
   }
+});
+
+// CRP-001 L1.1: workspace writer lease.
+function leaseFixture({ acquire, renew, commit, uploadDelayMs = 0 } = {}) {
+  const calls = [];
+  let renewals = 0;
+  const client = new CorpusWireClient({ baseUrl: "http://lease.test", fetchFn: async (url, init = {}) => {
+    const method = init.method ?? "GET";
+    if (url.includes("/v1/index/leases")) {
+      if (method === "DELETE") {
+        calls.push({ type: "release", query: new URL(url).searchParams.toString() });
+        return jsonResponse(200, { ok: true, result: { workspace_id: "fixture", released: true } });
+      }
+      const body = JSON.parse(init.body);
+      if (body.lease_id) {
+        renewals += 1;
+        calls.push({ type: "renew", leaseId: body.lease_id });
+        const custom = renew?.(renewals);
+        if (custom) return custom;
+      } else {
+        calls.push({ type: "acquire", holderId: body.holder_id });
+        const custom = acquire?.();
+        if (custom) return custom;
+      }
+      return jsonResponse(200, { ok: true, result: {
+        workspace_id: "fixture", holder_id: body.holder_id, lease_id: "a".repeat(32), ttl_seconds: 30,
+        expires_in_seconds: 30, renew_after_seconds: 10, server_time: "2026-10-18T00:00:00+00:00",
+        expires_at: "2026-10-18T00:00:30+00:00", renewed: Boolean(body.lease_id),
+      } });
+    }
+    if (url.endsWith("/v1/index/sessions") && method === "POST") {
+      calls.push({ type: "session", payload: JSON.parse(init.body) });
+      return jsonResponse(200, { ok: true, result: {
+        session_id: "leased", workspace_id: "fixture", collection_name: "fixture", manifest_revision: 1,
+        mode: "incremental", max_batch_bytes: 4096, max_concurrent_uploads: 1,
+      } });
+    }
+    if (url.endsWith("/manifest/batch")) {
+      calls.push({ type: "manifest" });
+      return jsonResponse(200, { ok: true, result: {
+        accepted: 1, upload_required: ["src/a.py"], unchanged: 0, deletes: 0, skipped: 0, errors: [],
+      } });
+    }
+    if (url.endsWith("/files/batch")) {
+      calls.push({ type: "upload" });
+      if (uploadDelayMs) await new Promise((resolve) => setTimeout(resolve, uploadDelayMs));
+      if (init.signal?.aborted) throw new DOMException("Upload aborted", "AbortError");
+      return jsonResponse(200, { ok: true, result: { files_received: 1, queued: false, errors: [] } });
+    }
+    if (url.endsWith("/commit")) {
+      calls.push({ type: "commit" });
+      const custom = commit?.();
+      if (custom) return custom;
+      return jsonResponse(200, { ok: true, result: {}, status: { phase: "completed" } });
+    }
+    if (url.endsWith("/status")) {
+      return jsonResponse(200, { ok: true, result: {
+        session_id: "leased", workspace_id: "fixture", collection_name: "fixture", mode: "incremental",
+        phase: "aborted", errors: [], pending_batches: 0, active_batches: 0,
+      } });
+    }
+    if (method === "DELETE") {
+      calls.push({ type: "abort" });
+      return jsonResponse(200, { ok: true, session_id: "leased", phase: "aborted" });
+    }
+    throw new Error(`Unexpected request ${method} ${url}`);
+  } });
+  const request = {
+    workspace: { workspaceId: "fixture" }, mode: "incremental",
+    files: [{ relativePath: "src/a.py", content: "x=1" }], processingPollMs: 5,
+  };
+  return { client, request, calls };
+}
+
+test("indexWorkspaceWithLease acquires before the session, fences it and releases after commit", async () => {
+  const fixture = leaseFixture();
+  const holderId = createLeaseHolderId("cw watch");
+  assert.match(holderId, /^[A-Za-z0-9._:@-]{8,128}$/);
+  const events = [];
+  const result = await fixture.client.indexWorkspaceWithLease(fixture.request, {
+    holderId, onLeaseEvent: (event) => events.push(event.type),
+  });
+  assert.equal(result.status.phase, "completed");
+  assert.deepEqual(fixture.calls.map((call) => call.type), [
+    "acquire", "session", "manifest", "upload", "commit", "release",
+  ]);
+  assert.equal(fixture.calls[1].payload.lease_holder_id, holderId);
+  assert.match(fixture.calls[5].query, /lease_id=a{32}/);
+  assert.deepEqual(events, ["acquired", "released"]);
+});
+
+test("toStartIndexSessionPayload omits lease_holder_id unless a lease fences the session", () => {
+  const payload = toStartIndexSessionPayload({ workspace: { workspaceId: "fixture" } });
+  assert.equal(Object.hasOwn(payload, "lease_holder_id"), false);
+});
+
+test("a held lease is thrown unchanged for the caller's existing backoff", async () => {
+  const fixture = leaseFixture({ acquire: () => jsonResponse(409, { detail: {
+    code: "index_lease_held", message: "Workspace writer lease is held by another sync writer",
+    retryable: true, retry_after_seconds: 7,
+  } }, { "Retry-After": "7" }) });
+  await assert.rejects(
+    fixture.client.indexWorkspaceWithLease(fixture.request, { holderId: "writer-b:0002" }),
+    (error) => {
+      assert.ok(error instanceof CorpusWireHttpError);
+      assert.equal(error.status, 409);
+      assert.equal(isWorkspaceLeaseHeldError(error), true);
+      assert.equal(error.retryAfterSeconds, 7);
+      return true;
+    },
+  );
+  assert.deepEqual(fixture.calls.map((call) => call.type), ["acquire"]);
+});
+
+test("the lease is renewed while uploading", async () => {
+  const fixture = leaseFixture({ uploadDelayMs: 120 });
+  const events = [];
+  await fixture.client.indexWorkspaceWithLease(fixture.request, {
+    holderId: "writer-a:0001", renewIntervalMs: 50, onLeaseEvent: (event) => events.push(event.type),
+  });
+  const renewals = fixture.calls.filter((call) => call.type === "renew");
+  assert.ok(renewals.length >= 1, JSON.stringify(fixture.calls));
+  assert.equal(renewals[0].leaseId, "a".repeat(32));
+  assert.ok(events.includes("renewed"));
+  assert.equal(fixture.calls.at(-1).type, "release");
+});
+
+test("a lease lost mid-session aborts the session and asks the caller to requeue", async () => {
+  const fixture = leaseFixture({
+    uploadDelayMs: 150,
+    renew: () => jsonResponse(409, { detail: {
+      code: "index_lease_lost", message: "Workspace writer lease was lost", retryable: false, retry_after_seconds: 0,
+    } }),
+  });
+  await assert.rejects(
+    fixture.client.indexWorkspaceWithLease(fixture.request, { holderId: "writer-a:0001", renewIntervalMs: 50 }),
+    (error) => {
+      assert.ok(error instanceof RemoteIndexLeaseLostError);
+      assert.equal(error.code, "lease_lost");
+      assert.equal(error.requeue, true);
+      assert.equal(isWorkspaceLeaseLostError(error), true);
+      return true;
+    },
+  );
+  const types = fixture.calls.map((call) => call.type);
+  assert.ok(types.includes("abort"), types.join(","));
+  assert.equal(types.includes("commit"), false);
+  // A lost lease is not released: it belongs to nobody or to another writer.
+  assert.equal(types.includes("release"), false);
+});
+
+test("a fenced commit refused by the server is reported as a lost lease", async () => {
+  const fixture = leaseFixture({ commit: () => jsonResponse(409, { detail: {
+    code: "index_lease_not_held", message: "Workspace writer lease is not held by this session's holder",
+    retryable: true, retry_after_seconds: 12,
+  } }) });
+  await assert.rejects(
+    fixture.client.indexWorkspaceWithLease(fixture.request, { holderId: "writer-a:0001" }),
+    RemoteIndexLeaseLostError,
+  );
+  const types = fixture.calls.map((call) => call.type);
+  assert.deepEqual(types.slice(0, 5), ["acquire", "session", "manifest", "upload", "commit"]);
+  assert.ok(types.includes("abort"));
+});
+
+test("transient renewal failures lose the lease only once the local monotonic deadline passes", async () => {
+  let clock = 0;
+  const fixture = leaseFixture({
+    uploadDelayMs: 200,
+    renew: (count) => {
+      clock += 11_000; // each failed renewal tick advances past a third of the TTL
+      return jsonResponse(503, { detail: { code: "unavailable", message: "busy", retryable: false } });
+    },
+  });
+  const events = [];
+  await assert.rejects(
+    fixture.client.indexWorkspaceWithLease(fixture.request, {
+      holderId: "writer-a:0001", renewIntervalMs: 20, monotonicNow: () => clock,
+      onLeaseEvent: (event) => events.push(event.type),
+    }),
+    RemoteIndexLeaseLostError,
+  );
+  assert.ok(events.includes("renewal_failed"));
+  assert.equal(events.filter((type) => type === "lost").length, 1);
+});
+
+test("an older server without the lease endpoint falls back to an unfenced session", async () => {
+  const fixture = leaseFixture({ acquire: () => jsonResponse(404, { detail: "Not Found" }) });
+  const events = [];
+  await fixture.client.indexWorkspaceWithLease(fixture.request, {
+    holderId: "writer-a:0001", onLeaseEvent: (event) => events.push(event.type),
+  });
+  assert.deepEqual(events, ["unsupported"]);
+  const session = fixture.calls.find((call) => call.type === "session");
+  assert.equal(Object.hasOwn(session.payload, "lease_holder_id"), false);
+  await assert.rejects(
+    fixture.client.indexWorkspaceWithLease(fixture.request, {
+      holderId: "writer-a:0001", fallbackWhenUnsupported: false,
+    }),
+    /No supported endpoint found/,
+  );
 });

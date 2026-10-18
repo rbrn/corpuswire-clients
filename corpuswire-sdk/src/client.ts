@@ -54,6 +54,9 @@ import type {
   RemoteIndexPreview,
   RemoteIndexSession,
   RemoteIndexScopeV2,
+  RemoteIndexWorkspaceLease,
+  WorkspaceLeaseOptions,
+  WorkspaceLeaseRequest,
   RemoteIndexSessionsResponse,
   RemoteIndexStatus,
   RemoteManifestBatchResult,
@@ -149,6 +152,50 @@ export class RemoteIndexDetachedError extends Error {
     this.sessionId = sessionId;
     this.status = status;
   }
+}
+
+/**
+ * The workspace writer lease was lost while a session was running (CRP-001
+ * L1.1). The session was aborted; callers requeue the paths and retry later.
+ */
+export class RemoteIndexLeaseLostError extends Error {
+  readonly code = "lease_lost";
+  readonly requeue = true;
+  readonly transfer?: IndexTransferSummary;
+  readonly sessionId: string | null;
+
+  constructor(message: string, options: { cause?: unknown; sessionId?: string | null; transfer?: IndexTransferSummary } = {}) {
+    super(message, { cause: options.cause });
+    this.name = "RemoteIndexLeaseLostError";
+    this.sessionId = options.sessionId ?? null;
+    this.transfer = options.transfer;
+  }
+}
+
+/** True for a 409 that means another writer holds the workspace lease. */
+export function isWorkspaceLeaseHeldError(error: unknown): boolean {
+  return error instanceof CorpusWireHttpError && error.status === 409
+    && (error.errorCode === "index_lease_held" || error.errorCode === "index_lease_not_held");
+}
+
+/** True when a lease was lost: a refused renewal, a refused fenced commit, or a local expiry. */
+export function isWorkspaceLeaseLostError(error: unknown): boolean {
+  return error instanceof RemoteIndexLeaseLostError
+    || (error instanceof CorpusWireHttpError && error.status === 409 && error.errorCode === "index_lease_lost");
+}
+
+/** Build a holder id that satisfies the server pattern `[A-Za-z0-9._:@-]{8,128}`. */
+export function createLeaseHolderId(prefix: string): string {
+  const safePrefix = prefix.replace(/[^A-Za-z0-9._:@-]+/g, "-").slice(0, 80) || "writer";
+  const random = typeof globalThis.crypto?.randomUUID === "function"
+    ? globalThis.crypto.randomUUID().replaceAll("-", "")
+    : `${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
+  return `${safePrefix}:${random.slice(0, 24)}`;
+}
+
+function isLeaseEndpointMissing(error: unknown): boolean {
+  if (error instanceof CorpusWireHttpError) return error.status === 404 || error.status === 405;
+  return error instanceof Error && error.message.startsWith("No supported endpoint found");
 }
 
 export class RemoteIndexCancelledError extends Error {
@@ -908,6 +955,151 @@ export class CorpusWireClient {
       },
     });
     return response.result;
+  }
+
+  /** Acquire (no leaseId) or renew (with leaseId) the workspace writer lease. */
+  async acquireWorkspaceLease(request: WorkspaceLeaseRequest): Promise<RemoteIndexWorkspaceLease> {
+    const response = await requestJson<{ ok: true; result: RemoteIndexWorkspaceLease }>({
+      baseUrl: this.baseUrl,
+      paths: ["/v1/index/leases"],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(removeUndefinedValues({
+          workspace_id: request.workspaceId,
+          holder_id: request.holderId,
+          lease_id: request.leaseId,
+        })),
+        signal: request.signal,
+      },
+    });
+    return response.result;
+  }
+
+  /** Release a lease this holder owns; a lost lease releases nothing. */
+  async releaseWorkspaceLease(request: WorkspaceLeaseRequest): Promise<{ workspace_id: string; released: boolean }> {
+    const params = new URLSearchParams({ workspace_id: request.workspaceId, holder_id: request.holderId });
+    if (request.leaseId) params.set("lease_id", request.leaseId);
+    const response = await requestJson<{ ok: true; result: { workspace_id: string; released: boolean } }>({
+      baseUrl: this.baseUrl,
+      paths: [`/v1/index/leases?${params.toString()}`],
+      fetchFn: this.fetchFn,
+      defaultHeaders: this.defaultHeaders,
+      basicAuth: this.basicAuth,
+      init: { method: "DELETE", signal: request.signal },
+      retryAttempts: 0,
+    });
+    return response.result;
+  }
+
+  /**
+   * CRP-001 L1.1: run {@link indexWorkspace} while holding the workspace
+   * writer lease. The lease is acquired before `POST /sessions` and renewed
+   * on a timer while the session runs; expiry is tracked on a local monotonic
+   * clock from the server's relative TTL, so wall-clock skew cannot matter.
+   * A 409 on acquisition (another writer) is thrown unchanged for the caller's
+   * backoff. If the lease is lost mid-session the session is aborted and a
+   * {@link RemoteIndexLeaseLostError} is thrown so the caller can requeue.
+   */
+  async indexWorkspaceWithLease(
+    request: IndexWorkspaceRequest,
+    options: WorkspaceLeaseOptions,
+  ): Promise<RemoteIndexCommitResponse> {
+    const workspaceId = request.workspace.workspaceId;
+    const holderId = options.holderId;
+    const now = options.monotonicNow ?? (() => performance.now());
+    let lease: RemoteIndexWorkspaceLease;
+    try {
+      lease = await this.acquireWorkspaceLease({ workspaceId, holderId, signal: request.signal });
+    } catch (error) {
+      if (options.fallbackWhenUnsupported !== false && isLeaseEndpointMissing(error)) {
+        options.onLeaseEvent?.({ type: "unsupported", error });
+        return this.indexWorkspace(request);
+      }
+      throw error;
+    }
+    options.onLeaseEvent?.({ type: "acquired", lease });
+    let deadline = now() + lease.expires_in_seconds * 1_000;
+    const leaseLost = new AbortController();
+    let lostError: unknown;
+    const markLost = (error: unknown): void => {
+      if (leaseLost.signal.aborted) return;
+      lostError = error;
+      leaseLost.abort();
+      options.onLeaseEvent?.({ type: "lost", error });
+    };
+    let stopped = false;
+    let renewing: Promise<void> | null = null;
+    const renew = async (): Promise<void> => {
+      const sentAt = now();
+      try {
+        const renewed = await withRequestBudget(
+          (signal) => this.acquireWorkspaceLease({ workspaceId, holderId, leaseId: lease.lease_id, signal }),
+          Math.max(1, deadline - sentAt), undefined, () => new Error("Workspace lease renewal timed out"),
+        );
+        if (stopped) return;
+        // Measure from the send time: the server's TTL started no earlier.
+        deadline = sentAt + renewed.expires_in_seconds * 1_000;
+        options.onLeaseEvent?.({ type: "renewed", lease: renewed });
+      } catch (error) {
+        if (stopped) return;
+        if (isWorkspaceLeaseLostError(error) || isWorkspaceLeaseHeldError(error) || now() >= deadline) {
+          markLost(error);
+        } else {
+          options.onLeaseEvent?.({ type: "renewal_failed", error });
+        }
+      }
+    };
+    const intervalMs = Math.max(50, options.renewIntervalMs ?? lease.renew_after_seconds * 1_000);
+    const timer = setInterval(() => {
+      if (stopped || renewing) return;
+      if (now() >= deadline) {
+        markLost(new Error("Workspace lease expired before it could be renewed"));
+        return;
+      }
+      renewing = renew().finally(() => { renewing = null; });
+    }, intervalMs);
+    (timer as { unref?: () => void }).unref?.();
+
+    const combined = new AbortController();
+    const forwardAbort = (): void => combined.abort();
+    request.signal?.addEventListener("abort", forwardAbort, { once: true });
+    leaseLost.signal.addEventListener("abort", forwardAbort, { once: true });
+    if (request.signal?.aborted) combined.abort();
+    try {
+      return await this.indexWorkspace({ ...request, signal: combined.signal, leaseHolderId: holderId });
+    } catch (error) {
+      const callerCancelled = request.signal?.aborted === true;
+      const fenced = error instanceof CorpusWireHttpError && error.status === 409
+        && error.errorCode === "index_lease_not_held";
+      if ((leaseLost.signal.aborted && !callerCancelled) || fenced) {
+        if (fenced) markLost(error);
+        const failure = error as { sessionId?: string; transfer?: IndexTransferSummary };
+        throw new RemoteIndexLeaseLostError(
+          "Workspace writer lease was lost during indexing; the session was aborted and its paths must be requeued.",
+          { cause: lostError ?? error, sessionId: failure?.sessionId ?? null, transfer: failure?.transfer },
+        );
+      }
+      throw error;
+    } finally {
+      stopped = true;
+      clearInterval(timer);
+      request.signal?.removeEventListener("abort", forwardAbort);
+      leaseLost.signal.removeEventListener("abort", forwardAbort);
+      await (renewing as Promise<void> | null)?.catch(() => undefined);
+      if (!leaseLost.signal.aborted) {
+        try {
+          const released = await withRequestBudget(
+            (signal) => this.releaseWorkspaceLease({ workspaceId, holderId, leaseId: lease.lease_id, signal }),
+            1_000, undefined, () => new Error("Workspace lease release timed out"),
+          );
+          options.onLeaseEvent?.({ type: "released", released: released.released });
+        } catch { /* The server TTL releases an unconfirmed lease. */ }
+      }
+    }
   }
 
   async previewIndexWorkspace(request: IndexWorkspaceRequest): Promise<RemoteIndexPreview> {
@@ -1911,6 +2103,7 @@ export function toStartIndexSessionPayload(request: StartRemoteIndexSessionReque
     evaluation_inventory_attestation: request.evaluationInventoryAttestation,
     base_coverage_token: request.baseCoverageToken,
     selection_policy_digest: request.selectionPolicyDigest,
+    lease_holder_id: request.leaseHolderId,
   });
 }
 

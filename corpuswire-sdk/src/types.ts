@@ -1728,6 +1728,54 @@ export interface StartRemoteIndexSessionRequest {
   maxFileSizeBytes?: number;
   recreateCollection?: boolean;
   snapshotScope?: RemoteIndexScopeV2 | null;
+  /**
+   * CRP-001 L1.1: the lease holder that fences this session. The server
+   * refuses the session and its commit unless this holder owns the workspace
+   * writer lease. Set by {@link CorpusWireClient.indexWorkspaceWithLease}.
+   */
+  leaseHolderId?: string;
+}
+
+/** Server-issued single-writer lease for a workspace (CRP-001 L1.1). */
+export interface RemoteIndexWorkspaceLease {
+  workspace_id: string;
+  holder_id: string;
+  lease_id: string;
+  ttl_seconds: number;
+  /** Relative to the server's clock when it answered; never compare with local wall time. */
+  expires_in_seconds: number;
+  renew_after_seconds: number;
+  server_time: string;
+  expires_at: string;
+  renewed: boolean;
+}
+
+export interface WorkspaceLeaseRequest {
+  workspaceId: string;
+  holderId: string;
+  /** Present for a renewal; omitted to acquire. */
+  leaseId?: string;
+  signal?: AbortSignal;
+}
+
+export type WorkspaceLeaseEvent =
+  | { type: "acquired"; lease: RemoteIndexWorkspaceLease }
+  | { type: "renewed"; lease: RemoteIndexWorkspaceLease }
+  | { type: "renewal_failed"; error: unknown }
+  | { type: "lost"; error: unknown }
+  | { type: "released"; released: boolean }
+  | { type: "unsupported"; error: unknown };
+
+export interface WorkspaceLeaseOptions {
+  /** Stable for one writer process, unique across writers. */
+  holderId: string;
+  /** Defaults to the server's renew_after_seconds (TTL / 3). */
+  renewIntervalMs?: number;
+  /** Run without a lease when the server has no lease endpoint (default true). */
+  fallbackWhenUnsupported?: boolean;
+  onLeaseEvent?: (event: WorkspaceLeaseEvent) => void;
+  /** Monotonic clock in milliseconds; defaults to performance.now(). */
+  monotonicNow?: () => number;
 }
 
 export interface RemoteIndexSession {

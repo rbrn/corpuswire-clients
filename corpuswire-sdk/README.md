@@ -428,6 +428,31 @@ Important update semantics:
 - Incremental sessions do not delete unmentioned files. Use `mode: "full"` for
   complete stale-file reconciliation.
 
+## Single-Writer Workspace Lease
+
+Sync clients that may run side by side (CLI watchers, MCP processes, VS Code)
+can serialize their sessions with the backend's workspace lease:
+
+```ts
+import { createLeaseHolderId, isWorkspaceLeaseHeldError, RemoteIndexLeaseLostError } from "@corpuswire/sdk";
+
+const holderId = createLeaseHolderId("my-sync-writer");
+try {
+  await client.indexWorkspaceWithLease(request, { holderId });
+} catch (error) {
+  if (isWorkspaceLeaseHeldError(error)) { /* back off: error.retryAfterSeconds */ }
+  if (error instanceof RemoteIndexLeaseLostError) { /* session aborted: requeue paths */ }
+}
+```
+
+The lease is acquired before `POST /v1/index/sessions`, fences the session
+(`lease_holder_id`) and is renewed every `renew_after_seconds` (TTL / 3) while
+it runs. Expiry is tracked on a local monotonic clock from the server's
+relative TTL (30 s), so client clock skew has no effect. An older backend
+without `/v1/index/leases` runs the session without a lease unless
+`fallbackWhenUnsupported: false`. `acquireWorkspaceLease` and
+`releaseWorkspaceLease` expose the raw endpoints.
+
 ## Low-Level Remote Indexing API
 
 `indexWorkspace()` is the preferred helper. Use the low-level methods when you

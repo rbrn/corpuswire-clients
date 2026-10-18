@@ -1,4 +1,4 @@
-import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceResponseEnvelope, CodebaseRepositoriesV1, CodebaseV1, CreateCodebaseRequest, GitHubProviderBindingPayload, GitHubProviderBindingRequest, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexSessionQuery, IndexWorkspaceRequest, IndexTransferSummary, CorpusWireClientOptions, LlmModelState, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, QualityEvent, QualityEventPayload, QualityEventRequest, QualityEventsQuery, QualityReview, QualityReviewQuery, QueryValueEvent, ProviderBindingResponseV1, ProviderBindingRevocationV1, ValueFeedbackRequest, ValueRollup, ValueRollupQuery, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexCodeStageResult, RemoteIndexProgressEvent, RemoteIndexPreview, RemoteIndexSession, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, ReviewContextCapabilitiesV1, ReviewContextJobV1, ReviewContextPollOptions, ReviewContextRequest, ReviewContextRequestV1, ReviewContextResult, ReviewContextCapabilitiesV2, ReviewContextJobV2, ReviewContextPollOptionsV2, ReviewContextRequestV2Input, ReviewContextRequestV2, ReviewContextResultV2, ReviewTelemetrySummaryV1, ReviewPurgeV1, ReviewStatusV1, ReviewStatusV2, SearchHit, StartRemoteIndexSessionRequest, WorkspaceDiagnosis, WorkspaceDiagnosisRequest, UpdateCodebaseRequest } from "./types.js";
+import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceResponseEnvelope, CodebaseRepositoriesV1, CodebaseV1, CreateCodebaseRequest, GitHubProviderBindingPayload, GitHubProviderBindingRequest, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexSessionQuery, IndexWorkspaceRequest, IndexTransferSummary, CorpusWireClientOptions, LlmModelState, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, QualityEvent, QualityEventPayload, QualityEventRequest, QualityEventsQuery, QualityReview, QualityReviewQuery, QueryValueEvent, ProviderBindingResponseV1, ProviderBindingRevocationV1, ValueFeedbackRequest, ValueRollup, ValueRollupQuery, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexCodeStageResult, RemoteIndexProgressEvent, RemoteIndexPreview, RemoteIndexSession, RemoteIndexWorkspaceLease, WorkspaceLeaseOptions, WorkspaceLeaseRequest, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, ReviewContextCapabilitiesV1, ReviewContextJobV1, ReviewContextPollOptions, ReviewContextRequest, ReviewContextRequestV1, ReviewContextResult, ReviewContextCapabilitiesV2, ReviewContextJobV2, ReviewContextPollOptionsV2, ReviewContextRequestV2Input, ReviewContextRequestV2, ReviewContextResultV2, ReviewTelemetrySummaryV1, ReviewPurgeV1, ReviewStatusV1, ReviewStatusV2, SearchHit, StartRemoteIndexSessionRequest, WorkspaceDiagnosis, WorkspaceDiagnosisRequest, UpdateCodebaseRequest } from "./types.js";
 export type RemoteIndexOwnedSessionIdentity = Pick<RemoteIndexSession, "session_id" | "workspace_id" | "collection_name" | "mode">;
 export declare class RemoteIndexInterruptionError extends Error {
     readonly reason: "cancel" | "detach" | "timeout";
@@ -18,6 +18,27 @@ export declare class RemoteIndexDetachedError extends Error {
     readonly backendContinues = true;
     constructor(sessionId: string, status: RemoteIndexStatus, reason: string);
 }
+/**
+ * The workspace writer lease was lost while a session was running (CRP-001
+ * L1.1). The session was aborted; callers requeue the paths and retry later.
+ */
+export declare class RemoteIndexLeaseLostError extends Error {
+    readonly code = "lease_lost";
+    readonly requeue = true;
+    readonly transfer?: IndexTransferSummary;
+    readonly sessionId: string | null;
+    constructor(message: string, options?: {
+        cause?: unknown;
+        sessionId?: string | null;
+        transfer?: IndexTransferSummary;
+    });
+}
+/** True for a 409 that means another writer holds the workspace lease. */
+export declare function isWorkspaceLeaseHeldError(error: unknown): boolean;
+/** True when a lease was lost: a refused renewal, a refused fenced commit, or a local expiry. */
+export declare function isWorkspaceLeaseLostError(error: unknown): boolean;
+/** Build a holder id that satisfies the server pattern `[A-Za-z0-9._:@-]{8,128}`. */
+export declare function createLeaseHolderId(prefix: string): string;
 export declare class RemoteIndexCancelledError extends Error {
     readonly transfer?: IndexTransferSummary;
     readonly sessionId: string;
@@ -92,6 +113,23 @@ export declare class CorpusWireClient {
     getIndexActivity(request?: IndexActivityQuery): Promise<IndexActivitySummary>;
     listIndexSessions(request?: IndexSessionQuery): Promise<RemoteIndexStatus[]>;
     startIndexSession(request: StartRemoteIndexSessionRequest): Promise<RemoteIndexSession>;
+    /** Acquire (no leaseId) or renew (with leaseId) the workspace writer lease. */
+    acquireWorkspaceLease(request: WorkspaceLeaseRequest): Promise<RemoteIndexWorkspaceLease>;
+    /** Release a lease this holder owns; a lost lease releases nothing. */
+    releaseWorkspaceLease(request: WorkspaceLeaseRequest): Promise<{
+        workspace_id: string;
+        released: boolean;
+    }>;
+    /**
+     * CRP-001 L1.1: run {@link indexWorkspace} while holding the workspace
+     * writer lease. The lease is acquired before `POST /sessions` and renewed
+     * on a timer while the session runs; expiry is tracked on a local monotonic
+     * clock from the server's relative TTL, so wall-clock skew cannot matter.
+     * A 409 on acquisition (another writer) is thrown unchanged for the caller's
+     * backoff. If the lease is lost mid-session the session is aborted and a
+     * {@link RemoteIndexLeaseLostError} is thrown so the caller can requeue.
+     */
+    indexWorkspaceWithLease(request: IndexWorkspaceRequest, options: WorkspaceLeaseOptions): Promise<RemoteIndexCommitResponse>;
     previewIndexWorkspace(request: IndexWorkspaceRequest): Promise<RemoteIndexPreview>;
     sendManifestBatch(sessionId: string, entries: RemoteManifestEntry[]): Promise<RemoteManifestBatchResult>;
     uploadFileBatch(sessionId: string, metadata: RemoteFileBatchMetadata, files: RemoteFileContent[], onAttempt?: () => void, options?: {
