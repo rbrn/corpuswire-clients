@@ -17,7 +17,7 @@ import { parseJsonc, resolveWorkspaceIdentity } from "../vendor/corpuswire-sdk/d
 const JSONRPC_VERSION = "2.0";
 const PROTOCOL_VERSION = "2024-11-05";
 const SERVER_NAME = "corpuswire-context-engine";
-const SERVER_VERSION = "0.1.4-beta.4";
+const SERVER_VERSION = "0.1.5-beta.1";
 const DEFAULT_BASE_URL = "http://127.0.0.1:18080";
 const DEFAULT_OUTPUT_MODE = "generic";
 const DEFAULT_TOP_K = 5;
