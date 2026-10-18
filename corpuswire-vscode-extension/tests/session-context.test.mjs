@@ -106,8 +106,18 @@ test("editor session reaches the wire as snake_case and is omitted when absent",
 
 test("extension sends editor session for both enhance flows and tracks saves in memory", async () => {
   const source = await readFile(new URL("../dist/extension.js", import.meta.url), "utf8");
-  assert.match(source, /buildEnhancementRequest\(prompt, settings, collectEditorSession\(prompt\)\)/);
-  assert.match(source, /buildEnhancementRequest\(selectedText, settings, collectEditorSession\(selectedText\)\)/);
+  for (const prompt of ["prompt", "selectedText"]) {
+    assert.match(source, new RegExp(`buildEnhancementRequest\\(${prompt}, settings, session\\)`));
+    // The session is captured with the editor before awaiting authentication,
+    // so switching editors meanwhile can't pair one workspace's files with
+    // another's credentials.
+    const capture = source.indexOf(`const session = collectEditorSession(${prompt}, editor);`);
+    const auth = source.indexOf("await buildAuthenticatedServiceHeaders(", capture);
+    assert.ok(capture > 0 && auth > capture, `${prompt} flow collects the session before the auth await`);
+    assert.ok(source.lastIndexOf("const editor = vscode.window.activeTextEditor;", capture) > 0);
+  }
+  const collector = source.slice(source.indexOf("function collectEditorSession("));
+  assert.doesNotMatch(collector.slice(0, collector.indexOf("\nfunction ", 1)), /activeTextEditor/);
   assert.match(source, /vscode\.workspace\.onDidSaveTextDocument\(recordSavedDocument\)/);
   assert.doesNotMatch(source, /globalState|workspaceState/);
 });
