@@ -24,6 +24,9 @@ const DEFAULT_TOP_K = 5;
 const DEFAULT_SYNC_DEBOUNCE_MS = 1000;
 const DEFAULT_SYNC_READ_FLUSH_TIMEOUT_MS = 250;
 const DEFAULT_SYNC_FLUSH_TIMEOUT_MS = 60000;
+// MCP hosts cancel a tool call after roughly five minutes, so an explicit
+// reconcile never waits longer than this, whatever maxWaitMs asks for.
+const DEFAULT_SYNC_HOST_WAIT_CAP_MS = 240000;
 const DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS = 5000;
 const DEFAULT_SYNC_GIT_TIMEOUT_MS = 5000;
 const DEFAULT_SYNC_GIT_MAX_FILES = 1000;
@@ -782,7 +785,14 @@ class SyncManager {
       };
     }
 
-    const maxWaitMs = optionalPositiveInteger(args.maxWaitMs, DEFAULT_SYNC_FLUSH_TIMEOUT_MS);
+    const hostWaitCapMs = optionalPositiveInteger(
+      this.env.CORPUSWIRE_SYNC_HOST_WAIT_CAP_MS,
+      DEFAULT_SYNC_HOST_WAIT_CAP_MS,
+    );
+    const maxWaitMs = Math.min(
+      optionalPositiveInteger(args.maxWaitMs, DEFAULT_SYNC_FLUSH_TIMEOUT_MS),
+      hostWaitCapMs,
+    );
     let latestProgress;
     const reportProgress = (event) => {
       latestProgress = event;

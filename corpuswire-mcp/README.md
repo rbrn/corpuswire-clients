@@ -311,6 +311,7 @@ Recommended prompt settings:
 - `CORPUSWIRE_SYNC_MAX_PENDING_PATHS`: pending changed/deleted path count that forces a flush
 - `CORPUSWIRE_SYNC_FLUSH_BEFORE_READ`: attempt a bounded flush before search/enhance
 - `CORPUSWIRE_SYNC_READ_FLUSH_TIMEOUT_MS`: max pre-read flush wait
+- `CORPUSWIRE_SYNC_HOST_WAIT_CAP_MS`: upper bound (default 240000) on how long `corpuswire_sync_reconcile` waits, whatever `maxWaitMs` asks for, so the call returns a reattachable session before the MCP host cancels it
 - `CORPUSWIRE_SYNC_BOOTSTRAP_CHECK`: run a startup freshness diagnosis when sync starts, default `false`
 - `CORPUSWIRE_SYNC_BOOTSTRAP_TIMEOUT_MS`: max startup/bootstrap diagnosis wait, default `5000`
 - `CORPUSWIRE_SYNC_MTIME_CACHE_ENABLED`: enable durable metadata-only mtime/hash duplicate suppression, default `false`

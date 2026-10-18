@@ -3241,6 +3241,49 @@ test("corpuswire-mcp caller timeout reports continued backend work and reattachm
   }
 });
 
+test("corpuswire-mcp caps an explicit reconcile wait below the host tool-call budget", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-wait-cap-"));
+  try {
+    await writeFile(path.join(tempDir, "README.md"), "# Synthetic wait cap fixture\n", "utf8");
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...globalThis.process.env,
+        CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+        CORPUSWIRE_SDK_PATH: sdkPath,
+        CORPUSWIRE_WORKSPACE_ID: "workspace-wait-cap",
+        CORPUSWIRE_REPO_PATH: tempDir,
+        CORPUSWIRE_SYNC_ENABLED: "true",
+        CORPUSWIRE_SYNC_HOST_WAIT_CAP_MS: "30",
+        MOCK_INDEX_DELAY_MS: "400",
+        MOCK_REQUESTS_PATH: requestsPath,
+      },
+    });
+    const rpc = createRpc(child);
+    try {
+      const started = Date.now();
+      const response = await rpc({
+        jsonrpc: "2.0",
+        id: 8,
+        method: "tools/call",
+        params: {
+          name: "corpuswire_sync_reconcile",
+          arguments: { includeGlobs: ["README.md"], maxFiles: 10, maxWaitMs: 3600000 },
+        },
+      });
+      assert.ok(Date.now() - started < 350, "the wait is bounded by the host cap, not maxWaitMs");
+      assert.equal(response.result.isError, false);
+      assert.match(response.result.content[0].text, /reconcileTimedOut: true/);
+      assert.match(response.result.content[0].text, /backendContinues: true/);
+    } finally {
+      child.kill();
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("sync path probe applies leading globstar, basename, and exclusion semantics", async () => {
   const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-globs-"));
   try {
