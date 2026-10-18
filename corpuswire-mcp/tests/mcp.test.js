@@ -3256,12 +3256,13 @@ test("corpuswire-mcp caps an explicit reconcile wait below the host tool-call bu
         CORPUSWIRE_REPO_PATH: tempDir,
         CORPUSWIRE_SYNC_ENABLED: "true",
         CORPUSWIRE_SYNC_HOST_WAIT_CAP_MS: "30",
-        MOCK_INDEX_DELAY_MS: "400",
+        MOCK_INDEX_DELAY_MS: "5000",
         MOCK_REQUESTS_PATH: requestsPath,
       },
     });
     const rpc = createRpc(child);
     try {
+      await rpc({ jsonrpc: "2.0", id: 7, method: "initialize", params: {} });
       const started = Date.now();
       const response = await rpc({
         jsonrpc: "2.0",
@@ -3272,7 +3273,7 @@ test("corpuswire-mcp caps an explicit reconcile wait below the host tool-call bu
           arguments: { includeGlobs: ["README.md"], maxFiles: 10, maxWaitMs: 3600000 },
         },
       });
-      assert.ok(Date.now() - started < 350, "the wait is bounded by the host cap, not maxWaitMs");
+      assert.ok(Date.now() - started < 2500, "the wait is bounded by the host cap, not maxWaitMs");
       assert.equal(response.result.isError, false);
       assert.match(response.result.content[0].text, /reconcileTimedOut: true/);
       assert.match(response.result.content[0].text, /backendContinues: true/);
