@@ -44,6 +44,7 @@ Usage:
   cw reconcile [options]     Full workspace indexing with confirmation
   cw "<prompt>" [options]
   cw enhance "<prompt>" [options]
+  cw rewrite "<prompt>" [--context-file <path>] [options]
   cw search "<query>" [options]
   cw health [options]
   cw index-events [options]
@@ -64,6 +65,8 @@ Options:
   --operation <operation>  Filter index events by operation
   --limit <number>         Maximum index events to print
   --local-only             Use deterministic local rewrite on the backend
+  --context-file <path>    JSON session context for enhance/rewrite:
+                           { conversation, activeFile, selection, recentEdits }
   --basic-auth <user:pass> Send HTTP Basic auth credentials
   --json                   Print the full JSON payload
   --ndjson                 Stream index-progress/v1 events as NDJSON
@@ -123,7 +126,10 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
 
   const args = [...argv];
   let command = argv.length === 0 || argv[0]?.startsWith("-") ? "index" : "enhance";
-  if (
+  if (args[0] === "rewrite") {
+    args.shift();
+    command = "enhance";
+  } else if (
     args[0] === "enhance" ||
     args[0] === "search" ||
     args[0] === "query" ||
@@ -167,6 +173,7 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
     rebuild: false,
     confirmRebuild: undefined,
     attachSessionId: undefined,
+    contextFile: undefined,
     trace: false,
     implicitIndex: argv.length === 0 || argv[0]?.startsWith("-"),
     watch: command === "watch",
@@ -314,6 +321,10 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
         options.attachSessionId = requireValue(args, index, arg);
         index += 1;
         break;
+      case "--context-file":
+        options.contextFile = requireValue(args, index, arg);
+        index += 1;
+        break;
       default:
         if (arg.startsWith("-")) throw new Error(`Unknown option: ${arg}`);
         options.promptParts.push(arg);
@@ -331,6 +342,9 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
   }
   if (command !== "init" && (options.indexAfterInit || options.verifyAfterInit)) {
     throw new Error("--index and --verify are only supported with init.");
+  }
+  if (options.contextFile !== undefined && command !== "enhance") {
+    throw new Error("--context-file is only supported with enhance/rewrite.");
   }
   if (!["enhance", "search", "query"].includes(command) && options.promptParts.length) {
     throw new Error(`Unexpected argument for ${command}: ${options.promptParts[0]}`);
@@ -524,6 +538,9 @@ export async function runCliCommand(options, dependencies = {}) {
     return;
   }
 
+  const session = options.contextFile
+    ? await readSessionContextFile(options.contextFile, options.sourceRoot || process.cwd())
+    : undefined;
   const response = await client.enhanceRaw({
     prompt,
     repoPath: options.repoPath || undefined,
@@ -532,6 +549,7 @@ export async function runCliCommand(options, dependencies = {}) {
     topK: options.topK,
     minScore: options.minScore,
     localOnly: options.localOnly,
+    ...(session ? { session } : {}),
   });
 
   if (options.json) {
@@ -540,6 +558,75 @@ export async function runCliCommand(options, dependencies = {}) {
   }
 
   write((sdk?.requireEnhancedPrompt ?? requireEnhancedPromptFallback)(response.result));
+}
+
+const SESSION_CONTEXT_KEYS = new Set(["conversation", "activeFile", "selection", "recentEdits"]);
+const SESSION_SELECTION_KEYS = new Set(["path", "startLine", "endLine", "text"]);
+
+/**
+ * Reads a `--context-file` JSON document shaped like the MCP
+ * corpuswire_enhance_prompt session arguments and returns the SDK session.
+ * Returns undefined when it holds nothing, so `session` is never sent empty.
+ * The SDK caps sizes and makes absolute paths under `workspaceRoot` relative.
+ */
+export async function readSessionContextFile(filePath, workspaceRoot) {
+  const resolved = path.resolve(filePath);
+  let parsed;
+  try {
+    parsed = JSON.parse(await readFile(resolved, "utf8"));
+  } catch (error) {
+    throw new Error(`Could not read --context-file ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("--context-file must contain a JSON object.");
+  }
+  const unknown = Object.keys(parsed).filter((key) => !SESSION_CONTEXT_KEYS.has(key));
+  if (unknown.length) {
+    throw new Error(`--context-file has unsupported keys: ${unknown.join(", ")}. Expected conversation, activeFile, selection, recentEdits.`);
+  }
+  const session = {};
+  if (parsed.conversation !== undefined && parsed.conversation !== null) {
+    if (!Array.isArray(parsed.conversation)) throw new Error("--context-file conversation must be an array.");
+    const turns = parsed.conversation.map((turn, index) => {
+      if (!turn || typeof turn !== "object" || !["user", "assistant"].includes(turn.role)
+        || typeof turn.text !== "string" || Object.keys(turn).some((key) => key !== "role" && key !== "text")) {
+        throw new Error(`--context-file conversation[${index}] must be { role: "user" | "assistant", text }.`);
+      }
+      return { role: turn.role, text: turn.text };
+    });
+    if (turns.length) session.conversation = turns;
+  }
+  if (parsed.activeFile !== undefined && parsed.activeFile !== null) {
+    if (typeof parsed.activeFile !== "string") throw new Error("--context-file activeFile must be a string.");
+    if (parsed.activeFile.trim()) session.activeFile = parsed.activeFile.trim();
+  }
+  if (parsed.selection !== undefined && parsed.selection !== null) {
+    const selection = parsed.selection;
+    if (!selection || typeof selection !== "object" || Array.isArray(selection)
+      || Object.keys(selection).some((key) => !SESSION_SELECTION_KEYS.has(key))
+      || typeof selection.path !== "string" || !selection.path.trim()
+      || !Number.isInteger(selection.startLine) || !Number.isInteger(selection.endLine)
+      || selection.startLine < 1 || selection.endLine < selection.startLine
+      || (selection.text !== undefined && selection.text !== null && typeof selection.text !== "string")) {
+      throw new Error("--context-file selection must be { path, startLine >= 1, endLine >= startLine, text? }.");
+    }
+    session.selection = {
+      path: selection.path.trim(),
+      startLine: selection.startLine,
+      endLine: selection.endLine,
+      ...(typeof selection.text === "string" && selection.text ? { text: selection.text } : {}),
+    };
+  }
+  if (parsed.recentEdits !== undefined && parsed.recentEdits !== null) {
+    if (!Array.isArray(parsed.recentEdits) || parsed.recentEdits.some((entry) => typeof entry !== "string")) {
+      throw new Error("--context-file recentEdits must be an array of paths.");
+    }
+    const recentEdits = parsed.recentEdits.map((entry) => entry.trim()).filter(Boolean);
+    if (recentEdits.length) session.recentEdits = recentEdits;
+  }
+  if (Object.keys(session).length === 0) return undefined;
+  session.workspaceRoot = path.resolve(workspaceRoot);
+  return session;
 }
 
 // Keep mutation calls alive long enough for the SDK to identify and cancel its own session.

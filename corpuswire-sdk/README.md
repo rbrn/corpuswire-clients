@@ -209,6 +209,29 @@ the inspect-first list before reading raw chunks.
 `requireEnhancedPrompt()` returns `enhanced_prompt` when present, falls back to
 the deterministic `enhancement_prompt`, and throws if neither exists.
 
+Pass optional editor and chat state as `session` to help the server resolve
+references such as "this function":
+
+```ts
+await client.enhance({
+  prompt: "why does this fail?",
+  repoPath: "/home/dev/project",
+  session: {
+    conversation: [{ role: "user", text: "the login test fails on CI" }],
+    activeFile: "/home/dev/project/src/auth/login.ts",
+    selection: { path: "src/auth/login.ts", startLine: 10, endLine: 24, text: "..." },
+    recentEdits: ["src/auth/session.ts"],
+  },
+});
+```
+
+The SDK sends it as snake_case `session` only when at least one field is
+usable, so servers that predate the field keep working when it is omitted.
+It keeps the last 20 conversation turns and the first 50 recent edits, caps
+texts at 8,000 characters, and converts absolute paths under
+`session.workspaceRoot` (default `repoPath`) to workspace-relative POSIX paths;
+paths it cannot make relative are dropped. `workspaceRoot` is never sent.
+
 ## Semantic Search
 
 ```ts

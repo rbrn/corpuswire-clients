@@ -1,4 +1,4 @@
-import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceResponseEnvelope, CodebaseRepositoriesV1, CodebaseV1, CreateCodebaseRequest, GitHubProviderBindingPayload, GitHubProviderBindingRequest, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexSessionQuery, IndexWorkspaceRequest, IndexTransferSummary, CorpusWireClientOptions, LlmModelState, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, QualityEvent, QualityEventPayload, QualityEventRequest, QualityEventsQuery, QualityReview, QualityReviewQuery, QueryValueEvent, ProviderBindingResponseV1, ProviderBindingRevocationV1, ValueFeedbackRequest, ValueRollup, ValueRollupQuery, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexCodeStageResult, RemoteIndexProgressEvent, RemoteIndexPreview, RemoteIndexSession, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, ReviewContextCapabilitiesV1, ReviewContextJobV1, ReviewContextPollOptions, ReviewContextRequest, ReviewContextRequestV1, ReviewContextResult, ReviewContextCapabilitiesV2, ReviewContextJobV2, ReviewContextPollOptionsV2, ReviewContextRequestV2Input, ReviewContextRequestV2, ReviewContextResultV2, ReviewTelemetrySummaryV1, ReviewPurgeV1, ReviewStatusV1, ReviewStatusV2, SearchHit, StartRemoteIndexSessionRequest, WorkspaceDiagnosis, WorkspaceDiagnosisRequest, UpdateCodebaseRequest } from "./types.js";
+import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceSessionContext, EnhanceSessionContextPayload, EnhanceResponseEnvelope, CodebaseRepositoriesV1, CodebaseV1, CreateCodebaseRequest, GitHubProviderBindingPayload, GitHubProviderBindingRequest, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexSessionQuery, IndexWorkspaceRequest, IndexTransferSummary, CorpusWireClientOptions, LlmModelState, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, QualityEvent, QualityEventPayload, QualityEventRequest, QualityEventsQuery, QualityReview, QualityReviewQuery, QueryValueEvent, ProviderBindingResponseV1, ProviderBindingRevocationV1, ValueFeedbackRequest, ValueRollup, ValueRollupQuery, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexCodeStageResult, RemoteIndexProgressEvent, RemoteIndexPreview, RemoteIndexSession, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, ReviewContextCapabilitiesV1, ReviewContextJobV1, ReviewContextPollOptions, ReviewContextRequest, ReviewContextRequestV1, ReviewContextResult, ReviewContextCapabilitiesV2, ReviewContextJobV2, ReviewContextPollOptionsV2, ReviewContextRequestV2Input, ReviewContextRequestV2, ReviewContextResultV2, ReviewTelemetrySummaryV1, ReviewPurgeV1, ReviewStatusV1, ReviewStatusV2, SearchHit, StartRemoteIndexSessionRequest, WorkspaceDiagnosis, WorkspaceDiagnosisRequest, UpdateCodebaseRequest } from "./types.js";
 export type RemoteIndexOwnedSessionIdentity = Pick<RemoteIndexSession, "session_id" | "workspace_id" | "collection_name" | "mode">;
 export declare class RemoteIndexInterruptionError extends Error {
     readonly reason: "cancel" | "detach" | "timeout";
@@ -142,6 +142,25 @@ export declare class CorpusWireClient {
 }
 export declare function toQualityEventPayload(request: QualityEventRequest): QualityEventPayload;
 export declare function toEnhancePayload(request: string | EnhancePromptRequest): EnhancePromptPayload;
+/** Server caps for `EnhanceRequest.session` (see corpuswire `EnhanceSessionContext`). */
+export declare const ENHANCE_SESSION_LIMITS: Readonly<{
+    conversationTurns: 20;
+    textChars: 8000;
+    pathChars: 1024;
+    recentEdits: 50;
+}>;
+/**
+ * Normalizes a session path to the workspace-relative POSIX form the server
+ * accepts. Absolute paths are made relative to `workspaceRoot` when they sit
+ * under it. Returns null for anything that cannot be made relative (outside
+ * the root, home-relative, escaping with `..`, too long or empty).
+ */
+export declare function toWorkspaceRelativeSessionPath(path: unknown, workspaceRoot?: string | null): string | null;
+/**
+ * Converts caller session state into the capped snake_case wire payload.
+ * Returns undefined when nothing usable remains, so `session` is omitted.
+ */
+export declare function toEnhanceSessionPayload(session: EnhanceSessionContext | null | undefined, workspaceRoot?: string | null): EnhanceSessionContextPayload | undefined;
 export declare function toQueryPayload(request: string | QueryPromptRequest): QueryPromptPayload;
 export declare function toGitHubProviderBindingPayload(request: GitHubProviderBindingRequest): GitHubProviderBindingPayload;
 export declare function toReviewContextPayload(request: ReviewContextRequest): ReviewContextRequestV1;
