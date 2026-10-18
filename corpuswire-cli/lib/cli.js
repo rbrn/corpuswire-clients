@@ -1,8 +1,16 @@
-import { isRetrievalExcludedPath } from "@corpuswire/sdk";
+import {
+  COMMIT_HISTORY_GIT_CONFIG,
+  COMMIT_HISTORY_GIT_TIMEOUT_MS,
+  GitIgnoreMatcher,
+  commitHistoryGitEnvironment,
+  formatAbstentionHint,
+  isRetrievalExcludedPath,
+  loadCommitHistoryDocuments,
+} from "@corpuswire/sdk";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { readFile, readdir, stat, lstat, mkdir, writeFile, open, realpath } from "node:fs/promises";
-import { constants as fsConstants, watch as watchFiles } from "node:fs";
+import { constants as fsConstants, readFileSync, watch as watchFiles } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -83,6 +91,8 @@ Options:
   --rebuild                Allow destructive collection recreation (second confirmation)
   --confirm-rebuild <id>   Required in non-interactive mode; must equal workspace ID
   --attach <session-id>    Follow an existing index session
+  --respect-gitignore      Skip files ignored by .gitignore and .git/info/exclude
+  --commit-history         Also upload recent commits as .corpuswire/commits/<sha>.md
   -V, --version            Show the installed CLI version
   -h, --help               Show this help
 
@@ -91,6 +101,10 @@ Environment:
   CORPUSWIRE_BASIC_AUTH
   CORPUSWIRE_WORKSPACE_ID
   CORPUSWIRE_REPO_PATH
+  CORPUSWIRE_RESPECT_GITIGNORE=true   Same as --respect-gitignore (default off)
+  CORPUSWIRE_COMMIT_HISTORY_ENABLED=true Same as --commit-history (default off)
+  CORPUSWIRE_COMMIT_HISTORY_SINCE_DAYS  Commit window in days. Default: 365
+  CORPUSWIRE_COMMIT_HISTORY_MAX_COMMITS Commit cap, at most 2000. Default: 2000
 `);
 }
 
@@ -99,6 +113,17 @@ function parseNumber(value, label) {
   if (!Number.isFinite(parsed)) {
     throw new Error(`Invalid ${label}: ${value}`);
   }
+  return parsed;
+}
+
+function envFlag(value) {
+  return ["1", "true", "yes", "on"].includes(String(value ?? "").trim().toLowerCase());
+}
+
+function envPositiveInteger(value, label) {
+  if (value === undefined || String(value).trim() === "") return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`${label} must be a positive integer.`);
   return parsed;
 }
 
@@ -172,6 +197,10 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
     pollMs: 10000,
     indexAfterInit: false,
     verifyAfterInit: false,
+    respectGitignore: envFlag(env.CORPUSWIRE_RESPECT_GITIGNORE),
+    commitHistory: envFlag(env.CORPUSWIRE_COMMIT_HISTORY_ENABLED),
+    commitHistorySinceDays: env.CORPUSWIRE_COMMIT_HISTORY_SINCE_DAYS,
+    commitHistoryMaxCommits: env.CORPUSWIRE_COMMIT_HISTORY_MAX_COMMITS,
   };
 
   for (let index = 0; index < args.length; index += 1) {
@@ -310,6 +339,12 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
       case "--attach":
         options.attachSessionId = requireValue(args, index, arg);
         index += 1;
+        break;
+      case "--respect-gitignore":
+        options.respectGitignore = true;
+        break;
+      case "--commit-history":
+        options.commitHistory = true;
         break;
       default:
         if (arg.startsWith("-")) throw new Error(`Unknown option: ${arg}`);
@@ -478,6 +513,8 @@ export async function runCliCommand(options, dependencies = {}) {
     const chunks = response.result?.retrieved_chunks ?? [];
     if (chunks.length === 0) {
       write("No context found.");
+      const hint = formatAbstentionHint(response.result);
+      if (hint) write(sanitizeTerminalText(hint));
       return;
     }
 
@@ -507,6 +544,9 @@ export async function runCliCommand(options, dependencies = {}) {
   }
 
   write((sdk?.requireEnhancedPrompt ?? requireEnhancedPromptFallback)(response.result));
+  // Keep stdout the prompt alone so it can be piped; the hint goes to stderr.
+  const hint = formatAbstentionHint(response.result);
+  if (hint) (dependencies.writeError ?? console.error)(sanitizeTerminalText(hint));
 }
 
 // Keep mutation calls alive long enough for the SDK to identify and cancel its own session.
@@ -747,6 +787,7 @@ export async function runWatchCommand(options, dependencies) {
         const scanGeneration = generation;
         const scan = await scanWorkspace(root, {
           capabilities, includeGlobs: options.includeGlobs, excludeGlobs: options.excludeGlobs,
+          respectGitignore: options.respectGitignore === true,
           maxFileSizeBytes: Math.min(options.maxFileSizeBytes ?? capabilities.max_file_size_bytes, capabilities.max_file_size_bytes),
           onProgress: () => {}, signal, workspaceId: options.workspaceId, startedAt: Date.now(),
         });
@@ -884,6 +925,7 @@ export async function runIndexCommand(options, dependencies) {
     capabilities,
     includeGlobs: options.includeGlobs ?? [],
     excludeGlobs: options.excludeGlobs ?? [],
+    respectGitignore: options.respectGitignore === true,
     maxFileSizeBytes: Math.min(options.maxFileSizeBytes ?? capabilities.max_file_size_bytes, capabilities.max_file_size_bytes),
     onProgress: renderer.render,
     signal: dependencies.signal,
@@ -909,6 +951,10 @@ export async function runIndexCommand(options, dependencies) {
     inventoryScan: (options.mode ?? "full") === "full" ? scan.inventoryScan : undefined,
     deletedPaths: [],
   };
+  const commitDocuments = options.commitHistory === true
+    ? await loadCliCommitDocuments(sourceRoot, options, dependencies)
+    : null;
+  if (commitDocuments) request.files = [...scan.files, ...commitDocuments];
   const preview = await dependencies.client.previewIndexWorkspace(request);
   renderer.finish();
   printIndexPreview(write, {
@@ -917,6 +963,7 @@ export async function runIndexCommand(options, dependencies) {
     scan,
     preview,
     ndjson: options.ndjson || options.json,
+    commitDocumentCount: commitDocuments?.length,
   });
 
   const approved = options.yes === true || (options.implicitIndex === true && configuration.profile === "local" && options.rebuild !== true)
@@ -1352,6 +1399,48 @@ function deriveWorkspaceId(sourceRoot) {
   return `local-docker://${slug}-${suffix}#main`;
 }
 
+/** Read ignore files under the workspace root for the shared SDK matcher (CRP-001 M3.1). */
+function createGitIgnoreMatcher(sourceRoot) {
+  return new GitIgnoreMatcher((relativePath) => {
+    try {
+      return readFileSync(path.join(sourceRoot, ...relativePath.split("/")), "utf8");
+    } catch {
+      return null;
+    }
+  });
+}
+
+/** Render recent commits as virtual documents for the existing index session (CRP-001 M2.1). */
+async function loadCliCommitDocuments(sourceRoot, options, dependencies) {
+  const runGit = dependencies.runCommitHistoryGit ?? (async (args) => {
+    try {
+      const { stdout } = await execFileAsync("git", [...COMMIT_HISTORY_GIT_CONFIG, ...args], {
+        cwd: sourceRoot, env: commitHistoryGitEnvironment(dependencies.env ?? process.env),
+        timeout: COMMIT_HISTORY_GIT_TIMEOUT_MS, maxBuffer: 256 * 1024 * 1024, encoding: "buffer",
+      });
+      return stdout.toString("utf8");
+    } catch {
+      return null;
+    }
+  });
+  const documents = await loadCommitHistoryDocuments({
+    runGit,
+    readTextFile: async (filePath) => {
+      try { return await readFile(path.resolve(sourceRoot, filePath), "utf8"); } catch { return null; }
+    },
+    sinceDays: envPositiveInteger(options.commitHistorySinceDays, "CORPUSWIRE_COMMIT_HISTORY_SINCE_DAYS"),
+    maxCommits: envPositiveInteger(options.commitHistoryMaxCommits, "CORPUSWIRE_COMMIT_HISTORY_MAX_COMMITS"),
+    gitignore: options.respectGitignore === true ? createGitIgnoreMatcher(sourceRoot) : undefined,
+    now: dependencies.now?.(),
+  });
+  return documents.map((document) => ({
+    relativePath: document.relativePath,
+    content: Buffer.from(document.content),
+    sha256: document.sha256,
+    mtimeNs: document.mtimeNs,
+  }));
+}
+
 async function scanWorkspace(sourceRoot, options) {
   try { return await scanWorkspaceComplete(sourceRoot, options); }
   catch (error) { throw Object.assign(error, { code: "scan_incomplete" }); }
@@ -1362,6 +1451,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
   const scanStartedAt = new Date(scanPhaseStartedAt).toISOString();
   const scannedPaths = [];
   let scanned = 0;
+  const gitignore = options.respectGitignore === true ? createGitIgnoreMatcher(sourceRoot) : null;
   const discoveryStartedAt = performance.now();
   async function walk(directory) {
     if (options.signal?.aborted) throw Object.assign(new Error("Workspace scan cancelled"), { code: "scan_incomplete" });
@@ -1376,12 +1466,16 @@ async function scanWorkspaceComplete(sourceRoot, options) {
         continue;
       }
       if (entry.isDirectory()) {
-        if (!DEFAULT_EXCLUDED_DIRECTORIES.has(entry.name) && !matchesAnyGlob(relativePath, options.excludeGlobs)) {
+        if (!DEFAULT_EXCLUDED_DIRECTORIES.has(entry.name) && !matchesAnyGlob(relativePath, options.excludeGlobs)
+          && !gitignore?.isIgnored(relativePath, { isDir: true })) {
           await walk(absolutePath);
         }
         continue;
       }
       if (!entry.isFile()) {
+        continue;
+      }
+      if (gitignore?.isIgnored(relativePath, { isDir: false })) {
         continue;
       }
       scanned += 1;
@@ -1469,7 +1563,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
     inventoryScan: {
       complete: true, startedAt: scanStartedAt, completedAt: new Date().toISOString(),
       excludedFileCount: excluded, producer: "corpuswire-cli-scan/v1",
-      ignoreDigest: createHash("sha256").update(JSON.stringify({ directories: [...DEFAULT_EXCLUDED_DIRECTORIES].sort(), hiddenPaths: "exclude", retrievalExclusions: "discovery-and-terraform/v1" })).digest("hex"),
+      ignoreDigest: createHash("sha256").update(JSON.stringify({ directories: [...DEFAULT_EXCLUDED_DIRECTORIES].sort(), hiddenPaths: "exclude", retrievalExclusions: "discovery-and-terraform/v1", ...(gitignore ? { gitignore: "respect/v1" } : {}) })).digest("hex"),
     },
     files,
     scanned,
@@ -1754,7 +1848,7 @@ function formatDuration(milliseconds) {
   return `${minutes}m ${(seconds % 60).toFixed(0)}s`;
 }
 
-function printIndexPreview(write, { configuration, sourceRoot, scan, preview, ndjson }) {
+function printIndexPreview(write, { configuration, sourceRoot, scan, preview, ndjson, commitDocumentCount }) {
   const payload = {
     workspace: configuration.workspaceId,
     source_root: sourceRoot,
@@ -1771,6 +1865,7 @@ function printIndexPreview(write, { configuration, sourceRoot, scan, preview, nd
     deleted_files: preview.deleted,
     destructive_risk: preview.destructive_risk,
   };
+  if (commitDocumentCount !== undefined) payload.commit_documents = commitDocumentCount;
   if (ndjson) {
     write(JSON.stringify({ type: "index_preview", preview: payload }));
     return;
@@ -1785,6 +1880,7 @@ function printIndexPreview(write, { configuration, sourceRoot, scan, preview, nd
     `  Candidate bytes: ${formatBytes(payload.candidate_bytes)}`,
     `  Expected mode: ${payload.expected_mode} (${payload.changed_files} changed, ${payload.unchanged_files} unchanged, ${payload.deleted_files} deleted)`,
     `  Destructive risk: ${payload.destructive_risk ? "YES — collection recreation requested" : "none"}`,
+    ...(commitDocumentCount === undefined ? [] : [`  Commit history: ${commitDocumentCount} documents (.corpuswire/commits/)`]),
   ].join("\n"));
 }
 

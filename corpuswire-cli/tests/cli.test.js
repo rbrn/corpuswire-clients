@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm, writeFile, readFile, readdir, chmod, symlink, rename } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 
@@ -2205,4 +2207,155 @@ test("runtime watcher failure reports safe reason and closes its handle once", {
   assert.deepEqual(fallback, { stage: "runtime", reason: "watch_permission_denied", error_code: "EPERM" });
   assert.equal(state.closed, 1);
   assert.ok(state.writes.every((line) => !line.includes("secret") && !line.includes("/private/path")));
+});
+
+// CRP-001 client follow-ups: M1.1 abstention hint, M3.1 .gitignore, M2.1 commit upload.
+
+function enhanceOptions() {
+  return {
+    command: "enhance", apiBaseUrl: "http://127.0.0.1:8000", outputMode: "generic", repoPath: "",
+    workspaceId: "workspace-1", topK: undefined, minScore: undefined, localOnly: false, json: false,
+    basicAuth: "", promptParts: ["where", "is", "billing"],
+  };
+}
+
+test("enhance prints the abstention hint on stderr only when the service abstained", async () => {
+  const run = async (extra) => {
+    const writes = [];
+    const errors = [];
+    await runCliCommand(enhanceOptions(), {
+      client: { enhanceRaw: async () => ({ ok: true, result: { enhanced_prompt: "enhanced prompt", ...extra } }) },
+      write: (line) => writes.push(line), writeError: (line) => errors.push(line),
+    });
+    return { writes, errors };
+  };
+  assert.deepEqual(await run({}), { writes: ["enhanced prompt"], errors: [] });
+  assert.deepEqual(await run({ retrieval_abstained: false, retrieval_closest_paths: [] }), { writes: ["enhanced prompt"], errors: [] });
+  assert.deepEqual(await run({ retrieval_abstained: true, retrieval_closest_paths: ["src/billing.py", "docs/billing.md"] }), {
+    writes: ["enhanced prompt"],
+    errors: ["Not found in the index; closest files, not confirmed: src/billing.py, docs/billing.md."],
+  });
+});
+
+test("search adds the abstention hint after an empty result only when abstained", async () => {
+  const run = async (extra) => {
+    const writes = [];
+    await runCliCommand({ ...enhanceOptions(), command: "search" }, {
+      client: { queryRaw: async () => ({ ok: true, result: { retrieved_chunks: [], ...extra } }) },
+      write: (line) => writes.push(line),
+    });
+    return writes;
+  };
+  assert.deepEqual(await run({}), ["No context found."]);
+  assert.deepEqual(await run({ retrieval_abstained: true, retrieval_closest_paths: ["a.py"] }), [
+    "No context found.", "Not found in the index; closest files, not confirmed: a.py.",
+  ]);
+});
+
+test("parseCliArgs keeps gitignore and commit history off unless enabled", () => {
+  const defaults = parseCliArgs([], {});
+  assert.equal(defaults.respectGitignore, false);
+  assert.equal(defaults.commitHistory, false);
+  const flags = parseCliArgs(["--respect-gitignore", "--commit-history"], {});
+  assert.equal(flags.respectGitignore, true);
+  assert.equal(flags.commitHistory, true);
+  const env = parseCliArgs([], { CORPUSWIRE_RESPECT_GITIGNORE: "true", CORPUSWIRE_COMMIT_HISTORY_ENABLED: "1" });
+  assert.equal(env.respectGitignore, true);
+  assert.equal(env.commitHistory, true);
+  assert.equal(parseCliArgs([], { CORPUSWIRE_RESPECT_GITIGNORE: "false" }).respectGitignore, false);
+});
+
+async function captureIndexRequest(fixture, extraOptions = {}, dependencies = {}) {
+  const captured = {};
+  const client = fakeIndexClient({
+    previewIndexWorkspace: async (request) => {
+      captured.previewFiles = request.files.map((file) => file.relativePath);
+      return { workspace_id: request.workspace.workspaceId, collection_name: "c", requested_mode: "full", expected_mode: "full",
+        candidates: request.files.length, included: request.files.length, excluded: 0, changed: request.files.length,
+        unchanged: 0, deleted: 0, candidate_bytes: 0, destructive_risk: false };
+    },
+    indexWorkspace: async (request) => {
+      captured.request = request;
+      return { ok: true, result: {}, status: {} };
+    },
+  });
+  const writes = [];
+  await runCliCommand({ ...indexOptions(fixture), yes: true, ...extraOptions }, {
+    client, write: (line) => writes.push(line), writeRaw: () => {}, isTTY: false, ...dependencies,
+  });
+  captured.writes = writes;
+  captured.paths = captured.request.files.map((file) => file.relativePath).sort();
+  return captured;
+}
+
+test("index respects .gitignore, nested ignore files and info/exclude only when enabled", async () => {
+  const fixture = await syntheticWorkspace();
+  try {
+    await mkdir(path.join(fixture, "generated"));
+    await mkdir(path.join(fixture, "src", "keep"), { recursive: true });
+    await mkdir(path.join(fixture, ".git", "info"), { recursive: true });
+    await writeFile(path.join(fixture, ".gitignore"), "generated/\n*.log.md\n!important.log.md\n");
+    await writeFile(path.join(fixture, "src", ".gitignore"), "local.md\n");
+    await writeFile(path.join(fixture, ".git", "info", "exclude"), "scratch.md\n");
+    await writeFile(path.join(fixture, "generated", "api.md"), "# generated\n");
+    await writeFile(path.join(fixture, "trace.log.md"), "# log\n");
+    await writeFile(path.join(fixture, "important.log.md"), "# kept\n");
+    await writeFile(path.join(fixture, "src", "local.md"), "# local\n");
+    await writeFile(path.join(fixture, "src", "keep", "local.md"), "# nested local\n");
+    await writeFile(path.join(fixture, "scratch.md"), "# scratch\n");
+
+    const off = await captureIndexRequest(fixture);
+    assert.deepEqual(off.paths, ["README.md", "generated/api.md", "important.log.md", "scratch.md", "src/index.js",
+      "src/keep/local.md", "src/local.md", "trace.log.md"]);
+    const on = await captureIndexRequest(fixture, { respectGitignore: true });
+    assert.deepEqual(on.paths, ["README.md", "important.log.md", "src/index.js"]);
+    assert.notEqual(on.request.inventoryScan.ignoreDigest, off.request.inventoryScan.ignoreDigest);
+    // Default digest unchanged from the published scanner contract.
+    assert.equal(off.request.inventoryScan.ignoreDigest, createHashHex(JSON.stringify({
+      directories: [".git", ".mypy_cache", ".pytest_cache", ".qdrant", ".ruff_cache", ".venv", "__pycache__", "build", "dist", "node_modules", "target", "venv"],
+      hiddenPaths: "exclude", retrievalExclusions: "discovery-and-terraform/v1",
+    })));
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
+function createHashHex(text) {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+test("index uploads commit documents as virtual paths only with --commit-history", async () => {
+  const fixture = await syntheticWorkspace();
+  try {
+    const git = (...args) => execFileSync("git", args, {
+      cwd: fixture, stdio: ["ignore", "pipe", "ignore"],
+      env: { ...process.env, GIT_AUTHOR_NAME: "Fixture Author", GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+        GIT_COMMITTER_NAME: "Fixture Author", GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+        GIT_AUTHOR_DATE: "2026-10-01T10:00:00+00:00", GIT_COMMITTER_DATE: "2026-10-01T10:00:00+00:00" },
+    });
+    git("init", "-q");
+    git("add", "README.md", "src/index.js");
+    git("commit", "-q", "-m", "Add synthetic sources");
+    const sha = git("rev-parse", "HEAD").toString().trim();
+    const now = () => new Date("2026-10-18T00:00:00Z");
+
+    const off = await captureIndexRequest(fixture, {}, { now });
+    assert.deepEqual(off.paths, ["README.md", "src/index.js"]);
+    assert.ok(!off.writes.join("\n").includes("Commit history"));
+
+    const on = await captureIndexRequest(fixture, { commitHistory: true }, { now });
+    assert.deepEqual(on.paths, [`.corpuswire/commits/${sha}.md`, "README.md", "src/index.js"]);
+    const document = on.request.files.find((file) => file.relativePath.startsWith(".corpuswire/"));
+    const text = Buffer.from(document.content).toString("utf8");
+    assert.match(text, new RegExp(`^# Commit ${sha.slice(0, 12)}: Add synthetic sources\\n`));
+    assert.ok(!text.includes("@example.invalid"));
+    assert.equal(document.sha256, createHashHex(text));
+    assert.equal(document.mtimeNs, Date.parse("2026-10-01T10:00:00Z") * 1_000_000);
+    assert.match(on.writes.join("\n"), /Commit history: 1 documents/);
+    // The inventory scan evidence itself is unchanged; commits ride along as files.
+    assert.equal(on.request.inventoryScan.ignoreDigest, off.request.inventoryScan.ignoreDigest);
+
+    await assert.rejects(
+      captureIndexRequest(fixture, { commitHistory: true, commitHistoryMaxCommits: "0" }, { now }),
+      /CORPUSWIRE_COMMIT_HISTORY_MAX_COMMITS must be a positive integer/,
+    );
+  } finally { await rm(fixture, { recursive: true, force: true }); }
 });

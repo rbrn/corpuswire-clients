@@ -3,3 +3,6 @@ export { CorpusWireHttpError, buildHeaders, createBasicAuthHeader, createBearerA
 export { documentTypes, promptOutputModes, promptTaskTypes, promptTaskTypeSources, } from "./types.js";
 export { INVENTORY_VERSION, WorkspaceScanIncompleteError, canonicalInventoryPath, inventoryDigest, inventorySha256, selectionPolicyDigest, buildWorkspaceInventory } from "./inventory.js";
 export { isRetrievalExcludedPath, ingestionPriority } from "./inventory.js";
+export { GIT_INFO_EXCLUDE_PATH, GITIGNORE_FILENAME, GitIgnoreMatcher } from "./gitignore.js";
+export { COMMIT_DOCUMENT_PREFIX, COMMIT_HISTORY_DEFAULT_SINCE_DAYS, COMMIT_HISTORY_GIT_CONFIG, COMMIT_HISTORY_GIT_TIMEOUT_MS, COMMIT_HISTORY_MAX_COMMITS_CAP, commitDocumentPath, commitHistoryGitEnvironment, isCommitDocumentPath, isCommitPathExcluded, loadCommitHistoryDocuments, parseCommitLog, readCommitHistory, renderCommitDocument, renderCommitDocumentText, } from "./commitHistory.js";
+export { formatAbstentionHint, retrievalAbstention } from "./abstention.js";

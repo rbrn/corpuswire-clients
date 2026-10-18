@@ -333,6 +333,28 @@ Use `corpuswire_doctor` as the quick replacement-readiness check before trusting
 
 For the local Docker app on an existing dense-only Qdrant collection, keep `APP_QDRANT_HYBRID_ENABLED=false` unless you intentionally recreate the collection for hybrid named vectors. A dense/hybrid mismatch raises a backend writer error; current backend builds close the failed index session so retry attempts are not blocked by a stale active-session lock.
 
+### CRP-001 options (off by default)
+
+- `CORPUSWIRE_RESPECT_GITIGNORE=true` skips files ignored by the root
+  `.gitignore`, nested `.gitignore` files and `.git/info/exclude`, with git's
+  precedence (a file inside an ignored directory cannot be re-included). It
+  applies to reconciliation and to every queued path (probe reason
+  `gitignore`), mirrors the server's `INGEST_RESPECT_GITIGNORE`, and uses the
+  SDK's `GitIgnoreMatcher`, which passes the server's shared fixture. Like the
+  server, it ignores `core.excludesFile` and the git index (a tracked file that
+  matches a pattern is skipped).
+- `CORPUSWIRE_COMMIT_HISTORY_ENABLED=true` makes `corpuswire_sync_reconcile`
+  also upload recent commits as virtual Markdown documents at
+  `.corpuswire/commits/<sha>.md`, in the same full session and with the
+  server's format, caps and skips (`CORPUSWIRE_COMMIT_HISTORY_SINCE_DAYS`,
+  default 365; `CORPUSWIRE_COMMIT_HISTORY_MAX_COMMITS`, default and maximum
+  2000). It needs a server whose remote indexer accepts those paths. Turning it
+  off removes the documents at the next full reconcile; incremental flushes
+  never add or delete them.
+- When `/v1/enhance` reports `retrieval_abstained: true`, the enhance and search
+  output add one line: `Not found in the index; closest files, not confirmed:
+  ...`. Without the field the output is unchanged.
+
 ## Inventory readiness compatibility note
 
 `filesUploaded` now counts acknowledged unique source-file transfers, so a warm full reconcile can report zero even when every eligible file was submitted. Use `filesSubmitted` and `filesReused` for the other boundaries. Missing SDK measurements display `unknown`; errors and detachments do not manufacture successful counts.

@@ -1,0 +1,207 @@
+{
+  "schema": "corpuswire.gitignore-cases/v1",
+  "description": "Shared git ignore matching cases. 'files' maps a workspace-relative ignore file path (.gitignore, nested dir/.gitignore or .git/info/exclude) to its text. Each check gives a workspace-relative POSIX path, whether it is a directory, and whether git treats it as ignored (a path inside an ignored directory counts as ignored). Expectations were checked against git check-ignore.",
+  "cases": [
+    {
+      "name": "basename pattern matches at any depth",
+      "files": {".gitignore": "*.log\nsecret.txt\n"},
+      "checks": [
+        {"path": "app.log", "is_dir": false, "expected_ignored": true},
+        {"path": "src/deep/app.log", "is_dir": false, "expected_ignored": true},
+        {"path": "src/deep/secret.txt", "is_dir": false, "expected_ignored": true},
+        {"path": "src/app.py", "is_dir": false, "expected_ignored": false},
+        {"path": "app.log.md", "is_dir": false, "expected_ignored": false}
+      ]
+    },
+    {
+      "name": "negation re-includes a file",
+      "files": {".gitignore": "*.md\n!README.md\n"},
+      "checks": [
+        {"path": "notes.md", "is_dir": false, "expected_ignored": true},
+        {"path": "README.md", "is_dir": false, "expected_ignored": false},
+        {"path": "docs/README.md", "is_dir": false, "expected_ignored": false},
+        {"path": "docs/guide.md", "is_dir": false, "expected_ignored": true}
+      ]
+    },
+    {
+      "name": "last matching pattern wins",
+      "files": {".gitignore": "!keep.txt\n*.txt\n"},
+      "checks": [
+        {"path": "keep.txt", "is_dir": false, "expected_ignored": true},
+        {"path": "other.txt", "is_dir": false, "expected_ignored": true}
+      ]
+    },
+    {
+      "name": "leading slash anchors to the ignore file directory",
+      "files": {".gitignore": "/config.json\n/out\n"},
+      "checks": [
+        {"path": "config.json", "is_dir": false, "expected_ignored": true},
+        {"path": "src/config.json", "is_dir": false, "expected_ignored": false},
+        {"path": "out", "is_dir": true, "expected_ignored": true},
+        {"path": "out/a.py", "is_dir": false, "expected_ignored": true},
+        {"path": "src/out/a.py", "is_dir": false, "expected_ignored": false}
+      ]
+    },
+    {
+      "name": "a middle slash anchors the pattern",
+      "files": {".gitignore": "docs/generated\nsrc/*.tmp.py\n"},
+      "checks": [
+        {"path": "docs/generated", "is_dir": true, "expected_ignored": true},
+        {"path": "docs/generated/api.md", "is_dir": false, "expected_ignored": true},
+        {"path": "pkg/docs/generated/api.md", "is_dir": false, "expected_ignored": false},
+        {"path": "src/a.tmp.py", "is_dir": false, "expected_ignored": true},
+        {"path": "src/sub/a.tmp.py", "is_dir": false, "expected_ignored": false}
+      ]
+    },
+    {
+      "name": "trailing slash matches directories only",
+      "files": {".gitignore": "cache/\n"},
+      "checks": [
+        {"path": "cache", "is_dir": true, "expected_ignored": true},
+        {"path": "cache/data.json", "is_dir": false, "expected_ignored": true},
+        {"path": "src/cache", "is_dir": true, "expected_ignored": true},
+        {"path": "src/cache/data.json", "is_dir": false, "expected_ignored": true},
+        {"path": "cache", "is_dir": false, "expected_ignored": false},
+        {"path": "src/cache", "is_dir": false, "expected_ignored": false}
+      ]
+    },
+    {
+      "name": "files inside an ignored directory cannot be re-included",
+      "files": {".gitignore": "build/\n!build/keep.md\n"},
+      "checks": [
+        {"path": "build/keep.md", "is_dir": false, "expected_ignored": true},
+        {"path": "build/other.md", "is_dir": false, "expected_ignored": true}
+      ]
+    },
+    {
+      "name": "dir/* with a negated subdirectory",
+      "files": {".gitignore": "logs/*\n!logs/keep/\n"},
+      "checks": [
+        {"path": "logs", "is_dir": true, "expected_ignored": false},
+        {"path": "logs/a.txt", "is_dir": false, "expected_ignored": true},
+        {"path": "logs/drop", "is_dir": true, "expected_ignored": true},
+        {"path": "logs/drop/a.txt", "is_dir": false, "expected_ignored": true},
+        {"path": "logs/keep", "is_dir": true, "expected_ignored": false},
+        {"path": "logs/keep/a.txt", "is_dir": false, "expected_ignored": false}
+      ]
+    },
+    {
+      "name": "double star forms",
+      "files": {".gitignore": "**/fixtures\na/**/z.md\nvendor/**\n!vendor/keep.md\n"},
+      "checks": [
+        {"path": "fixtures", "is_dir": true, "expected_ignored": true},
+        {"path": "pkg/x/fixtures/data.json", "is_dir": false, "expected_ignored": true},
+        {"path": "a/z.md", "is_dir": false, "expected_ignored": true},
+        {"path": "a/b/c/z.md", "is_dir": false, "expected_ignored": true},
+        {"path": "b/a/z.md", "is_dir": false, "expected_ignored": false},
+        {"path": "vendor", "is_dir": true, "expected_ignored": false},
+        {"path": "vendor/lib.py", "is_dir": false, "expected_ignored": true},
+        {"path": "vendor/keep.md", "is_dir": false, "expected_ignored": false},
+        {"path": "vendor/sub/lib.py", "is_dir": false, "expected_ignored": true}
+      ]
+    },
+    {
+      "name": "single star and question mark do not cross slashes",
+      "files": {".gitignore": "doc/*.txt\nfile?.py\n"},
+      "checks": [
+        {"path": "doc/a.txt", "is_dir": false, "expected_ignored": true},
+        {"path": "doc/sub/a.txt", "is_dir": false, "expected_ignored": false},
+        {"path": "file1.py", "is_dir": false, "expected_ignored": true},
+        {"path": "file10.py", "is_dir": false, "expected_ignored": false}
+      ]
+    },
+    {
+      "name": "character classes",
+      "files": {".gitignore": "*.py[co]\nreport[0-9].md\n"},
+      "checks": [
+        {"path": "mod.pyc", "is_dir": false, "expected_ignored": true},
+        {"path": "mod.pyo", "is_dir": false, "expected_ignored": true},
+        {"path": "mod.py", "is_dir": false, "expected_ignored": false},
+        {"path": "report7.md", "is_dir": false, "expected_ignored": true},
+        {"path": "reportX.md", "is_dir": false, "expected_ignored": false}
+      ]
+    },
+    {
+      "name": "comments, blank lines and escapes",
+      "files": {".gitignore": "# a comment\n\n\\#literal.md\n\\!bang.md\n"},
+      "checks": [
+        {"path": "# a comment", "is_dir": false, "expected_ignored": false},
+        {"path": "#literal.md", "is_dir": false, "expected_ignored": true},
+        {"path": "!bang.md", "is_dir": false, "expected_ignored": true},
+        {"path": "bang.md", "is_dir": false, "expected_ignored": false}
+      ]
+    },
+    {
+      "name": "nested ignore files are relative to their directory",
+      "files": {
+        ".gitignore": "*.tmp\n",
+        "pkg/.gitignore": "/local.md\ngen/\n"
+      },
+      "checks": [
+        {"path": "pkg/local.md", "is_dir": false, "expected_ignored": true},
+        {"path": "local.md", "is_dir": false, "expected_ignored": false},
+        {"path": "pkg/sub/local.md", "is_dir": false, "expected_ignored": false},
+        {"path": "pkg/sub/gen", "is_dir": true, "expected_ignored": true},
+        {"path": "pkg/sub/gen/a.py", "is_dir": false, "expected_ignored": true},
+        {"path": "gen/a.py", "is_dir": false, "expected_ignored": false},
+        {"path": "pkg/x.tmp", "is_dir": false, "expected_ignored": true}
+      ]
+    },
+    {
+      "name": "a deeper ignore file overrides a shallower one",
+      "files": {
+        ".gitignore": "*.md\n",
+        "docs/.gitignore": "!*.md\n"
+      },
+      "checks": [
+        {"path": "notes.md", "is_dir": false, "expected_ignored": true},
+        {"path": "docs/guide.md", "is_dir": false, "expected_ignored": false},
+        {"path": "docs/sub/guide.md", "is_dir": false, "expected_ignored": false},
+        {"path": "src/notes.md", "is_dir": false, "expected_ignored": true}
+      ]
+    },
+    {
+      "name": "a nested negation re-includes a directory ignored by the root",
+      "files": {
+        ".gitignore": "docs/*\n",
+        "docs/.gitignore": "!api/\n"
+      },
+      "checks": [
+        {"path": "docs/index.md", "is_dir": false, "expected_ignored": true},
+        {"path": "docs/api", "is_dir": true, "expected_ignored": false},
+        {"path": "docs/api/ref.md", "is_dir": false, "expected_ignored": false}
+      ]
+    },
+    {
+      "name": "an ignore file inside an ignored directory is never read",
+      "files": {
+        ".gitignore": "private/\n",
+        "private/.gitignore": "!*\n"
+      },
+      "checks": [
+        {"path": "private/a.md", "is_dir": false, "expected_ignored": true}
+      ]
+    },
+    {
+      "name": "info exclude has the lowest precedence",
+      "files": {
+        ".git/info/exclude": "scratch/\n*.draft.md\n",
+        ".gitignore": "!keep.draft.md\n"
+      },
+      "checks": [
+        {"path": "scratch/a.py", "is_dir": false, "expected_ignored": true},
+        {"path": "notes.draft.md", "is_dir": false, "expected_ignored": true},
+        {"path": "keep.draft.md", "is_dir": false, "expected_ignored": false},
+        {"path": "src/x.draft.md", "is_dir": false, "expected_ignored": true}
+      ]
+    },
+    {
+      "name": "no ignore files ignores nothing",
+      "files": {},
+      "checks": [
+        {"path": "a.log", "is_dir": false, "expected_ignored": false},
+        {"path": "build", "is_dir": true, "expected_ignored": false}
+      ]
+    }
+  ]
+}

@@ -5184,3 +5184,154 @@ test("bootstrap and read freshness preserve timeout receipts and reject late hea
     }
   }
 });
+
+// CRP-001 client follow-ups: M1.1 abstention hint, M3.1 .gitignore, M2.1 commit upload.
+
+async function writeFollowupMockSdk(tempDir) {
+  const mock = await writeMockSdk(tempDir);
+  const wrapperPath = path.join(tempDir, "followup-sdk.mjs");
+  await writeFile(wrapperPath, `
+export * from ${JSON.stringify(VENDORED_SDK_INDEX.href)};
+export { CorpusWireHttpError, assertReviewContextV2Result } from ${JSON.stringify(new URL(`file://${mock.sdkPath}`).href)};
+import { CorpusWireClient as MockClient } from ${JSON.stringify(new URL(`file://${mock.sdkPath}`).href)};
+const extra = (name) => (process.env[name] ? JSON.parse(process.env[name]) : null);
+export class CorpusWireClient extends MockClient {
+  async enhance(request) {
+    const result = await super.enhance(request);
+    return extra("MOCK_ENHANCE_EXTRA") ? { ...result, ...extra("MOCK_ENHANCE_EXTRA") } : result;
+  }
+  async queryRaw(request) {
+    const response = await super.queryRaw(request);
+    return extra("MOCK_QUERY_EXTRA") ? { ...response, result: { ...response.result, ...extra("MOCK_QUERY_EXTRA") } } : response;
+  }
+}
+`, "utf8");
+  return { ...mock, sdkPath: wrapperPath };
+}
+
+async function callFollowupTool(tempDir, env, name, args) {
+  const { sdkPath, requestsPath } = await writeFollowupMockSdk(tempDir);
+  const child = spawn("node", [SERVER_BIN], { stdio: ["pipe", "pipe", "pipe"], env: {
+    ...globalThis.process.env,
+    CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+    CORPUSWIRE_SDK_PATH: sdkPath,
+    CORPUSWIRE_WORKSPACE_ID: "workspace-followups",
+    CORPUSWIRE_RETRIEVAL_FAILURE_REPORT_DIR: path.join(tempDir, "reports"),
+    MOCK_REQUESTS_PATH: requestsPath,
+    ...env,
+  } });
+  const rpc = createRpc(child);
+  try {
+    const response = await rpc({ jsonrpc: "2.0", id: 91, method: "tools/call", params: { name, arguments: args } });
+    const calls = (await readFile(requestsPath, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
+    return { response, text: response.result?.content?.[0]?.text ?? "", calls };
+  } finally {
+    child.kill();
+  }
+}
+
+function withoutReportPaths(text) {
+  return text.split("\n").filter((line) => !/retrieval-failures|reports\//.test(line)).join("\n");
+}
+
+test("followups: enhance output is unchanged without abstention and adds one hint line with it", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-abstention-"));
+  try {
+    const args = { prompt: "where is billing configured", localOnly: true };
+    const absent = await callFollowupTool(tempDir, {}, "corpuswire_enhance_prompt", args);
+    const falsy = await callFollowupTool(tempDir, {
+      MOCK_ENHANCE_EXTRA: JSON.stringify({ retrieval_abstained: false, retrieval_closest_paths: [] }),
+    }, "corpuswire_enhance_prompt", args);
+    const abstained = await callFollowupTool(tempDir, {
+      MOCK_ENHANCE_EXTRA: JSON.stringify({ retrieval_abstained: true, retrieval_closest_paths: ["src/billing.py", "docs/billing.md"] }),
+    }, "corpuswire_enhance_prompt", args);
+    assert.equal(absent.response.result.isError, false);
+    assert.equal(withoutReportPaths(falsy.text), withoutReportPaths(absent.text));
+    assert.doesNotMatch(absent.text, /closest files, not confirmed/);
+    const hint = "Not found in the index; closest files, not confirmed: `src/billing.py`, `docs/billing.md`.";
+    assert.ok(abstained.text.includes(hint));
+    assert.equal(
+      withoutReportPaths(abstained.text.replace(`\n\n${hint}`, "")),
+      withoutReportPaths(absent.text),
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("followups: search shows the abstention hint only for an abstained empty result", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-abstention-search-"));
+  try {
+    const args = { query: "where is billing configured" };
+    const absent = await callFollowupTool(tempDir, { MOCK_QUERY_EMPTY: "true" }, "corpuswire_search", args);
+    const abstained = await callFollowupTool(tempDir, {
+      MOCK_QUERY_EMPTY: "true",
+      MOCK_QUERY_EXTRA: JSON.stringify({ retrieval_abstained: true, retrieval_closest_paths: ["src/billing.py"] }),
+    }, "corpuswire_search", args);
+    assert.match(absent.text, /No hits returned\./);
+    assert.doesNotMatch(absent.text, /closest files, not confirmed/);
+    assert.match(abstained.text, /No hits returned\.\nNot found in the index; closest files, not confirmed: `src\/billing.py`\./);
+    assert.equal(
+      withoutReportPaths(abstained.text.replace("\nNot found in the index; closest files, not confirmed: `src/billing.py`.", "")),
+      withoutReportPaths(absent.text),
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("followups: reconcile honours .gitignore only with CORPUSWIRE_RESPECT_GITIGNORE", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-gitignore-"));
+  const workspace = path.join(tempDir, "workspace");
+  try {
+    await mkdir(path.join(workspace, "generated"), { recursive: true });
+    await mkdir(path.join(workspace, "docs"), { recursive: true });
+    await mkdir(path.join(workspace, ".git", "info"), { recursive: true });
+    await writeFile(path.join(workspace, ".gitignore"), "generated/\n*.log.md\n", "utf8");
+    await writeFile(path.join(workspace, "docs", ".gitignore"), "draft.md\n", "utf8");
+    await writeFile(path.join(workspace, ".git", "info", "exclude"), "scratch.md\n", "utf8");
+    for (const file of ["README.md", "generated/api.md", "trace.log.md", "docs/guide.md", "docs/draft.md", "scratch.md"]) {
+      await writeFile(path.join(workspace, file), `# ${file}\n`, "utf8");
+    }
+    const env = { CORPUSWIRE_REPO_PATH: workspace, CORPUSWIRE_SYNC_ENABLED: "true" };
+    const args = { includeGlobs: ["**/*.md"], maxFiles: 20, maxWaitMs: 5000 };
+    const off = await callFollowupTool(tempDir, env, "corpuswire_sync_reconcile", args);
+    assert.equal(off.response.result.isError, false);
+    assert.deepEqual(off.calls.at(-1).files.sort(), ["README.md", "docs/draft.md", "docs/guide.md", "generated/api.md", "scratch.md", "trace.log.md"]);
+    const on = await callFollowupTool(tempDir, { ...env, CORPUSWIRE_RESPECT_GITIGNORE: "true" }, "corpuswire_sync_reconcile", args);
+    assert.equal(on.response.result.isError, false);
+    assert.deepEqual(on.calls.at(-1).files.sort(), ["README.md", "docs/guide.md"]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("followups: reconcile uploads commit documents only with CORPUSWIRE_COMMIT_HISTORY_ENABLED", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-commits-"));
+  const workspace = path.join(tempDir, "workspace");
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(path.join(workspace, "README.md"), "# Readme\n", "utf8");
+    const gitEnv = { ...globalThis.process.env, GIT_AUTHOR_NAME: "Fixture Author", GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+      GIT_COMMITTER_NAME: "Fixture Author", GIT_COMMITTER_EMAIL: "fixture@example.invalid" };
+    const git = (...args) => new Promise((resolve, reject) => {
+      const child = spawn("git", args, { cwd: workspace, env: gitEnv, stdio: ["ignore", "pipe", "ignore"] });
+      let stdout = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.on("close", (code) => (code === 0 ? resolve(stdout.trim()) : reject(new Error(`git ${args[0]} failed`))));
+    });
+    await git("init", "-q");
+    await git("add", "README.md");
+    await git("commit", "-q", "-m", "Add readme");
+    const sha = await git("rev-parse", "HEAD");
+    const env = { CORPUSWIRE_REPO_PATH: workspace, CORPUSWIRE_SYNC_ENABLED: "true" };
+    const args = { includeGlobs: ["**/*.md"], maxFiles: 20, maxWaitMs: 5000 };
+    const off = await callFollowupTool(tempDir, env, "corpuswire_sync_reconcile", args);
+    assert.deepEqual(off.calls.at(-1).files, ["README.md"]);
+    const on = await callFollowupTool(tempDir, { ...env, CORPUSWIRE_COMMIT_HISTORY_ENABLED: "true" }, "corpuswire_sync_reconcile", args);
+    assert.equal(on.response.result.isError, false);
+    assert.deepEqual(on.calls.at(-1).files, ["README.md", `.corpuswire/commits/${sha}.md`]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});

@@ -121,6 +121,10 @@ export interface PromptEnhancementResult {
   citations: string[];
   answer: string | null;
   generation_error: string | null;
+  /** True when calibrated abstention withheld all evidence (CRP-001 M1.1); absent from older services. */
+  retrieval_abstained?: boolean;
+  /** Up to two unconfirmed leads, set only with `retrieval_abstained`. */
+  retrieval_closest_paths?: string[];
 }
 
 export interface ActionResponseContext {

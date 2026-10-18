@@ -6,3 +6,9 @@ export type { ApiErrorPayload, ActiveProjectHealth, AgentContextPacket, AgentCon
 export { INVENTORY_VERSION, WorkspaceScanIncompleteError, canonicalInventoryPath, inventoryDigest, inventorySha256, selectionPolicyDigest, buildWorkspaceInventory } from "./inventory.js";
 export type { InventoryScan, InventorySelectionPolicy, WorkspaceInventory, WorkspaceCoverage, IndexTransferSummary } from "./types.js";
 export { isRetrievalExcludedPath, ingestionPriority } from "./inventory.js";
+export { GIT_INFO_EXCLUDE_PATH, GITIGNORE_FILENAME, GitIgnoreMatcher } from "./gitignore.js";
+export type { GitIgnoreFileReader } from "./gitignore.js";
+export { COMMIT_DOCUMENT_PREFIX, COMMIT_HISTORY_DEFAULT_SINCE_DAYS, COMMIT_HISTORY_GIT_CONFIG, COMMIT_HISTORY_GIT_TIMEOUT_MS, COMMIT_HISTORY_MAX_COMMITS_CAP, commitDocumentPath, commitHistoryGitEnvironment, isCommitDocumentPath, isCommitPathExcluded, loadCommitHistoryDocuments, parseCommitLog, readCommitHistory, renderCommitDocument, renderCommitDocumentText, } from "./commitHistory.js";
+export type { CommitDocument, CommitFileStat, CommitHistoryGitRunner, CommitHistoryOptions, CommitRecord } from "./commitHistory.js";
+export { formatAbstentionHint, retrievalAbstention } from "./abstention.js";
+export type { RetrievalAbstention } from "./abstention.js";

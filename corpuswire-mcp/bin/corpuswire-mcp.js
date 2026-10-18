@@ -3,7 +3,7 @@
 import { execFile } from "node:child_process";
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
-import { constants as fsConstants, existsSync, watch as watchFileSystem, writeSync } from "node:fs";
+import { constants as fsConstants, existsSync, readFileSync, watch as watchFileSystem, writeSync } from "node:fs";
 import { link, mkdir, readdir, readFile, realpath, rename, stat, lstat, open, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -1419,6 +1419,10 @@ class SyncManager {
     }
 
     const gitMetadata = await this.readGitMetadata(context.sourceRoot);
+    // CRP-001 M2.1: commits ride along as virtual documents in the same full session.
+    const commitDocuments = optionalBoolean(this.env.CORPUSWIRE_COMMIT_HISTORY_ENABLED, false)
+      ? await this.loadCommitDocuments(context)
+      : null;
     const response = await this.indexWorkspaceWithSessionConflictRetry(client, {
       workspace: {
         workspaceId: context.workspaceId,
@@ -1436,6 +1440,7 @@ class SyncManager {
         ignoreDigest: createHash("sha256").update(JSON.stringify({
           excludedSegments: [...EXCLUDED_PATH_SEGMENTS].sort(), hiddenDirectories: "except-safe-ancestors",
           sensitiveTerraform: "skip/v1", discoveryOnly: "skip/v1",
+          ...(context.gitignore ? { gitignore: "respect/v1" } : {}),
         })).digest("hex"),
       },
       client: removeUndefinedValues({
@@ -1457,7 +1462,7 @@ class SyncManager {
       batchBytes: optionalPositiveInteger(this.env.CORPUSWIRE_SYNC_BATCH_BYTES, undefined),
       maxFileSizeBytes: context.effectiveMaxFileSizeBytes,
       recreateCollection,
-      files,
+      files: commitDocuments ? [...files, ...commitDocuments] : files,
       deletedPaths: [],
       onProgress,
     }, { operation: "reconcile" });
@@ -1485,6 +1490,7 @@ class SyncManager {
       filesDeleted: 0,
       filesSkipped: skippedPaths.length,
       skippedPaths,
+      ...(commitDocuments ? { commitDocuments: commitDocuments.length } : {}),
       recreateCollection,
       response,
       durationMs,
@@ -1492,6 +1498,38 @@ class SyncManager {
     };
     this.recordResult(result, "reconcile");
     return result;
+  }
+
+  async loadCommitDocuments(context) {
+    if (typeof sdk.loadCommitHistoryDocuments !== "function") {
+      throw new Error("@corpuswire/sdk does not expose loadCommitHistoryDocuments; update the SDK or unset CORPUSWIRE_COMMIT_HISTORY_ENABLED.");
+    }
+    const env = sdk.commitHistoryGitEnvironment(this.env);
+    const documents = await sdk.loadCommitHistoryDocuments({
+      runGit: async (args) => {
+        try {
+          const { stdout } = await execFileAsync("git", [...sdk.COMMIT_HISTORY_GIT_CONFIG, ...args], {
+            cwd: context.sourceRoot, env, encoding: "buffer",
+            timeout: sdk.COMMIT_HISTORY_GIT_TIMEOUT_MS, maxBuffer: 256 * 1024 * 1024,
+          });
+          return stdout.toString("utf8");
+        } catch {
+          return null;
+        }
+      },
+      readTextFile: async (filePath) => {
+        try { return await readFile(path.resolve(context.sourceRoot, filePath), "utf8"); } catch { return null; }
+      },
+      sinceDays: optionalPositiveInteger(this.env.CORPUSWIRE_COMMIT_HISTORY_SINCE_DAYS, undefined),
+      maxCommits: optionalPositiveInteger(this.env.CORPUSWIRE_COMMIT_HISTORY_MAX_COMMITS, undefined),
+      gitignore: context.gitignore,
+    });
+    return documents.map((document) => ({
+      relativePath: document.relativePath,
+      content: Buffer.from(document.content),
+      sha256: document.sha256,
+      mtimeNs: document.mtimeNs,
+    }));
   }
 
   async readRemoteFile(entry, context, { useCache = false } = {}) {
@@ -1837,6 +1875,9 @@ class SyncManager {
           if (isExcludedDirectory(relativePath, context.excludeGlobs)) {
             continue;
           }
+          if (context.gitignore?.isIgnored(relativePath, { isDir: true })) {
+            continue;
+          }
           stack.push(absolutePath);
           continue;
         }
@@ -1873,6 +1914,8 @@ class SyncManager {
     if (!workspaceId) {
       throw new JsonRpcError(-32602, "Sync requires workspaceId or CORPUSWIRE_WORKSPACE_ID.");
     }
+    // CRP-001 M3.1: off by default, mirroring the server's INGEST_RESPECT_GITIGNORE.
+    const respectGitignore = optionalBoolean(this.env.CORPUSWIRE_RESPECT_GITIGNORE, false);
     return {
       effectiveMaxFileSizeBytes: Math.min(
         optionalPositiveInteger(this.env.CORPUSWIRE_SYNC_MAX_FILE_SIZE_BYTES, DEFAULT_SYNC_MAX_FILE_SIZE_BYTES),
@@ -1881,7 +1924,9 @@ class SyncManager {
       selectionIdentity: JSON.stringify({
         maxFileSizeBytes: this.env.CORPUSWIRE_SYNC_MAX_FILE_SIZE_BYTES ?? DEFAULT_SYNC_MAX_FILE_SIZE_BYTES,
         supportedFileRegistryVersion: this.supportedFileRegistryVersion ?? null, producer: "corpuswire-mcp-scan/v1",
+        ...(respectGitignore ? { respectGitignore: true } : {}),
       }),
+      ...(respectGitignore ? { gitignore: createGitIgnoreMatcher(path.resolve(sourceRootRaw)) } : {}),
       sourceRoot: path.resolve(sourceRootRaw),
       workspaceId,
       includeGlobs: resolveSyncGlobList(args, this.env.CORPUSWIRE_SYNC_INCLUDE_GLOBS, "includeGlobs", "include_globs"),
@@ -5700,7 +5745,7 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minSc
   ];
 
   if (hits.length === 0) {
-    lines.push("", "No hits returned.");
+    lines.push("", "No hits returned.", ...abstentionHintLines(result).slice(1));
     const advice = retrievalRecoveryAdvice({ result, context, retrievalWarning });
     if (advice) {
       lines.push("", "Recovery:", advice);
@@ -6254,6 +6299,7 @@ async function enhancePrompt(args, observation = undefined) {
     "",
     "Context used:",
     ...(contextUsed.length > 0 ? contextUsed : ["- No repository context was selected."]),
+    ...abstentionHintLines(result),
     "",
     "Retrieval metadata:",
     `- baseUrl: ${client.baseUrl}`,
@@ -6308,6 +6354,14 @@ async function enhancePrompt(args, observation = undefined) {
     },
   });
   return appendFailureReportPath(formatted, failureReportPath);
+}
+
+/** CRP-001 M1.1: one line when the service abstained; nothing otherwise, so output is unchanged. */
+function abstentionHintLines(result) {
+  const hint = typeof sdk.formatAbstentionHint === "function"
+    ? sdk.formatAbstentionHint(result, { quotePaths: true })
+    : null;
+  return hint ? ["", hint] : [];
 }
 
 function indentPreviewBlock(text) {
@@ -7135,6 +7189,20 @@ function syncContextKey(context) {
   ].join("\0");
 }
 
+/** Read ignore files under the workspace root for the shared SDK matcher (CRP-001 M3.1). */
+function createGitIgnoreMatcher(sourceRoot) {
+  if (typeof sdk.GitIgnoreMatcher !== "function") {
+    throw new Error("@corpuswire/sdk does not expose GitIgnoreMatcher; update the SDK or unset CORPUSWIRE_RESPECT_GITIGNORE.");
+  }
+  return new sdk.GitIgnoreMatcher((relativePath) => {
+    try {
+      return readFileSync(path.join(sourceRoot, ...relativePath.split("/")), "utf8");
+    } catch {
+      return null;
+    }
+  });
+}
+
 function isSyncIndexableRelativePath(relativePath, context) {
   return classifySyncRelativePath(relativePath, context).accepted;
 }
@@ -7156,6 +7224,9 @@ function classifySyncRelativePath(relativePath, context) {
     && !SAFE_INDEXABLE_PATHS.has(normalized)
   ) {
     return { accepted: false, reason: "excluded_segment" };
+  }
+  if (context.gitignore?.isIgnored(normalized, { isDir: false })) {
+    return { accepted: false, reason: "gitignore" };
   }
   const effectivePath = effectiveIndexableRelativePath(normalized);
   const effectiveName = path.posix.basename(effectivePath).toLowerCase();

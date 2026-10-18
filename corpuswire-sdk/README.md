@@ -209,6 +209,23 @@ the inspect-first list before reading raw chunks.
 `requireEnhancedPrompt()` returns `enhanced_prompt` when present, falls back to
 the deterministic `enhancement_prompt`, and throws if neither exists.
 
+When the service's calibrated abstention withholds evidence, the result carries
+`retrieval_abstained: true` and up to two `retrieval_closest_paths`. Both fields
+are optional in the types. `formatAbstentionHint(result)` returns one short
+line (`Not found in the index; closest files, not confirmed: ...`) or `null`
+when the service did not abstain or is older.
+
+### Inventory helpers for file producers
+
+- `GitIgnoreMatcher` decides git ignore rules from a reader callback (root and
+  nested `.gitignore`, `.git/info/exclude`, git's precedence). It matches the
+  server's `corpuswire.ingest.gitignore` on the shared fixture in
+  `tests/fixtures/gitignore_cases.json`.
+- `loadCommitHistoryDocuments({ runGit, readTextFile })` renders recent commits
+  as `.corpuswire/commits/<sha>.md` documents, byte-identical to the server's
+  `corpuswire.ingest.commit_history`, for upload with the other files of an
+  `indexWorkspace()` request. Git is injected, so the SDK stays dependency-free.
+
 ## Semantic Search
 
 ```ts

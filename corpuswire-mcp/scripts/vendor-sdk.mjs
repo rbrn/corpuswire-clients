@@ -14,8 +14,14 @@ const clientsRoot = path.resolve(mcpRoot, "..");
 const sdkDist = path.join(clientsRoot, "corpuswire-sdk", "dist");
 const vendorDist = path.join(mcpRoot, "vendor", "corpuswire-sdk", "dist");
 const files = Object.freeze([
+  "abstention.d.ts",
+  "abstention.js",
   "client.d.ts",
   "client.js",
+  "commitHistory.d.ts",
+  "commitHistory.js",
+  "gitignore.d.ts",
+  "gitignore.js",
   "http.d.ts",
   "http.js",
   "inventory.js",

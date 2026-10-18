@@ -1,0 +1,186 @@
+{
+ "schema": "corpuswire.commit-history-cases/v1",
+ "description": "Generated from corpuswire.ingest.commit_history (server repo): raw git log output in the commit-history format, the shallow boundary shas, and the documents the server renders (records it cannot parse are absent). 'excluded' is the server's skip rule for any changed path (respect_gitignore off).",
+ "raw_log": "\u001eC\u001faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\u001fAda Example\u001f2026-10-01T09:30:00+02:00\u001fFix parser for nested tags\n\nLonger explanation.\n\nCo-Authored-By: Bob Person <bob@example.invalid>\nSigned-off-by: Carol <carol.x@mail.example.invalid>\n\u001f\n10\t2\tsrc/parser.py\u0000-\t-\tdocs/diagram.png\u00003\t0\tREADME.md\u0000\u001eC\u001fcccccccccccccccccccccccccccccccccccccccc\u001fdddddddddddddddddddddddddddddddddddddddd eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\u001fMerge Bot\u001f2026-09-30T12:00:00+00:00\u001fMerge pull request #7 from feature\n\nFeature body\n\u001f\n1\t1\tsrc/app.py\u0000\u001eC\u001fffffffffffffffffffffffffffffffffffffffff\u001f\u001fShallow Person\u001f2026-09-29T08:00:00-05:00\u001fInitial import\n\u001f\n100\t0\tsrc/app.py\u0000\u001eC\u001f1111111111111111111111111111111111111111\u001faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fLong Writer\u001f2026-09-28T00:00:00+00:00\u001fSquash: many changes\n\nLine with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 \n\u001f\n0\t0\tsrc/gen/file_000.py\u00001\t0\tsrc/gen/file_001.py\u00002\t0\tsrc/gen/file_002.py\u00003\t0\tsrc/gen/file_003.py\u00004\t0\tsrc/gen/file_004.py\u00005\t0\tsrc/gen/file_005.py\u00006\t0\tsrc/gen/file_006.py\u00007\t0\tsrc/gen/file_007.py\u00008\t0\tsrc/gen/file_008.py\u00009\t0\tsrc/gen/file_009.py\u000010\t0\tsrc/gen/file_010.py\u000011\t0\tsrc/gen/file_011.py\u000012\t0\tsrc/gen/file_012.py\u000013\t0\tsrc/gen/file_013.py\u000014\t0\tsrc/gen/file_014.py\u000015\t0\tsrc/gen/file_015.py\u000016\t0\tsrc/gen/file_016.py\u000017\t0\tsrc/gen/file_017.py\u000018\t0\tsrc/gen/file_018.py\u000019\t0\tsrc/gen/file_019.py\u000020\t0\tsrc/gen/file_020.py\u000021\t0\tsrc/gen/file_021.py\u000022\t0\tsrc/gen/file_022.py\u000023\t0\tsrc/gen/file_023.py\u000024\t0\tsrc/gen/file_024.py\u000025\t0\tsrc/gen/file_025.py\u000026\t0\tsrc/gen/file_026.py\u000027\t0\tsrc/gen/file_027.py\u000028\t0\tsrc/gen/file_028.py\u000029\t0\tsrc/gen/file_029.py\u000030\t0\tsrc/gen/file_030.py\u000031\t0\tsrc/gen/file_031.py\u000032\t0\tsrc/gen/file_032.py\u000033\t0\tsrc/gen/file_033.py\u000034\t0\tsrc/gen/file_034.py\u000035\t0\tsrc/gen/file_035.py\u000036\t0\tsrc/gen/file_036.py\u000037\t0\tsrc/gen/file_037.py\u000038\t0\tsrc/gen/file_038.py\u000039\t0\tsrc/gen/file_039.py\u000040\t0\tsrc/gen/file_040.py\u000041\t0\tsrc/gen/file_041.py\u000042\t0\tsrc/gen/file_042.py\u000043\t0\tsrc/gen/file_043.py\u000044\t0\tsrc/gen/file_044.py\u000045\t0\tsrc/gen/file_045.py\u000046\t0\tsrc/gen/file_046.py\u000047\t0\tsrc/gen/file_047.py\u000048\t0\tsrc/gen/file_048.py\u000049\t0\tsrc/gen/file_049.py\u000050\t0\tsrc/gen/file_050.py\u000051\t0\tsrc/gen/file_051.py\u000052\t0\tsrc/gen/file_052.py\u000053\t0\tsrc/gen/file_053.py\u000054\t0\tsrc/gen/file_054.py\u000055\t0\tsrc/gen/file_055.py\u000056\t0\tsrc/gen/file_056.py\u000057\t0\tsrc/gen/file_057.py\u000058\t0\tsrc/gen/file_058.py\u000059\t0\tsrc/gen/file_059.py\u000060\t0\tsrc/gen/file_060.py\u000061\t0\tsrc/gen/file_061.py\u000062\t0\tsrc/gen/file_062.py\u000063\t0\tsrc/gen/file_063.py\u000064\t0\tsrc/gen/file_064.py\u000065\t0\tsrc/gen/file_065.py\u000066\t0\tsrc/gen/file_066.py\u000067\t0\tsrc/gen/file_067.py\u000068\t0\tsrc/gen/file_068.py\u000069\t0\tsrc/gen/file_069.py\u000070\t0\tsrc/gen/file_070.py\u000071\t0\tsrc/gen/file_071.py\u000072\t0\tsrc/gen/file_072.py\u000073\t0\tsrc/gen/file_073.py\u000074\t0\tsrc/gen/file_074.py\u000075\t0\tsrc/gen/file_075.py\u000076\t0\tsrc/gen/file_076.py\u000077\t0\tsrc/gen/file_077.py\u000078\t0\tsrc/gen/file_078.py\u000079\t0\tsrc/gen/file_079.py\u000080\t0\tsrc/gen/file_080.py\u000081\t0\tsrc/gen/file_081.py\u000082\t0\tsrc/gen/file_082.py\u000083\t0\tsrc/gen/file_083.py\u000084\t0\tsrc/gen/file_084.py\u000085\t0\tsrc/gen/file_085.py\u000086\t0\tsrc/gen/file_086.py\u000087\t0\tsrc/gen/file_087.py\u000088\t0\tsrc/gen/file_088.py\u000089\t0\tsrc/gen/file_089.py\u000090\t0\tsrc/gen/file_090.py\u000091\t0\tsrc/gen/file_091.py\u000092\t0\tsrc/gen/file_092.py\u000093\t0\tsrc/gen/file_093.py\u000094\t0\tsrc/gen/file_094.py\u000095\t0\tsrc/gen/file_095.py\u000096\t0\tsrc/gen/file_096.py\u000097\t0\tsrc/gen/file_097.py\u000098\t0\tsrc/gen/file_098.py\u000099\t0\tsrc/gen/file_099.py\u0000100\t0\tsrc/gen/file_100.py\u0000101\t0\tsrc/gen/file_101.py\u0000102\t0\tsrc/gen/file_102.py\u0000103\t0\tsrc/gen/file_103.py\u0000104\t0\tsrc/gen/file_104.py\u0000105\t0\tsrc/gen/file_105.py\u0000106\t0\tsrc/gen/file_106.py\u0000107\t0\tsrc/gen/file_107.py\u0000108\t0\tsrc/gen/file_108.py\u0000109\t0\tsrc/gen/file_109.py\u0000110\t0\tsrc/gen/file_110.py\u0000111\t0\tsrc/gen/file_111.py\u0000112\t0\tsrc/gen/file_112.py\u0000113\t0\tsrc/gen/file_113.py\u0000114\t0\tsrc/gen/file_114.py\u0000115\t0\tsrc/gen/file_115.py\u0000116\t0\tsrc/gen/file_116.py\u0000117\t0\tsrc/gen/file_117.py\u0000118\t0\tsrc/gen/file_118.py\u0000119\t0\tsrc/gen/file_119.py\u0000120\t0\tsrc/gen/file_120.py\u0000121\t0\tsrc/gen/file_121.py\u0000122\t0\tsrc/gen/file_122.py\u0000123\t0\tsrc/gen/file_123.py\u0000124\t0\tsrc/gen/file_124.py\u0000125\t0\tsrc/gen/file_125.py\u0000126\t0\tsrc/gen/file_126.py\u0000127\t0\tsrc/gen/file_127.py\u0000128\t0\tsrc/gen/file_128.py\u0000129\t0\tsrc/gen/file_129.py\u0000130\t0\tsrc/gen/file_130.py\u0000131\t0\tsrc/gen/file_131.py\u0000132\t0\tsrc/gen/file_132.py\u0000133\t0\tsrc/gen/file_133.py\u0000134\t0\tsrc/gen/file_134.py\u0000135\t0\tsrc/gen/file_135.py\u0000136\t0\tsrc/gen/file_136.py\u0000137\t0\tsrc/gen/file_137.py\u0000138\t0\tsrc/gen/file_138.py\u0000139\t0\tsrc/gen/file_139.py\u0000140\t0\tsrc/gen/file_140.py\u0000141\t0\tsrc/gen/file_141.py\u0000142\t0\tsrc/gen/file_142.py\u0000143\t0\tsrc/gen/file_143.py\u0000144\t0\tsrc/gen/file_144.py\u0000145\t0\tsrc/gen/file_145.py\u0000146\t0\tsrc/gen/file_146.py\u0000147\t0\tsrc/gen/file_147.py\u0000148\t0\tsrc/gen/file_148.py\u0000149\t0\tsrc/gen/file_149.py\u0000150\t0\tsrc/gen/file_150.py\u0000151\t0\tsrc/gen/file_151.py\u0000152\t0\tsrc/gen/file_152.py\u0000153\t0\tsrc/gen/file_153.py\u0000154\t0\tsrc/gen/file_154.py\u0000155\t0\tsrc/gen/file_155.py\u0000156\t0\tsrc/gen/file_156.py\u0000157\t0\tsrc/gen/file_157.py\u0000158\t0\tsrc/gen/file_158.py\u0000159\t0\tsrc/gen/file_159.py\u0000160\t0\tsrc/gen/file_160.py\u0000161\t0\tsrc/gen/file_161.py\u0000162\t0\tsrc/gen/file_162.py\u0000163\t0\tsrc/gen/file_163.py\u0000164\t0\tsrc/gen/file_164.py\u0000165\t0\tsrc/gen/file_165.py\u0000166\t0\tsrc/gen/file_166.py\u0000167\t0\tsrc/gen/file_167.py\u0000168\t0\tsrc/gen/file_168.py\u0000169\t0\tsrc/gen/file_169.py\u0000170\t0\tsrc/gen/file_170.py\u0000171\t0\tsrc/gen/file_171.py\u0000172\t0\tsrc/gen/file_172.py\u0000173\t0\tsrc/gen/file_173.py\u0000174\t0\tsrc/gen/file_174.py\u0000175\t0\tsrc/gen/file_175.py\u0000176\t0\tsrc/gen/file_176.py\u0000177\t0\tsrc/gen/file_177.py\u0000178\t0\tsrc/gen/file_178.py\u0000179\t0\tsrc/gen/file_179.py\u0000180\t0\tsrc/gen/file_180.py\u0000181\t0\tsrc/gen/file_181.py\u0000182\t0\tsrc/gen/file_182.py\u0000183\t0\tsrc/gen/file_183.py\u0000184\t0\tsrc/gen/file_184.py\u0000185\t0\tsrc/gen/file_185.py\u0000186\t0\tsrc/gen/file_186.py\u0000187\t0\tsrc/gen/file_187.py\u0000188\t0\tsrc/gen/file_188.py\u0000189\t0\tsrc/gen/file_189.py\u0000190\t0\tsrc/gen/file_190.py\u0000191\t0\tsrc/gen/file_191.py\u0000192\t0\tsrc/gen/file_192.py\u0000193\t0\tsrc/gen/file_193.py\u0000194\t0\tsrc/gen/file_194.py\u0000195\t0\tsrc/gen/file_195.py\u0000196\t0\tsrc/gen/file_196.py\u0000197\t0\tsrc/gen/file_197.py\u0000198\t0\tsrc/gen/file_198.py\u0000199\t0\tsrc/gen/file_199.py\u0000200\t0\tsrc/gen/file_200.py\u0000201\t0\tsrc/gen/file_201.py\u0000202\t0\tsrc/gen/file_202.py\u0000203\t0\tsrc/gen/file_203.py\u0000204\t0\tsrc/gen/file_204.py\u0000\u001eC\u001f2222222222222222222222222222222222222222\u001faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001f\u001f2026-09-27T00:00:00+00:00\u001f\n\u001f\n\u001eC\u001f3333333333333333333333333333333333333333\u001faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fDot Toucher\u001f2026-09-26T00:00:00+00:00\u001fUpdate workflow\n\u001f\n1\t1\t.github/workflows/ci.yml\u00001\t0\tsrc/app.py\u0000\u001eC\u001f4444444444444444444444444444444444444444\u001faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fTf Person\u001f2026-09-25T00:00:00+00:00\u001fUpdate values\n\u001f\n1\t1\tinfra/prod.tfvars\u0000\u001eC\u001f5555555555555555555555555555555555555555\u001faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fVendor Person\u001f2026-09-24T00:00:00+00:00\u001fBump deps\n\u001f\n1\t1\tnode_modules/x/index.js\u0000\u001eC\u001f6666666666666666666666666666666666666666666666666666666666666666\u001faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fSha256 Person\u001f2026-09-23T00:00:00+00:00\u001fSHA-256 repo\n\u001f\n1\t1\tsrc/app.py\u0000\u001eC\u001f7777777777777777777777777777777777777777\u001faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fBad Date\u001fnot-a-date\u001fBroken\n\u001f\n1\t1\tsrc/app.py\u0000\u001eC\u001f8888888888888888888888888888888888888888\u001faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u001fEmail In Name <name@example.invalid>\u001f2026-09-22T00:00:00+00:00\u001f  Subject with spaces  \nreach me at someone@example.invalid please\n\u001f\n2\t2\tsrc/app.py\u00002\t2\tsrc/app.py\u00001\t1\t.vscode/mcp.json.example\u0000",
+ "shallow": [
+  "ffffffffffffffffffffffffffffffffffffffff"
+ ],
+ "documents": [
+  {
+   "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "excluded": false,
+   "relative_path": ".corpuswire/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md",
+   "text": "# Commit aaaaaaaaaaaa: Fix parser for nested tags\n\n- Commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n- Author: Ada Example\n- Date: 2026-10-01T09:30:00+02:00\n- Parents: bbbbbbbbbbbb\n- Files changed: 3 (+13 -2)\n\n## Message\n\nFix parser for nested tags\n\nLonger explanation.\n\nCo-Authored-By: Bob Person\nSigned-off-by: Carol\n\n## Changed files\n\n- `src/parser.py` (+10 -2)\n- `docs/diagram.png` (binary)\n- `README.md` (+3 -0)\n",
+   "source_hash": "d313afa5feb36456a78f8b96f835cc9cccc2327389427b9f53819a0bbebef42c"
+  },
+  {
+   "sha": "cccccccccccccccccccccccccccccccccccccccc",
+   "excluded": false,
+   "relative_path": ".corpuswire/commits/cccccccccccccccccccccccccccccccccccccccc.md",
+   "text": "# Commit cccccccccccc: Merge pull request #7 from feature\n\n- Commit: cccccccccccccccccccccccccccccccccccccccc\n- Author: Merge Bot\n- Date: 2026-09-30T12:00:00+00:00\n- Parents: dddddddddddd, eeeeeeeeeeee\n- Kind: merge commit; changes are listed against the first parent\n- Files changed: 1 (+1 -1)\n\n## Message\n\nMerge pull request #7 from feature\n\nFeature body\n\n## Changed files\n\n- `src/app.py` (+1 -1)\n",
+   "source_hash": "4c980bb0935ef01b4e21008a6d68bc94e89ea8c6a31fa53817dc9ede69edb724"
+  },
+  {
+   "sha": "ffffffffffffffffffffffffffffffffffffffff",
+   "excluded": false,
+   "relative_path": ".corpuswire/commits/ffffffffffffffffffffffffffffffffffffffff.md",
+   "text": "# Commit ffffffffffff: Initial import\n\n- Commit: ffffffffffffffffffffffffffffffffffffffff\n- Author: Shallow Person\n- Date: 2026-09-29T08:00:00-05:00\n- Changes: unknown (shallow clone boundary)\n\n## Message\n\nInitial import\n",
+   "source_hash": "b5e8831911319ed1982a6ebc8322262def1d4b7f774dd5f373d34a47878c4907"
+  },
+  {
+   "sha": "1111111111111111111111111111111111111111",
+   "excluded": false,
+   "relative_path": ".corpuswire/commits/1111111111111111111111111111111111111111.md",
+   "text": "# Commit 111111111111: Squash: many changes\n\n- Commit: 1111111111111111111111111111111111111111\n- Author: Long Writer\n- Date: 2026-09-28T00:00:00+00:00\n- Parents: aaaaaaaaaaaa\n- Files changed: 205 (+20910 -0)\n\n## Message\n\nSquash: many changes\n\nLine with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with ünïcödé and emoji 😀 Line with\n\n[message truncated]\n\n## Changed files\n\n- `src/gen/file_000.py` (+0 -0)\n- `src/gen/file_001.py` (+1 -0)\n- `src/gen/file_002.py` (+2 -0)\n- `src/gen/file_003.py` (+3 -0)\n- `src/gen/file_004.py` (+4 -0)\n- `src/gen/file_005.py` (+5 -0)\n- `src/gen/file_006.py` (+6 -0)\n- `src/gen/file_007.py` (+7 -0)\n- `src/gen/file_008.py` (+8 -0)\n- `src/gen/file_009.py` (+9 -0)\n- `src/gen/file_010.py` (+10 -0)\n- `src/gen/file_011.py` (+11 -0)\n- `src/gen/file_012.py` (+12 -0)\n- `src/gen/file_013.py` (+13 -0)\n- `src/gen/file_014.py` (+14 -0)\n- `src/gen/file_015.py` (+15 -0)\n- `src/gen/file_016.py` (+16 -0)\n- `src/gen/file_017.py` (+17 -0)\n- `src/gen/file_018.py` (+18 -0)\n- `src/gen/file_019.py` (+19 -0)\n- `src/gen/file_020.py` (+20 -0)\n- `src/gen/file_021.py` (+21 -0)\n- `src/gen/file_022.py` (+22 -0)\n- `src/gen/file_023.py` (+23 -0)\n- `src/gen/file_024.py` (+24 -0)\n- `src/gen/file_025.py` (+25 -0)\n- `src/gen/file_026.py` (+26 -0)\n- `src/gen/file_027.py` (+27 -0)\n- `src/gen/file_028.py` (+28 -0)\n- `src/gen/file_029.py` (+29 -0)\n- `src/gen/file_030.py` (+30 -0)\n- `src/gen/file_031.py` (+31 -0)\n- `src/gen/file_032.py` (+32 -0)\n- `src/gen/file_033.py` (+33 -0)\n- `src/gen/file_034.py` (+34 -0)\n- `src/gen/file_035.py` (+35 -0)\n- `src/gen/file_036.py` (+36 -0)\n- `src/gen/file_037.py` (+37 -0)\n- `src/gen/file_038.py` (+38 -0)\n- `src/gen/file_039.py` (+39 -0)\n- `src/gen/file_040.py` (+40 -0)\n- `src/gen/file_041.py` (+41 -0)\n- `src/gen/file_042.py` (+42 -0)\n- `src/gen/file_043.py` (+43 -0)\n- `src/gen/file_044.py` (+44 -0)\n- `src/gen/file_045.py` (+45 -0)\n- `src/gen/file_046.py` (+46 -0)\n- `src/gen/file_047.py` (+47 -0)\n- `src/gen/file_048.py` (+48 -0)\n- `src/gen/file_049.py` (+49 -0)\n- `src/gen/file_050.py` (+50 -0)\n- `src/gen/file_051.py` (+51 -0)\n- `src/gen/file_052.py` (+52 -0)\n- `src/gen/file_053.py` (+53 -0)\n- `src/gen/file_054.py` (+54 -0)\n- `src/gen/file_055.py` (+55 -0)\n- `src/gen/file_056.py` (+56 -0)\n- `src/gen/file_057.py` (+57 -0)\n- `src/gen/file_058.py` (+58 -0)\n- `src/gen/file_059.py` (+59 -0)\n- `src/gen/file_060.py` (+60 -0)\n- `src/gen/file_061.py` (+61 -0)\n- `src/gen/file_062.py` (+62 -0)\n- `src/gen/file_063.py` (+63 -0)\n- `src/gen/file_064.py` (+64 -0)\n- `src/gen/file_065.py` (+65 -0)\n- `src/gen/file_066.py` (+66 -0)\n- `src/gen/file_067.py` (+67 -0)\n- `src/gen/file_068.py` (+68 -0)\n- `src/gen/file_069.py` (+69 -0)\n- `src/gen/file_070.py` (+70 -0)\n- `src/gen/file_071.py` (+71 -0)\n- `src/gen/file_072.py` (+72 -0)\n- `src/gen/file_073.py` (+73 -0)\n- `src/gen/file_074.py` (+74 -0)\n- `src/gen/file_075.py` (+75 -0)\n- `src/gen/file_076.py` (+76 -0)\n- `src/gen/file_077.py` (+77 -0)\n- `src/gen/file_078.py` (+78 -0)\n- `src/gen/file_079.py` (+79 -0)\n- `src/gen/file_080.py` (+80 -0)\n- `src/gen/file_081.py` (+81 -0)\n- `src/gen/file_082.py` (+82 -0)\n- `src/gen/file_083.py` (+83 -0)\n- `src/gen/file_084.py` (+84 -0)\n- `src/gen/file_085.py` (+85 -0)\n- `src/gen/file_086.py` (+86 -0)\n- `src/gen/file_087.py` (+87 -0)\n- `src/gen/file_088.py` (+88 -0)\n- `src/gen/file_089.py` (+89 -0)\n- `src/gen/file_090.py` (+90 -0)\n- `src/gen/file_091.py` (+91 -0)\n- `src/gen/file_092.py` (+92 -0)\n- `src/gen/file_093.py` (+93 -0)\n- `src/gen/file_094.py` (+94 -0)\n- `src/gen/file_095.py` (+95 -0)\n- `src/gen/file_096.py` (+96 -0)\n- `src/gen/file_097.py` (+97 -0)\n- `src/gen/file_098.py` (+98 -0)\n- `src/gen/file_099.py` (+99 -0)\n- `src/gen/file_100.py` (+100 -0)\n- `src/gen/file_101.py` (+101 -0)\n- `src/gen/file_102.py` (+102 -0)\n- `src/gen/file_103.py` (+103 -0)\n- `src/gen/file_104.py` (+104 -0)\n- `src/gen/file_105.py` (+105 -0)\n- `src/gen/file_106.py` (+106 -0)\n- `src/gen/file_107.py` (+107 -0)\n- `src/gen/file_108.py` (+108 -0)\n- `src/gen/file_109.py` (+109 -0)\n- `src/gen/file_110.py` (+110 -0)\n- `src/gen/file_111.py` (+111 -0)\n- `src/gen/file_112.py` (+112 -0)\n- `src/gen/file_113.py` (+113 -0)\n- `src/gen/file_114.py` (+114 -0)\n- `src/gen/file_115.py` (+115 -0)\n- `src/gen/file_116.py` (+116 -0)\n- `src/gen/file_117.py` (+117 -0)\n- `src/gen/file_118.py` (+118 -0)\n- `src/gen/file_119.py` (+119 -0)\n- `src/gen/file_120.py` (+120 -0)\n- `src/gen/file_121.py` (+121 -0)\n- `src/gen/file_122.py` (+122 -0)\n- `src/gen/file_123.py` (+123 -0)\n- `src/gen/file_124.py` (+124 -0)\n- `src/gen/file_125.py` (+125 -0)\n- `src/gen/file_126.py` (+126 -0)\n- `src/gen/file_127.py` (+127 -0)\n- `src/gen/file_128.py` (+128 -0)\n- `src/gen/file_129.py` (+129 -0)\n- `src/gen/file_130.py` (+130 -0)\n- `src/gen/file_131.py` (+131 -0)\n- `src/gen/file_132.py` (+132 -0)\n- `src/gen/file_133.py` (+133 -0)\n- `src/gen/file_134.py` (+134 -0)\n- `src/gen/file_135.py` (+135 -0)\n- `src/gen/file_136.py` (+136 -0)\n- `src/gen/file_137.py` (+137 -0)\n- `src/gen/file_138.py` (+138 -0)\n- `src/gen/file_139.py` (+139 -0)\n- `src/gen/file_140.py` (+140 -0)\n- `src/gen/file_141.py` (+141 -0)\n- `src/gen/file_142.py` (+142 -0)\n- `src/gen/file_143.py` (+143 -0)\n- `src/gen/file_144.py` (+144 -0)\n- `src/gen/file_145.py` (+145 -0)\n- `src/gen/file_146.py` (+146 -0)\n- `src/gen/file_147.py` (+147 -0)\n- `src/gen/file_148.py` (+148 -0)\n- `src/gen/file_149.py` (+149 -0)\n- `src/gen/file_150.py` (+150 -0)\n- `src/gen/file_151.py` (+151 -0)\n- `src/gen/file_152.py` (+152 -0)\n- `src/gen/file_153.py` (+153 -0)\n- `src/gen/file_154.py` (+154 -0)\n- `src/gen/file_155.py` (+155 -0)\n- `src/gen/file_156.py` (+156 -0)\n- `src/gen/file_157.py` (+157 -0)\n- `src/gen/file_158.py` (+158 -0)\n- `src/gen/file_159.py` (+159 -0)\n- `src/gen/file_160.py` (+160 -0)\n- `src/gen/file_161.py` (+161 -0)\n- `src/gen/file_162.py` (+162 -0)\n- `src/gen/file_163.py` (+163 -0)\n- `src/gen/file_164.py` (+164 -0)\n- `src/gen/file_165.py` (+165 -0)\n- `src/gen/file_166.py` (+166 -0)\n- `src/gen/file_167.py` (+167 -0)\n- `src/gen/file_168.py` (+168 -0)\n- `src/gen/file_169.py` (+169 -0)\n- `src/gen/file_170.py` (+170 -0)\n- `src/gen/file_171.py` (+171 -0)\n- `src/gen/file_172.py` (+172 -0)\n- `src/gen/file_173.py` (+173 -0)\n- `src/gen/file_174.py` (+174 -0)\n- `src/gen/file_175.py` (+175 -0)\n- `src/gen/file_176.py` (+176 -0)\n- `src/gen/file_177.py` (+177 -0)\n- `src/gen/file_178.py` (+178 -0)\n- `src/gen/file_179.py` (+179 -0)\n- `src/gen/file_180.py` (+180 -0)\n- `src/gen/file_181.py` (+181 -0)\n- `src/gen/file_182.py` (+182 -0)\n- `src/gen/file_183.py` (+183 -0)\n- `src/gen/file_184.py` (+184 -0)\n- `src/gen/file_185.py` (+185 -0)\n- `src/gen/file_186.py` (+186 -0)\n- `src/gen/file_187.py` (+187 -0)\n- `src/gen/file_188.py` (+188 -0)\n- `src/gen/file_189.py` (+189 -0)\n- `src/gen/file_190.py` (+190 -0)\n- `src/gen/file_191.py` (+191 -0)\n- `src/gen/file_192.py` (+192 -0)\n- `src/gen/file_193.py` (+193 -0)\n- `src/gen/file_194.py` (+194 -0)\n- `src/gen/file_195.py` (+195 -0)\n- `src/gen/file_196.py` (+196 -0)\n- `src/gen/file_197.py` (+197 -0)\n- `src/gen/file_198.py` (+198 -0)\n- `src/gen/file_199.py` (+199 -0)\n- and 5 more\n",
+   "source_hash": "28f4cc147b1722c1400ae188f101e70041ed1713c5a1630659ccc54ff51735b5"
+  },
+  {
+   "sha": "2222222222222222222222222222222222222222",
+   "excluded": false,
+   "relative_path": ".corpuswire/commits/2222222222222222222222222222222222222222.md",
+   "text": "# Commit 222222222222: (no subject)\n\n- Commit: 2222222222222222222222222222222222222222\n- Author: unknown\n- Date: 2026-09-27T00:00:00+00:00\n- Parents: aaaaaaaaaaaa\n- Files changed: 0 (+0 -0)\n\n## Message\n\n(no subject)\n",
+   "source_hash": "426a575c6b860961f0238d6c901efd6b862eba332463cb7a61943074a0b335f5"
+  },
+  {
+   "sha": "3333333333333333333333333333333333333333",
+   "excluded": true,
+   "relative_path": ".corpuswire/commits/3333333333333333333333333333333333333333.md",
+   "text": "# Commit 333333333333: Update workflow\n\n- Commit: 3333333333333333333333333333333333333333\n- Author: Dot Toucher\n- Date: 2026-09-26T00:00:00+00:00\n- Parents: aaaaaaaaaaaa\n- Files changed: 2 (+2 -1)\n\n## Message\n\nUpdate workflow\n\n## Changed files\n\n- `.github/workflows/ci.yml` (+1 -1)\n- `src/app.py` (+1 -0)\n",
+   "source_hash": "5ff5e35a9bf539cd59a2e3ef9b5743e951fb06ae2d27979e20cb4570787e1389"
+  },
+  {
+   "sha": "4444444444444444444444444444444444444444",
+   "excluded": true,
+   "relative_path": ".corpuswire/commits/4444444444444444444444444444444444444444.md",
+   "text": "# Commit 444444444444: Update values\n\n- Commit: 4444444444444444444444444444444444444444\n- Author: Tf Person\n- Date: 2026-09-25T00:00:00+00:00\n- Parents: aaaaaaaaaaaa\n- Files changed: 1 (+1 -1)\n\n## Message\n\nUpdate values\n\n## Changed files\n\n- `infra/prod.tfvars` (+1 -1)\n",
+   "source_hash": "78accbb6e328d96d9b2618bd72dda95e4f8f83fef74bbac49101218cf0315b8b"
+  },
+  {
+   "sha": "5555555555555555555555555555555555555555",
+   "excluded": true,
+   "relative_path": ".corpuswire/commits/5555555555555555555555555555555555555555.md",
+   "text": "# Commit 555555555555: Bump deps\n\n- Commit: 5555555555555555555555555555555555555555\n- Author: Vendor Person\n- Date: 2026-09-24T00:00:00+00:00\n- Parents: aaaaaaaaaaaa\n- Files changed: 1 (+1 -1)\n\n## Message\n\nBump deps\n\n## Changed files\n\n- `node_modules/x/index.js` (+1 -1)\n",
+   "source_hash": "755519c5ff83037c5b8e4810d2765e2e02743bc16d9636bd37d7f21e6ee175ee"
+  },
+  {
+   "sha": "6666666666666666666666666666666666666666666666666666666666666666",
+   "excluded": false,
+   "relative_path": ".corpuswire/commits/6666666666666666666666666666666666666666666666666666666666666666.md",
+   "text": "# Commit 666666666666: SHA-256 repo\n\n- Commit: 6666666666666666666666666666666666666666666666666666666666666666\n- Author: Sha256 Person\n- Date: 2026-09-23T00:00:00+00:00\n- Parents: aaaaaaaaaaaa\n- Files changed: 1 (+1 -1)\n\n## Message\n\nSHA-256 repo\n\n## Changed files\n\n- `src/app.py` (+1 -1)\n",
+   "source_hash": "51360c86c48b08331d3fe68ebc5e5b213f4ca120013ac25cc546cb76859e8483"
+  },
+  {
+   "sha": "8888888888888888888888888888888888888888",
+   "excluded": false,
+   "relative_path": ".corpuswire/commits/8888888888888888888888888888888888888888.md",
+   "text": "# Commit 888888888888: Subject with spaces\n\n- Commit: 8888888888888888888888888888888888888888\n- Author: Email In Name\n- Date: 2026-09-22T00:00:00+00:00\n- Parents: aaaaaaaaaaaa\n- Files changed: 2 (+3 -3)\n\n## Message\n\nSubject with spaces\n\nreach me at please\n\n## Changed files\n\n- `src/app.py` (+2 -2)\n- `.vscode/mcp.json.example` (+1 -1)\n",
+   "source_hash": "322125ec90cb2f41f64369487073fd3a70f54a723f6502f371ddbd6112ca2730"
+  }
+ ],
+ "path_cases": [
+  {
+   "path": "src/app.py",
+   "excluded": false
+  },
+  {
+   "path": ".env",
+   "excluded": true
+  },
+  {
+   "path": ".github/x.yml",
+   "excluded": true
+  },
+  {
+   "path": "a/.hidden/b.py",
+   "excluded": true
+  },
+  {
+   "path": "build/out.js",
+   "excluded": true
+  },
+  {
+   "path": "src/build/x.py",
+   "excluded": true
+  },
+  {
+   "path": "node_modules/a.js",
+   "excluded": true
+  },
+  {
+   "path": ".venv-dev/x.py",
+   "excluded": true
+  },
+  {
+   "path": "venv/x.py",
+   "excluded": false
+  },
+  {
+   "path": "x/__pycache__/y.pyc",
+   "excluded": true
+  },
+  {
+   "path": "Pods/a.swift",
+   "excluded": true
+  },
+  {
+   "path": ".vscode/mcp.json.example",
+   "excluded": false
+  },
+  {
+   "path": ".vscode/mcp.json",
+   "excluded": true
+  },
+  {
+   "path": "infra/prod.tfvars",
+   "excluded": true
+  },
+  {
+   "path": "infra/prod.tfvars.json",
+   "excluded": true
+  },
+  {
+   "path": "terraform.tfstate.backup",
+   "excluded": true
+  },
+  {
+   "path": "crash.log",
+   "excluded": true
+  },
+  {
+   "path": "tfplan",
+   "excluded": true
+  },
+  {
+   "path": "plan.tfplan",
+   "excluded": true
+  },
+  {
+   "path": "out.plan",
+   "excluded": true
+  },
+  {
+   "path": "out.plan.json",
+   "excluded": true
+  },
+  {
+   "path": "docs/plan.md",
+   "excluded": false
+  },
+  {
+   "path": "target/classes/A.class",
+   "excluded": true
+  },
+  {
+   "path": "obj/x.cs",
+   "excluded": true
+  },
+  {
+   "path": "dist",
+   "excluded": true
+  },
+  {
+   "path": "src/distribution.py",
+   "excluded": false
+  }
+ ]
+}

@@ -188,6 +188,22 @@ export CORPUSWIRE_WORKSPACE_ID=github://rbrn/corpuswire#main
 
 Avoid storing Basic Auth values or bearer tokens in shell history.
 
+Options from CRP-001, all off by default:
+
+- `--respect-gitignore` or `CORPUSWIRE_RESPECT_GITIGNORE=true` skips files
+  ignored by the root and nested `.gitignore` files and `.git/info/exclude`
+  during the scan, with git's precedence. It changes the inventory's ignore
+  digest, so the server sees a different selection policy.
+- `--commit-history` or `CORPUSWIRE_COMMIT_HISTORY_ENABLED=true` uploads recent
+  commits as `.corpuswire/commits/<sha>.md` documents with the indexed files,
+  rendered exactly as the server's `INGEST_COMMIT_HISTORY_ENABLED` documents
+  (`CORPUSWIRE_COMMIT_HISTORY_SINCE_DAYS`, default 365;
+  `CORPUSWIRE_COMMIT_HISTORY_MAX_COMMITS`, default and maximum 2000). Watch mode
+  re-reads commits only when a file change triggers an index.
+- `cw enhance` prints `Not found in the index; closest files, not confirmed:
+  ...` on stderr when the service abstained, so stdout stays the prompt;
+  `cw search` prints it after `No context found.`.
+
 ## Usage Examples
 
 Check the backend:
