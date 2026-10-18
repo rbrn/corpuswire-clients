@@ -5,6 +5,7 @@ import { mkdtemp, mkdir, rm, writeFile, readFile, readdir, chmod, symlink, renam
 import { EventEmitter, once } from "node:events";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
+import { rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
@@ -313,7 +314,7 @@ test("main indexes the current folder with no arguments after printing the previ
 test("main prints the installed CLI version offline for command and flags", async () => {
   const metadata = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const lock = JSON.parse(await readFile(new URL("../package-lock.json", import.meta.url), "utf8"));
-  assert.equal(metadata.version, "0.1.4-beta.7");
+  assert.equal(metadata.version, "0.1.5-beta.1");
   assert.deepEqual(metadata.bin, { cw: "bin/corpuswire.js" });
   assert.equal(lock.version, metadata.version);
   assert.equal(lock.packages[""].version, metadata.version);
@@ -326,7 +327,7 @@ test("main prints the installed CLI version offline for command and flags", asyn
       fetchFn: () => { throw new Error("Version must not contact the backend"); },
       sdk: { CorpusWireClient: class { constructor() { throw new Error("Version must not load a client"); } } },
     });
-    assert.deepEqual(writes, ["0.1.4-beta.7"]);
+    assert.deepEqual(writes, ["0.1.5-beta.1"]);
   }
   const help = [];
   await main(["--help"], { write: (line) => help.push(line) });
@@ -1410,7 +1411,7 @@ test("CLI complete scan carries inventory evidence and cancellation cannot reach
   } finally { await rm(fixture, { recursive: true, force: true }); }
 });
 
-async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, onPreview, onDiagnosis, onSetup, watcherUnavailable = false, watcherError } = {}) {
+async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, onPreview, onDiagnosis, onSetup, onConfirm, onClientSetup, watcherUnavailable = false, watcherError } = {}) {
   const root = await syntheticWorkspace();
   const controller = new AbortController();
   const state = {
@@ -1449,12 +1450,16 @@ async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, 
   });
   try {
     await onSetup?.(state);
+    const selectedArgs = state.sourceRoot ? [...argv, "--source-root", state.sourceRoot] : argv;
     const args = argv.includes("watch") || argv.includes("--watch")
-      ? [...argv, "--poll-ms", "100", "--debounce-ms", "10"] : argv;
+      ? [...selectedArgs, "--poll-ms", "100", "--debounce-ms", "10"] : selectedArgs;
     state.result = await main(args, {
-      cwd: root, homeDirectory: root, env: {}, client, signal: controller.signal, isTTY,
+      cwd: state.cwd ?? root, homeDirectory: root, env: {}, platform: "linux",
+      client: onClientSetup ? undefined : client,
+      sdk: onClientSetup ? { CorpusWireClient: class { constructor() { onClientSetup(state); return client; } } } : undefined,
+      signal: controller.signal, isTTY,
       write: (line) => state.writes.push(line), writeRaw: () => {},
-      confirm: () => { throw new Error("Local watch must not request indexing confirmation"); },
+      confirm: async (prompt) => { if (onConfirm) return onConfirm(state, prompt); throw new Error("Local watch must not request indexing confirmation"); },
       watchFactory: (sourceRoot, options, callback) => {
         assert.equal(sourceRoot, root);
         assert.equal(options.recursive, true);
@@ -2208,6 +2213,148 @@ test("runtime watcher failure reports safe reason and closes its handle once", {
   assert.deepEqual(fallback, { stage: "runtime", reason: "watch_permission_denied", error_code: "EPERM" });
   assert.equal(state.closed, 1);
   assert.ok(state.writes.every((line) => !line.includes("secret") && !line.includes("/private/path")));
+});
+
+
+test("review: unknown environment profiles and nonpositive or unsafe file limits fail before requests", async () => {
+  let requests = 0;
+  const client = { getIndexCapabilities: async () => { requests += 1; } };
+  await assert.rejects(main(["index"], { env: { CORPUSWIRE_PROFILE: "hostd" }, client }), /Unsupported profile/);
+  for (const limit of ["0", "0.5", "9007199254740992"]) {
+    await assert.rejects(main(["index", "--max-file-size", limit], { env: {}, client }), /positive safe integer/);
+  }
+  assert.equal(requests, 0);
+  assert.equal(parseCliArgs(["index", "--profile", "local"], { CORPUSWIRE_PROFILE: "hostd" }).profile, "local");
+});
+
+test("review: option-first bare prompts retain enhancement dispatch", () => {
+  for (const args of [["--json", "explain this"], ["--output-mode", "copilot", "prompt"]]) {
+    const result = parseCliArgs(args, {});
+    assert.equal(result.command, "enhance");
+    assert.equal(result.implicitIndex, false);
+    assert.equal(result.promptParts.length, 1);
+  }
+  assert.throws(() => parseCliArgs(["index", "prompt"], {}), /Unexpected argument/);
+});
+
+test("review: one-shot scans accept canonical aliases and source-root symlinks", async () => {
+  const root = await syntheticWorkspace();
+  const link = `${root}-alias`;
+  await symlink(root, link);
+  try {
+    let request;
+    const result = await main(["index", "--source-root", link, "--yes"], {
+      cwd: root, homeDirectory: root, env: {}, write: () => {}, writeRaw: () => {},
+      client: fakeIndexClient({ indexWorkspace: async (value) => { request = value; return { ok: true, result: {}, status: {} }; } }),
+    });
+    assert.equal(result.ok, true);
+    assert.equal(request.workspace.displayRoot, root);
+    assert.ok(request.files.length > 0);
+  } finally { await rm(link, { force: true }); await rm(root, { recursive: true, force: true }); }
+});
+
+test("review: interactive hosted implicit indexing preserves one-shot confirmation", async () => {
+  const root = await syntheticWorkspace();
+  let confirmations = 0, mutations = 0;
+  try {
+    const result = await main([], {
+      cwd: root, homeDirectory: root, isTTY: true,
+      env: { CORPUSWIRE_PROFILE: "hosted", CORPUSWIRE_BASE_URL: "https://example.invalid" },
+      client: fakeIndexClient({ indexWorkspace: async () => { mutations += 1; } }),
+      confirm: async () => { confirmations += 1; return ""; }, write: () => {}, writeRaw: () => {},
+      watchFactory: () => { throw new Error("Hosted implicit indexing must not watch"); },
+    });
+    assert.equal(result.started, false);
+    assert.equal(confirmations, 1);
+    assert.equal(mutations, 0);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("review: explicit index/reconcile watches confirm once and refusal makes no mutation", async () => {
+  for (const command of ["index", "reconcile"]) {
+    let confirmations = 0;
+    const refused = await watchFixture({ argv: [command, "--watch"], onConfirm: () => { confirmations += 1; return ""; } });
+    assert.ifError(refused.error);
+    assert.equal(confirmations, 1);
+    assert.equal(refused.requests.length, 0);
+    assert.equal(refused.result.started, false);
+    confirmations = 0;
+    const accepted = await watchFixture({ argv: [command, "--watch"], onConfirm: () => { confirmations += 1; return "y"; },
+      onWait: async (state) => {
+        if (state.requests.length === 1) { await writeFile(path.join(state.root, "README.md"), "# second\n"); state.notify(); }
+        else if (state.requests.length === 2) state.controller.abort();
+      },
+    });
+    assert.ifError(accepted.error);
+    assert.equal(confirmations, 1);
+    assert.equal(accepted.requests.length, 2);
+  }
+});
+
+test("review: first stop aborts stalled health and diagnosis beneath base path", async () => {
+  for (const endpoint of ["/v1/health", "/v1/context/diagnose", "/health", "/context/diagnose"]) {
+    const controller = new AbortController();
+    const fetch = createWatchFetch(async (_url, init) => new Promise((_, reject) => {
+      init.signal.addEventListener("abort", () => reject(new DOMException("stopped", "AbortError")), { once: true });
+    }), { baseUrl: "https://example.invalid/cw", signal: controller.signal, timeoutMs: 5000 });
+    const result = fetch(`https://example.invalid/cw${endpoint}`);
+    controller.abort();
+    await assert.rejects(result, /stopped/);
+  }
+});
+
+test("review: explicit and implicit watches fence removed or retargeted source-root aliases", { timeout: 10000 }, async () => {
+  for (const implicit of [false, true]) {
+    for (const action of ["remove", "retarget"]) {
+      let changed = false;
+      const state = await watchFixture({ argv: implicit ? [] : ["watch"], isTTY: implicit,
+        onSetup: async (current) => {
+          current.alias = `${current.root}-watch-alias`;
+          current.extraPaths.push(current.alias);
+          await symlink(current.root, current.alias);
+          if (implicit) current.cwd = current.alias;
+          else current.sourceRoot = current.alias;
+          current.replacement = await syntheticWorkspace();
+          current.extraPaths.push(current.replacement);
+        },
+        onIndex: async (current, request) => {
+          assert.equal(request.workspace.displayRoot, current.root, "Publication must use the selected canonical root");
+        },
+        onWait: async (current) => {
+          if (changed) return;
+          changed = true;
+          await rm(current.alias);
+          if (action === "retarget") await symlink(current.replacement, current.alias);
+          // The selected canonical target is still intact and changed; losing
+          // the alias fence would incorrectly publish this second generation.
+          await writeFile(path.join(current.root, "README.md"), "# Changed after alias loss\n");
+          assert.equal(await readFile(path.join(current.root, "README.md"), "utf8"), "# Changed after alias loss\n");
+          current.notify("README.md");
+        },
+      });
+      assert.equal(state.requests.length, 1, `${implicit ? "implicit" : "explicit"} ${action}: alias drift must prevent follow-up publication`);
+      assert.equal(state.error?.code, "watch_fence");
+      assert.match(state.error.message, action === "remove" ? /disappeared/ : /replaced/);
+      assert.ok(state.waits < 50, "Alias drift must stop promptly");
+    }
+  }
+});
+
+test("review: watch does not adopt an alias retargeted during client setup", async () => {
+  const state = await watchFixture({ onSetup: async (current) => {
+    current.alias = `${current.root}-setup-alias`;
+    current.extraPaths.push(current.alias);
+    current.sourceRoot = current.alias;
+    await symlink(current.root, current.alias);
+    current.replacement = await syntheticWorkspace();
+    current.extraPaths.push(current.replacement);
+  }, onClientSetup: (current) => {
+    rmSync(current.alias);
+    symlinkSync(current.replacement, current.alias);
+  } });
+  assert.equal(state.requests.length, 0, "Pre-publication fence must detect alias retargeting during setup");
+  assert.equal(state.error?.code, "watch_fence");
+  assert.match(state.error.message, /replaced/);
 });
 
 async function existingSessionSdkFixture({ command = 'index', phase = 'completed', interrupt = false, onStatus, preflight, race = false, noList = false, timeoutMs, interruptEvent, ndjson = false, unreadable = false, readTimeoutMs, hanging = false } = {}) {

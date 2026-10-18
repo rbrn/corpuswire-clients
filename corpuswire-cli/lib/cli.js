@@ -1,4 +1,4 @@
-import { isRetrievalExcludedPath } from "@corpuswire/sdk";
+import { deriveWorkspaceId, isRetrievalExcludedPath } from "@corpuswire/sdk";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { readFile, readdir, stat, lstat, mkdir, writeFile, open, realpath } from "node:fs/promises";
@@ -8,6 +8,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline/promises";
 import { promisify } from "node:util";
+import { MCP_HELP, doctorHostConfig, formatMcpResult, installHostConfig, locateMcpServer, parseMcpArgs } from "./mcp-hosts.js";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:18080";
 const DEFAULT_WATCH_REQUEST_TIMEOUT_MS = 30_000;
@@ -29,7 +30,7 @@ const INDEX_TRACE_STAGES = new Set([
   "session_lock_wait", "session_lock_hold", "session_catalog",
   "writer_creation", "schema_preflight", "session_persistence",
 ]);
-const CLI_VERSION = "0.1.4-beta.7";
+const CLI_VERSION = "0.1.5-beta.1";
 
 export function printHelp(write = console.log) {
   write(`cw
@@ -49,6 +50,7 @@ Usage:
   cw index-activity [options]
   cw index [options]
   cw version                 Show the installed CLI version (offline)
+  cw mcp serve|install|doctor Run or configure the MCP server for Claude Code, VS Code, Copilot CLI or Codex
 
 Options:
   --api-base-url <url>     Backend base URL. Default: ${DEFAULT_BASE_URL}
@@ -319,6 +321,14 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
     }
   }
 
+  if (options.implicitIndex && options.promptParts.length) {
+    command = options.command = "enhance";
+    options.implicitIndex = false;
+  }
+  if (!["local", "hosted"].includes(options.profile)) throw new Error(`Unsupported profile: ${options.profile}`);
+  if (options.maxFileSizeBytes !== undefined && (!Number.isSafeInteger(options.maxFileSizeBytes) || options.maxFileSizeBytes <= 0)) {
+    throw new Error("max-file-size must be a positive safe integer.");
+  }
   if (command !== "init" && (options.indexAfterInit || options.verifyAfterInit)) {
     throw new Error("--index and --verify are only supported with init.");
   }
@@ -337,15 +347,31 @@ export async function runCliCommand(options, dependencies = {}) {
   const write = dependencies.write ?? console.log;
   const configurationInputs = { ...options };
   if (["index", "reconcile", "init", "doctor", "watch"].includes(options.command)) {
-    const sourceRoot = path.resolve(options.sourceRoot || process.cwd());
+    const requestedSourceRoot = path.resolve(options.sourceRoot || process.cwd());
+    const sourceRoot = await realpath(requestedSourceRoot);
     const sourceStats = await stat(sourceRoot);
     if (!sourceStats.isDirectory()) throw new Error(`Workspace root is not a directory: ${sourceRoot}`);
     const configuration = await resolveIndexConfiguration(options, sourceRoot, dependencies);
     validateIndexDestination(configuration);
-    options = { ...options, ...configuration, apiBaseUrl: configuration.baseUrl, sourceRoot, configuration };
+    options = { ...options, ...configuration, apiBaseUrl: configuration.baseUrl, sourceRoot, requestedSourceRoot, configuration };
+    const interactive = dependencies.isTTY ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    if (options.implicitIndex && configuration.profile === "local" && interactive
+      && !options.once && !options.nonInteractive && !options.json && !options.ndjson) options.watch = true;
     if (options.command === "init") {
       const result = await initializeWorkspace(options, dependencies);
       if (!options.indexAfterInit && !options.verifyAfterInit) return result;
+    }
+  }
+  // Query commands use the workspace this folder is configured or indexed for,
+  // the same identity `cw` indexes with, unless one was named explicitly.
+  let derivedQueryWorkspace;
+  if (["search", "query", "enhance", "health"].includes(options.command) && !options.workspaceId && !options.repoPath) {
+    const sourceRoot = path.resolve(options.sourceRoot || process.cwd());
+    const configuration = await resolveIndexConfiguration(options, sourceRoot, dependencies).catch(() => undefined);
+    if (configuration?.workspaceId) {
+      if (configuration.workspaceIdSource === "derived") derivedQueryWorkspace = configuration.workspaceId;
+      options = { ...options, workspaceId: configuration.workspaceId,
+        apiBaseUrl: options.apiBaseUrlExplicit ? options.apiBaseUrl : configuration.baseUrl };
     }
   }
   const sdk = dependencies.client ? undefined : dependencies.sdk ?? await loadSdk();
@@ -374,6 +400,12 @@ export async function runCliCommand(options, dependencies = {}) {
         ? traceCollector.wrapFetch(fetchFn ?? globalThis.fetch)
         : fetchFn,
     });
+
+  if (derivedQueryWorkspace && !(await workspaceHasIndex(client, derivedQueryWorkspace))) {
+    // A folder default nobody indexed yet would only return nothing; keep the backend default.
+    (dependencies.writeError ?? console.error)(`Note: ${derivedQueryWorkspace} has no index yet; using the backend default workspace. Run cw in this folder to index it.`);
+    options = { ...options, workspaceId: "" };
+  }
 
   if (options.watch) return runWatchCommand(options, { ...dependencies, client, sdk, write, traceCollector, configurationInputs });
 
@@ -532,7 +564,7 @@ export function createWatchFetch(fetchFn, {
     const sessionId = /^\/v1\/index\/sessions\/([^/]+)(?:\/|$)/.exec(apiPathname)?.[1];
     const requestTimeoutMs = publication ? publicationTimeoutMs : timeoutMs;
     const signals = [init.signal, detachSignal];
-    if (["/v1/index/capabilities", "/v1/index/preview"].includes(apiPathname)) signals.push(signal);
+    if (["/v1/index/capabilities", "/v1/index/preview", "/v1/health", "/v1/context/diagnose", "/health", "/context/diagnose"].includes(apiPathname)) signals.push(signal);
     const abort = () => controller.abort();
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; abort(); }, requestTimeoutMs);
@@ -647,8 +679,8 @@ export async function runWatchCommand(options, dependencies) {
       : `${message} Reason: ${fallback.reason}${fallback.error_code ? ` (${fallback.error_code})` : ""}.`);
   };
   const signal = dependencies.signal;
-  const requestedRoot = options.sourceRoot;
-  const root = await realpath(requestedRoot);
+  const requestedRoot = options.requestedSourceRoot ?? path.resolve(options.sourceRoot);
+  const root = options.requestedSourceRoot ? options.sourceRoot : await realpath(requestedRoot);
   const rootIdentity = await stat(root);
   const configurationInputs = dependencies.configurationInputs ?? options;
   const configurationIdentity = watchConfigurationIdentity(options.configuration);
@@ -704,7 +736,7 @@ export async function runWatchCommand(options, dependencies) {
     if (currentRoot !== root || currentIdentity.dev !== rootIdentity.dev || currentIdentity.ino !== rootIdentity.ino) {
       throw watchFailure("Workspace root was replaced. Restart cw to select the new folder.");
     }
-    const configuration = await resolveIndexConfiguration(configurationInputs, requestedRoot, dependencies);
+    const configuration = await resolveIndexConfiguration(configurationInputs, root, dependencies);
     if (watchConfigurationIdentity(configuration) !== configurationIdentity) {
       throw watchFailure("Workspace, service, or indexing filters changed. Restart cw to apply the new configuration.");
     }
@@ -765,7 +797,10 @@ export async function runWatchCommand(options, dependencies) {
         if (generation !== scanGeneration) continue;
         const digest = createHash("sha256").update(JSON.stringify(scan.files.map((file) => [file.relativePath, file.sha256]).sort((a, b) => a[0].localeCompare(b[0])))).digest("hex");
         if (digest !== publishedDigest) {
-          const result = await runIndexCommand({ ...options, sourceRoot: root, yes: true, nonInteractive: true }, {
+          const initialExplicitIndex = publications === 0 && ["index", "reconcile"].includes(options.command) && !options.implicitIndex;
+          const result = await runIndexCommand({ ...options, sourceRoot: root,
+            yes: initialExplicitIndex ? options.yes : true,
+            nonInteractive: initialExplicitIndex ? options.nonInteractive : true }, {
             ...dependencies, capabilities, preparedScan: scan, assertObserveFence: assertFence,
             write: (line) => {
               if (!options.json && !options.ndjson) return output(line);
@@ -779,6 +814,7 @@ export async function runWatchCommand(options, dependencies) {
             },
           });
           if (signal?.aborted) break;
+          if (result.started === false) return { ...result, stopped: true, publications, exitCode: 0 };
           if (result.observedExisting && result.phase === "completed") {
             // A borrowed publication cannot attest this process's local inventory.
             publishedDigest = null;
@@ -837,7 +873,7 @@ export async function runIndexCommand(options, dependencies) {
   const write = dependencies.write ?? console.log;
   const writeRaw = dependencies.writeRaw ?? ((value) => process.stdout.write(value));
   const isTTY = dependencies.isTTY ?? Boolean(process.stdout.isTTY);
-  const sourceRoot = path.resolve(options.sourceRoot || process.cwd());
+  const sourceRoot = await realpath(path.resolve(options.sourceRoot || process.cwd()));
   const traceCollector = dependencies.traceCollector ?? createIndexTraceCollector();
   const sourceStats = await stat(sourceRoot);
   if (!sourceStats.isDirectory()) {
@@ -1100,8 +1136,10 @@ async function resolveIndexConfiguration(options, sourceRoot, dependencies = {})
   return {
     profile: options.profile ?? "local",
     workspaceId: options.workspaceIdExplicit || options.workspaceId
-      ? options.workspaceId || deriveWorkspaceId(sourceRoot)
-      : configuredWorkspaceId || deriveWorkspaceId(sourceRoot),
+      ? options.workspaceId || await deriveWorkspaceId(sourceRoot)
+      : configuredWorkspaceId || await deriveWorkspaceId(sourceRoot),
+    workspaceIdSource: options.workspaceIdExplicit || options.workspaceId ? "explicit"
+      : configuredWorkspaceId ? "configured" : "derived",
     baseUrl: options.apiBaseUrlExplicit
       ? options.apiBaseUrl
       : configuredBaseUrl || options.apiBaseUrl || DEFAULT_BASE_URL,
@@ -1122,6 +1160,16 @@ async function resolveIndexConfiguration(options, sourceRoot, dependencies = {})
       ?? mcpValue("CORPUSWIRE_SYNC_MAX_FILE_SIZE_BYTES")
       ?? nestedValue(userSettings, "remoteIndexing.maxFileSizeBytes")),
   };
+}
+
+async function workspaceHasIndex(client, workspaceId) {
+  if (typeof client.diagnoseWorkspace !== "function") return false;
+  try {
+    const diagnosis = await client.diagnoseWorkspace({ workspaceId });
+    return diagnosis?.can_retrieve === true || Number(diagnosis?.point_count) > 0;
+  } catch {
+    return false;
+  }
 }
 
 function nestedValue(record, dottedPath) {
@@ -1343,6 +1391,7 @@ async function runDoctorCommand(options, dependencies) {
 }
 
 function validateIndexDestination(configuration) {
+  if (!["local", "hosted"].includes(configuration.profile)) throw new Error(`Unsupported profile: ${configuration.profile}`);
   let url;
   try {
     url = new URL(configuration.baseUrl);
@@ -1358,19 +1407,6 @@ function validateIndexDestination(configuration) {
   if (configuration.profile === "local" && !["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname)) {
     throw new Error("Local indexing profiles require a loopback CorpusWire service. Use --profile hosted for HTTPS services.");
   }
-}
-
-function deriveWorkspaceId(sourceRoot) {
-  const slug = path.basename(sourceRoot)
-    .normalize("NFKD")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  if (!slug) {
-    throw new Error("Could not derive a workspace identity; pass --workspace-id explicitly.");
-  }
-  const suffix = createHash("sha256").update(path.resolve(sourceRoot)).digest("hex").slice(0, 12);
-  return `local-docker://${slug}-${suffix}#main`;
 }
 
 async function scanWorkspace(sourceRoot, options) {
@@ -2349,6 +2385,7 @@ function formatIndexEvent(event) {
 }
 
 export async function main(argv = process.argv.slice(2), dependencies = {}) {
+  if (argv[0] === "mcp") return runMcpCommand(argv.slice(1), dependencies);
   const options = parseCliArgs(argv, dependencies.env ?? process.env, dependencies.cwd ?? process.cwd());
   if (options.version) {
     (dependencies.write ?? console.log)(CLI_VERSION);
@@ -2366,8 +2403,6 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     }
     return result;
   };
-  const interactive = dependencies.isTTY ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
-  if (options.implicitIndex && interactive && !options.once && !options.nonInteractive && !options.json && !options.ndjson) options.watch = true;
   const indexingCommand = ["index", "reconcile", "watch"].includes(options.command)
     || (options.command === "init" && options.indexAfterInit);
   if (!indexingCommand || dependencies.signal) {
@@ -2408,4 +2443,34 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     runtimeProcess.off("SIGINT", onInterrupt);
     runtimeProcess.off("SIGTERM", onInterrupt);
   }
+}
+
+/** `cw mcp …`: serve the MCP server, or install and check a host's configuration. */
+export async function runMcpCommand(argv, dependencies = {}) {
+  const env = dependencies.env ?? process.env;
+  const write = dependencies.write ?? console.log;
+  const options = parseMcpArgs(argv, env, dependencies.cwd ?? process.cwd());
+  if (!options.subcommand || options.subcommand === "help") {
+    write(MCP_HELP);
+    return undefined;
+  }
+  if (options.subcommand === "serve") {
+    // stdout belongs to the protocol from here on; credentials stay in this process.
+    if (!env.CORPUSWIRE_BEARER_TOKEN && !env.CORPUSWIRE_BASIC_AUTH) {
+      const { bearerToken } = await resolveServiceAuthorization({ basicAuth: "", apiBaseUrl: options.apiBaseUrl }, dependencies)
+        .catch(() => ({ bearerToken: "" }));
+      if (bearerToken) env.CORPUSWIRE_BEARER_TOKEN = bearerToken;
+    }
+    await import(await locateMcpServer(env));
+    return undefined;
+  }
+  const result = options.subcommand === "install"
+    ? await installHostConfig(options, dependencies)
+    : await doctorHostConfig(options, dependencies);
+  write(options.json ? JSON.stringify(result, null, 2) : formatMcpResult(result));
+  if (result.ok === false) {
+    if (dependencies.process) dependencies.process.exitCode = 1;
+    else if (!dependencies.write) process.exitCode = 1;
+  }
+  return result;
 }

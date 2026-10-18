@@ -208,3 +208,17 @@ export { INVENTORY_VERSION, WorkspaceScanIncompleteError, canonicalInventoryPath
 export type { InventoryScan, InventorySelectionPolicy, WorkspaceInventory, WorkspaceCoverage, IndexTransferSummary } from "./types.js";
 
 export { isRetrievalExcludedPath, ingestionPriority } from "./inventory.js";
+export {
+  WORKSPACE_IDENTITY_VERSION,
+  configuredWorkspaceId,
+  deriveWorkspaceId,
+  parseJsonc,
+  resolveWorkspaceIdentity,
+  userProfilePaths,
+  workspaceConfigPaths,
+} from "./workspace-identity.js";
+export type {
+  ResolveWorkspaceIdentityOptions,
+  WorkspaceIdentity,
+  WorkspaceIdentitySource,
+} from "./workspace-identity.js";

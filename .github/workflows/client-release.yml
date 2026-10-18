@@ -1,0 +1,62 @@
+name: Client prerelease
+
+# Pushing sdk-v*, mcp-v* or cli-v* publishes that package as a GitHub
+# prerelease with its npm archive and checksum. Running the workflow by hand
+# with a tag name creates that tag at the dispatched commit instead. Notes come
+# from release-notes/<tag>.md at that commit.
+on:
+  push:
+    tags:
+      - 'sdk-v*'
+      - 'mcp-v*'
+      - 'cli-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create and publish, such as mcp-v0.1.5-beta.1'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+      - name: Pack the tagged package
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          case "$TAG" in
+            sdk-v*) DIR=corpuswire-sdk; TITLE="CorpusWire SDK" ;;
+            mcp-v*) DIR=corpuswire-mcp; TITLE="CorpusWire MCP" ;;
+            cli-v*) DIR=corpuswire-cli; TITLE="CorpusWire CLI" ;;
+            *) echo "Unsupported tag $TAG" >&2; exit 1 ;;
+          esac
+          VERSION="${TAG#*-v}"
+          test "$(node -p "require('./$DIR/package.json').version")" = "$VERSION"
+          test -f "release-notes/$TAG.md"
+          # Tests run against the main repository checkout before tagging; the
+          # MCP suite also exercises the plugin wrapper that lives there.
+          if [ "$DIR" = corpuswire-mcp ]; then (cd "$DIR" && npm run check:vendor); fi
+          mkdir -p dist
+          npm pack "./$DIR" --pack-destination dist
+          (cd dist && for f in *.tgz; do sha256sum "$f" > "$f.sha256"; done)
+          echo "TITLE=$TITLE $VERSION" >> "$GITHUB_ENV"
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then TARGET=--verify-tag; else TARGET="--target=$GITHUB_SHA"; fi
+          gh release create "$TAG" dist/*.tgz dist/*.sha256 "$TARGET" --prerelease --title "$TITLE" --notes-file "release-notes/$TAG.md"

@@ -1,6 +1,6 @@
 {
   "name": "@corpuswire/mcp",
-  "version": "0.1.4-beta.4",
+  "version": "0.1.5-beta.1",
   "description": "STDIO MCP server for secure local or remote CorpusWire retrieval, prompt enhancement, and workspace sync",
   "type": "module",
   "bin": {
@@ -13,6 +13,8 @@
     "bin",
     "lib/selected-neighbor.mjs",
     "lib/source-root-coalescing.mjs",
+    "lib/host-profile.mjs",
+    "lib/workspace-scope.mjs",
     "examples",
     "vendor",
     "README.md"

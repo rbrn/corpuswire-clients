@@ -1,2 +1,5 @@
 # Local MCP retrieval diagnostics are runtime output, not release sources.
 corpuswire-mcp/reports/retrieval-failures/
+
+# Installed dependencies are rebuilt from package lockfiles.
+node_modules/
