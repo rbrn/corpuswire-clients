@@ -750,8 +750,15 @@ class SyncManager {
     const checkedAt = this.bootstrapStatus.checkedAt;
     const checkedAtMs = checkedAt ? Date.parse(checkedAt) : NaN;
     const freshnessAgeMs = Number.isFinite(checkedAtMs) ? Math.max(0, Date.now() - checkedAtMs) : null;
-    const isStaleForStrict = this.bootstrapStatus.needsReconcile === true
-      && (staleAfterMs === 0 || (freshnessAgeMs !== null && freshnessAgeMs >= staleAfterMs));
+    // A healthy code checkpoint can replace a full baseline observed by this
+    // process. Startup and local observation failures still require reconcile.
+    const readableCodeCheckpoint = this.bootstrapStatus.codeReady === true
+      && this.bootstrapStatus.needsReconcile !== true
+      && this.readableCheckpointBaseline?.contextKey === this.coverageContextKey
+      && this.readableCheckpointBaseline !== undefined && this.lastError === null;
+    const unprovenObservationGap = this.observationGap !== false && !readableCodeCheckpoint;
+    const isStaleForStrict = unprovenObservationGap || (this.bootstrapStatus.needsReconcile === true
+      && (staleAfterMs === 0 || (freshnessAgeMs !== null && freshnessAgeMs >= staleAfterMs)));
     return {
       state: this.bootstrapStatus.state,
       needsReconcile: this.observationGap !== false || this.bootstrapStatus.needsReconcile,
@@ -987,7 +994,21 @@ class SyncManager {
         error.code = "CORPUSWIRE_HEALTH_TIMEOUT";
         throw error;
       }
-      return this.applyBootstrapStatus(checked.value);
+      const selectionArgs = { ...args };
+      for (const [field, alias, envKey] of [
+        ["includeGlobs", "include_globs", "CORPUSWIRE_SYNC_INCLUDE_GLOBS"],
+        ["excludeGlobs", "exclude_globs", "CORPUSWIRE_SYNC_EXCLUDE_GLOBS"],
+      ]) {
+        if (this.coverageSelectionContext && !Object.hasOwn(args, field) && !Object.hasOwn(args, alias)
+          && this.coverageSelectionEnvironment?.[envKey] === this.env[envKey]) {
+          selectionArgs[field] = this.coverageSelectionContext[field];
+        }
+      }
+      return this.applyBootstrapStatus(checked.value, this.resolveContext(selectionArgs));
+    } catch (error) {
+      this.observationGap = true;
+      this.readableCheckpointBaseline = undefined;
+      throw error;
     } finally {
       healthStop.abort();
     }
@@ -1010,14 +1031,57 @@ class SyncManager {
     return bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId });
   }
 
-  applyBootstrapStatus(bootstrapStatus) {
+  applyBootstrapStatus(bootstrapStatus, selectionContext = undefined) {
+    const previous = this.bootstrapStatus;
+    let contextKey;
+    try {
+      contextKey = syncContextKey(selectionContext ?? this.resolveContext({
+        workspaceId: bootstrapStatus.workspaceId,
+      }));
+    } catch { /* Missing identity cannot authorize a checkpoint exception. */ }
+    const baseline = this.observationGap === false && previous.coverage?.state === "verified"
+      ? { contextKey: this.coverageContextKey, workspaceId: previous.workspaceId,
+        repoPath: previous.repoPath, collection: previous.collection,
+        resolvedWorkspaceId: previous.resolvedWorkspaceId ?? null,
+        resolvedContext: previous.resolvedContext ?? null,
+        coverageToken: previous.coverage.coverage_token,
+        selectionPolicyDigest: previous.coverage.selection_policy_digest }
+      : this.readableCheckpointBaseline;
+    const sameOwnedIdentity = baseline !== undefined
+      && typeof baseline.contextKey === "string" && baseline.contextKey === contextKey
+      && baseline.contextKey === this.coverageContextKey
+      && baseline.workspaceId === bootstrapStatus.workspaceId
+      && baseline.repoPath === bootstrapStatus.repoPath && baseline.collection === bootstrapStatus.collection
+      && baseline.resolvedWorkspaceId === (bootstrapStatus.resolvedWorkspaceId ?? null)
+      && baseline.resolvedContext === (bootstrapStatus.resolvedContext ?? null)
+      && typeof baseline.coverageToken === "string" && baseline.coverageToken.length > 0
+      && typeof baseline.selectionPolicyDigest === "string" && baseline.selectionPolicyDigest.length > 0
+      && bootstrapStatus.needsReconcile !== true && this.lastError === null;
+    const sameOwnedCheckpoint = sameOwnedIdentity && bootstrapStatus.codeReady === true
+      && (bootstrapStatus.coverage?.coverage_token == null
+        || bootstrapStatus.coverage.coverage_token === baseline.coverageToken)
+      && (bootstrapStatus.coverage?.selection_policy_digest == null
+        || bootstrapStatus.coverage.selection_policy_digest === baseline.selectionPolicyDigest);
+    const completedOwnedCheckpoint = this.readableCheckpointBaseline !== undefined && sameOwnedIdentity
+      && bootstrapStatus.coverage?.state === "verified" && bootstrapStatus.publicCodeReady === true
+      && !isBootstrapHealthBlocked(bootstrapStatus)
+      && bootstrapStatus.coverage.coverage_token === baseline.coverageToken
+      && bootstrapStatus.coverage.selection_policy_digest === baseline.selectionPolicyDigest;
     if (this.observationGap === false && (
-      this.bootstrapStatus.coverage?.coverage_token !== bootstrapStatus.coverage?.coverage_token
-      || this.bootstrapStatus.coverage?.selection_policy_digest
-        !== bootstrapStatus.coverage?.selection_policy_digest
+      previous.coverage?.coverage_token !== bootstrapStatus.coverage?.coverage_token
+      || previous.coverage?.selection_policy_digest !== bootstrapStatus.coverage?.selection_policy_digest
+      || ((previous.workspaceId != null || previous.repoPath != null) && (
+        (previous.resolvedWorkspaceId ?? null) !== (bootstrapStatus.resolvedWorkspaceId ?? null)
+        || (previous.resolvedContext ?? null) !== (bootstrapStatus.resolvedContext ?? null)
+        || previous.workspaceId !== bootstrapStatus.workspaceId || previous.repoPath !== bootstrapStatus.repoPath
+        || previous.collection !== bootstrapStatus.collection))
+      || (bootstrapStatus.codeReady === true && !sameOwnedCheckpoint)
     )) {
       this.observationGap = true;
+      this.readableCheckpointBaseline = undefined;
     }
+    if (completedOwnedCheckpoint) this.observationGap = false;
+    this.readableCheckpointBaseline = sameOwnedCheckpoint ? baseline : undefined;
     this.recordBootstrapStatus(bootstrapStatus);
     return bootstrapStatus;
   }
@@ -1032,6 +1096,7 @@ class SyncManager {
     this.activeReconcile = this.runReconcile(context, args, onProgress)
       .catch((error) => {
         this.observationGap = true;
+        this.readableCheckpointBaseline = undefined;
         this.recordError(error, "reconcile");
         this.lastReconcileFinishedAt = new Date().toISOString();
         return {
@@ -1208,7 +1273,7 @@ class SyncManager {
     this.lastFlushStartedAt = new Date(startedAt).toISOString();
     if (this.observationGap === false) {
       try { await this.refreshBootstrapStatus(batch); }
-      catch { this.observationGap = true; }
+      catch { this.observationGap = true; this.readableCheckpointBaseline = undefined; }
     }
     if (isBootstrapHealthBlocked(this.bootstrapStatus) && this.bootstrapStatus.emptyWriteReady !== true) {
       this.requeueBatch(batch);
@@ -1290,6 +1355,7 @@ class SyncManager {
       || !coverage.selection_policy_digest
       || this.coverageContextKey !== syncContextKey(batch)) {
       this.observationGap = true;
+      this.readableCheckpointBaseline = undefined;
       this.bootstrapStatus = {
         ...this.bootstrapStatus,
         state: "needs_reconcile",
@@ -1471,7 +1537,10 @@ class SyncManager {
     }, { operation: "reconcile" });
 
     this.observationGap = response.status?.coverage?.state !== "verified";
-    await this.applySyncCacheUploadResult(context, files.map((file) => ({
+    this.readableCheckpointBaseline = undefined;
+    await this.applySyncCacheUploadResult({ ...context,
+      diagnosisRepoPath: firstNonEmptyString(args.repoPath, args.repo_path, this.env.CORPUSWIRE_REPO_PATH, context.sourceRoot),
+    }, files.map((file) => ({
       relativePath: file.relativePath, size: file.content.length, mtimeNs: file.mtimeNs, sha256: file.sha256,
     })), new Set(), response, true);
     const durationMs = Date.now() - startedAt;
@@ -1631,7 +1700,29 @@ class SyncManager {
     if (evidence?.state === "verified" && response.transfer?.complete) {
       const firstNonemptyPublication = this.bootstrapStatus.emptyWriteReady === true
         && evidence.eligible_file_count > 0;
+      if (fullBaseline && (this.bootstrapStatus.state === "not_checked"
+        || (this.bootstrapStatus.state === "unknown" && this.bootstrapStatus.diagnosisTimedOut === true))
+        && this.bootstrapStatus.workspaceId == null && this.bootstrapStatus.repoPath == null
+        && this.bootstrapStatus.resolvedWorkspaceId == null && this.bootstrapStatus.resolvedContext == null) {
+        const receiptWorkspaceId = response.status.workspace_id;
+        if (typeof receiptWorkspaceId === "string" && receiptWorkspaceId.length > 0
+          && receiptWorkspaceId === context.workspaceId && response.status.collection_name
+          && evidence.coverage_token && evidence.selection_policy_digest) {
+          this.bootstrapStatus = { ...this.bootstrapStatus, state: "ready", healthBlocked: false,
+            diagnosisTimedOut: false, workspaceId: context.workspaceId,
+            repoPath: context.diagnosisRepoPath ?? this.env.CORPUSWIRE_REPO_PATH ?? context.sourceRoot,
+            resolvedWorkspaceId: receiptWorkspaceId, resolvedContext: receiptWorkspaceId };
+        } else {
+          this.observationGap = true;
+          this.readableCheckpointBaseline = undefined;
+        }
+      }
       this.coverageContextKey = syncContextKey(context);
+      this.coverageSelectionContext = { includeGlobs: [...(context.includeGlobs ?? [])], excludeGlobs: [...(context.excludeGlobs ?? [])] };
+      this.coverageSelectionEnvironment = {
+        CORPUSWIRE_SYNC_INCLUDE_GLOBS: this.env.CORPUSWIRE_SYNC_INCLUDE_GLOBS,
+        CORPUSWIRE_SYNC_EXCLUDE_GLOBS: this.env.CORPUSWIRE_SYNC_EXCLUDE_GLOBS,
+      };
       this.bootstrapStatus = { ...this.bootstrapStatus, coverage: evidence,
         checkedAt: new Date().toISOString(), collection: response.status.collection_name,
         state: isBootstrapHealthBlocked(this.bootstrapStatus) ? "blocked" : "ready", needsReconcile: false };
@@ -1646,12 +1737,14 @@ class SyncManager {
             || fresh.coverage.coverage_token !== evidence.coverage_token
             || fresh.coverage.selection_policy_digest !== evidence.selection_policy_digest) {
             this.observationGap = true;
+            this.readableCheckpointBaseline = undefined;
             this.bootstrapStatus = { ...fresh, state: "blocked", healthBlocked: true,
               emptyWriteReady: false, canRetrieve: false, needsReconcile: true,
               reason: "The fresh health diagnosis does not match the completed publication." };
           }
         } catch (error) {
           this.observationGap = true;
+          this.readableCheckpointBaseline = undefined;
           this.bootstrapStatus = { ...this.bootstrapStatus, state: "blocked", healthBlocked: true,
             emptyWriteReady: false, canRetrieve: null, needsReconcile: true,
             reason: "The first nonempty publication needs a fresh health diagnosis." };
@@ -1660,6 +1753,7 @@ class SyncManager {
       }
     } else {
       this.observationGap = true;
+      this.readableCheckpointBaseline = undefined;
     }
     if (!this.isCacheEnabled()) {
       return;
@@ -1673,6 +1767,7 @@ class SyncManager {
       cacheState.data.collection = response.status?.collection_name ?? null;
       if (coverage?.state !== "verified" || !response.transfer?.complete) {
         this.observationGap = true;
+        this.readableCheckpointBaseline = undefined;
         await this.saveSyncCache(cacheState);
         return;
       }
@@ -2040,6 +2135,7 @@ class SyncManager {
 
   recordError(error, operation = "flush") {
     this.observationGap = true;
+    this.readableCheckpointBaseline = undefined;
     this.lastError = error instanceof Error ? error.message : String(error);
     const finishedAt = new Date().toISOString();
     if (operation === "reconcile") {
@@ -2062,6 +2158,10 @@ class SyncManager {
   }
 
   recordBootstrapStatus(status) {
+    if (status.healthBlocked === true || ["blocked", "unknown", "error"].includes(status.state)) {
+      this.readableCheckpointBaseline = undefined;
+      if (["unknown", "error"].includes(status.state)) this.observationGap = true;
+    }
     this.bootstrapStatus = {
       ...initialBootstrapStatus(),
       ...status,
@@ -5279,28 +5379,50 @@ function withResolvedIdentity(text, identity) {
 function diagnosisFromHealth(response, { repoPath, workspaceId }) {
   const index = response.index ?? {};
   const activeProject = response.active_project ?? {};
+  const context = response.context ?? {};
   const qdrant = response.qdrant ?? {};
+  const contextWorkspaceId = optionalString(context.workspace_id);
+  const activeWorkspaceId = optionalString(activeProject.workspace_id);
+  const workspaceConflict = contextWorkspaceId && activeWorkspaceId && contextWorkspaceId !== activeWorkspaceId;
+  const resolvedWorkspaceId = workspaceConflict ? null : contextWorkspaceId ?? activeWorkspaceId ?? null;
+  const collections = [activeProject.collection, qdrant.collection, index.collection].map(optionalString).filter(Boolean);
+  const collectionConflict = new Set(collections).size > 1;
+  const storageWorkspaceId = optionalString(context.storage_workspace_id);
+  const indexWorkspaceId = optionalString(index.workspace_id);
+  const storageConflict = storageWorkspaceId && indexWorkspaceId && storageWorkspaceId !== indexWorkspaceId;
+  // Health defaults do not prove which repository was selected. Compare service paths
+  // lexically; resolving them on the client would confuse remote and local roots.
+  const selectedPaths = [activeProject.path, index.path].map(optionalString).filter(Boolean);
+  const normalizeServicePath = (value) => (value.split("/").includes("..") ? value : path.posix.normalize(value)).replace(/\/$/, "") || "/";
+  const selectedPathConflict = !workspaceId && new Set(selectedPaths.map(normalizeServicePath)).size > 1;
+  const requestedPathMismatch = !workspaceId && repoPath
+    && (selectedPaths.length === 0 || normalizeServicePath(selectedPaths[0]) !== normalizeServicePath(repoPath));
+  const identityProblem = Boolean(workspaceConflict || storageConflict || collectionConflict || collections.length === 0
+    || selectedPathConflict || requestedPathMismatch || (workspaceId && resolvedWorkspaceId !== workspaceId));
+  const healthProblem = identityProblem || response.ok === false;
   const collectionExists = typeof qdrant.collection_exists === "boolean" ? qdrant.collection_exists : undefined;
   const pointCount = Number.isInteger(qdrant.point_count) ? qdrant.point_count : undefined;
-  const canRetrieve = collectionExists === true && (pointCount ?? 0) > 0;
+  const canRetrieve = !healthProblem && collectionExists === true && (pointCount ?? 0) > 0;
   return {
     status: canRetrieve ? "ready" : "blocked",
     can_retrieve: canRetrieve,
     requested_repo_path: repoPath ?? null,
     requested_workspace_id: workspaceId ?? null,
-    resolved_context: activeProject.path ?? response.docs_source_dir ?? "unknown",
-    resolved_workspace_id: activeProject.workspace_id ?? workspaceId ?? null,
+    resolved_context: workspaceId
+      ? resolvedWorkspaceId
+      : selectedPathConflict ? null : selectedPaths[0] ?? response.docs_source_dir ?? "unknown",
+    resolved_workspace_id: resolvedWorkspaceId,
     resolution_mode: workspaceId ? "remote" : "local",
-    collection: activeProject.collection ?? qdrant.collection ?? "unknown",
+    collection: collectionConflict ? null : collections[0] ?? "unknown",
     collection_exists: collectionExists,
     point_count: pointCount,
-    qdrant_error: qdrant.error ?? null,
+    qdrant_error: qdrant.error ?? (healthProblem ? "Health response does not attest the requested workspace, repository, and collection." : null),
     index,
     active_backend: {
       default_repo_path: response.docs_source_dir,
       default_collection: qdrant.collection,
-      requested_context: activeProject.path ?? response.docs_source_dir,
-      matches_requested_context: true,
+      requested_context: activeProject.path ?? index.path ?? response.docs_source_dir,
+      matches_requested_context: !identityProblem,
     },
     checks: [],
     recovery_actions: [],
@@ -5337,6 +5459,8 @@ function bootstrapStatusForTimeout(maxWaitMs) {
   return {
     ...initialBootstrapStatus(),
     state: "unknown",
+    diagnosisTimedOut: true,
+    needsReconcile: true,
     healthBlocked: true,
     canRetrieve: false,
     checkedAt: new Date().toISOString(),
