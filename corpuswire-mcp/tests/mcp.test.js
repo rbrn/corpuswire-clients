@@ -3,10 +3,14 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+// Existing fixtures assert exact unscoped requests; host-folder resolution is covered in hosts.test.js.
+process.env.CORPUSWIRE_IDENTITY_RESOLUTION ??= "env-only";
 
 const SERVER_BIN = fileURLToPath(new URL("../bin/corpuswire-mcp.js", import.meta.url));
 const WRAPPER_BIN = fileURLToPath(new URL("../../../plugins/corpuswire-context-engine/scripts/mcp-server.mjs", import.meta.url));
@@ -1488,7 +1492,10 @@ test("source-verified neighbor restores a definition line just before a selected
   }
 });
 
-test("private search telemetry records only timings and does not alter MCP results", async () => {
+// The private telemetry sink only accepts macOS /private/tmp paths by design.
+test("private search telemetry records only timings and does not alter MCP results", {
+  skip: !existsSync("/private/tmp") && "requires the macOS /private/tmp telemetry location",
+}, async () => {
   const tempDir = await mkdtemp("/private/tmp/corpuswire-search-telemetry-");
   await chmod(tempDir, 0o700);
   try {

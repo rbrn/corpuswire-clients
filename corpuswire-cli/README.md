@@ -115,8 +115,8 @@ npm ci --prefix corpuswire-cli --offline --ignore-scripts --omit=dev
 npm pack ./corpuswire-sdk --pack-destination /tmp/corpuswire-snapshot
 npm pack ./corpuswire-cli --pack-destination /tmp/corpuswire-snapshot
 npm install --prefix /tmp/corpuswire-install \
-  /tmp/corpuswire-snapshot/corpuswire-sdk-0.1.4.tgz \
-  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.4-beta.7.tgz
+  /tmp/corpuswire-snapshot/corpuswire-sdk-0.1.5.tgz \
+  /tmp/corpuswire-snapshot/corpuswire-cli-0.1.5-beta.1.tgz
 /tmp/corpuswire-install/node_modules/.bin/cw --version
 ```
 
@@ -187,6 +187,30 @@ export CORPUSWIRE_WORKSPACE_ID=github://rbrn/corpuswire#main
 ```
 
 Avoid storing Basic Auth values or bearer tokens in shell history.
+
+## MCP hosts
+
+`cw mcp serve` runs the CorpusWire MCP server on stdio, resolving service
+credentials the same way other `cw` commands do; configs never contain them.
+
+```bash
+cw mcp install --host claude-code            # writes ./.mcp.json
+cw mcp install --host claude-code --scope user   # prints the `claude mcp add` command
+cw mcp install --host vscode                 # writes ./.vscode/mcp.json
+cw mcp install --host copilot-cli            # writes ~/.copilot/mcp-config.json
+cw mcp install --host codex                  # writes ~/.codex/config.toml
+cw mcp doctor --host codex                   # config, launcher, PATH, handshake, workspace
+```
+
+`install` backs up any file it changes, supports `--dry-run`, and refuses to
+replace an entry it did not write, or a JSON file with comments, without
+`--force`. A project config includes the folder's configured workspace id; a
+folder default is left for the server to derive.
+
+`cw search`, `cw enhance` and `cw health` now use the folder's configured
+workspace, or the folder default `cw` indexes with when the backend has an index
+for it, unless `--workspace-id`, `--repo-path` or the matching environment
+variable names one.
 
 ## Usage Examples
 
