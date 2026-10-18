@@ -193,7 +193,7 @@ What the server does for each host:
 - **Workspace identity.** When neither the arguments nor
   `CORPUSWIRE_WORKSPACE_ID`/`CORPUSWIRE_REPO_PATH` name a workspace, read tools
   (search, enhance, doctor, diagnose, rate) resolve it from the host's folder:
-  the first MCP root the host offers, else `CORPUSWIRE_SYNC_ROOT`, else the git
+  the first MCP root the host offers, else `CORPUSWIRE_SYNC_ROOT`, else `CLAUDE_PROJECT_DIR`, else the git
   top level of the server's working folder. In that folder the server reads
   `.vscode/settings.json`, `.vscode/mcp.json`, `.mcp.json`, then the user
   profile, then derives the same folder default `cw` indexes with. A derived id

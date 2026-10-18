@@ -62,7 +62,7 @@ function startServer(context, { cwd, env = {}, roots } = {}) {
   const baseEnv = { ...process.env };
   for (const key of ["CORPUSWIRE_WORKSPACE_ID", "CORPUSWIRE_REPO_PATH", "CORPUSWIRE_SYNC_ROOT", "CORPUSWIRE_OUTPUT_MODE",
     "CORPUSWIRE_HOST", "CORPUSWIRE_IDENTITY_RESOLUTION", "CORPUSWIRE_TOOL_PROFILE", "CORPUSWIRE_RESULT_HEADER",
-    "CORPUSWIRE_RETRIEVAL_LOG_DIR"]) delete baseEnv[key];
+    "CORPUSWIRE_RETRIEVAL_LOG_DIR", "CLAUDE_PROJECT_DIR"]) delete baseEnv[key];
   const child = spawn("node", [SERVER_BIN], {
     cwd: cwd ?? context.repo,
     stdio: ["pipe", "pipe", "pipe"],
@@ -171,6 +171,19 @@ test("Claude Code: the project's .mcp.json identity scopes search from the serve
     { kind: "enhance", workspaceId: "local-docker://sample#main", outputMode: "claude-code" },
     { kind: "rate", workspaceId: "local-docker://sample#main", surface: "claude-code" },
   ]);
+});
+
+test("Claude Code: CLAUDE_PROJECT_DIR names the project when the server starts elsewhere", async (t) => {
+  const context = await fixture();
+  t.after(context.cleanup);
+  await writeFile(path.join(context.repo, ".mcp.json"), JSON.stringify({ mcpServers: {
+    "corpuswire-context-engine": { env: { CORPUSWIRE_WORKSPACE_ID: "local-docker://sample#main" } } } }));
+  const server = startServer(context, { cwd: context.dir, env: { CLAUDE_PROJECT_DIR: context.repo } });
+  try {
+    await server.initialize("claude-code");
+    const result = await server.call("corpuswire_search", { query: "where is x" });
+    assert.match(result.content[0].text, /- requestedWorkspaceId: local-docker:\/\/sample#main/);
+  } finally { server.stop(); }
 });
 
 test("VS Code Copilot: workspace roots from the host pick the folder's settings", async (t) => {

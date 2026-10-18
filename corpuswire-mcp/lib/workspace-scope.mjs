@@ -35,6 +35,9 @@ export function createWorkspaceScope({
     }
     const syncRoot = typeof env.CORPUSWIRE_SYNC_ROOT === "string" && env.CORPUSWIRE_SYNC_ROOT.trim();
     if (syncRoot) return { root: path.resolve(syncRoot), source: "sync-root", otherRoots: [] };
+    // Claude Code sets the project root for servers it spawns, whatever their cwd.
+    const projectDir = typeof env.CLAUDE_PROJECT_DIR === "string" && env.CLAUDE_PROJECT_DIR.trim();
+    if (projectDir) return { root: path.resolve(projectDir), source: "claude-project-dir", otherRoots: [] };
     const toplevel = await gitToplevel(cwd).catch(() => undefined);
     if (toplevel) return { root: path.resolve(toplevel), source: "git-toplevel", otherRoots: [] };
     // Hosts that spawn servers from the home directory or "/" have no project folder.
