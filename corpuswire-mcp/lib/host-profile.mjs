@@ -40,14 +40,15 @@ export const SERVER_INSTRUCTIONS = [
 ].join(" ");
 
 // Annotations follow the MCP tool annotation hints. A tool is read-only when it
-// changes nothing in the workspace, the index or the quality ledger.
+// changes nothing in the workspace, the index or the quality ledger. Review
+// context requests start a backend job, so they count as writes.
 const READ_ONLY = { readOnlyHint: true, openWorldHint: false };
 const WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
 const IDEMPOTENT_WRITE = { ...WRITE, idempotentHint: true };
 
 export const TOOL_METADATA = Object.freeze({
-  corpuswire_review_context: { title: "Review context", annotations: READ_ONLY },
-  corpuswire_review_context_v2: { title: "Review context (v2)", annotations: READ_ONLY },
+  corpuswire_review_context: { title: "Review context", annotations: WRITE },
+  corpuswire_review_context_v2: { title: "Review context (v2)", annotations: WRITE },
   corpuswire_codebase_status: { title: "Codebase status", annotations: READ_ONLY },
   corpuswire_search: { title: "Search workspace context", annotations: READ_ONLY },
   corpuswire_enhance_prompt: { title: "Enhance prompt", annotations: READ_ONLY },

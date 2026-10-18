@@ -15,9 +15,11 @@
     "test": "node --test tests/*.test.js"
   },
   "dependencies": {
+    "@corpuswire/mcp": "file:../corpuswire-mcp",
     "@corpuswire/sdk": "file:../corpuswire-sdk"
   },
   "bundledDependencies": [
+    "@corpuswire/mcp",
     "@corpuswire/sdk"
   ],
   "repository": {
