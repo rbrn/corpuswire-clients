@@ -1,4 +1,4 @@
-import { isRetrievalExcludedPath } from "@corpuswire/sdk";
+import { deriveWorkspaceId, isRetrievalExcludedPath } from "@corpuswire/sdk";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { readFile, readdir, stat, lstat, mkdir, writeFile, open, realpath } from "node:fs/promises";
@@ -8,6 +8,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline/promises";
 import { promisify } from "node:util";
+import { MCP_HELP, doctorHostConfig, formatMcpResult, installHostConfig, locateMcpServer, parseMcpArgs } from "./mcp-hosts.js";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:18080";
 const DEFAULT_WATCH_REQUEST_TIMEOUT_MS = 30_000;
@@ -18,6 +19,7 @@ const DEFAULT_EXCLUDED_DIRECTORIES = new Set([
   ".git", ".mypy_cache", ".pytest_cache", ".qdrant", ".ruff_cache", ".venv",
   "__pycache__", "build", "dist", "node_modules", "target", "venv",
 ]);
+const TERMINAL_INDEX_SESSION_PHASES = new Set(["completed", "aborted", "failed", "expired", "incomplete"]);
 const INDEX_PROGRESS_SCHEMA_VERSION = "index-progress/v1";
 const INDEX_OBSERVABILITY_SCHEMA_VERSION = "index-observability/v1";
 const INDEX_OBSERVABILITY_HEADER = "X-CorpusWire-Index-Observability";
@@ -28,7 +30,7 @@ const INDEX_TRACE_STAGES = new Set([
   "session_lock_wait", "session_lock_hold", "session_catalog",
   "writer_creation", "schema_preflight", "session_persistence",
 ]);
-const CLI_VERSION = "0.1.4-beta.7";
+const CLI_VERSION = "0.1.5-beta.1";
 
 export function printHelp(write = console.log) {
   write(`cw
@@ -49,6 +51,7 @@ Usage:
   cw index-activity [options]
   cw index [options]
   cw version                 Show the installed CLI version (offline)
+  cw mcp serve|install|doctor Run or configure the MCP server for Claude Code, VS Code, Copilot CLI or Codex
 
 Options:
   --api-base-url <url>     Backend base URL. Default: ${DEFAULT_BASE_URL}
@@ -85,7 +88,7 @@ Options:
   --timeout-ms <number>    Explicit caller wait budget; backend continues on expiry
   --rebuild                Allow destructive collection recreation (second confirmation)
   --confirm-rebuild <id>   Required in non-interactive mode; must equal workspace ID
-  --attach <session-id>    Follow an existing index session
+  --attach <session-id>    Follow an existing session; no total deadline unless --timeout-ms
   -V, --version            Show the installed CLI version
   -h, --help               Show this help
 
@@ -329,6 +332,14 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
     }
   }
 
+  if (options.implicitIndex && options.promptParts.length) {
+    command = options.command = "enhance";
+    options.implicitIndex = false;
+  }
+  if (!["local", "hosted"].includes(options.profile)) throw new Error(`Unsupported profile: ${options.profile}`);
+  if (options.maxFileSizeBytes !== undefined && (!Number.isSafeInteger(options.maxFileSizeBytes) || options.maxFileSizeBytes <= 0)) {
+    throw new Error("max-file-size must be a positive safe integer.");
+  }
   if (command !== "init" && (options.indexAfterInit || options.verifyAfterInit)) {
     throw new Error("--index and --verify are only supported with init.");
   }
@@ -350,15 +361,31 @@ export async function runCliCommand(options, dependencies = {}) {
   const write = dependencies.write ?? console.log;
   const configurationInputs = { ...options };
   if (["index", "reconcile", "init", "doctor", "watch"].includes(options.command)) {
-    const sourceRoot = path.resolve(options.sourceRoot || process.cwd());
+    const requestedSourceRoot = path.resolve(options.sourceRoot || process.cwd());
+    const sourceRoot = await realpath(requestedSourceRoot);
     const sourceStats = await stat(sourceRoot);
     if (!sourceStats.isDirectory()) throw new Error(`Workspace root is not a directory: ${sourceRoot}`);
     const configuration = await resolveIndexConfiguration(options, sourceRoot, dependencies);
     validateIndexDestination(configuration);
-    options = { ...options, ...configuration, apiBaseUrl: configuration.baseUrl, sourceRoot, configuration };
+    options = { ...options, ...configuration, apiBaseUrl: configuration.baseUrl, sourceRoot, requestedSourceRoot, configuration };
+    const interactive = dependencies.isTTY ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    if (options.implicitIndex && configuration.profile === "local" && interactive
+      && !options.once && !options.nonInteractive && !options.json && !options.ndjson) options.watch = true;
     if (options.command === "init") {
       const result = await initializeWorkspace(options, dependencies);
       if (!options.indexAfterInit && !options.verifyAfterInit) return result;
+    }
+  }
+  // Query commands use the workspace this folder is configured or indexed for,
+  // the same identity `cw` indexes with, unless one was named explicitly.
+  let derivedQueryWorkspace;
+  if (["search", "query", "enhance", "health"].includes(options.command) && !options.workspaceId && !options.repoPath) {
+    const sourceRoot = path.resolve(options.sourceRoot || process.cwd());
+    const configuration = await resolveIndexConfiguration(options, sourceRoot, dependencies).catch(() => undefined);
+    if (configuration?.workspaceId) {
+      if (configuration.workspaceIdSource === "derived") derivedQueryWorkspace = configuration.workspaceId;
+      options = { ...options, workspaceId: configuration.workspaceId,
+        apiBaseUrl: options.apiBaseUrlExplicit ? options.apiBaseUrl : configuration.baseUrl };
     }
   }
   const sdk = dependencies.client ? undefined : dependencies.sdk ?? await loadSdk();
@@ -387,6 +414,12 @@ export async function runCliCommand(options, dependencies = {}) {
         ? traceCollector.wrapFetch(fetchFn ?? globalThis.fetch)
         : fetchFn,
     });
+
+  if (derivedQueryWorkspace && !(await workspaceHasIndex(client, derivedQueryWorkspace))) {
+    // A folder default nobody indexed yet would only return nothing; keep the backend default.
+    (dependencies.writeError ?? console.error)(`Note: ${derivedQueryWorkspace} has no index yet; using the backend default workspace. Run cw in this folder to index it.`);
+    options = { ...options, workspaceId: "" };
+  }
 
   if (options.watch) return runWatchCommand(options, { ...dependencies, client, sdk, write, traceCollector, configurationInputs });
 
@@ -618,7 +651,7 @@ export function createWatchFetch(fetchFn, {
     const sessionId = /^\/v1\/index\/sessions\/([^/]+)(?:\/|$)/.exec(apiPathname)?.[1];
     const requestTimeoutMs = publication ? publicationTimeoutMs : timeoutMs;
     const signals = [init.signal, detachSignal];
-    if (["/v1/index/capabilities", "/v1/index/preview"].includes(apiPathname)) signals.push(signal);
+    if (["/v1/index/capabilities", "/v1/index/preview", "/v1/health", "/v1/context/diagnose", "/health", "/context/diagnose"].includes(apiPathname)) signals.push(signal);
     const abort = () => controller.abort();
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; abort(); }, requestTimeoutMs);
@@ -667,7 +700,7 @@ function createServiceFetch(fetchFn, baseUrl) {
       throw Object.assign(new Error(
         `CorpusWire API unavailable at ${displayServiceUrl(baseUrl)} (fetch failed).\n${guidance}\nIf this URL is unexpected, check CORPUSWIRE_BASE_URL, workspace .vscode/settings.json, .vscode/mcp.json or .mcp.json, and your CorpusWire user profile. Use --api-base-url <url> to explicitly select the intended service.`,
         { cause: error },
-      ), { name: error.name, code });
+      ), { name: error.name, code, serviceUnavailable: true });
     }
   };
 }
@@ -733,8 +766,8 @@ export async function runWatchCommand(options, dependencies) {
       : `${message} Reason: ${fallback.reason}${fallback.error_code ? ` (${fallback.error_code})` : ""}.`);
   };
   const signal = dependencies.signal;
-  const requestedRoot = options.sourceRoot;
-  const root = await realpath(requestedRoot);
+  const requestedRoot = options.requestedSourceRoot ?? path.resolve(options.sourceRoot);
+  const root = options.requestedSourceRoot ? options.sourceRoot : await realpath(requestedRoot);
   const rootIdentity = await stat(root);
   const configurationInputs = dependencies.configurationInputs ?? options;
   const configurationIdentity = watchConfigurationIdentity(options.configuration);
@@ -790,7 +823,7 @@ export async function runWatchCommand(options, dependencies) {
     if (currentRoot !== root || currentIdentity.dev !== rootIdentity.dev || currentIdentity.ino !== rootIdentity.ino) {
       throw watchFailure("Workspace root was replaced. Restart cw to select the new folder.");
     }
-    const configuration = await resolveIndexConfiguration(configurationInputs, requestedRoot, dependencies);
+    const configuration = await resolveIndexConfiguration(configurationInputs, root, dependencies);
     if (watchConfigurationIdentity(configuration) !== configurationIdentity) {
       throw watchFailure("Workspace, service, or indexing filters changed. Restart cw to apply the new configuration.");
     }
@@ -811,6 +844,15 @@ export async function runWatchCommand(options, dependencies) {
     } catch (error) {
       reportWatcherFallback(error, "startup");
     }
+    await assertFence();
+    const observationRenderer = createProgressRenderer({ write: output, writeRaw: dependencies.writeRaw ?? (() => {}),
+      isTTY: dependencies.isTTY ?? Boolean(process.stdout.isTTY), ndjson: options.ndjson || options.json });
+    const existing = await preflightExistingSession(options, { ...dependencies, assertObserveFence: assertFence }, observationRenderer, write);
+    if (existing?.detached && !signal?.aborted) throw watchFailure("Stopped following existing indexing; backend work may continue. Run cw doctor before restarting.");
+    if (existing && !existing.detached && existing.phase !== "completed") {
+      throw watchFailure(`Existing indexing ended as ${existing.phase}; run cw doctor to check serving readiness.`);
+    }
+    await assertFence();
     let capabilities;
     for (let attempt = 0; ; attempt += 1) {
       try { capabilities = await dependencies.client.getIndexCapabilities(); break; }
@@ -842,8 +884,11 @@ export async function runWatchCommand(options, dependencies) {
         if (generation !== scanGeneration) continue;
         const digest = createHash("sha256").update(JSON.stringify(scan.files.map((file) => [file.relativePath, file.sha256]).sort((a, b) => a[0].localeCompare(b[0])))).digest("hex");
         if (digest !== publishedDigest) {
-          const result = await runIndexCommand({ ...options, sourceRoot: root, yes: true, nonInteractive: true }, {
-            ...dependencies, capabilities, preparedScan: scan,
+          const initialExplicitIndex = publications === 0 && ["index", "reconcile"].includes(options.command) && !options.implicitIndex;
+          const result = await runIndexCommand({ ...options, sourceRoot: root,
+            yes: initialExplicitIndex ? options.yes : true,
+            nonInteractive: initialExplicitIndex ? options.nonInteractive : true }, {
+            ...dependencies, capabilities, preparedScan: scan, assertObserveFence: assertFence,
             write: (line) => {
               if (!options.json && !options.ndjson) return output(line);
               try { JSON.parse(line); } catch { return write(line); }
@@ -856,6 +901,12 @@ export async function runWatchCommand(options, dependencies) {
             },
           });
           if (signal?.aborted) break;
+          if (result.started === false) return { ...result, stopped: true, publications, exitCode: 0 };
+          if (result.observedExisting && result.phase === "completed") {
+            // A borrowed publication cannot attest this process's local inventory.
+            publishedDigest = null;
+            continue;
+          }
           if (result.ok === false || result.cancelled || result.conflict || result.started === false || result.status?.phase !== "completed"
             || result.status?.coverage?.state !== "verified" || result.transfer?.complete !== true) {
             throw watchFailure("Reconciliation did not complete. Watch stopped; run cw doctor before restarting.");
@@ -909,7 +960,7 @@ export async function runIndexCommand(options, dependencies) {
   const write = dependencies.write ?? console.log;
   const writeRaw = dependencies.writeRaw ?? ((value) => process.stdout.write(value));
   const isTTY = dependencies.isTTY ?? Boolean(process.stdout.isTTY);
-  const sourceRoot = path.resolve(options.sourceRoot || process.cwd());
+  const sourceRoot = await realpath(path.resolve(options.sourceRoot || process.cwd()));
   const traceCollector = dependencies.traceCollector ?? createIndexTraceCollector();
   const sourceStats = await stat(sourceRoot);
   if (!sourceStats.isDirectory()) {
@@ -961,9 +1012,19 @@ export async function runIndexCommand(options, dependencies) {
       preview: null,
       scan: null,
       wallTimeMs: Date.now() - startedAt,
+      ndjson: options.ndjson || options.json,
     });
     emitTrace({ status });
     return status;
+  }
+
+  if (!dependencies.preparedScan) {
+    const existing = await preflightExistingSession(options, dependencies, renderer, write);
+    // A followed session may be an ordinary index, so an explicit rebuild still
+    // runs (behind its own confirmation) once that session has completed.
+    const rebuildAfterObservation = options.rebuild === true && existing?.observedExisting === true
+      && existing.detached !== true && existing.phase === "completed";
+    if (existing && !rebuildAfterObservation) return existing;
   }
 
   const capabilities = dependencies.capabilities ?? await dependencies.client.getIndexCapabilities();
@@ -1166,8 +1227,10 @@ async function resolveIndexConfiguration(options, sourceRoot, dependencies = {})
   return {
     profile: options.profile ?? "local",
     workspaceId: options.workspaceIdExplicit || options.workspaceId
-      ? options.workspaceId || deriveWorkspaceId(sourceRoot)
-      : configuredWorkspaceId || deriveWorkspaceId(sourceRoot),
+      ? options.workspaceId || await deriveWorkspaceId(sourceRoot)
+      : configuredWorkspaceId || await deriveWorkspaceId(sourceRoot),
+    workspaceIdSource: options.workspaceIdExplicit || options.workspaceId ? "explicit"
+      : configuredWorkspaceId ? "configured" : "derived",
     baseUrl: options.apiBaseUrlExplicit
       ? options.apiBaseUrl
       : configuredBaseUrl || options.apiBaseUrl || DEFAULT_BASE_URL,
@@ -1188,6 +1251,16 @@ async function resolveIndexConfiguration(options, sourceRoot, dependencies = {})
       ?? mcpValue("CORPUSWIRE_SYNC_MAX_FILE_SIZE_BYTES")
       ?? nestedValue(userSettings, "remoteIndexing.maxFileSizeBytes")),
   };
+}
+
+async function workspaceHasIndex(client, workspaceId) {
+  if (typeof client.diagnoseWorkspace !== "function") return false;
+  try {
+    const diagnosis = await client.diagnoseWorkspace({ workspaceId });
+    return diagnosis?.can_retrieve === true || Number(diagnosis?.point_count) > 0;
+  } catch {
+    return false;
+  }
 }
 
 function nestedValue(record, dottedPath) {
@@ -1409,6 +1482,7 @@ async function runDoctorCommand(options, dependencies) {
 }
 
 function validateIndexDestination(configuration) {
+  if (!["local", "hosted"].includes(configuration.profile)) throw new Error(`Unsupported profile: ${configuration.profile}`);
   let url;
   try {
     url = new URL(configuration.baseUrl);
@@ -1424,19 +1498,6 @@ function validateIndexDestination(configuration) {
   if (configuration.profile === "local" && !["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname)) {
     throw new Error("Local indexing profiles require a loopback CorpusWire service. Use --profile hosted for HTTPS services.");
   }
-}
-
-function deriveWorkspaceId(sourceRoot) {
-  const slug = path.basename(sourceRoot)
-    .normalize("NFKD")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  if (!slug) {
-    throw new Error("Could not derive a workspace identity; pass --workspace-id explicitly.");
-  }
-  const suffix = createHash("sha256").update(path.resolve(sourceRoot)).digest("hex").slice(0, 12);
-  return `local-docker://${slug}-${suffix}#main`;
 }
 
 async function scanWorkspace(sourceRoot, options) {
@@ -1978,6 +2039,9 @@ async function handleSessionConflict({ conflict, client, renderer, options, depe
     `Age: ${conflict.age_seconds ?? "unknown"}s; phase: ${conflict.progress?.phase ?? conflict.phase ?? "unknown"}; last progress: ${conflict.last_progress_seconds ?? "unknown"}s ago.`,
     "Safe choices: attach/follow, cancel with confirmation, or exit.",
   ].join("\n"));
+  if (options.configuration?.profile === "local" && conflict.workspace_id === options.workspaceId) {
+    return followExistingSession(client, conflict.session_id, renderer, options, dependencies);
+  }
   if (options.nonInteractive) {
     return { ok: false, conflict, attached: false };
   }
@@ -2017,25 +2081,172 @@ async function readChoice(dependencies, prompt) {
   }
 }
 
-async function followExistingSession(client, sessionId, renderer, options, dependencies) {
-  if (typeof client.followIndexSession === "function") {
-    return client.followIndexSession(sessionId, {
-      timeoutMs: options.timeoutMs,
-      pollMs: options.processingPollMs ?? 250,
-      signal: dependencies.signal,
-      detachSignal: dependencies.detachSignal,
-      onProgress: renderer.render,
-    });
+async function preflightExistingSession(options, dependencies, renderer, write) {
+  const client = dependencies.client;
+  if (typeof client.listIndexSessions !== "function") {
+    write(options.ndjson || options.json
+      ? JSON.stringify({ type: "session_preflight_unavailable", reason: "client_method_missing" })
+      : "Active-session lookup is unavailable in this client; the service lock will guard indexing.");
+    return null;
   }
-  for (;;) {
-    const status = await client.getIndexSessionStatus(sessionId);
-    if (status.progress) {
-      renderer.render(status.progress);
+  let sessions;
+  let lookupTimer;
+  let stopLookup;
+  const lookupSignal = dependencies.signal;
+  const lookupController = new AbortController();
+  try {
+    const interrupted = new Promise((_, reject) => {
+      stopLookup = () => {
+        reject(Object.assign(new Error("Indexing startup interrupted before scanning"), { name: "AbortError" }));
+        lookupController.abort();
+      };
+      lookupSignal?.addEventListener("abort", stopLookup, { once: true });
+      if (lookupSignal?.aborted) stopLookup();
+      lookupTimer = setTimeout(() => {
+        reject(new Error("Active-session lookup timed out"));
+        lookupController.abort();
+      }, dependencies.watchRequestTimeoutMs ?? DEFAULT_WATCH_REQUEST_TIMEOUT_MS);
+    });
+    sessions = await Promise.race([client.listIndexSessions({ workspaceId: options.workspaceId }, { signal: lookupController.signal }), interrupted]);
+  }
+  catch (cause) {
+    if (cause?.serviceUnavailable) {
+      cause.message += "\nExisting indexing could not be checked; no files were scanned.";
+      throw cause;
     }
-    if (["completed", "aborted", "failed", "expired"].includes(status.phase)) {
-      return status;
+    throw Object.assign(new Error("Could not check existing indexing; no files were scanned. Check service/authentication and retry.", { cause }), { code: "session_preflight_unavailable" });
+  } finally {
+    clearTimeout(lookupTimer);
+    lookupSignal?.removeEventListener("abort", stopLookup);
+  }
+  if (!Array.isArray(sessions) || sessions.some((session) => !session || typeof session.session_id !== "string"
+    || !session.session_id || session.workspace_id !== options.workspaceId || typeof session.phase !== "string")) {
+    throw Object.assign(new Error("Active-session lookup returned unexpected workspace data; no files were scanned."), { code: "session_preflight_invalid" });
+  }
+  const active = sessions.filter((session) => !TERMINAL_INDEX_SESSION_PHASES.has(session.phase));
+  if (active.length > 1) {
+    throw Object.assign(new Error("Multiple indexing sessions are active; run cw doctor before selecting one with --attach. No files were scanned."), { code: "session_preflight_ambiguous" });
+  }
+  if (!active.length) return null;
+  if (options.configuration?.profile !== "local") {
+    write(options.ndjson || options.json
+      ? JSON.stringify({ type: "session_conflict", session_id: active[0].session_id, attached: false })
+      : `Indexing is already running. Follow it with: cw index --attach ${sanitizeTerminalText(active[0].session_id)}`);
+    return { ok: false, conflict: active[0], attached: false };
+  }
+  return followExistingSession(client, active[0].session_id, renderer, options, dependencies);
+}
+
+// Observing a session never transfers ownership: interruption must detach, not abort.
+async function followExistingSession(client, sessionId, renderer, options, dependencies) {
+  const write = dependencies.write ?? console.log;
+  const emit = (message, extra = {}) => write(options.ndjson || options.json
+    ? JSON.stringify({ type: "session_observation", session_id: sessionId, message, ...extra }) : message);
+  const detach = new AbortController();
+  const signals = [dependencies.signal, dependencies.detachSignal].filter(Boolean);
+  let detachReason = null;
+  const onDetach = () => { detachReason ??= "caller_interrupted"; detach.abort(); };
+  for (const signal of signals) {
+    signal.addEventListener("abort", onDetach, { once: true });
+    if (signal.aborted) onDetach();
+  }
+  // Explicit attachment retains its existing unbounded total wait; automatic observation stays bounded.
+  const observationTimeoutMs = options.timeoutMs
+    ?? (options.attachSessionId && !options.watch ? undefined : DEFAULT_WATCH_PUBLICATION_TIMEOUT_MS);
+  const observationTimer = observationTimeoutMs === undefined
+    ? undefined : setTimeout(() => { detachReason ??= "observation_timeout"; detach.abort(); }, Math.max(1, observationTimeoutMs));
+  dependencies.onObservationChange?.(true);
+  let codeReadyShown = false;
+  const getStatus = async (id, statusOptions = {}) => {
+    await dependencies.assertObserveFence?.();
+    let stopRead;
+    let readTimer;
+    const readController = new AbortController();
+    let status;
+    try {
+      const interrupted = new Promise((_, reject) => {
+        stopRead = () => {
+          readController.abort();
+          reject(Object.assign(new Error("Observation detached"), { name: "RemoteIndexDetachedError" }));
+        };
+        detach.signal.addEventListener("abort", stopRead, { once: true });
+        if (detach.signal.aborted) stopRead();
+        readTimer = setTimeout(() => {
+          detachReason ??= "status_request_timeout";
+          reject(Object.assign(new Error("Existing indexing status request timed out"), {
+            name: "RemoteIndexDetachedError", code: "session_observation_read_timeout",
+          }));
+          readController.abort();
+        }, dependencies.watchRequestTimeoutMs ?? DEFAULT_WATCH_REQUEST_TIMEOUT_MS);
+      });
+      status = await Promise.race([client.getIndexSessionStatus(id, { ...statusOptions, signal: readController.signal }), interrupted]);
+    } finally {
+      clearTimeout(readTimer);
+      detach.signal.removeEventListener("abort", stopRead);
     }
-    await new Promise((resolve) => setTimeout(resolve, options.processingPollMs ?? 250));
+    if (status.workspace_id && status.workspace_id !== options.workspaceId) {
+      throw Object.assign(new Error("Observed indexing belongs to another workspace; stopped without cancelling it."), { code: "session_preflight_invalid" });
+    }
+    if (!codeReadyShown && status.coverage?.code_ready === true) {
+      codeReadyShown = true;
+      const pending = [status.coverage.documentation_pending ? "documentation pending" : null,
+        status.coverage.other_pending ? "other files pending" : null].filter(Boolean);
+      const sessionState = TERMINAL_INDEX_SESSION_PHASES.has(status.phase)
+        ? `Existing indexing ${sanitizeTerminalText(status.phase)}.` : "Existing indexing continues.";
+      emit(`Code ready${pending.length ? `; ${pending.join("; ")}` : ""}. ${sessionState}`, { code_ready: true,
+        documentation_pending: status.coverage.documentation_pending === true, other_pending: status.coverage.other_pending === true });
+    }
+    return status;
+  };
+  emit(`Following existing indexing session ${sanitizeTerminalText(sessionId)}; no local files are being scanned. Ctrl+C detaches and leaves indexing running.`);
+  try {
+    let status;
+    if (typeof client.followIndexSession === "function") {
+      // Preserve the SDK's status/deadline machinery, with fenced, cancellable GETs.
+      const observer = Object.create(client);
+      if (typeof client.getIndexSessionStatus === "function") observer.getIndexSessionStatus = getStatus;
+      status = await observer.followIndexSession(sessionId, {
+        timeoutMs: observationTimeoutMs,
+        pollMs: options.processingPollMs ?? 250,
+        detachSignal: detach.signal,
+        onProgress: renderer.render,
+      });
+    } else {
+      const deadline = observationTimeoutMs === undefined ? null : Date.now() + observationTimeoutMs;
+      for (;;) {
+        if (detach.signal.aborted || (deadline !== null && Date.now() >= deadline)) throw Object.assign(new Error("Observation detached"), { name: "RemoteIndexDetachedError" });
+        status = await getStatus(sessionId);
+        if (status.progress) renderer.render(status.progress);
+        if (TERMINAL_INDEX_SESSION_PHASES.has(status.phase)) break;
+        await new Promise((resolve) => {
+          const finish = () => { clearTimeout(timer); detach.signal.removeEventListener("abort", finish); resolve(); };
+          const timer = setTimeout(finish, deadline === null ? options.processingPollMs ?? 250 : Math.min(options.processingPollMs ?? 250, Math.max(1, deadline - Date.now())));
+          detach.signal.addEventListener("abort", finish, { once: true });
+          if (detach.signal.aborted) finish();
+        });
+      }
+    }
+    await dependencies.assertObserveFence?.();
+    emit(`Existing indexing ${sanitizeTerminalText(status.phase)}. Run cw doctor to check serving readiness.`, { phase: status.phase });
+    return { ...status, status, observedExisting: true, ok: status.phase === "completed", exitCode: status.phase === "completed" ? 0 : 1 };
+  } catch (error) {
+    if (error?.name === "RemoteIndexDetachedError" || ((detach.signal.aborted || detachReason === "status_request_timeout") && error?.name === "AbortError")) {
+      const reason = detachReason ?? "observation_timeout";
+      const timedOut = reason !== "caller_interrupted";
+      const message = reason === "status_request_timeout"
+        ? "Status request timed out; detached from existing indexing. Backend work may continue. Run cw doctor to check serving readiness."
+        : timedOut
+        ? "Observation deadline elapsed; indexing completion is unverified. Detached without cancelling backend work. Run cw doctor to check serving readiness."
+        : "Detached from existing indexing; backend work continues. Run cw doctor to check serving readiness.";
+      emit(message, { detached: true, reason, outcome: timedOut ? "timeout" : "caller_interrupted", exit_code: timedOut ? 1 : 0 });
+      return { ok: !timedOut, exitCode: timedOut ? 1 : 0, reason, observedExisting: true, detached: true, phase: "observing_detached" };
+    }
+    throw error;
+  } finally {
+    clearTimeout(observationTimer);
+    renderer.finish?.();
+    dependencies.onObservationChange?.(false);
+    for (const signal of signals) signal.removeEventListener("abort", onDetach);
   }
 }
 
@@ -2265,6 +2476,7 @@ function formatIndexEvent(event) {
 }
 
 export async function main(argv = process.argv.slice(2), dependencies = {}) {
+  if (argv[0] === "mcp") return runMcpCommand(argv.slice(1), dependencies);
   const options = parseCliArgs(argv, dependencies.env ?? process.env, dependencies.cwd ?? process.cwd());
   if (options.version) {
     (dependencies.write ?? console.log)(CLI_VERSION);
@@ -2282,8 +2494,6 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     }
     return result;
   };
-  const interactive = dependencies.isTTY ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
-  if (options.implicitIndex && interactive && !options.once && !options.nonInteractive && !options.json && !options.ndjson) options.watch = true;
   const indexingCommand = ["index", "reconcile", "watch"].includes(options.command)
     || (options.command === "init" && options.indexAfterInit);
   if (!indexingCommand || dependencies.signal) {
@@ -2293,12 +2503,14 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   const controller = new AbortController();
   const detachController = new AbortController();
   let interrupts = 0;
+  let observingExisting = false;
   const runtimeProcess = dependencies.process ?? process;
   const onInterrupt = () => {
     interrupts += 1;
     if (interrupts === 1) {
       (dependencies.writeError ?? console.error)(
-        options.watch ? "Stopping watch; cancelling any indexing owned by this process…" : "Cancelling: requesting backend abort and waiting for acknowledgement…",
+        observingExisting ? "Detaching from existing indexing; backend work continues…"
+          : options.watch ? "Stopping watch; cancelling any indexing owned by this process…" : "Cancelling: requesting backend abort and waiting for acknowledgement…",
       );
       controller.abort();
       return;
@@ -2315,10 +2527,41 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       ...dependencies,
       signal: controller.signal,
       detachSignal: detachController.signal,
+      onObservationChange: (value) => { observingExisting = value; dependencies.onObservationChange?.(value); },
       output: options.ndjson || options.json ? runtimeProcess.stderr : dependencies.output,
     }));
   } finally {
     runtimeProcess.off("SIGINT", onInterrupt);
     runtimeProcess.off("SIGTERM", onInterrupt);
   }
+}
+
+/** `cw mcp …`: serve the MCP server, or install and check a host's configuration. */
+export async function runMcpCommand(argv, dependencies = {}) {
+  const env = dependencies.env ?? process.env;
+  const write = dependencies.write ?? console.log;
+  const options = parseMcpArgs(argv, env, dependencies.cwd ?? process.cwd());
+  if (!options.subcommand || options.subcommand === "help") {
+    write(MCP_HELP);
+    return undefined;
+  }
+  if (options.subcommand === "serve") {
+    // stdout belongs to the protocol from here on; credentials stay in this process.
+    if (!env.CORPUSWIRE_BEARER_TOKEN && !env.CORPUSWIRE_BASIC_AUTH) {
+      const { bearerToken } = await resolveServiceAuthorization({ basicAuth: "", apiBaseUrl: options.apiBaseUrl }, dependencies)
+        .catch(() => ({ bearerToken: "" }));
+      if (bearerToken) env.CORPUSWIRE_BEARER_TOKEN = bearerToken;
+    }
+    await import(await locateMcpServer(env));
+    return undefined;
+  }
+  const result = options.subcommand === "install"
+    ? await installHostConfig(options, dependencies)
+    : await doctorHostConfig(options, dependencies);
+  write(options.json ? JSON.stringify(result, null, 2) : formatMcpResult(result));
+  if (result.ok === false) {
+    if (dependencies.process) dependencies.process.exitCode = 1;
+    else if (!dependencies.write) process.exitCode = 1;
+  }
+  return result;
 }

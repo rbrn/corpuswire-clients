@@ -20,6 +20,8 @@ const files = Object.freeze([
   "http.js",
   "inventory.js",
   "inventory.d.ts",
+  "workspace-identity.js",
+  "workspace-identity.d.ts",
   "index.d.ts",
   "index.js",
   "types.d.ts",

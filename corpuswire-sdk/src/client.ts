@@ -875,14 +875,17 @@ export class CorpusWireClient {
     return response.activity;
   }
 
-  async listIndexSessions(request: IndexSessionQuery = {}): Promise<RemoteIndexStatus[]> {
+  async listIndexSessions(
+    request: IndexSessionQuery = {},
+    options: { signal?: AbortSignal } = {},
+  ): Promise<RemoteIndexStatus[]> {
     const response = await requestJson<RemoteIndexSessionsResponse>({
       baseUrl: this.baseUrl,
       paths: [`/v1/index/sessions${toQueryString(toIndexSessionQueryParams(request))}`],
       fetchFn: this.fetchFn,
       defaultHeaders: this.defaultHeaders,
       basicAuth: this.basicAuth,
-      init: { method: "GET" },
+      init: { method: "GET", signal: options.signal },
     });
     return response.sessions;
   }
@@ -1129,7 +1132,7 @@ export class CorpusWireClient {
     for (;;) {
       const status = await this.getIndexSessionStatus(sessionId);
       const pollDelay = observeStatus(status);
-      if (["completed", "aborted", "failed", "expired"].includes(status.phase)) {
+      if (["completed", "aborted", "failed", "expired", "incomplete"].includes(status.phase)) {
         return status;
       }
       if (options.signal?.aborted && !abortSent) {

@@ -1106,3 +1106,18 @@ test('cancelled empty discovery on fresh continuation preserves code without sta
   assert.equal(harness.information.length, 0);
   assert.ok(harness.warnings.some((message) => /Workspace scan incomplete.*Published code is preserved/.test(message)));
 });
+
+test('discovery glob stays within the native VS Code non-nested brace contract', () => {
+  // minimatch accepts nested braces, unlike the native VS Code watcher matcher.
+  let depth = 0;
+  for (const character of includeGlob) {
+    if (character === '{') {
+      depth += 1;
+      assert.ok(depth <= 1, 'Nested alternatives silently prevent native watcher matches');
+    } else if (character === '}') {
+      depth -= 1;
+      assert.ok(depth >= 0, 'Unbalanced discovery alternatives');
+    }
+  }
+  assert.equal(depth, 0);
+});

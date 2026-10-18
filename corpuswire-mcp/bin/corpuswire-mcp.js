@@ -10,11 +10,14 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { planSelectedNeighbor } from "../lib/selected-neighbor.mjs";
 import { canonicalCoalescingDeliveryComplete, planSourceRootCoalescing } from "../lib/source-root-coalescing.mjs";
+import { SERVER_INSTRUCTIONS, decorateTools, detectHost, negotiateProtocolVersion, readToolProfile } from "../lib/host-profile.mjs";
+import { createWorkspaceScope, formatIdentityLines } from "../lib/workspace-scope.mjs";
+import { parseJsonc, resolveWorkspaceIdentity } from "../vendor/corpuswire-sdk/dist/workspace-identity.js";
 
 const JSONRPC_VERSION = "2.0";
 const PROTOCOL_VERSION = "2024-11-05";
 const SERVER_NAME = "corpuswire-context-engine";
-const SERVER_VERSION = "0.1.4-beta.4";
+const SERVER_VERSION = "0.1.5-beta.1";
 const DEFAULT_BASE_URL = "http://127.0.0.1:18080";
 const DEFAULT_OUTPUT_MODE = "generic";
 const DEFAULT_TOP_K = 5;
@@ -40,6 +43,11 @@ const PRIVATE_SEARCH_TELEMETRY_MAX_FILE_BYTES = 128 * 1024;
 const PRIVATE_SEARCH_TELEMETRY_PREFIX = "cw-search-timing-";
 const DIRECTORY_GLOB_PROBE = "__corpuswire_directory_probe__";
 const OUTPUT_MODES = new Set(["generic", "copilot", "claude-code", "sequential"]);
+// Set by initialize; CORPUSWIRE_HOST overrides detection for hosts that report no clientInfo.
+let hostProfile = detectHost(undefined, process.env.CORPUSWIRE_HOST);
+let clientCapabilities = {};
+const pendingClientRequests = new Map();
+let nextClientRequestId = 1;
 const QUALITY_WORK_TYPES = Object.freeze([
   "semantic_retrieval",
   "prompt_enhancement",
@@ -742,8 +750,15 @@ class SyncManager {
     const checkedAt = this.bootstrapStatus.checkedAt;
     const checkedAtMs = checkedAt ? Date.parse(checkedAt) : NaN;
     const freshnessAgeMs = Number.isFinite(checkedAtMs) ? Math.max(0, Date.now() - checkedAtMs) : null;
-    const isStaleForStrict = this.bootstrapStatus.needsReconcile === true
-      && (staleAfterMs === 0 || (freshnessAgeMs !== null && freshnessAgeMs >= staleAfterMs));
+    // A healthy code checkpoint can replace a full baseline observed by this
+    // process. Startup and local observation failures still require reconcile.
+    const readableCodeCheckpoint = this.bootstrapStatus.codeReady === true
+      && this.bootstrapStatus.needsReconcile !== true
+      && this.readableCheckpointBaseline?.contextKey === this.coverageContextKey
+      && this.readableCheckpointBaseline !== undefined && this.lastError === null;
+    const unprovenObservationGap = this.observationGap !== false && !readableCodeCheckpoint;
+    const isStaleForStrict = unprovenObservationGap || (this.bootstrapStatus.needsReconcile === true
+      && (staleAfterMs === 0 || (freshnessAgeMs !== null && freshnessAgeMs >= staleAfterMs)));
     return {
       state: this.bootstrapStatus.state,
       needsReconcile: this.observationGap !== false || this.bootstrapStatus.needsReconcile,
@@ -979,7 +994,21 @@ class SyncManager {
         error.code = "CORPUSWIRE_HEALTH_TIMEOUT";
         throw error;
       }
-      return this.applyBootstrapStatus(checked.value);
+      const selectionArgs = { ...args };
+      for (const [field, alias, envKey] of [
+        ["includeGlobs", "include_globs", "CORPUSWIRE_SYNC_INCLUDE_GLOBS"],
+        ["excludeGlobs", "exclude_globs", "CORPUSWIRE_SYNC_EXCLUDE_GLOBS"],
+      ]) {
+        if (this.coverageSelectionContext && !Object.hasOwn(args, field) && !Object.hasOwn(args, alias)
+          && this.coverageSelectionEnvironment?.[envKey] === this.env[envKey]) {
+          selectionArgs[field] = this.coverageSelectionContext[field];
+        }
+      }
+      return this.applyBootstrapStatus(checked.value, this.resolveContext(selectionArgs));
+    } catch (error) {
+      this.observationGap = true;
+      this.readableCheckpointBaseline = undefined;
+      throw error;
     } finally {
       healthStop.abort();
     }
@@ -1002,14 +1031,57 @@ class SyncManager {
     return bootstrapStatusFromDiagnosis(diagnosis, { repoPath, workspaceId });
   }
 
-  applyBootstrapStatus(bootstrapStatus) {
+  applyBootstrapStatus(bootstrapStatus, selectionContext = undefined) {
+    const previous = this.bootstrapStatus;
+    let contextKey;
+    try {
+      contextKey = syncContextKey(selectionContext ?? this.resolveContext({
+        workspaceId: bootstrapStatus.workspaceId,
+      }));
+    } catch { /* Missing identity cannot authorize a checkpoint exception. */ }
+    const baseline = this.observationGap === false && previous.coverage?.state === "verified"
+      ? { contextKey: this.coverageContextKey, workspaceId: previous.workspaceId,
+        repoPath: previous.repoPath, collection: previous.collection,
+        resolvedWorkspaceId: previous.resolvedWorkspaceId ?? null,
+        resolvedContext: previous.resolvedContext ?? null,
+        coverageToken: previous.coverage.coverage_token,
+        selectionPolicyDigest: previous.coverage.selection_policy_digest }
+      : this.readableCheckpointBaseline;
+    const sameOwnedIdentity = baseline !== undefined
+      && typeof baseline.contextKey === "string" && baseline.contextKey === contextKey
+      && baseline.contextKey === this.coverageContextKey
+      && baseline.workspaceId === bootstrapStatus.workspaceId
+      && baseline.repoPath === bootstrapStatus.repoPath && baseline.collection === bootstrapStatus.collection
+      && baseline.resolvedWorkspaceId === (bootstrapStatus.resolvedWorkspaceId ?? null)
+      && baseline.resolvedContext === (bootstrapStatus.resolvedContext ?? null)
+      && typeof baseline.coverageToken === "string" && baseline.coverageToken.length > 0
+      && typeof baseline.selectionPolicyDigest === "string" && baseline.selectionPolicyDigest.length > 0
+      && bootstrapStatus.needsReconcile !== true && this.lastError === null;
+    const sameOwnedCheckpoint = sameOwnedIdentity && bootstrapStatus.codeReady === true
+      && (bootstrapStatus.coverage?.coverage_token == null
+        || bootstrapStatus.coverage.coverage_token === baseline.coverageToken)
+      && (bootstrapStatus.coverage?.selection_policy_digest == null
+        || bootstrapStatus.coverage.selection_policy_digest === baseline.selectionPolicyDigest);
+    const completedOwnedCheckpoint = this.readableCheckpointBaseline !== undefined && sameOwnedIdentity
+      && bootstrapStatus.coverage?.state === "verified" && bootstrapStatus.publicCodeReady === true
+      && !isBootstrapHealthBlocked(bootstrapStatus)
+      && bootstrapStatus.coverage.coverage_token === baseline.coverageToken
+      && bootstrapStatus.coverage.selection_policy_digest === baseline.selectionPolicyDigest;
     if (this.observationGap === false && (
-      this.bootstrapStatus.coverage?.coverage_token !== bootstrapStatus.coverage?.coverage_token
-      || this.bootstrapStatus.coverage?.selection_policy_digest
-        !== bootstrapStatus.coverage?.selection_policy_digest
+      previous.coverage?.coverage_token !== bootstrapStatus.coverage?.coverage_token
+      || previous.coverage?.selection_policy_digest !== bootstrapStatus.coverage?.selection_policy_digest
+      || ((previous.workspaceId != null || previous.repoPath != null) && (
+        (previous.resolvedWorkspaceId ?? null) !== (bootstrapStatus.resolvedWorkspaceId ?? null)
+        || (previous.resolvedContext ?? null) !== (bootstrapStatus.resolvedContext ?? null)
+        || previous.workspaceId !== bootstrapStatus.workspaceId || previous.repoPath !== bootstrapStatus.repoPath
+        || previous.collection !== bootstrapStatus.collection))
+      || (bootstrapStatus.codeReady === true && !sameOwnedCheckpoint)
     )) {
       this.observationGap = true;
+      this.readableCheckpointBaseline = undefined;
     }
+    if (completedOwnedCheckpoint) this.observationGap = false;
+    this.readableCheckpointBaseline = sameOwnedCheckpoint ? baseline : undefined;
     this.recordBootstrapStatus(bootstrapStatus);
     return bootstrapStatus;
   }
@@ -1024,6 +1096,7 @@ class SyncManager {
     this.activeReconcile = this.runReconcile(context, args, onProgress)
       .catch((error) => {
         this.observationGap = true;
+        this.readableCheckpointBaseline = undefined;
         this.recordError(error, "reconcile");
         this.lastReconcileFinishedAt = new Date().toISOString();
         return {
@@ -1200,7 +1273,7 @@ class SyncManager {
     this.lastFlushStartedAt = new Date(startedAt).toISOString();
     if (this.observationGap === false) {
       try { await this.refreshBootstrapStatus(batch); }
-      catch { this.observationGap = true; }
+      catch { this.observationGap = true; this.readableCheckpointBaseline = undefined; }
     }
     if (isBootstrapHealthBlocked(this.bootstrapStatus) && this.bootstrapStatus.emptyWriteReady !== true) {
       this.requeueBatch(batch);
@@ -1282,6 +1355,7 @@ class SyncManager {
       || !coverage.selection_policy_digest
       || this.coverageContextKey !== syncContextKey(batch)) {
       this.observationGap = true;
+      this.readableCheckpointBaseline = undefined;
       this.bootstrapStatus = {
         ...this.bootstrapStatus,
         state: "needs_reconcile",
@@ -1463,7 +1537,10 @@ class SyncManager {
     }, { operation: "reconcile" });
 
     this.observationGap = response.status?.coverage?.state !== "verified";
-    await this.applySyncCacheUploadResult(context, files.map((file) => ({
+    this.readableCheckpointBaseline = undefined;
+    await this.applySyncCacheUploadResult({ ...context,
+      diagnosisRepoPath: firstNonEmptyString(args.repoPath, args.repo_path, this.env.CORPUSWIRE_REPO_PATH, context.sourceRoot),
+    }, files.map((file) => ({
       relativePath: file.relativePath, size: file.content.length, mtimeNs: file.mtimeNs, sha256: file.sha256,
     })), new Set(), response, true);
     const durationMs = Date.now() - startedAt;
@@ -1623,7 +1700,29 @@ class SyncManager {
     if (evidence?.state === "verified" && response.transfer?.complete) {
       const firstNonemptyPublication = this.bootstrapStatus.emptyWriteReady === true
         && evidence.eligible_file_count > 0;
+      if (fullBaseline && (this.bootstrapStatus.state === "not_checked"
+        || (this.bootstrapStatus.state === "unknown" && this.bootstrapStatus.diagnosisTimedOut === true))
+        && this.bootstrapStatus.workspaceId == null && this.bootstrapStatus.repoPath == null
+        && this.bootstrapStatus.resolvedWorkspaceId == null && this.bootstrapStatus.resolvedContext == null) {
+        const receiptWorkspaceId = response.status.workspace_id;
+        if (typeof receiptWorkspaceId === "string" && receiptWorkspaceId.length > 0
+          && receiptWorkspaceId === context.workspaceId && response.status.collection_name
+          && evidence.coverage_token && evidence.selection_policy_digest) {
+          this.bootstrapStatus = { ...this.bootstrapStatus, state: "ready", healthBlocked: false,
+            diagnosisTimedOut: false, workspaceId: context.workspaceId,
+            repoPath: context.diagnosisRepoPath ?? this.env.CORPUSWIRE_REPO_PATH ?? context.sourceRoot,
+            resolvedWorkspaceId: receiptWorkspaceId, resolvedContext: receiptWorkspaceId };
+        } else {
+          this.observationGap = true;
+          this.readableCheckpointBaseline = undefined;
+        }
+      }
       this.coverageContextKey = syncContextKey(context);
+      this.coverageSelectionContext = { includeGlobs: [...(context.includeGlobs ?? [])], excludeGlobs: [...(context.excludeGlobs ?? [])] };
+      this.coverageSelectionEnvironment = {
+        CORPUSWIRE_SYNC_INCLUDE_GLOBS: this.env.CORPUSWIRE_SYNC_INCLUDE_GLOBS,
+        CORPUSWIRE_SYNC_EXCLUDE_GLOBS: this.env.CORPUSWIRE_SYNC_EXCLUDE_GLOBS,
+      };
       this.bootstrapStatus = { ...this.bootstrapStatus, coverage: evidence,
         checkedAt: new Date().toISOString(), collection: response.status.collection_name,
         state: isBootstrapHealthBlocked(this.bootstrapStatus) ? "blocked" : "ready", needsReconcile: false };
@@ -1638,12 +1737,14 @@ class SyncManager {
             || fresh.coverage.coverage_token !== evidence.coverage_token
             || fresh.coverage.selection_policy_digest !== evidence.selection_policy_digest) {
             this.observationGap = true;
+            this.readableCheckpointBaseline = undefined;
             this.bootstrapStatus = { ...fresh, state: "blocked", healthBlocked: true,
               emptyWriteReady: false, canRetrieve: false, needsReconcile: true,
               reason: "The fresh health diagnosis does not match the completed publication." };
           }
         } catch (error) {
           this.observationGap = true;
+          this.readableCheckpointBaseline = undefined;
           this.bootstrapStatus = { ...this.bootstrapStatus, state: "blocked", healthBlocked: true,
             emptyWriteReady: false, canRetrieve: null, needsReconcile: true,
             reason: "The first nonempty publication needs a fresh health diagnosis." };
@@ -1652,6 +1753,7 @@ class SyncManager {
       }
     } else {
       this.observationGap = true;
+      this.readableCheckpointBaseline = undefined;
     }
     if (!this.isCacheEnabled()) {
       return;
@@ -1665,6 +1767,7 @@ class SyncManager {
       cacheState.data.collection = response.status?.collection_name ?? null;
       if (coverage?.state !== "verified" || !response.transfer?.complete) {
         this.observationGap = true;
+        this.readableCheckpointBaseline = undefined;
         await this.saveSyncCache(cacheState);
         return;
       }
@@ -2032,6 +2135,7 @@ class SyncManager {
 
   recordError(error, operation = "flush") {
     this.observationGap = true;
+    this.readableCheckpointBaseline = undefined;
     this.lastError = error instanceof Error ? error.message : String(error);
     const finishedAt = new Date().toISOString();
     if (operation === "reconcile") {
@@ -2054,6 +2158,10 @@ class SyncManager {
   }
 
   recordBootstrapStatus(status) {
+    if (status.healthBlocked === true || ["blocked", "unknown", "error"].includes(status.state)) {
+      this.readableCheckpointBaseline = undefined;
+      if (["unknown", "error"].includes(status.state)) this.observationGap = true;
+    }
     this.bootstrapStatus = {
       ...initialBootstrapStatus(),
       ...status,
@@ -2301,6 +2409,12 @@ async function handleMessage(message) {
 
   const messageId = message.id;
   if (messageId === undefined || messageId === null) {
+    if (message.method === "notifications/roots/list_changed") workspaceScope.invalidateRoots();
+    return null;
+  }
+
+  if (message.method === undefined && ("result" in message || "error" in message)) {
+    settleClientRequest(messageId, message);
     return null;
   }
 
@@ -2341,20 +2455,74 @@ async function handleRequest(method, params) {
 
 function initialize(params) {
   const requestedProtocol = typeof params.protocolVersion === "string" && params.protocolVersion.trim()
-    ? params.protocolVersion
+    ? params.protocolVersion.trim()
     : PROTOCOL_VERSION;
+  hostProfile = detectHost(asRecord(params.clientInfo), process.env.CORPUSWIRE_HOST);
+  clientCapabilities = asRecord(params.capabilities);
+  if (process.env.CORPUSWIRE_MCP_HANDSHAKE_LOG === "1") {
+    // Names only, on stderr, so a host's handshake can be recorded without content.
+    const clientInfo = asRecord(params.clientInfo);
+    process.stderr.write(`${JSON.stringify({ corpuswire_handshake: {
+      clientName: optionalString(clientInfo.name) ?? null, clientVersion: optionalString(clientInfo.version) ?? null,
+      protocolVersion: requestedProtocol, capabilities: Object.keys(clientCapabilities).sort(),
+      host: hostProfile.id, cwd: process.cwd(),
+    } })}\n`);
+  }
 
   return {
-    protocolVersion: requestedProtocol,
+    protocolVersion: negotiateProtocolVersion(requestedProtocol),
     capabilities: {
       tools: { listChanged: false },
     },
     serverInfo: {
       name: SERVER_NAME,
+      title: "CorpusWire Context Engine",
       version: SERVER_VERSION,
     },
+    instructions: SERVER_INSTRUCTIONS,
   };
 }
+
+/** Send a request to the host (for example roots/list) and await its response. */
+function requestClient(method, params, timeoutMs) {
+  const id = `corpuswire-${nextClientRequestId++}`;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingClientRequests.delete(id);
+      reject(new Error(`${method} timed out`));
+    }, timeoutMs);
+    pendingClientRequests.set(id, { resolve, reject, timer });
+    writeProtocolMessage({ jsonrpc: JSONRPC_VERSION, id, method, ...(params ? { params } : {}) });
+  });
+}
+
+function settleClientRequest(id, message) {
+  const pending = pendingClientRequests.get(id);
+  if (!pending) return;
+  pendingClientRequests.delete(id);
+  clearTimeout(pending.timer);
+  if (message.error) pending.reject(new Error(optionalString(asRecord(message.error).message) ?? "client error"));
+  else pending.resolve(message.result);
+}
+
+const workspaceScope = createWorkspaceScope({
+  env: process.env,
+  cwd: process.cwd(),
+  homeDirectory: homedir(),
+  readJson: async (filePath) => parseJsonc(await readFile(filePath, "utf8")),
+  resolveIdentity: resolveWorkspaceIdentity,
+  clientSupportsRoots: () => isRecord(clientCapabilities.roots),
+  requestRoots: (timeoutMs) => requestClient("roots/list", undefined, timeoutMs),
+  gitToplevel: async (cwd) => {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"],
+      { cwd, timeout: DEFAULT_SYNC_GIT_TIMEOUT_MS, windowsHide: true });
+    return stdout.trim() || undefined;
+  },
+  workspaceHasIndex: async (workspaceId) => {
+    const diagnosis = await buildClient().diagnoseWorkspace({ workspaceId });
+    return diagnosis?.can_retrieve === true || Number(diagnosis?.point_count) > 0;
+  },
+});
 
 // Private capture is independent of indexing and is never sent to the backend.
 // A shared directory lock serializes quota accounting across MCP processes.
@@ -2978,7 +3146,7 @@ function parseAllowedOrigins(value) {
 }
 
 async function listToolsWithPlugins() {
-  const builtin = toolDefinitions();
+  const builtin = decorateTools(toolDefinitions(), readToolProfile(process.env.CORPUSWIRE_TOOL_PROFILE));
   const builtinNames = new Set(builtin.map((t) => t.name));
   const plugin = await fetchPluginTools();
   const merged = [...builtin];
@@ -3095,7 +3263,7 @@ function toolDefinitions() {
     },
     {
       name: "corpuswire_search",
-      description: "Search the configured CorpusWire index for repository context without answer generation.",
+      description: "Semantic search over this workspace's indexed code and documents. Returns ranked file paths with line ranges, symbols and excerpts, without answer generation. Use it before reading unfamiliar code or to find where something is defined, configured or documented.",
       inputSchema: {
         type: "object",
         additionalProperties: false,
@@ -3110,7 +3278,7 @@ function toolDefinitions() {
           },
           workspaceId: {
             type: "string",
-            description: "Local API workspace id used to scope retrieval. Defaults to CORPUSWIRE_WORKSPACE_ID when set.",
+            description: "Workspace id used to scope retrieval. Defaults to CORPUSWIRE_WORKSPACE_ID, then to the id configured for the host's workspace folder; pass it only when the result header shows the wrong workspace.",
           },
           topK: {
             type: "integer",
@@ -3141,20 +3309,20 @@ function toolDefinitions() {
     },
     {
       name: "corpuswire_enhance_prompt",
-      description: "Preview a base Codex prompt enhanced with local repository context. Returns the original prompt, augmented prompt, context sources, and retrieval metadata.",
+      description: "Rewrite a coding-agent prompt into a clearer instruction grounded in this workspace's indexed context. Returns the original prompt, the augmented prompt, the files it used, and retrieval metadata. Use it when a task is short, vague, or names no files.",
       inputSchema: {
         type: "object",
         additionalProperties: false,
         properties: {
           prompt: {
             type: "string",
-            description: "Base prompt to rewrite into a clearer context-grounded Codex instruction.",
+            description: "Base prompt to rewrite into a clearer, context-grounded instruction.",
           },
           outputMode: {
             type: "string",
             enum: [...OUTPUT_MODES],
             default: DEFAULT_OUTPUT_MODE,
-            description: "Prompt style requested from the backend.",
+            description: "Prompt style requested from the backend. Defaults to the calling host's style (claude-code for Claude Code, copilot for GitHub Copilot, generic otherwise).",
           },
           repoPath: {
             type: "string",
@@ -3162,7 +3330,7 @@ function toolDefinitions() {
           },
           workspaceId: {
             type: "string",
-            description: "Local API workspace id used to scope retrieval. Defaults to CORPUSWIRE_WORKSPACE_ID when set.",
+            description: "Workspace id used to scope retrieval. Defaults to CORPUSWIRE_WORKSPACE_ID, then to the id configured for the host's workspace folder; pass it only when the result header shows the wrong workspace.",
           },
           topK: {
             type: "integer",
@@ -3253,7 +3421,7 @@ function toolDefinitions() {
             type: "string",
             description: "Evaluated query or base prompt. The server redacts it by default before persistence.",
           },
-          surface: { type: "string", description: "Calling surface, for example codex, vscode, copilot, or cli." },
+          surface: { type: "string", description: "Calling surface, for example claude-code, codex, vscode, copilot-cli, or cli. Defaults to the detected MCP host." },
           roundId: { type: "string", description: "Shared id linking the engines evaluated in one comparison round." },
           resultPaths: { type: "array", items: { type: "string" }, default: [] },
           warning: { type: "string" },
@@ -4910,8 +5078,7 @@ async function searchContextCore(args, telemetry) {
   const query = requiredString(args, "query");
   const topK = optionalPositiveInteger(args.topK ?? process.env.CORPUSWIRE_TOP_K, DEFAULT_TOP_K);
   const minScore = optionalScore(args.minScore ?? process.env.CORPUSWIRE_MIN_SCORE);
-  const repoPath = optionalString(args.repoPath ?? process.env.CORPUSWIRE_REPO_PATH);
-  const workspaceId = optionalString(args.workspaceId ?? process.env.CORPUSWIRE_WORKSPACE_ID);
+  const { repoPath, workspaceId, identity } = await resolveReadScope(args);
   const sourceFilterRaw = optionalStringArray(args, "sourceFilter");
   const sourceFilter = sourceFilterRaw.length > 0 ? sourceFilterRaw : undefined;
   const maxChars = Math.min(
@@ -4957,6 +5124,7 @@ async function searchContextCore(args, telemetry) {
     query,
     repoPath,
     workspaceId,
+    identity,
     topK,
     minScore,
     maxChars,
@@ -5138,8 +5306,8 @@ async function indexActivity(args) {
 
 async function doctor(args) {
   const client = buildClient();
-  const repoPath = optionalString(args.repoPath ?? args.repo_path ?? process.env.CORPUSWIRE_REPO_PATH);
-  const workspaceId = optionalString(args.workspaceId ?? args.workspace_id ?? process.env.CORPUSWIRE_WORKSPACE_ID);
+  const { repoPath, workspaceId, identity } = await resolveReadScope({
+    repoPath: args.repoPath ?? args.repo_path, workspaceId: args.workspaceId ?? args.workspace_id });
   const collection = optionalString(args.collection);
   const activityWindowHours = optionalPositiveInteger(
     args.activityWindowHours ?? args.activity_window_hours,
@@ -5183,7 +5351,7 @@ async function doctor(args) {
 
   const syncStatus = syncManager.snapshot();
   const verdict = determineDoctorVerdict({ healthResponse, diagnosis, syncStatus, sessions, activity, errors });
-  return formatDoctor({
+  return withResolvedIdentity(formatDoctor({
     baseUrl: client.baseUrl,
     repoPath,
     workspaceId,
@@ -5196,44 +5364,99 @@ async function doctor(args) {
     sessions,
     activity,
     errors,
-  });
+  }), identity);
 }
 
 async function diagnoseWorkspace(args) {
   const client = buildClient();
-  const repoPath = optionalString(args.repoPath ?? process.env.CORPUSWIRE_REPO_PATH);
-  const workspaceId = optionalString(args.workspaceId ?? process.env.CORPUSWIRE_WORKSPACE_ID);
+  const { repoPath, workspaceId, identity } = await resolveReadScope(args);
   const diagnosis = typeof client.diagnoseWorkspace === "function"
     ? await client.diagnoseWorkspace({ repoPath, workspaceId })
     : diagnosisFromHealth(await client.health({ repoPath, workspaceId }), { repoPath, workspaceId });
-  return formatWorkspaceDiagnosis({ baseUrl: client.baseUrl, repoPath, workspaceId, diagnosis });
+  return withResolvedIdentity(formatWorkspaceDiagnosis({ baseUrl: client.baseUrl, repoPath, workspaceId, diagnosis }), identity);
+}
+
+/** Workspace scope for read tools: explicit and env values unchanged, otherwise resolved from the host's folder. */
+async function resolveReadScope(args) {
+  const explicit = optionalString(args.workspaceId) !== undefined || optionalString(args.repoPath) !== undefined;
+  const workspaceId = optionalString(args.workspaceId ?? process.env.CORPUSWIRE_WORKSPACE_ID);
+  const repoPath = optionalString(args.repoPath ?? process.env.CORPUSWIRE_REPO_PATH);
+  if (workspaceId !== undefined || repoPath !== undefined) {
+    return { workspaceId, repoPath, identity: { source: explicit ? "argument" : "env", workspaceId, repoPath } };
+  }
+  return workspaceScope.resolve({});
+}
+
+// Configured identities print nothing new, so existing env-configured hosts see unchanged output.
+function formatResolvedIdentity(identity) {
+  return identity && !["argument", "env"].includes(identity.source) ? formatIdentityLines(identity) : [];
+}
+
+// CORPUSWIRE_RESULT_HEADER=compact drops tenancy and storage lines a coding agent
+// cannot act on; hits, packets, citations and warnings are unchanged.
+const COMPACT_HEADER_DROPPED_PREFIXES = Object.freeze([
+  "- tenantId:", "- userId:", "- actorKind:", "- membershipRole:", "- collection:", "- manifestRevision:",
+]);
+
+function compactResultHeader(lines) {
+  if ((process.env.CORPUSWIRE_RESULT_HEADER ?? "full").trim().toLowerCase() !== "compact") return lines;
+  return lines.filter((line) => !COMPACT_HEADER_DROPPED_PREFIXES.some((prefix) => line.startsWith(prefix)));
+}
+
+function withResolvedIdentity(text, identity) {
+  const lines = formatResolvedIdentity(identity);
+  if (lines.length === 0) return text;
+  const [first, ...rest] = text.split("\n");
+  return [first, ...lines, ...rest].join("\n");
 }
 
 function diagnosisFromHealth(response, { repoPath, workspaceId }) {
   const index = response.index ?? {};
   const activeProject = response.active_project ?? {};
+  const context = response.context ?? {};
   const qdrant = response.qdrant ?? {};
+  const contextWorkspaceId = optionalString(context.workspace_id);
+  const activeWorkspaceId = optionalString(activeProject.workspace_id);
+  const workspaceConflict = contextWorkspaceId && activeWorkspaceId && contextWorkspaceId !== activeWorkspaceId;
+  const resolvedWorkspaceId = workspaceConflict ? null : contextWorkspaceId ?? activeWorkspaceId ?? null;
+  const collections = [activeProject.collection, qdrant.collection, index.collection].map(optionalString).filter(Boolean);
+  const collectionConflict = new Set(collections).size > 1;
+  const storageWorkspaceId = optionalString(context.storage_workspace_id);
+  const indexWorkspaceId = optionalString(index.workspace_id);
+  const storageConflict = storageWorkspaceId && indexWorkspaceId && storageWorkspaceId !== indexWorkspaceId;
+  // Health defaults do not prove which repository was selected. Compare service paths
+  // lexically; resolving them on the client would confuse remote and local roots.
+  const selectedPaths = [activeProject.path, index.path].map(optionalString).filter(Boolean);
+  const normalizeServicePath = (value) => (value.split("/").includes("..") ? value : path.posix.normalize(value)).replace(/\/$/, "") || "/";
+  const selectedPathConflict = !workspaceId && new Set(selectedPaths.map(normalizeServicePath)).size > 1;
+  const requestedPathMismatch = !workspaceId && repoPath
+    && (selectedPaths.length === 0 || normalizeServicePath(selectedPaths[0]) !== normalizeServicePath(repoPath));
+  const identityProblem = Boolean(workspaceConflict || storageConflict || collectionConflict || collections.length === 0
+    || selectedPathConflict || requestedPathMismatch || (workspaceId && resolvedWorkspaceId !== workspaceId));
+  const healthProblem = identityProblem || response.ok === false;
   const collectionExists = typeof qdrant.collection_exists === "boolean" ? qdrant.collection_exists : undefined;
   const pointCount = Number.isInteger(qdrant.point_count) ? qdrant.point_count : undefined;
-  const canRetrieve = collectionExists === true && (pointCount ?? 0) > 0;
+  const canRetrieve = !healthProblem && collectionExists === true && (pointCount ?? 0) > 0;
   return {
     status: canRetrieve ? "ready" : "blocked",
     can_retrieve: canRetrieve,
     requested_repo_path: repoPath ?? null,
     requested_workspace_id: workspaceId ?? null,
-    resolved_context: activeProject.path ?? response.docs_source_dir ?? "unknown",
-    resolved_workspace_id: activeProject.workspace_id ?? workspaceId ?? null,
+    resolved_context: workspaceId
+      ? resolvedWorkspaceId
+      : selectedPathConflict ? null : selectedPaths[0] ?? response.docs_source_dir ?? "unknown",
+    resolved_workspace_id: resolvedWorkspaceId,
     resolution_mode: workspaceId ? "remote" : "local",
-    collection: activeProject.collection ?? qdrant.collection ?? "unknown",
+    collection: collectionConflict ? null : collections[0] ?? "unknown",
     collection_exists: collectionExists,
     point_count: pointCount,
-    qdrant_error: qdrant.error ?? null,
+    qdrant_error: qdrant.error ?? (healthProblem ? "Health response does not attest the requested workspace, repository, and collection." : null),
     index,
     active_backend: {
       default_repo_path: response.docs_source_dir,
       default_collection: qdrant.collection,
-      requested_context: activeProject.path ?? response.docs_source_dir,
-      matches_requested_context: true,
+      requested_context: activeProject.path ?? index.path ?? response.docs_source_dir,
+      matches_requested_context: !identityProblem,
     },
     checks: [],
     recovery_actions: [],
@@ -5270,6 +5493,8 @@ function bootstrapStatusForTimeout(maxWaitMs) {
   return {
     ...initialBootstrapStatus(),
     state: "unknown",
+    diagnosisTimedOut: true,
+    needsReconcile: true,
     healthBlocked: true,
     canRetrieve: false,
     checkedAt: new Date().toISOString(),
@@ -5700,16 +5925,17 @@ function formatIndexActivity({ baseUrl, workspaceId, collection, windowHours, li
   return lines.join("\n");
 }
 
-function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minScore, maxChars, result, context, hits, readPreparation, onRenderedHit }) {
+function formatSearchResult({ baseUrl, query, repoPath, workspaceId, identity, topK, minScore, maxChars, result, context, hits, readPreparation, onRenderedHit }) {
   const index = asRecord(context.index);
   const retrievalWarning = optionalString(result.retrieval_warning);
-  const lines = [
+  const lines = compactResultHeader([
     "CorpusWire search:",
     `- baseUrl: ${baseUrl}`,
     `- query: ${query}`,
     `- retrievalQuery: ${result.retrieval_query ?? "unknown"}`,
     `- requestedRepoPath: ${repoPath ?? "backend default"}`,
     `- requestedWorkspaceId: ${workspaceId ?? "backend default"}`,
+    ...formatResolvedIdentity(identity),
     `- resolvedContext: ${context.repo_path ?? context.workspace_id ?? "unknown"}`,
     `- contextWorkspaceId: ${context.workspace_id ?? "unknown"}`,
     `- tenantId: ${context.tenant_id ?? "unknown"}`,
@@ -5731,7 +5957,7 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, topK, minSc
     ...(retrievalWarning ? [`- retrievalWarning: ${retrievalWarning}`] : []),
     ...formatWarnings(index.health_warnings),
     ...formatReadPreparation(readPreparation),
-  ];
+  ]);
 
   if (hits.length === 0) {
     lines.push("", "No hits returned.");
@@ -6232,11 +6458,10 @@ function indentSnippet(text) {
 
 async function enhancePrompt(args, observation = undefined) {
   const prompt = requiredString(args, "prompt");
-  const outputMode = readOutputMode(args.outputMode ?? process.env.CORPUSWIRE_OUTPUT_MODE ?? DEFAULT_OUTPUT_MODE);
+  const outputMode = readOutputMode(args.outputMode ?? process.env.CORPUSWIRE_OUTPUT_MODE ?? hostProfile.defaultOutputMode);
   const topK = optionalPositiveInteger(args.topK ?? process.env.CORPUSWIRE_TOP_K, DEFAULT_TOP_K);
   const minScore = optionalScore(args.minScore ?? process.env.CORPUSWIRE_MIN_SCORE);
-  const repoPath = optionalString(args.repoPath ?? process.env.CORPUSWIRE_REPO_PATH);
-  const workspaceId = optionalString(args.workspaceId ?? process.env.CORPUSWIRE_WORKSPACE_ID);
+  const { repoPath, workspaceId, identity } = await resolveReadScope(args);
   const localOnly = optionalBoolean(args.localOnly ?? process.env.CORPUSWIRE_LOCAL_ONLY, true);
   const sourceFilterRaw = optionalStringArray(args, "sourceFilter");
   const sourceFilter = sourceFilterRaw.length > 0 ? sourceFilterRaw : undefined;
@@ -6279,7 +6504,7 @@ async function enhancePrompt(args, observation = undefined) {
     })
     : [];
 
-  const formatted = [
+  const formatted = compactResultHeader([
     "Prompt augmentation preview",
     "",
     "Original prompt:",
@@ -6295,6 +6520,7 @@ async function enhancePrompt(args, observation = undefined) {
     `- baseUrl: ${client.baseUrl}`,
     `- repoPath: ${repoPath ?? "backend default"}`,
     `- workspaceId: ${workspaceId ?? result.workspace_id ?? "backend default"}`,
+    ...formatResolvedIdentity(identity),
     `- tenantId: ${result.tenant_id ?? "unknown"}`,
     `- userId: ${result.user_id ?? "anonymous-local"}`,
     `- actorKind: ${result.actor_kind ?? "unknown"}`,
@@ -6316,7 +6542,7 @@ async function enhancePrompt(args, observation = undefined) {
     ...(Array.isArray(result.citations) && result.citations.length > 0
       ? ["", "Citations:", ...result.citations.map((citation) => `- ${citation}`)]
       : []),
-  ].join("\n");
+  ]).join("\n");
   const failureMode = enhancementFailureMode({
     result,
     enhancedPrompt,
@@ -6354,7 +6580,8 @@ function indentPreviewBlock(text) {
 }
 
 async function recordQualityResult(args) {
-  const workspaceId = optionalString(args.workspaceId ?? process.env.CORPUSWIRE_WORKSPACE_ID);
+  const workspaceId = optionalString(args.workspaceId ?? process.env.CORPUSWIRE_WORKSPACE_ID)
+    ?? (await resolveReadScope({})).workspaceId;
   if (!workspaceId) {
     throw new JsonRpcError(-32602, "Quality ratings require workspaceId or CORPUSWIRE_WORKSPACE_ID.");
   }
@@ -6380,7 +6607,7 @@ async function recordQualityResult(args) {
     engine,
     scorecard,
     query: optionalString(args.query) ?? "",
-    surface: optionalString(args.surface) ?? "codex",
+    surface: optionalString(args.surface) ?? hostProfile.surface,
     roundId: optionalString(args.roundId),
     resultPaths: optionalStringArray(args, "resultPaths"),
     warning: optionalString(args.warning),
@@ -7958,7 +8185,7 @@ function formatToolError(error, operation = "request") {
   const message = error instanceof Error ? error.message : String(error);
   if (isConnectionError(message)) {
     const baseUrl = process.env.CORPUSWIRE_BASE_URL ?? DEFAULT_BASE_URL;
-    return `Could not connect to corpuswire at ${baseUrl} while handling the ${operation}. Start the FastAPI server and try again. ${message}`;
+    return `Could not connect to corpuswire at ${baseUrl} while handling the ${operation}. Start the CorpusWire service (for example docker compose up -d) or run cw doctor, then try again. ${message}`;
   }
   if (sdk.CorpusWireHttpError && error instanceof sdk.CorpusWireHttpError) {
     const guidance = boundedRecoveryGuidance(error.recoveryGuidance);

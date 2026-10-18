@@ -90,7 +90,9 @@ export declare class CorpusWireClient {
     getIndexCapabilities(): Promise<RemoteIndexCapabilities>;
     getIndexEvents(request?: IndexEventQuery): Promise<IndexEvent[]>;
     getIndexActivity(request?: IndexActivityQuery): Promise<IndexActivitySummary>;
-    listIndexSessions(request?: IndexSessionQuery): Promise<RemoteIndexStatus[]>;
+    listIndexSessions(request?: IndexSessionQuery, options?: {
+        signal?: AbortSignal;
+    }): Promise<RemoteIndexStatus[]>;
     startIndexSession(request: StartRemoteIndexSessionRequest): Promise<RemoteIndexSession>;
     previewIndexWorkspace(request: IndexWorkspaceRequest): Promise<RemoteIndexPreview>;
     sendManifestBatch(sessionId: string, entries: RemoteManifestEntry[]): Promise<RemoteManifestBatchResult>;
