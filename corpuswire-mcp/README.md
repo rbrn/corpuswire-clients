@@ -175,6 +175,46 @@ bash ./scripts/regression_local_mcp.sh /Users/constantinaldea/workspace/my-conte
 
 That command runs the Docker/API regression gate, then exercises the Codex wrapper path and this direct Copilot-oriented MCP path against `http://127.0.0.1:${APP_HOST_PORT:-8000}`. When the repository has `.env` with `APP_HOST_PORT`, the script uses that port.
 
+## Hosts: Claude Code, GitHub Copilot and Codex
+
+One server serves every host. `cw mcp install --host <host>` writes a config
+that launches `cw mcp serve`, so moving or renaming a checkout no longer breaks
+it, and `cw mcp doctor --host <host>` checks the config and runs a handshake.
+Hosts: `claude-code`, `vscode`, `copilot-cli`, `codex`.
+
+What the server does for each host:
+
+- **Host detection.** `initialize` reads `clientInfo.name` (`claude-code`,
+  `Visual Studio Code`, Copilot CLI names containing `copilot`, Codex names
+  containing `codex`). The host sets the `surface` recorded by
+  `corpuswire_rate_result` and the default `outputMode` of
+  `corpuswire_enhance_prompt` (`claude-code`, `copilot`, or `generic`).
+  `CORPUSWIRE_OUTPUT_MODE` and explicit arguments still win.
+- **Workspace identity.** When neither the arguments nor
+  `CORPUSWIRE_WORKSPACE_ID`/`CORPUSWIRE_REPO_PATH` name a workspace, read tools
+  (search, enhance, doctor, diagnose, rate) resolve it from the host's folder:
+  the first MCP root the host offers, else `CORPUSWIRE_SYNC_ROOT`, else the git
+  top level of the server's working folder. In that folder the server reads
+  `.vscode/settings.json`, `.vscode/mcp.json`, `.mcp.json`, then the user
+  profile, then derives the same folder default `cw` indexes with. A derived id
+  is used only when the backend reports an index for it; otherwise the request
+  keeps the backend default. The result header names the source as
+  `workspaceIdentity`, so a wrong workspace is visible. Sync tools still need
+  explicit configuration.
+- **Standard metadata.** Every tool has a `title` and MCP annotations;
+  read-only tools carry `readOnlyHint: true`, and `corpuswire_sync_reconcile`
+  and `corpuswire_sync_abort_session` carry `destructiveHint: true`.
+  `initialize` returns short server `instructions` and negotiates
+  `2025-06-18`, `2025-03-26` or `2024-11-05`.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CORPUSWIRE_HOST` | detected | Force `claude-code`, `vscode-copilot`, `copilot-cli`, `codex` or `unknown` (pre-detection defaults) |
+| `CORPUSWIRE_IDENTITY_RESOLUTION` | `auto` | `env-only` restores the previous unscoped behavior |
+| `CORPUSWIRE_TOOL_PROFILE` | `full` | `core` lists search, enhance, doctor, rate, sync delta and sync flush |
+| `CORPUSWIRE_RESULT_HEADER` | `full` | `compact` drops tenant, user, actor, membership, collection and manifest lines from search and enhance headers |
+| `CORPUSWIRE_MCP_HANDSHAKE_LOG` | off | `1` writes the host's client name, protocol and capability names to stderr |
+
 ## GitHub Copilot Chat In VS Code
 
 For a workspace-local example, see [../../.vscode/mcp.json.example](../../.vscode/mcp.json.example). To activate it, copy the example to `.vscode/mcp.json`, adjust paths, then run **MCP: List Servers** or use the Start button in the VS Code MCP file.
