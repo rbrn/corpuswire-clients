@@ -358,11 +358,15 @@ async function runPromptEnhancement(
   prompt: string,
   post: (message: PanelOutboundMessage) => void,
 ): Promise<void> {
-  const resource = vscode.window.activeTextEditor?.document.uri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
+  // Capture the editor once: settings, credentials and session must describe
+  // the same workspace even if the user switches editors while auth runs.
+  const editor = vscode.window.activeTextEditor;
+  const resource = editor?.document.uri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
   const settings = readSettings(resource);
   for (const warning of settings.configurationWarnings) {
     void vscode.window.showWarningMessage(warning);
   }
+  const session = collectEditorSession(prompt, editor);
 
   const enhancerService = settings.services.enhancer;
   const client = new CorpusWireClient({
@@ -370,7 +374,7 @@ async function runPromptEnhancement(
     endpointMode: "v1-only",
     defaultHeaders: await buildAuthenticatedServiceHeaders(settings, enhancerService),
   });
-  const request = buildEnhancementRequest(prompt, settings, collectEditorSession(prompt));
+  const request = buildEnhancementRequest(prompt, settings, session);
 
   post({ type: "loading", value: true });
   try {
@@ -1164,13 +1168,16 @@ async function enhanceSelectedPrompt(): Promise<void> {
     void vscode.window.showWarningMessage(warning);
   }
 
+  // Collect the session from the captured editor before awaiting authentication.
+  const session = collectEditorSession(selectedText, editor);
+
   const enhancerService = settings.services.enhancer;
   const client = new CorpusWireClient({
     baseUrl: enhancerService.url,
     endpointMode: "v1-only",
     defaultHeaders: await buildAuthenticatedServiceHeaders(settings, enhancerService),
   });
-  const request = buildEnhancementRequest(selectedText, settings, collectEditorSession(selectedText));
+  const request = buildEnhancementRequest(selectedText, settings, session);
 
   let outcome: PromptEnhancementOutcome | undefined;
 
@@ -1241,9 +1248,13 @@ function buildEnhancementRequest(
  * the same workspace folder. When the selection is the prompt itself (the
  * selection-as-prompt command), it is not repeated as a selection. Text from
  * index-excluded files (dotfiles such as `.env`, build output) is never sent.
+ * The caller passes the editor it captured with its settings, before any
+ * await, so the session cannot come from a different workspace.
  */
-function collectEditorSession(prompt: string): EnhanceSessionContext | undefined {
-  const editor = vscode.window.activeTextEditor;
+function collectEditorSession(
+  prompt: string,
+  editor: vscode.TextEditor | undefined,
+): EnhanceSessionContext | undefined {
   const folder = editor
     ? vscode.workspace.getWorkspaceFolder(editor.document.uri)
     : vscode.workspace.workspaceFolders?.[0];
