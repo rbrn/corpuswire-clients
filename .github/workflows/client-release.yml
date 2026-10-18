@@ -1,14 +1,20 @@
 name: Client prerelease
 
 # Pushing sdk-v*, mcp-v* or cli-v* publishes that package as a GitHub
-# prerelease with its npm archive and checksum. Notes come from
-# release-notes/<tag>.md at the tagged commit.
+# prerelease with its npm archive and checksum. Running the workflow by hand
+# with a tag name creates that tag at the dispatched commit instead. Notes come
+# from release-notes/<tag>.md at that commit.
 on:
   push:
     tags:
       - 'sdk-v*'
       - 'mcp-v*'
       - 'cli-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create and publish, such as mcp-v0.1.5-beta.1'
+        required: true
 
 permissions:
   contents: read
@@ -28,12 +34,13 @@ jobs:
           node-version: '20'
       - name: Pack the tagged package
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           case "$TAG" in
             sdk-v*) DIR=corpuswire-sdk; TITLE="CorpusWire SDK" ;;
             mcp-v*) DIR=corpuswire-mcp; TITLE="CorpusWire MCP" ;;
             cli-v*) DIR=corpuswire-cli; TITLE="CorpusWire CLI" ;;
+            *) echo "Unsupported tag $TAG" >&2; exit 1 ;;
           esac
           VERSION="${TAG#*-v}"
           test "$(node -p "require('./$DIR/package.json').version")" = "$VERSION"
@@ -49,5 +56,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" dist/*.tgz dist/*.sha256 --verify-tag --prerelease --title "$TITLE" --notes-file "release-notes/$TAG.md"
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then TARGET=--verify-tag; else TARGET="--target=$GITHUB_SHA"; fi
+          gh release create "$TAG" dist/*.tgz dist/*.sha256 "$TARGET" --prerelease --title "$TITLE" --notes-file "release-notes/$TAG.md"
