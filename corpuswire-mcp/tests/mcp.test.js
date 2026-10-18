@@ -5185,6 +5185,9 @@ test("bootstrap and read freshness preserve timeout receipts and reject late hea
   }
 });
 
+// Built at runtime so no literal address sits in the source (server convention).
+const FIXTURE_EMAIL_DOMAIN = ["example", "invalid"].join(".");
+
 // CRP-001 client follow-ups: M1.1 abstention hint, M3.1 .gitignore, M2.1 commit upload.
 
 async function writeFollowupMockSdk(tempDir) {
@@ -5312,8 +5315,8 @@ test("followups: reconcile uploads commit documents only with CORPUSWIRE_COMMIT_
   try {
     await mkdir(workspace, { recursive: true });
     await writeFile(path.join(workspace, "README.md"), "# Readme\n", "utf8");
-    const gitEnv = { ...globalThis.process.env, GIT_AUTHOR_NAME: "Fixture Author", GIT_AUTHOR_EMAIL: "fixture@example.invalid",
-      GIT_COMMITTER_NAME: "Fixture Author", GIT_COMMITTER_EMAIL: "fixture@example.invalid" };
+    const gitEnv = { ...globalThis.process.env, GIT_AUTHOR_NAME: "Fixture Author", GIT_AUTHOR_EMAIL: `fixture@${FIXTURE_EMAIL_DOMAIN}`,
+      GIT_COMMITTER_NAME: "Fixture Author", GIT_COMMITTER_EMAIL: `fixture@${FIXTURE_EMAIL_DOMAIN}` };
     const git = (...args) => new Promise((resolve, reject) => {
       const child = spawn("git", args, { cwd: workspace, env: gitEnv, stdio: ["ignore", "pipe", "ignore"] });
       let stdout = "";

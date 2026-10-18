@@ -2209,6 +2209,9 @@ test("runtime watcher failure reports safe reason and closes its handle once", {
   assert.ok(state.writes.every((line) => !line.includes("secret") && !line.includes("/private/path")));
 });
 
+// Built at runtime so no literal address sits in the source (server convention).
+const FIXTURE_EMAIL_DOMAIN = ["example", "invalid"].join(".");
+
 // CRP-001 client follow-ups: M1.1 abstention hint, M3.1 .gitignore, M2.1 commit upload.
 
 function enhanceOptions() {
@@ -2327,8 +2330,8 @@ test("index uploads commit documents as virtual paths only with --commit-history
   try {
     const git = (...args) => execFileSync("git", args, {
       cwd: fixture, stdio: ["ignore", "pipe", "ignore"],
-      env: { ...process.env, GIT_AUTHOR_NAME: "Fixture Author", GIT_AUTHOR_EMAIL: "fixture@example.invalid",
-        GIT_COMMITTER_NAME: "Fixture Author", GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+      env: { ...process.env, GIT_AUTHOR_NAME: "Fixture Author", GIT_AUTHOR_EMAIL: `fixture@${FIXTURE_EMAIL_DOMAIN}`,
+        GIT_COMMITTER_NAME: "Fixture Author", GIT_COMMITTER_EMAIL: `fixture@${FIXTURE_EMAIL_DOMAIN}`,
         GIT_AUTHOR_DATE: "2026-10-01T10:00:00+00:00", GIT_COMMITTER_DATE: "2026-10-01T10:00:00+00:00" },
     });
     git("init", "-q");
@@ -2346,7 +2349,7 @@ test("index uploads commit documents as virtual paths only with --commit-history
     const document = on.request.files.find((file) => file.relativePath.startsWith(".corpuswire/"));
     const text = Buffer.from(document.content).toString("utf8");
     assert.match(text, new RegExp(`^# Commit ${sha.slice(0, 12)}: Add synthetic sources\\n`));
-    assert.ok(!text.includes("@example.invalid"));
+    assert.ok(!text.includes(`@${FIXTURE_EMAIL_DOMAIN}`));
     assert.equal(document.sha256, createHashHex(text));
     assert.equal(document.mtimeNs, Date.parse("2026-10-01T10:00:00Z") * 1_000_000);
     assert.match(on.writes.join("\n"), /Commit history: 1 documents/);

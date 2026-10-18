@@ -17,6 +17,9 @@ import {
   retrievalAbstention,
 } from "../dist/index.js";
 
+// Built at runtime so no literal address sits in the source (server convention).
+const FIXTURE_EMAIL_DOMAIN = ["example", "invalid"].join(".");
+
 const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"));
 
 test("gitignore matcher agrees with every expectation in the shared server fixture", () => {
@@ -58,7 +61,7 @@ test("gitignore matcher handles escapes, classes and unreadable files", () => {
 
 test("commit documents match the server rendering byte for byte", async () => {
   const cases = fixture("commit_history_cases.json");
-  const records = parseCommitLog(cases.raw_log, new Set(cases.shallow));
+  const records = parseCommitLog(cases.raw_log.replaceAll("{{FIXTURE_EMAIL_DOMAIN}}", FIXTURE_EMAIL_DOMAIN), new Set(cases.shallow));
   assert.deepEqual(records.map((record) => record.sha), cases.documents.map((document) => document.sha));
   for (const [index, expected] of cases.documents.entries()) {
     const record = records[index];
@@ -90,15 +93,15 @@ test("loadCommitHistoryDocuments reads a real repository with skips, caps and gi
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const git = (...args) => execFileSync("git", args, {
     cwd: root, stdio: ["ignore", "pipe", "ignore"],
-    env: { ...process.env, GIT_AUTHOR_NAME: "Fixture Author", GIT_AUTHOR_EMAIL: "fixture@example.invalid",
-      GIT_COMMITTER_NAME: "Fixture Author", GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+    env: { ...process.env, GIT_AUTHOR_NAME: "Fixture Author", GIT_AUTHOR_EMAIL: `fixture@${FIXTURE_EMAIL_DOMAIN}`,
+      GIT_COMMITTER_NAME: "Fixture Author", GIT_COMMITTER_EMAIL: `fixture@${FIXTURE_EMAIL_DOMAIN}`,
       GIT_AUTHOR_DATE: "2026-10-01T10:00:00+00:00", GIT_COMMITTER_DATE: "2026-10-01T10:00:00+00:00" },
   });
   git("init", "-q");
   mkdirSync(path.join(root, "src"));
   writeFileSync(path.join(root, "src", "app.py"), "print(1)\n");
   git("add", ".");
-  git("commit", "-q", "-m", "Add app\n\nSigned-off-by: Fixture Author <fixture@example.invalid>");
+  git("commit", "-q", "-m", `Add app\n\nSigned-off-by: Fixture Author <fixture@${FIXTURE_EMAIL_DOMAIN}>`);
   writeFileSync(path.join(root, ".env"), "SECRET=1\n");
   git("add", "-f", ".env");
   git("commit", "-q", "-m", "Touch env");
@@ -113,7 +116,7 @@ test("loadCommitHistoryDocuments reads a real repository with skips, caps and gi
   assert.deepEqual(documents.map((document) => document.text.split("\n")[0].replace(/^# Commit [0-9a-f]{12}: /, "")), ["Add log", "Add app"]);
   for (const document of documents) {
     assert.ok(isCommitDocumentPath(document.relativePath));
-    assert.ok(!document.text.includes("@example.invalid"));
+    assert.ok(!document.text.includes(`@${FIXTURE_EMAIL_DOMAIN}`));
     assert.equal(document.mtimeNs, Date.parse("2026-10-01T10:00:00Z") * 1_000_000);
   }
   assert.match(documents[1].text, /Signed-off-by: Fixture Author\n/);
