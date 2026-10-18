@@ -2357,13 +2357,13 @@ test("review: watch does not adopt an alias retargeted during client setup", asy
   assert.match(state.error.message, /replaced/);
 });
 
-async function existingSessionSdkFixture({ command = 'index', phase = 'completed', interrupt = false, onStatus, preflight, race = false, noList = false, timeoutMs, interruptEvent, ndjson = false, unreadable = false, readTimeoutMs, hanging = false } = {}) {
+async function existingSessionSdkFixture({ command = 'index', phase = 'completed', interrupt = false, onStatus, preflight, race = false, noList = false, timeoutMs, interruptEvent, ndjson = false, unreadable = false, readTimeoutMs, hanging = false, extraArgs = [] } = {}) {
   const root = await syntheticWorkspace();
   const workspaceId = 'demo://existing-session#main';
   const controller = new AbortController();
   const runtimeProcess = new EventEmitter();
   const errorWrites = [];
-  const calls = []; const writes = []; let starts = 0; let previews = 0; let reads = 0;
+  const calls = []; const writes = []; const indexRequests = []; let starts = 0; let previews = 0; let reads = 0;
   let listCalls = 0; let statusCalls = 0;
   const client = new CorpusWireClient({ baseUrl: 'http://fixture.test', fetchFn: async (input, init) => {
     const url = new URL(input); calls.push({ method: init.method ?? 'GET', path: url.pathname });
@@ -2384,8 +2384,8 @@ async function existingSessionSdkFixture({ command = 'index', phase = 'completed
   }});
   const other = fakeIndexClient({
     previewIndexWorkspace: async request => { previews++; reads += request.files.length; return {workspace_id:workspaceId,collection_name:'synthetic',requested_mode:'full',expected_mode:'full',included:request.files.length,candidates:request.files.length,changed:0,unchanged:request.files.length,deleted:0,excluded:0,candidate_bytes:0,destructive_risk:false}; },
-    indexWorkspace: async () => {
-      starts++;
+    indexWorkspace: async (request) => {
+      starts++; indexRequests.push(request);
       if (race && starts === 1) throw Object.assign(new Error('Synthetic race'),{status:409,errorDetail:{active_session:{session_id:'existing',workspace_id:workspaceId,phase:'committing'}}});
       return {ok:true,status:{phase:'completed',coverage:{state:'verified'}},transfer:{complete:true}};
     },
@@ -2402,6 +2402,7 @@ async function existingSessionSdkFixture({ command = 'index', phase = 'completed
     // Bare interactive invocation must remain implicit; noninteractive would select one-shot.
     if(command==='bare') args.splice(args.indexOf('--non-interactive'),1);
     if(ndjson) args.push("--ndjson");
+    args.push(...extraArgs);
     if(timeoutMs) args.push('--timeout-ms',String(timeoutMs));
     result=await main(args,{client,cwd:root,homeDirectory:root,env:{},isTTY:command==='bare',process:runtimeProcess,writeError:line=>errorWrites.push(line),watchRequestTimeoutMs:readTimeoutMs,...(interruptEvent ? {} : {signal:controller.signal}),
       write:line=>writes.push(line),writeRaw:()=>{},
@@ -2410,7 +2411,7 @@ async function existingSessionSdkFixture({ command = 'index', phase = 'completed
     });
   } catch(caught) {error=caught;}
   finally {await rm(root,{recursive:true,force:true});}
-  return {result,error,calls,writes,errorWrites,starts,previews,reads,listCalls,statusCalls,processExitCode:runtimeProcess.exitCode};
+  return {result,error,calls,writes,errorWrites,indexRequests,starts,previews,reads,listCalls,statusCalls,processExitCode:runtimeProcess.exitCode};
 }
 
 test('existing workspace sessions are observed before file reads in index, watch and bare cw', async()=>{
@@ -2666,5 +2667,19 @@ test('explicit incomplete attachment returns terminal failure immediately throug
       assert.equal(state.writes.some(line=>line.includes('Existing indexing continues')),false);
       if(ndjson) assert.ok(state.writes.map(line=>JSON.parse(line)).some(event=>event.type==='session_observation'&&event.phase==='incomplete'));
     }
+  }
+});
+
+test('explicit rebuild still recreates the collection after following a completed existing session', async()=>{
+  const workspaceId='demo://existing-session#main';
+  const state=await existingSessionSdkFixture({command:'index',extraArgs:['--rebuild','--confirm-rebuild',workspaceId]});
+  assert.ifError(state.error);
+  assert.equal(state.listCalls,1);
+  assert.match(state.writes.join('\n'),/Existing indexing completed/);
+  assert.equal(state.starts,1,'The requested rebuild must run after observation');
+  assert.equal(state.indexRequests[0].recreateCollection,true);
+  for(const phase of ['failed','aborted']) {
+    const failed=await existingSessionSdkFixture({command:'index',phase,extraArgs:['--rebuild','--confirm-rebuild',workspaceId]});
+    assert.equal(failed.starts,0,`A ${phase} observed session must not start a rebuild`);
   }
 });

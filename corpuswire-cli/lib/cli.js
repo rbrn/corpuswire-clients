@@ -933,7 +933,11 @@ export async function runIndexCommand(options, dependencies) {
 
   if (!dependencies.preparedScan) {
     const existing = await preflightExistingSession(options, dependencies, renderer, write);
-    if (existing) return existing;
+    // A followed session may be an ordinary index, so an explicit rebuild still
+    // runs (behind its own confirmation) once that session has completed.
+    const rebuildAfterObservation = options.rebuild === true && existing?.observedExisting === true
+      && existing.detached !== true && existing.phase === "completed";
+    if (existing && !rebuildAfterObservation) return existing;
   }
 
   const capabilities = dependencies.capabilities ?? await dependencies.client.getIndexCapabilities();
