@@ -29,6 +29,10 @@ This package is the preferred distributable MCP entrypoint for the VS Code/Copil
 - `corpuswire_sync_sessions`: lists active index sessions visible to the local backend, optionally filtered by workspace id.
 - `corpuswire_sync_abort_session`: aborts a known index session by id after inspection.
 - `corpuswire_index_activity`: reports persisted backend index activity and recent index events.
+- `corpuswire_remember`, `corpuswire_memories`, `corpuswire_forget` (only with
+  `CORPUSWIRE_MEMORIES_ENABLED=true`): store, list and delete short facts for
+  the workspace through `/v1/memories`. The server adds matching facts to
+  enhanced prompts as a "Remembered facts" block.
 
 Search and enhancement responses render `Agent context packets` when the API
 returns them. These are ordered file-level inspection hints with roles such as
@@ -288,6 +292,7 @@ Recommended prompt settings:
 - `CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_ATTEMPTS`: active-session 409 retry attempts before requeueing, default `5`
 - `CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_DELAY_MS`: base active-session retry delay, default `750`
 - `CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_MAX_DELAY_MS`: active-session retry delay ceiling, default `5000`
+- `CORPUSWIRE_MEMORIES_ENABLED`: list the workspace memory tools, default `false`; the API must also set `CORPUSWIRE_MEMORIES_ENABLED=true`. A memory holds at most 500 characters and a workspace at most 200. Text that matches the client's credential-redaction patterns is refused before it is sent, and the server checks again. The client never logs memory text or writes it to failure reports.
 - `CORPUSWIRE_INDEX_OBSERVABILITY_ENABLED`: request and render content-free `index-observability/v1` timings for sync/reconcile, default `false`; the API must also set `INDEX_OBSERVABILITY_ENABLED=true`
 
 `corpuswire_sync_bootstrap` is diagnostic by default. It calls workspace diagnosis, reports `bootstrapState` and `needsReconcile` in sync status, and returns recovery actions when the local API workspace index is stale, degraded, missing, or blocked. It uploads files only when called with `"reconcile": true`.

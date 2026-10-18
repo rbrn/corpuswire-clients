@@ -2780,6 +2780,15 @@ async function callTool(params, observation = undefined) {
     }
   }
 
+  if (MEMORY_TOOL_NAMES.has(name) && memoriesEnabled()) {
+    try {
+      return textToolResult(await callMemoryTool(name, args));
+    } catch (error) {
+      // Never report the arguments: they may hold the memory text.
+      return textToolResult(formatToolError(error, "memory request"), true);
+    }
+  }
+
   // Plugin-contributed tool: dispatch to /v1/plugins/mcp-call.
   const pluginTools = await fetchPluginTools();
   if (pluginTools.some((t) => t.name === name)) {
@@ -2990,6 +2999,11 @@ async function listToolsWithPlugins() {
 }
 
 function toolDefinitions() {
+  const tools = builtinToolDefinitions();
+  return memoriesEnabled() ? [...tools, ...memoryToolDefinitions()] : tools;
+}
+
+function builtinToolDefinitions() {
   return [
     {
       name: "corpuswire_review_context",
@@ -6999,6 +7013,156 @@ function firstNonEmptyString(...values) {
     }
   }
   return null;
+}
+
+// Workspace memories (CRP-001 L3.2): short facts stored per workspace on the
+// server and added to enhanced prompts. Behind CORPUSWIRE_MEMORIES_ENABLED
+// (default off), which must also be on for the server. Memory text is never
+// logged or written to failure reports by this client.
+const MEMORY_MAX_CHARS = 500;
+const MEMORY_TOOL_NAMES = new Set([
+  "corpuswire_remember",
+  "corpuswire_memories",
+  "corpuswire_forget",
+]);
+
+function memoriesEnabled() {
+  try {
+    return optionalBoolean(process.env.CORPUSWIRE_MEMORIES_ENABLED, false);
+  } catch {
+    return false;
+  }
+}
+
+function memoryToolDefinitions() {
+  const workspaceId = {
+    type: "string",
+    description: "Stable workspace identity. Defaults to CORPUSWIRE_WORKSPACE_ID.",
+  };
+  return [
+    {
+      name: "corpuswire_remember",
+      description: "Store a short fact about this workspace (at most 500 characters) that CorpusWire adds to enhanced prompts. Text that looks like a credential is rejected.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          workspaceId,
+          text: {
+            type: "string",
+            maxLength: MEMORY_MAX_CHARS,
+            description: "The fact to remember, for example \"integration tests need the local Qdrant container\".",
+          },
+        },
+        required: ["text"],
+      },
+    },
+    {
+      name: "corpuswire_memories",
+      description: "List the facts remembered for this workspace, newest first, with their ids.",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: { workspaceId },
+      },
+    },
+    {
+      name: "corpuswire_forget",
+      description: "Delete one remembered fact of this workspace by its id (see corpuswire_memories).",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          workspaceId,
+          memoryId: { type: "string", description: "Id of the memory to delete." },
+        },
+        required: ["memoryId"],
+      },
+    },
+  ];
+}
+
+async function callMemoryTool(name, args) {
+  const workspaceId = optionalString(args.workspaceId ?? process.env.CORPUSWIRE_WORKSPACE_ID);
+  if (!workspaceId) {
+    throw new JsonRpcError(-32602, "Memories require workspaceId or CORPUSWIRE_WORKSPACE_ID.");
+  }
+  if (name === "corpuswire_remember") {
+    const text = typeof args.text === "string" ? args.text.split(/\s+/).filter(Boolean).join(" ") : "";
+    if (!text) {
+      throw new JsonRpcError(-32602, "Invalid params: text must be a non-empty string.");
+    }
+    if (text.length > MEMORY_MAX_CHARS) {
+      throw new JsonRpcError(-32602, `Invalid params: text is longer than ${MEMORY_MAX_CHARS} characters.`);
+    }
+    if (redactCredentialText(text) !== text) {
+      throw new JsonRpcError(-32602, "Memory text looks like it contains a credential and was not sent.");
+    }
+    const payload = await memoryRequest("POST", "/v1/memories", {
+      workspace_id: workspaceId,
+      text,
+      source: "mcp",
+    });
+    const memory = payload.memory ?? {};
+    return [
+      payload.created === false ? "CorpusWire already remembers this fact:" : "CorpusWire remembered:",
+      `- memoryId: ${memory.memory_id}`,
+      `- workspaceId: ${memory.workspace_id}`,
+      `- text: ${memory.text}`,
+    ].join("\n");
+  }
+  if (name === "corpuswire_memories") {
+    const payload = await memoryRequest(
+      "GET",
+      `/v1/memories?workspace_id=${encodeURIComponent(workspaceId)}`,
+    );
+    const memories = Array.isArray(payload.memories) ? payload.memories : [];
+    if (memories.length === 0) {
+      return `CorpusWire has no remembered facts for ${workspaceId}.`;
+    }
+    return [
+      `CorpusWire remembered facts for ${workspaceId} (${memories.length}):`,
+      ...memories.map((memory) => `- ${memory.memory_id}: ${memory.text}`),
+    ].join("\n");
+  }
+  const memoryId = requiredString(args, "memoryId").trim();
+  await memoryRequest(
+    "DELETE",
+    `/v1/memories/${encodeURIComponent(memoryId)}?workspace_id=${encodeURIComponent(workspaceId)}`,
+  );
+  return `CorpusWire forgot memory ${memoryId}.`;
+}
+
+async function memoryRequest(method, requestPath, body = undefined) {
+  const client = buildClient();
+  const baseUrl = typeof sdk.normalizeBaseUrl === "function"
+    ? sdk.normalizeBaseUrl(client.baseUrl)
+    : String(client.baseUrl).replace(/\/+$/, "");
+  const extraHeaders = body === undefined ? {} : { "Content-Type": "application/json" };
+  const headers = typeof sdk.buildHeaders === "function"
+    ? sdk.buildHeaders(client.defaultHeaders, client.basicAuth, extraHeaders)
+    : { ...(client.defaultHeaders ?? {}), ...extraHeaders };
+  const fetchFn = client.fetchFn ?? globalThis.fetch;
+  const response = await fetchFn(`${baseUrl}${requestPath}`, {
+    method,
+    headers,
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  let payload = {};
+  try {
+    payload = await response.json();
+  } catch {
+    payload = {};
+  }
+  if (!response.ok) {
+    // Server details never contain memory text.
+    const detail = typeof payload?.detail === "string" ? payload.detail : response.statusText;
+    if (response.status === 404 && detail === "Not Found") {
+      throw new Error("the server has workspace memories turned off (CORPUSWIRE_MEMORIES_ENABLED) or is too old.");
+    }
+    throw new Error(`HTTP ${response.status}: ${detail}`);
+  }
+  return payload;
 }
 
 function requiredString(args, key) {
