@@ -229,6 +229,102 @@ Use the Copilot CLI MCP config shape in [examples/copilot-cli-mcp-config.json](e
 
 Enable sync tools only when the server has the intended local workspace root and the target local CorpusWire workspace id.
 
+## Enhancement Slash Command And Host Hooks (opt-in)
+
+Everything in this section is off unless you turn it on. Without
+`CORPUSWIRE_MCP_PROMPTS`, `prompts/list` returns an empty list, `prompts/get`
+is an unknown method, and `initialize` advertises no prompts capability, exactly
+as before.
+
+### MCP prompt `enhance`
+
+Set `CORPUSWIRE_MCP_PROMPTS=on` (also `1`, `true` or `yes`) in the server's
+`env`. The server then advertises the prompts capability and lists one prompt,
+`enhance`, with one required argument, `prompt`. Getting it sends the same
+`/v1/enhance` request as `corpuswire_enhance_prompt` with its defaults
+(`CORPUSWIRE_OUTPUT_MODE`, `CORPUSWIRE_TOP_K`, `CORPUSWIRE_LOCAL_ONLY`, the
+workspace scope and the read-side freshness preparation) and returns only the
+rewrite, as a single user message. Hosts that support MCP prompts insert that
+message into the conversation. A backend failure is a JSON-RPC error, so the
+host shows an error and sends nothing.
+
+- Claude Code: with the server registered as `corpuswire`, type
+  `/mcp__corpuswire__enhance <your prompt>`. If your Claude Code version maps
+  space-separated words to separate arguments, quote the prompt.
+- Other hosts list the prompt where they show MCP prompts. Check that your host
+  version supports MCP prompts before relying on it.
+
+Rollback: unset `CORPUSWIRE_MCP_PROMPTS` or set it to `off`, then restart the
+host.
+
+### Claude Code `UserPromptSubmit` hook
+
+A `UserPromptSubmit` hook cannot replace the prompt, but text it prints on
+stdout (exit code 0) is added to the context Claude sees. This recipe acts only
+on prompts that start with `+cw `, calls the `cw` CLI (`cw enhance` prints the
+bare rewrite) and stays silent on any failure, so a down service never blocks a
+prompt. Save it as an executable script, for example
+`~/.claude/hooks/corpuswire-enhance.sh`:
+
+```sh
+#!/bin/sh
+# Opt-in: only prompts that start with "+cw " are enhanced.
+exec node -e '
+let input = "";
+process.stdin.on("data", (chunk) => { input += chunk; }).on("end", () => {
+  let prompt = "";
+  try { prompt = JSON.parse(input || "{}").prompt ?? ""; } catch { process.exit(0); }
+  const match = /^\s*\+cw\s+([\s\S]+)/.exec(prompt);
+  if (!match) process.exit(0);
+  const run = require("node:child_process").spawnSync(
+    "cw", ["enhance", match[1], "--output-mode", "claude-code"],
+    { encoding: "utf8", timeout: 25000 });
+  if (run.status !== 0 || !run.stdout.trim()) process.exit(0);
+  process.stdout.write("CorpusWire rewrite of this prompt; treat it as the task:\n\n" + run.stdout);
+});'
+```
+
+Register it in `~/.claude/settings.json` or the project's
+`.claude/settings.local.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/corpuswire-enhance.sh", "timeout": 30 }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`cw` reads its own configuration (`cw init`), so the hook needs no token in
+the settings file. Remove the hook entry to roll back.
+
+### Codex
+
+Register the server in `~/.codex/config.toml` and add the flag if your Codex
+version lists MCP prompts:
+
+```toml
+[mcp_servers.corpuswire]
+command = "corpuswire-mcp"
+env = { CORPUSWIRE_WORKSPACE_ID = "<workspace-id>", CORPUSWIRE_OUTPUT_MODE = "generic", CORPUSWIRE_MCP_PROMPTS = "on" }
+```
+
+A custom prompt works whether or not the host lists MCP prompts. Save
+`~/.codex/prompts/cw-enhance.md`:
+
+```markdown
+Call the `corpuswire_enhance_prompt` tool with this prompt: $ARGUMENTS
+Then treat the "Augmented prompt" it returns as the task and carry it out.
+```
+
+and type `/prompts:cw-enhance <your prompt>`. Delete the file to roll back.
+
 ## Correct Configuration
 
 Set `CORPUSWIRE_BASE_URL` to the API that should answer retrieval requests. The local Docker/API default is `http://127.0.0.1:18080`; an explicit configuration overrides it. Remote access is fail-closed: set `CORPUSWIRE_REMOTE_ENABLED=true`, use HTTPS, list the exact origin in `CORPUSWIRE_ALLOWED_ORIGINS`, and provide `CORPUSWIRE_BEARER_TOKEN` or legacy `CORPUSWIRE_BASIC_AUTH`. Redirects are rejected.
@@ -262,6 +358,7 @@ Recommended prompt settings:
 - `CORPUSWIRE_OUTPUT_MODE`: `generic`, `copilot`, `claude-code`, or `sequential`
 - `CORPUSWIRE_TOP_K`: retrieval chunk count
 - `CORPUSWIRE_LOCAL_ONLY`: deterministic rewrite mode, default `true`
+- `CORPUSWIRE_MCP_PROMPTS`: list the `enhance` MCP prompt (`on`, `1`, `true`, `yes`), default off
 - `CORPUSWIRE_BASIC_AUTH`: optional `username:password`
 - `CORPUSWIRE_BEARER_TOKEN`: optional scoped bearer token
 - `CORPUSWIRE_SYNC_ENABLED`: enable remote incremental sync

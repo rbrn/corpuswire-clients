@@ -2321,6 +2321,9 @@ async function handleMessage(message) {
 }
 
 async function handleRequest(method, params) {
+  if (method === "prompts/get" && mcpPromptsEnabled()) {
+    return getMcpPrompt(params);
+  }
   switch (method) {
     case "initialize":
       return initialize(params);
@@ -2333,7 +2336,7 @@ async function handleRequest(method, params) {
     case "resources/list":
       return { resources: [] };
     case "prompts/list":
-      return { prompts: [] };
+      return { prompts: mcpPromptsEnabled() ? listMcpPrompts() : [] };
     default:
       throw new JsonRpcError(-32601, `Method not found: ${method}`);
   }
@@ -2348,11 +2351,71 @@ function initialize(params) {
     protocolVersion: requestedProtocol,
     capabilities: {
       tools: { listChanged: false },
+      ...(mcpPromptsEnabled() ? { prompts: { listChanged: false } } : {}),
     },
     serverInfo: {
       name: SERVER_NAME,
       version: SERVER_VERSION,
     },
+  };
+}
+
+// MCP prompts (CRP-001 L2.2). Off unless CORPUSWIRE_MCP_PROMPTS is set to a
+// true value; when off, prompts/list stays empty, prompts/get stays an unknown
+// method and initialize advertises no prompts capability.
+const MCP_ENHANCE_PROMPT_NAME = "enhance";
+
+function mcpPromptsEnabled() {
+  const raw = process.env.CORPUSWIRE_MCP_PROMPTS;
+  return typeof raw === "string" && ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+}
+
+function listMcpPrompts() {
+  return [
+    {
+      name: MCP_ENHANCE_PROMPT_NAME,
+      title: "CorpusWire: enhance prompt",
+      description: "Rewrite a prompt into a clearer instruction grounded in this workspace's indexed context.",
+      // One argument only: hosts that map space-separated words to arguments
+      // in order would otherwise split a multi-word prompt.
+      arguments: [
+        {
+          name: "prompt",
+          description: "The prompt to enhance.",
+          required: true,
+        },
+      ],
+    },
+  ];
+}
+
+async function getMcpPrompt(params) {
+  const name = params.name;
+  if (name !== MCP_ENHANCE_PROMPT_NAME) {
+    throw new JsonRpcError(-32602, `Invalid params: unknown prompt ${typeof name === "string" ? name : ""}`.trim());
+  }
+  const promptArguments = asRecord(params.arguments);
+  const prompt = typeof promptArguments.prompt === "string" ? promptArguments.prompt.trim() : "";
+  if (!prompt) {
+    throw new JsonRpcError(-32602, "Invalid params: prompt is required.");
+  }
+  let rewrite;
+  try {
+    rewrite = await enhancePromptRewrite({ prompt });
+  } catch (error) {
+    if (error instanceof JsonRpcError) throw error;
+    throw new JsonRpcError(-32603, formatToolError(error, "enhancement request"));
+  }
+  return {
+    description: rewrite.usedLocalFallback
+      ? "CorpusWire rewrite (local deterministic fallback)"
+      : "CorpusWire rewrite",
+    messages: [
+      {
+        role: "user",
+        content: { type: "text", text: rewrite.enhancedPrompt },
+      },
+    ],
   };
 }
 
@@ -6196,7 +6259,7 @@ function indentSnippet(text) {
     .join("\n");
 }
 
-async function enhancePrompt(args, observation = undefined) {
+function readEnhanceRequest(args) {
   const prompt = requiredString(args, "prompt");
   const outputMode = readOutputMode(args.outputMode ?? process.env.CORPUSWIRE_OUTPUT_MODE ?? DEFAULT_OUTPUT_MODE);
   const topK = optionalPositiveInteger(args.topK ?? process.env.CORPUSWIRE_TOP_K, DEFAULT_TOP_K);
@@ -6206,10 +6269,7 @@ async function enhancePrompt(args, observation = undefined) {
   const localOnly = optionalBoolean(args.localOnly ?? process.env.CORPUSWIRE_LOCAL_ONLY, true);
   const sourceFilterRaw = optionalStringArray(args, "sourceFilter");
   const sourceFilter = sourceFilterRaw.length > 0 ? sourceFilterRaw : undefined;
-
-  const readPreparation = await syncManager.prepareForRead(args);
-  const client = buildClient();
-  const request = {
+  return {
     prompt,
     outputMode,
     repoPath,
@@ -6219,6 +6279,26 @@ async function enhancePrompt(args, observation = undefined) {
     localOnly,
     sourceFilter,
   };
+}
+
+/** The bare rewrite for the MCP `enhance` prompt: same request and fallback as the tool. */
+async function enhancePromptRewrite(args) {
+  const request = readEnhanceRequest(args);
+  await syncManager.prepareForRead(args);
+  const { result, usedLocalFallback } = await enhanceWithLocalFallback(buildClient(), request);
+  const enhancedPrompt = resolveEnhancedPrompt(result);
+  if (!enhancedPrompt) {
+    throw new Error(result.generation_error ?? "corpuswire returned no enhanced prompt.");
+  }
+  return { enhancedPrompt, usedLocalFallback };
+}
+
+async function enhancePrompt(args, observation = undefined) {
+  const request = readEnhanceRequest(args);
+  const { prompt, outputMode, repoPath, workspaceId, topK, localOnly } = request;
+
+  const readPreparation = await syncManager.prepareForRead(args);
+  const client = buildClient();
   const { result, usedLocalFallback } = await enhanceWithLocalFallback(client, request);
   if (observation) {
     observation.enhancementLocalFallback = usedLocalFallback;

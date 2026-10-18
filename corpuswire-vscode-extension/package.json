@@ -16,6 +16,7 @@
     "onStartupFinished",
     "onView:corpuswire.promptView",
     "onCommand:corpuswire.enhancePrompt",
+    "onCommand:corpuswire.enhancePromptWithPreview",
     "onCommand:corpuswire.indexWorkspace",
     "onCommand:corpuswire.rebuildWorkspaceIndex",
     "onCommand:corpuswire.openPanel",
@@ -29,6 +30,10 @@
       {
         "command": "corpuswire.enhancePrompt",
         "title": "CorpusWire: Enhance Prompt"
+      },
+      {
+        "command": "corpuswire.enhancePromptWithPreview",
+        "title": "CorpusWire: Enhance Prompt with Preview"
       },
       {
         "command": "corpuswire.indexWorkspace",
@@ -45,6 +50,36 @@
       {
         "command": "corpuswire.focusPanel",
         "title": "CorpusWire: Focus Sidebar Widget"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "corpuswire.enhancePromptWithPreview",
+        "key": "ctrl+alt+e",
+        "mac": "cmd+alt+e",
+        "args": {
+          "source": "selection"
+        },
+        "when": "config.corpuswire.enhanceKeybinding.enabled && editorTextFocus && editorHasSelection && !inChatInput"
+      },
+      {
+        "command": "corpuswire.enhancePromptWithPreview",
+        "key": "ctrl+alt+e",
+        "mac": "cmd+alt+e",
+        "args": {
+          "source": "input"
+        },
+        "when": "config.corpuswire.enhanceKeybinding.enabled && !(editorTextFocus && editorHasSelection && !inChatInput)"
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "corpuswire.enhancer",
+        "name": "corpuswire",
+        "fullName": "CorpusWire",
+        "description": "Enhance a prompt with repository context",
+        "isSticky": false,
+        "when": "config.corpuswire.chatParticipant.enabled"
       }
     ],
     "viewsContainers": {
@@ -250,6 +285,18 @@
           "default": false,
           "scope": "resource",
           "description": "Use the backend's deterministic local prompt rewrite instead of first trying the configured generation provider."
+        },
+        "corpuswire.enhanceKeybinding.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "markdownDescription": "Bind `Ctrl+Alt+E` (`Cmd+Alt+E` on macOS) to `CorpusWire: Enhance Prompt with Preview`. Remove or rebind it in Keyboard Shortcuts at any time."
+        },
+        "corpuswire.chatParticipant.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "application",
+          "markdownDescription": "Register the `@corpuswire` chat participant, which enhances the chat prompt with repository context and hands the rewrite back to the chat input."
         },
         "corpuswire.remoteIndexing.enabled": {
           "type": "boolean",

@@ -2759,6 +2759,101 @@ test("corpuswire-mcp retries prompt enhancement with localOnly when generation s
   }
 });
 
+async function withPromptHost(env, run) {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-prompts-"));
+  const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+  const baseEnv = { ...globalThis.process.env };
+  delete baseEnv.CORPUSWIRE_MCP_PROMPTS;
+  const child = spawn("node", [SERVER_BIN], {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: {
+      ...baseEnv,
+      CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
+      CORPUSWIRE_SDK_PATH: sdkPath,
+      CORPUSWIRE_WORKSPACE_ID: "workspace-from-env",
+      CORPUSWIRE_RETRIEVAL_LOG_DIR: "",
+      MOCK_REQUESTS_PATH: requestsPath,
+      ...env,
+    },
+  });
+  try {
+    await run(createRpc(child), requestsPath);
+  } finally {
+    child.kill();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+test("MCP prompts stay empty and unadvertised unless CORPUSWIRE_MCP_PROMPTS is on", async () => {
+  for (const env of [{}, { CORPUSWIRE_MCP_PROMPTS: "off" }, { CORPUSWIRE_MCP_PROMPTS: "false" }, { CORPUSWIRE_MCP_PROMPTS: "" }]) {
+    await withPromptHost(env, async (rpc, requestsPath) => {
+      const init = await rpc({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } });
+      assert.deepEqual(init.result.capabilities, { tools: { listChanged: false } });
+      const list = await rpc({ jsonrpc: "2.0", id: 2, method: "prompts/list", params: {} });
+      assert.deepEqual(list, { jsonrpc: "2.0", id: 2, result: { prompts: [] } });
+      const get = await rpc({ jsonrpc: "2.0", id: 3, method: "prompts/get", params: { name: "enhance", arguments: { prompt: "x" } } });
+      assert.equal(get.error.code, -32601);
+      assert.equal(get.error.message, "Method not found: prompts/get");
+      assert.equal((await readFile(requestsPath, "utf8")).trim(), "");
+    });
+  }
+});
+
+test("MCP enhance prompt lists one argument and returns the bare rewrite", async () => {
+  await withPromptHost({ CORPUSWIRE_MCP_PROMPTS: "on" }, async (rpc, requestsPath) => {
+    const init = await rpc({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    assert.deepEqual(init.result.capabilities, { tools: { listChanged: false }, prompts: { listChanged: false } });
+    const list = await rpc({ jsonrpc: "2.0", id: 2, method: "prompts/list", params: {} });
+    assert.deepEqual(list.result.prompts.map((prompt) => prompt.name), ["enhance"]);
+    assert.deepEqual(list.result.prompts[0].arguments, [
+      { name: "prompt", description: "The prompt to enhance.", required: true },
+    ]);
+
+    const get = await rpc({
+      jsonrpc: "2.0", id: 3, method: "prompts/get",
+      params: { name: "enhance", arguments: { prompt: "  fix enhancer fallback  " } },
+    });
+    assert.equal(get.error, undefined);
+    assert.deepEqual(get.result.messages, [
+      { role: "user", content: { type: "text", text: "Local deterministic rewrite" } },
+    ]);
+    assert.equal(get.result.description, "CorpusWire rewrite");
+
+    const missing = await rpc({ jsonrpc: "2.0", id: 4, method: "prompts/get", params: { name: "enhance", arguments: { prompt: "  " } } });
+    assert.equal(missing.error.code, -32602);
+    const unknown = await rpc({ jsonrpc: "2.0", id: 5, method: "prompts/get", params: { name: "other", arguments: { prompt: "x" } } });
+    assert.equal(unknown.error.code, -32602);
+    assert.match(unknown.error.message, /unknown prompt other/);
+
+    // The prompt sends the same request the enhance tool sends with its defaults.
+    const tool = await rpc({
+      jsonrpc: "2.0", id: 6, method: "tools/call",
+      params: { name: "corpuswire_enhance_prompt", arguments: { prompt: "fix enhancer fallback" } },
+    });
+    assert.equal(tool.result.isError, false);
+    const requests = (await readFile(requestsPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(requests.length, 2);
+    assert.deepEqual(requests[0], requests[1]);
+    assert.deepEqual(requests[0], {
+      prompt: "fix enhancer fallback", outputMode: "generic", workspaceId: "workspace-from-env", topK: 5, localOnly: true,
+    });
+  });
+});
+
+test("MCP enhance prompt reports the local fallback and backend failures as JSON-RPC errors", async () => {
+  await withPromptHost({ CORPUSWIRE_MCP_PROMPTS: "1", CORPUSWIRE_LOCAL_ONLY: "false" }, async (rpc) => {
+    const get = await rpc({ jsonrpc: "2.0", id: 1, method: "prompts/get", params: { name: "enhance", arguments: { prompt: "fix it" } } });
+    assert.equal(get.result.messages[0].content.text, "Local deterministic rewrite");
+    assert.match(get.result.description, /local deterministic fallback/);
+  });
+  await withPromptHost({ CORPUSWIRE_MCP_PROMPTS: "true", MOCK_ENHANCE_EMPTY: "true" }, async (rpc) => {
+    const get = await rpc({ jsonrpc: "2.0", id: 1, method: "prompts/get", params: { name: "enhance", arguments: { prompt: "fix it" } } });
+    assert.equal(get.result, undefined);
+    assert.equal(get.error.code, -32603);
+    assert.match(get.error.message, /no enhanced prompt/);
+  });
+});
+
 test("corpuswire-mcp records and reviews central quality ratings", async () => {
   const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-"));
   try {

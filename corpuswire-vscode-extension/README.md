@@ -17,6 +17,18 @@ the MCP package is the tool surface Copilot discovers.
 
 - `CorpusWire: Enhance Prompt` replaces selected prompt text with a
   context-grounded rewrite from `/v1/enhance`.
+- `CorpusWire: Enhance Prompt with Preview` enhances the selection, or a typed
+  prompt when nothing is selected, and shows the original and the rewrite side
+  by side. Accept replaces the selection (a typed prompt is copied to the
+  clipboard); Reject leaves everything as it was. Set
+  `corpuswire.enhanceKeybinding.enabled` to bind it to `Ctrl+Alt+E`
+  (`Cmd+Alt+E` on macOS). The keybinding is off by default and can be removed
+  or rebound in Keyboard Shortcuts like any other.
+- Optional `@corpuswire` chat participant (`corpuswire.chatParticipant.enabled`,
+  off by default): `@corpuswire <prompt>` in the chat panel returns the
+  rewrite with **Use as chat input**, which puts it back in the chat input
+  without sending it, and **Copy**. Turning the setting off removes the
+  participant without a reload.
 - `CorpusWire: Index Workspace` performs a complete remote indexing session for
   the current workspace.
 - `CorpusWire: Rebuild Workspace Index` performs an explicit clean rebuild for
@@ -36,6 +48,7 @@ the MCP package is the tool surface Copilot discovers.
 | Path | Purpose |
 | --- | --- |
 | `src/extension.ts` | Command registration, indexing command, file watcher, prompt enhancement flow, error formatting |
+| `src/enhance-preview.ts` | Pure helpers for the preview command and the chat participant |
 | `src/configuration.ts` | VS Code settings, home config loading, service inheritance, header construction, repo/workspace resolution |
 | `package.json` | VS Code contribution points, settings schema, scripts, and local SDK dependency |
 | `tsconfig.json` | TypeScript compiler options |

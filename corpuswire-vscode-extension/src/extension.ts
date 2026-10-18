@@ -26,6 +26,18 @@ import {
 } from "./enhancement-quality.js";
 import { hasAuthorizationHeader, resolveCliBearerToken } from "./service-auth.js";
 import { INDEX_INCLUDE_GLOB } from "./index-discovery.js";
+import {
+  CHAT_COPY_PROMPT_COMMAND,
+  CHAT_EMPTY_PROMPT_REPLY,
+  CHAT_PARTICIPANT_ID,
+  CHAT_PARTICIPANT_SETTING,
+  CHAT_USE_PROMPT_COMMAND,
+  ENHANCE_PREVIEW_COMMAND,
+  PREVIEW_SCHEME,
+  ToggleRegistration,
+  formatChatEnhanceResponse,
+  resolveEnhanceSource,
+} from "./enhance-preview.js";
 import type {
   EnhancementQuality,
   EnhancementQualityStatus,
@@ -627,6 +639,7 @@ export function activate(context: vscode.ExtensionContext): void {
     statusBar,
   );
   registerRemoteIndexWatchers(context);
+  registerEnhancePreviewAndChat(context);
 }
 
 export function deactivate(): void {
@@ -1711,4 +1724,220 @@ function escapeHtml(text: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+// --- CRP-001 L2.1: one-keystroke enhancement with a diff preview, and the
+// opt-in @corpuswire chat participant. The existing corpuswire.enhancePrompt
+// command is untouched; both features only add new entry points.
+
+const previewContents = new Map<string, string>();
+let previewSequence = 0;
+
+function registerEnhancePreviewAndChat(context: vscode.ExtensionContext): void {
+  const previewEmitter = new vscode.EventEmitter<vscode.Uri>();
+  const previewProvider: vscode.TextDocumentContentProvider = {
+    onDidChange: previewEmitter.event,
+    provideTextDocumentContent: (uri) => previewContents.get(uri.toString()) ?? "",
+  };
+
+  const chatParticipant = new ToggleRegistration(createCorpusWireChatParticipant);
+  const syncChatParticipant = () => chatParticipant.sync(
+    vscode.workspace.getConfiguration("corpuswire").get<boolean>(CHAT_PARTICIPANT_SETTING, false) === true,
+  );
+  syncChatParticipant();
+
+  context.subscriptions.push(
+    previewEmitter,
+    vscode.workspace.registerTextDocumentContentProvider(PREVIEW_SCHEME, previewProvider),
+    vscode.commands.registerCommand(ENHANCE_PREVIEW_COMMAND, enhancePromptWithPreview),
+    vscode.commands.registerCommand(CHAT_USE_PROMPT_COMMAND, useEnhancedPromptInChat),
+    vscode.commands.registerCommand(CHAT_COPY_PROMPT_COMMAND, copyEnhancedPrompt),
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration(`corpuswire.${CHAT_PARTICIPANT_SETTING}`)) {
+        syncChatParticipant();
+      }
+    }),
+    chatParticipant,
+  );
+}
+
+async function enhanceText(prompt: string, resource: vscode.Uri | undefined): Promise<PromptEnhancementOutcome> {
+  const settings = readSettings(resource);
+  for (const warning of settings.configurationWarnings) {
+    void vscode.window.showWarningMessage(warning);
+  }
+  const enhancerService = settings.services.enhancer;
+  const client = new CorpusWireClient({
+    baseUrl: enhancerService.url,
+    endpointMode: "v1-only",
+    defaultHeaders: await buildAuthenticatedServiceHeaders(settings, enhancerService),
+  });
+  try {
+    return await enhancePromptWithFallback(client, buildEnhancementRequest(prompt, settings));
+  } catch (error) {
+    throw new Error(formatEnhancementError(error, enhancerService.url));
+  }
+}
+
+function enhancementResultMessage(outcome: PromptEnhancementOutcome): string {
+  return outcome.usedLocalFallback
+    ? `Prompt enhanced with CorpusWire local fallback. ${outcome.quality.message}`
+    : `Prompt enhanced with CorpusWire. ${outcome.quality.message}`;
+}
+
+/**
+ * Enhances the selection (or a typed prompt), shows the original and the
+ * rewrite side by side, and applies the rewrite only on Accept. A typed prompt
+ * is copied to the clipboard on Accept, so it can be pasted into any chat.
+ */
+async function enhancePromptWithPreview(args?: unknown): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  const selection = editor?.selection;
+  const selectedText = editor && selection && !selection.isEmpty ? editor.document.getText(selection) : undefined;
+  const source = resolveEnhanceSource(args, selectedText);
+
+  let original: string;
+  if (source === "selection" && editor && selection && selectedText) {
+    original = selectedText;
+  } else {
+    const typed = await vscode.window.showInputBox({
+      title: "CorpusWire: Enhance Prompt",
+      prompt: "Prompt to enhance with repository context",
+      ignoreFocusOut: true,
+    });
+    if (!typed || typed.trim().length === 0) {
+      return;
+    }
+    original = typed;
+  }
+  const target = source === "selection" && editor && selection
+    ? { uri: editor.document.uri, range: new vscode.Range(selection.start, selection.end), version: editor.document.version }
+    : undefined;
+
+  let outcome: PromptEnhancementOutcome;
+  try {
+    outcome = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: "Enhancing prompt with CorpusWire", cancellable: false },
+      () => enhanceText(original, editor?.document.uri ?? vscode.workspace.workspaceFolders?.[0]?.uri),
+    );
+  } catch (error) {
+    void vscode.window.showWarningMessage(error instanceof Error ? error.message : String(error));
+    return;
+  }
+
+  const id = ++previewSequence;
+  const originalUri = vscode.Uri.from({ scheme: PREVIEW_SCHEME, path: `/original-${id}.md` });
+  const enhancedUri = vscode.Uri.from({ scheme: PREVIEW_SCHEME, path: `/enhanced-${id}.md` });
+  previewContents.set(originalUri.toString(), original);
+  previewContents.set(enhancedUri.toString(), outcome.replacement);
+  try {
+    await vscode.commands.executeCommand(
+      "vscode.diff",
+      originalUri,
+      enhancedUri,
+      "CorpusWire: original ↔ enhanced",
+      { preview: true, preserveFocus: true, viewColumn: vscode.ViewColumn.Beside },
+    );
+    const accept = target ? "Accept" : "Accept and copy";
+    const choice = await vscode.window.showInformationMessage(
+      enhancementResultMessage(outcome),
+      accept,
+      "Reject",
+    );
+    if (choice !== accept) {
+      return;
+    }
+    if (!target) {
+      await vscode.env.clipboard.writeText(outcome.replacement);
+      void vscode.window.showInformationMessage("Enhanced prompt copied to the clipboard.");
+      return;
+    }
+    const document = vscode.workspace.textDocuments.find((item) => item.uri.toString() === target.uri.toString());
+    if (!document || document.version !== target.version) {
+      await vscode.env.clipboard.writeText(outcome.replacement);
+      void vscode.window.showWarningMessage(
+        "The document changed during enhancement, so the selection was not replaced. The enhanced prompt is on the clipboard.",
+      );
+      return;
+    }
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(target.uri, target.range, outcome.replacement);
+    if (!await vscode.workspace.applyEdit(edit)) {
+      void vscode.window.showWarningMessage("VS Code could not replace the selected text.");
+    }
+  } finally {
+    await closePreviewTabs(enhancedUri);
+    previewContents.delete(originalUri.toString());
+    previewContents.delete(enhancedUri.toString());
+  }
+}
+
+async function closePreviewTabs(enhancedUri: vscode.Uri): Promise<void> {
+  const tabs = vscode.window.tabGroups.all.flatMap((group) => group.tabs).filter((tab) =>
+    tab.input instanceof vscode.TabInputTextDiff && tab.input.modified.toString() === enhancedUri.toString());
+  if (tabs.length > 0) {
+    await vscode.window.tabGroups.close(tabs);
+  }
+}
+
+function createCorpusWireChatParticipant(): vscode.Disposable | undefined {
+  // The chat API is part of VS Code 1.90+; older or chat-less hosts get nothing.
+  if (typeof vscode.chat?.createChatParticipant !== "function") {
+    return undefined;
+  }
+  const participant = vscode.chat.createChatParticipant(CHAT_PARTICIPANT_ID, handleCorpusWireChatRequest);
+  participant.iconPath = new vscode.ThemeIcon("sparkle");
+  return participant;
+}
+
+async function handleCorpusWireChatRequest(
+  request: vscode.ChatRequest,
+  _context: vscode.ChatContext,
+  stream: vscode.ChatResponseStream,
+  token: vscode.CancellationToken,
+): Promise<vscode.ChatResult> {
+  const prompt = request.prompt.trim();
+  if (!prompt) {
+    stream.markdown(CHAT_EMPTY_PROMPT_REPLY);
+    return {};
+  }
+  stream.progress("Enhancing with CorpusWire…");
+  let outcome: PromptEnhancementOutcome;
+  try {
+    outcome = await enhanceText(prompt, vscode.window.activeTextEditor?.document.uri ?? vscode.workspace.workspaceFolders?.[0]?.uri);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { errorDetails: { message } };
+  }
+  if (token.isCancellationRequested) {
+    return {};
+  }
+  stream.markdown(formatChatEnhanceResponse(outcome.replacement, {
+    usedLocalFallback: outcome.usedLocalFallback,
+    qualityStatus: outcome.quality.status,
+    qualityMessage: outcome.quality.message,
+  }));
+  stream.button({ command: CHAT_USE_PROMPT_COMMAND, title: "Use as chat input", arguments: [outcome.replacement] });
+  stream.button({ command: CHAT_COPY_PROMPT_COMMAND, title: "Copy", arguments: [outcome.replacement] });
+  return { metadata: { usedLocalFallback: outcome.usedLocalFallback, qualityStatus: outcome.quality.status } };
+}
+
+/** Hands the rewrite back to the chat input without sending it. */
+async function useEnhancedPromptInChat(text?: unknown): Promise<void> {
+  if (typeof text !== "string" || text.length === 0) {
+    return;
+  }
+  try {
+    await vscode.commands.executeCommand("workbench.action.chat.open", { query: text, isPartialQuery: true });
+  } catch {
+    await copyEnhancedPrompt(text);
+  }
+}
+
+async function copyEnhancedPrompt(text?: unknown): Promise<void> {
+  if (typeof text !== "string" || text.length === 0) {
+    return;
+  }
+  await vscode.env.clipboard.writeText(text);
+  void vscode.window.showInformationMessage("Enhanced prompt copied to the clipboard.");
 }
