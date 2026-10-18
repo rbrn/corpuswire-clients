@@ -11,6 +11,7 @@
   },
   "files": [
     "bin",
+    "lib/git-head-watch.mjs",
     "lib/selected-neighbor.mjs",
     "lib/source-root-coalescing.mjs",
     "examples",

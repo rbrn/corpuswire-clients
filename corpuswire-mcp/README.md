@@ -288,6 +288,10 @@ Recommended prompt settings:
 - `CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_ATTEMPTS`: active-session 409 retry attempts before requeueing, default `5`
 - `CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_DELAY_MS`: base active-session retry delay, default `750`
 - `CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_MAX_DELAY_MS`: active-session retry delay ceiling, default `5000`
+- `CORPUSWIRE_SYNC_LEASE_ENABLED`: acquire the backend's single-writer workspace lease (`POST /v1/index/leases`, 30 s server TTL, renewed while the session runs) before each sync session, default `false`. A 409 from another holder uses the active-session retry above; a lease lost mid-session aborts the session and requeues its paths (or the reconcile). An older backend without the endpoint is used without a lease. `corpuswire_sync_status` shows `leaseEvents` when on.
+- `CORPUSWIRE_SYNC_HEAD_WATCH`: poll `.git/HEAD`, the current branch ref and `packed-refs` (mtimes only, no git process and no backend call while idle) and follow a commit, checkout or reset with a git delta, default `false`. Supports detached HEAD and linked worktrees (`.git` file). Same-commit changes such as `git checkout -b` sync nothing.
+- `CORPUSWIRE_SYNC_HEAD_WATCH_INTERVAL_MS`: HEAD poll interval, default `1000`
+- `CORPUSWIRE_SYNC_HEAD_DELTA_MAX_FILES`: largest HEAD-change delta queued path by path; larger switches, or an old commit git cannot diff, run one full filtered reconcile instead, default `500`
 - `CORPUSWIRE_INDEX_OBSERVABILITY_ENABLED`: request and render content-free `index-observability/v1` timings for sync/reconcile, default `false`; the API must also set `INDEX_OBSERVABILITY_ENABLED=true`
 
 `corpuswire_sync_bootstrap` is diagnostic by default. It calls workspace diagnosis, reports `bootstrapState` and `needsReconcile` in sync status, and returns recovery actions when the local API workspace index is stale, degraded, missing, or blocked. It uploads files only when called with `"reconcile": true`.

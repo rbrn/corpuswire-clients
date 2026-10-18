@@ -10,6 +10,13 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { planSelectedNeighbor } from "../lib/selected-neighbor.mjs";
 import { canonicalCoalescingDeliveryComplete, planSourceRootCoalescing } from "../lib/source-root-coalescing.mjs";
+import {
+  DEFAULT_HEAD_DELTA_MAX_FILES,
+  DEFAULT_HEAD_WATCH_INTERVAL_MS,
+  createGitHeadWatcher,
+  parseGitDiffNameStatusZ,
+  planHeadChange,
+} from "../lib/git-head-watch.mjs";
 
 const JSONRPC_VERSION = "2.0";
 const PROTOCOL_VERSION = "2024-11-05";
@@ -226,6 +233,14 @@ class SyncManager {
     this.activeBootstrapCheck = null;
     this.activeGitDelta = null;
     this.watcher = null;
+    this.headWatcher = null;
+    this.lastHeadChange = null;
+    this.headChangeCounts = { none: 0, delta: 0, reconcile: 0, failed: 0 };
+    this.reconcileRetryTimer = null;
+    this.leaseHolderId = null;
+    this.leaseEnabled = optionalBoolean(env.CORPUSWIRE_SYNC_LEASE_ENABLED, false);
+    this.leaseCounts = { acquired: 0, renewed: 0, renewalFailed: 0, lost: 0, released: 0, held: 0, unsupported: 0 };
+    this.lastLeaseEvent = null;
     this.reconcileTimer = null;
     this.lastResult = null;
     this.lastError = null;
@@ -296,6 +311,128 @@ class SyncManager {
       }
     } catch (error) {
       this.recordError(error);
+    }
+  }
+
+  // CRP-001 L1.2: follow HEAD and branch changes (commit, checkout, reset,
+  // detached HEAD, linked worktrees) by polling local git metadata. Off by
+  // default; idle polling reads only file mtimes and never calls the backend.
+  startHeadWatcherIfConfigured() {
+    if (!this.isEnabled() || !optionalBoolean(this.env.CORPUSWIRE_SYNC_HEAD_WATCH, false)) {
+      return;
+    }
+    let context;
+    try {
+      context = this.resolveContext({});
+    } catch (error) {
+      this.recordError(error, "git");
+      return;
+    }
+    this.headWatcher = createGitHeadWatcher({
+      sourceRoot: context.sourceRoot,
+      intervalMs: optionalPositiveInteger(
+        this.env.CORPUSWIRE_SYNC_HEAD_WATCH_INTERVAL_MS,
+        DEFAULT_HEAD_WATCH_INTERVAL_MS,
+      ),
+      onChange: (previous, next) => this.handleHeadChange(previous, next, context),
+      onError: (error) => this.recordError(error, "git"),
+    });
+    this.headWatcher.start().catch((error) => this.recordError(error, "git"));
+  }
+
+  async handleHeadChange(previous, next, context) {
+    const maxFiles = optionalPositiveInteger(
+      this.env.CORPUSWIRE_SYNC_HEAD_DELTA_MAX_FILES,
+      DEFAULT_HEAD_DELTA_MAX_FILES,
+    );
+    let diff = null;
+    let diffError = null;
+    if (previous?.head && next?.head && previous.head !== next.head) {
+      try {
+        const timeoutMs = optionalPositiveInteger(this.env.CORPUSWIRE_SYNC_GIT_TIMEOUT_MS, DEFAULT_SYNC_GIT_TIMEOUT_MS);
+        const output = await runGit(context.sourceRoot, [
+          "diff", "--name-status", "-z", "--no-renames", "--relative", previous.head, next.head, "--",
+        ], { timeoutMs, maxBuffer: optionalPositiveInteger(
+          this.env.CORPUSWIRE_SYNC_GIT_MAX_STATUS_BYTES,
+          DEFAULT_SYNC_GIT_MAX_STATUS_BYTES,
+        ) });
+        diff = parseGitDiffNameStatusZ(output);
+      } catch (error) {
+        diffError = error;
+      }
+    }
+    const plan = planHeadChange({ previous, next, diff, diffError, maxFiles });
+    this.lastGitHead = next?.head ?? null;
+    this.lastGitBranch = next?.branch ?? null;
+    this.lastHeadChange = removeUndefinedValues({
+      observedAt: new Date().toISOString(),
+      previousHead: previous?.head ?? null,
+      head: next?.head ?? null,
+      branch: next?.branch ?? null,
+      detached: next?.detached === true,
+      action: plan.action,
+      reason: plan.reason,
+      total: plan.total,
+    });
+    this.headChangeCounts[plan.action] = (this.headChangeCounts[plan.action] ?? 0) + 1;
+    this.recordSyncEvent({
+      source: "head",
+      eventType: "head_changed",
+      decision: plan.action === "none" ? "skipped" : "accepted",
+      reason: plan.reason,
+    });
+    try {
+      if (plan.action === "delta") {
+        await this.addDelta({
+          sourceRoot: context.sourceRoot,
+          workspaceId: context.workspaceId,
+          includeGlobs: context.includeGlobs,
+          excludeGlobs: context.excludeGlobs,
+          changedPaths: plan.changedPaths,
+          deletedPaths: plan.deletedPaths,
+          eventSource: "head",
+        });
+      } else if (plan.action === "reconcile") {
+        // A large or unknown switch: one full filtered reconcile replaces the
+        // per-path delta. Queued paths are flushed first by runReconcile.
+        await this.reconcileAll({});
+      }
+    } catch (error) {
+      this.headChangeCounts.failed += 1;
+      this.recordError(error, plan.action === "reconcile" ? "reconcile" : "flush");
+    }
+    return plan;
+  }
+
+  isLeaseEnabled() {
+    return this.leaseEnabled === true;
+  }
+
+  // CRP-001 L1.1: one holder id per MCP process, unique across writers.
+  workspaceLeaseHolderId() {
+    if (!this.leaseHolderId) {
+      this.leaseHolderId = `corpuswire-mcp:${randomUUID().replaceAll("-", "").slice(0, 24)}`;
+    }
+    return this.leaseHolderId;
+  }
+
+  recordLeaseEvent(event) {
+    const counter = {
+      acquired: "acquired", renewed: "renewed", renewal_failed: "renewalFailed",
+      lost: "lost", released: "released", unsupported: "unsupported",
+    }[event?.type];
+    if (counter) this.leaseCounts[counter] += 1;
+    this.lastLeaseEvent = { type: event?.type ?? "unknown", at: new Date().toISOString() };
+  }
+
+  scheduleReconcileRetry(delayMs) {
+    if (this.reconcileRetryTimer) return;
+    this.reconcileRetryTimer = setTimeout(() => {
+      this.reconcileRetryTimer = null;
+      this.reconcileAll({}).catch((error) => this.recordError(error, "reconcile"));
+    }, delayMs);
+    if (typeof this.reconcileRetryTimer.unref === "function") {
+      this.reconcileRetryTimer.unref();
     }
   }
 
@@ -1026,8 +1163,17 @@ class SyncManager {
         this.observationGap = true;
         this.recordError(error, "reconcile");
         this.lastReconcileFinishedAt = new Date().toISOString();
+        const leaseLost = isWorkspaceLeaseLostFailure(error);
+        if (leaseLost) {
+          // The session was aborted; run the whole reconcile again later.
+          this.scheduleReconcileRetry(optionalNonNegativeInteger(
+            this.env.CORPUSWIRE_SYNC_SESSION_CONFLICT_RETRY_DELAY_MS,
+            DEFAULT_SYNC_SESSION_CONFLICT_RETRY_DELAY_MS,
+          ));
+        }
         return {
           ok: false,
+          ...(leaseLost ? { leaseLost: true, requeued: true } : {}),
           reconcile: true,
           error: error instanceof Error ? error.message : String(error),
           filesQueued: 0,
@@ -1139,6 +1285,7 @@ class SyncManager {
           return {
             ok: false,
             requeued: true,
+            ...(isWorkspaceLeaseLostFailure(error) ? { leaseLost: true } : {}),
             error: error instanceof Error ? error.message : String(error),
             filesQueued: batch.changedPaths.length,
             filesUploaded: error.transfer?.files_transferred ?? null,
@@ -1566,11 +1713,24 @@ class SyncManager {
       DEFAULT_SYNC_SESSION_CONFLICT_RETRY_MAX_DELAY_MS,
     );
 
+    const useLease = this.isLeaseEnabled() && typeof client.indexWorkspaceWithLease === "function";
+    if (this.isLeaseEnabled() && !useLease) {
+      this.recordLeaseEvent({ type: "unsupported" });
+    }
     for (let conflictAttempt = 0; ; conflictAttempt += 1) {
       try {
-        return await client.indexWorkspace(request);
+        return useLease
+          ? await client.indexWorkspaceWithLease(request, {
+            holderId: this.workspaceLeaseHolderId(),
+            onLeaseEvent: (event) => this.recordLeaseEvent(event),
+          })
+          : await client.indexWorkspace(request);
       } catch (error) {
-        if (!isActiveSessionConflictError(error)) {
+        const leaseHeld = useLease && isWorkspaceLeaseHeldFailure(error);
+        if (leaseHeld) {
+          this.leaseCounts.held += 1;
+        }
+        if (!leaseHeld && !isActiveSessionConflictError(error)) {
           throw error;
         }
         if (conflictAttempt >= retryAttempts) {
@@ -2186,6 +2346,17 @@ class SyncManager {
       lastGitHead: this.lastGitHead,
       lastGitBranch: this.lastGitBranch,
       lastGitDeltaCounts: this.lastGitDeltaCounts,
+      ...(this.headWatcher ? {
+        headWatchActive: true,
+        lastHeadChange: this.lastHeadChange,
+        headChangeCounts: { ...this.headChangeCounts },
+      } : {}),
+      ...(this.leaseEnabled === true ? {
+        leaseEnabled: true,
+        leaseHolderId: this.leaseHolderId,
+        leaseCounts: { ...this.leaseCounts },
+        lastLeaseEvent: this.lastLeaseEvent,
+      } : {}),
       lastError: this.lastError,
       sessionConflictRetryCounts: { ...this.sessionConflictRetryCounts },
       lastSessionConflictAt: this.lastSessionConflictAt,
@@ -2221,6 +2392,7 @@ const syncManager = new SyncManager();
 syncManager.startWatcherIfConfigured();
 syncManager.startScheduledReconcileIfConfigured();
 syncManager.startBootstrapCheckIfConfigured();
+syncManager.startHeadWatcherIfConfigured();
 
 process.stdin.setEncoding("utf8");
 
@@ -7451,6 +7623,21 @@ function isActiveSessionConflictError(error) {
     || /already active for workspace_id/i.test(message);
 }
 
+// CRP-001 L1.1: another writer holds the workspace lease (or a fenced session
+// start found it held). Retried with the same backoff as a session conflict.
+function isWorkspaceLeaseHeldFailure(error) {
+  if (error?.status !== 409) {
+    return false;
+  }
+  const code = error?.errorCode ?? parseErrorDetail(error)?.code;
+  return code === "index_lease_held" || code === "index_lease_not_held";
+}
+
+function isWorkspaceLeaseLostFailure(error) {
+  return error?.name === "RemoteIndexLeaseLostError" || error?.code === "lease_lost"
+    || (error?.status === 409 && (error?.errorCode ?? parseErrorDetail(error)?.code) === "index_lease_lost");
+}
+
 function calculateSessionConflictRetryDelayMs(error, { attempt, baseDelayMs, maxDelayMs }) {
   const retryAfterMs = retryAfterMsFromError(error);
   if (retryAfterMs !== null) {
@@ -7655,6 +7842,18 @@ function formatSyncPayload(payload) {
     `- acceptedEvents: ${formatSyncCountMap(status.acceptedEventCounts, ["changed", "deleted"])}`,
     `- skippedEvents: ${formatSyncCountMap(status.skippedEventCounts)}`,
   ];
+  if (status.headWatchActive) {
+    const change = status.lastHeadChange;
+    lines.push(`- headWatchActive: true`);
+    lines.push(`- lastHeadChange: ${change ? `${change.action} (${change.reason}) ${change.previousHead ?? "unknown"} -> ${change.head ?? "unknown"}${change.detached ? " detached" : ""}` : "none"}`);
+    lines.push(`- headChanges: ${formatSyncCountMap(status.headChangeCounts, ["none", "delta", "reconcile", "failed"])}`);
+  }
+  if (status.leaseEnabled) {
+    lines.push(`- leaseEnabled: true`);
+    lines.push(`- leaseHolderId: ${status.leaseHolderId ?? "not_acquired"}`);
+    lines.push(`- leaseEvents: ${formatSyncCountMap(status.leaseCounts, ["acquired", "renewed", "renewalFailed", "lost", "released", "held", "unsupported"])}`);
+    lines.push(`- lastLeaseEvent: ${status.lastLeaseEvent ? `${status.lastLeaseEvent.type} at ${status.lastLeaseEvent.at}` : "none"}`);
+  }
 
   if (payload.reason) {
     lines.push(`- reason: ${payload.reason}`);

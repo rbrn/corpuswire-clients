@@ -1407,7 +1407,7 @@ test("CLI complete scan carries inventory evidence and cancellation cannot reach
   } finally { await rm(fixture, { recursive: true, force: true }); }
 });
 
-async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, onPreview, onDiagnosis, onSetup, watcherUnavailable = false, watcherError } = {}) {
+async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, onPreview, onDiagnosis, onSetup, watcherUnavailable = false, watcherError, env = {}, extendClient, headWatcherFactory } = {}) {
   const root = await syntheticWorkspace();
   const controller = new AbortController();
   const state = {
@@ -1444,12 +1444,14 @@ async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, 
       return await onDiagnosis?.(state, request) ?? { status: "ready", can_retrieve: true, resolved_workspace_id: request.workspaceId, index: { health_status: "ok", coverage: { state: "verified" } } };
     },
   });
+  if (extendClient) Object.assign(client, extendClient(state, client));
   try {
     await onSetup?.(state);
     const args = argv.includes("watch") || argv.includes("--watch")
       ? [...argv, "--poll-ms", "100", "--debounce-ms", "10"] : argv;
     state.result = await main(args, {
-      cwd: root, homeDirectory: root, env: {}, client, signal: controller.signal, isTTY,
+      cwd: root, homeDirectory: root, env, client, signal: controller.signal, isTTY,
+      ...(headWatcherFactory ? { headWatcherFactory: (options) => headWatcherFactory(state, options) } : {}),
       write: (line) => state.writes.push(line), writeRaw: () => {},
       confirm: () => { throw new Error("Local watch must not request indexing confirmation"); },
       watchFactory: (sourceRoot, options, callback) => {
@@ -2205,4 +2207,82 @@ test("runtime watcher failure reports safe reason and closes its handle once", {
   assert.deepEqual(fallback, { stage: "runtime", reason: "watch_permission_denied", error_code: "EPERM" });
   assert.equal(state.closed, 1);
   assert.ok(state.writes.every((line) => !line.includes("secret") && !line.includes("/private/path")));
+});
+
+// CRP-001 L1.1 and L1.2: the cw watcher's workspace lease and HEAD watcher.
+function leaseError(code, retryAfterSeconds = 0) {
+  return Object.assign(new Error(`409 ERROR: ${code}`), {
+    status: 409, errorCode: code, retryAfterSeconds, errorDetail: { code, retry_after_seconds: retryAfterSeconds },
+  });
+}
+
+test("watch keeps using plain indexWorkspace when the lease is not enabled", { timeout: 5000 }, async () => {
+  const state = await watchFixture({
+    extendClient: () => ({ indexWorkspaceWithLease: async () => { throw new Error("lease must stay unused"); } }),
+    onWait: (current) => current.controller.abort(),
+  });
+  assert.ifError(state.error);
+  assert.equal(state.requests.length, 1);
+  assert.equal(state.writes.some((line) => /lease/i.test(line)), false);
+});
+
+test("watch backs off on a held lease and on a lost lease, then publishes", { timeout: 5000 }, async () => {
+  const leaseCalls = [];
+  const state = await watchFixture({
+    env: { CORPUSWIRE_SYNC_LEASE_ENABLED: "true" },
+    extendClient: (current, client) => ({
+      indexWorkspace: async () => { throw new Error("plain indexWorkspace must not run with the lease enabled"); },
+      indexWorkspaceWithLease: async (request, options) => {
+        leaseCalls.push(options.holderId);
+        if (leaseCalls.length === 1) throw leaseError("index_lease_held", 0);
+        if (leaseCalls.length === 2) {
+          throw Object.assign(new Error("Workspace writer lease was lost"), { name: "RemoteIndexLeaseLostError", code: "lease_lost" });
+        }
+        current.requests.push({ files: request.files.map((file) => ({ path: file.relativePath })) });
+        return { ok: true, result: {}, status: { phase: "completed", coverage: { state: "verified" } }, transfer: { complete: true } };
+      },
+    }),
+    onWait: (current) => { if (current.requests.length >= 1) current.controller.abort(); },
+  });
+  assert.ifError(state.error);
+  assert.equal(leaseCalls.length, 3);
+  assert.equal(new Set(leaseCalls).size, 1);
+  assert.match(leaseCalls[0], /^cw-watch:[0-9a-f]{24}$/);
+  assert.ok(state.writes.some((line) => /Another sync writer holds the workspace lease; retrying in/.test(line)));
+  assert.ok(state.writes.some((line) => /Workspace lease was lost; the session was aborted/.test(line)));
+  assert.equal(state.writes.some((line) => /Indexing failed/.test(line)), false);
+  assert.ok(state.writes.some((line) => /Index verified/.test(line)));
+});
+
+test("watch HEAD option wakes a complete rescan on a HEAD change", { timeout: 5000 }, async () => {
+  let fire;
+  let closed = 0;
+  let changed = false;
+  const state = await watchFixture({
+    env: { CORPUSWIRE_SYNC_HEAD_WATCH: "true", CORPUSWIRE_SYNC_HEAD_WATCH_INTERVAL_MS: "250" },
+    headWatcherFactory: (_current, options) => {
+      assert.equal(options.intervalMs, 250);
+      fire = options.onChange;
+      return { start: async () => ({}), close: () => { closed += 1; } };
+    },
+    onWait: async (current) => {
+      if (!changed && current.requests.length === 1) {
+        changed = true;
+        await writeFile(path.join(current.root, "README.md"), "# Branch content\n");
+        fire({ head: "1".repeat(40), branch: "main" }, { head: "2".repeat(40), branch: "feature", detached: false });
+      }
+      if (current.requests.length >= 2) current.controller.abort();
+    },
+  });
+  assert.ifError(state.error);
+  assert.equal(state.requests.length, 2);
+  assert.ok(state.writes.some((line) => /Git HEAD changed \(feature\); rescanning/.test(line)));
+  assert.ok(closed >= 1);
+});
+
+test("the CLI and MCP copies of the HEAD watcher stay byte-identical", async () => {
+  const cliCopy = await readFile(new URL("../lib/git-head-watch.js", import.meta.url));
+  const mcpCopy = await readFile(new URL("../../corpuswire-mcp/lib/git-head-watch.mjs", import.meta.url)).catch(() => null);
+  if (mcpCopy === null) return; // packed CLI without the monorepo
+  assert.ok(cliCopy.equals(mcpCopy));
 });

@@ -8,6 +8,8 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline/promises";
 import { promisify } from "node:util";
+import { randomUUID } from "node:crypto";
+import { DEFAULT_HEAD_WATCH_INTERVAL_MS, createGitHeadWatcher } from "./git-head-watch.js";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:18080";
 const DEFAULT_WATCH_REQUEST_TIMEOUT_MS = 30_000;
@@ -604,6 +606,27 @@ function watchRetryable(error) {
     || error.name === "TypeError" || ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ENOENT"].includes(error.code);
 }
 
+// CRP-001 L1.1: workspace writer lease outcomes, recognized by the backend's
+// stable error codes (or the SDK's lease-lost error).
+function isWatchLeaseHeld(error) {
+  const code = error?.errorCode ?? error?.errorDetail?.code;
+  return error?.status === 409 && (code === "index_lease_held" || code === "index_lease_not_held");
+}
+
+function isWatchLeaseLost(error) {
+  return error?.name === "RemoteIndexLeaseLostError" || error?.code === "lease_lost"
+    || (error?.status === 409 && (error?.errorCode ?? error?.errorDetail?.code) === "index_lease_lost");
+}
+
+function optionalEnvBoolean(value) {
+  return typeof value === "string" && ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+}
+
+function optionalEnvPositiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 function watchFailure(message, code = "watch_fence") {
   return Object.assign(new Error(message), { code });
 }
@@ -662,6 +685,13 @@ export async function runWatchCommand(options, dependencies) {
   let publications = 0;
   let stopped = false;
   let watcherErrorReported = false;
+  const env = dependencies.env ?? process.env;
+  // CRP-001 L1.1: opt-in single-writer lease, shared with MCP sync writers.
+  const lease = optionalEnvBoolean(env.CORPUSWIRE_SYNC_LEASE_ENABLED)
+    ? { holderId: `cw-watch:${randomUUID().replaceAll("-", "").slice(0, 24)}` }
+    : null;
+  let leaseConflicts = 0;
+  let headWatcher = null;
 
   const onChange = (_event, filename) => {
     if (stopped) return;
@@ -677,6 +707,7 @@ export async function runWatchCommand(options, dependencies) {
     if (stopped) return;
     stopped = true;
     watcher?.close();
+    headWatcher?.close();
     wake?.();
   };
   signal?.addEventListener("abort", closeWatcher, { once: true });
@@ -724,6 +755,24 @@ export async function runWatchCommand(options, dependencies) {
     } catch (error) {
       reportWatcherFallback(error, "startup");
     }
+    // CRP-001 L1.2: dot paths are ignored above, so `.git` events never wake
+    // the loop. With this option a commit, checkout or reset (also in a
+    // linked worktree or on a detached HEAD) wakes it for a complete scan.
+    if (optionalEnvBoolean(env.CORPUSWIRE_SYNC_HEAD_WATCH)) {
+      headWatcher = (dependencies.headWatcherFactory ?? createGitHeadWatcher)({
+        sourceRoot: root,
+        intervalMs: optionalEnvPositiveInteger(env.CORPUSWIRE_SYNC_HEAD_WATCH_INTERVAL_MS, DEFAULT_HEAD_WATCH_INTERVAL_MS),
+        onChange: (previous, next) => {
+          if (stopped) return;
+          write(`Git HEAD changed (${next.detached ? "detached" : next.branch ?? "unknown branch"}); rescanning.`);
+          generation += 1;
+          lastEventAt = Date.now();
+          wake?.();
+        },
+        onError: () => {},
+      });
+      await headWatcher.start();
+    }
     let capabilities;
     for (let attempt = 0; ; attempt += 1) {
       try { capabilities = await dependencies.client.getIndexCapabilities(); break; }
@@ -756,7 +805,7 @@ export async function runWatchCommand(options, dependencies) {
         const digest = createHash("sha256").update(JSON.stringify(scan.files.map((file) => [file.relativePath, file.sha256]).sort((a, b) => a[0].localeCompare(b[0])))).digest("hex");
         if (digest !== publishedDigest) {
           const result = await runIndexCommand({ ...options, sourceRoot: root, yes: true, nonInteractive: true }, {
-            ...dependencies, capabilities, preparedScan: scan,
+            ...dependencies, capabilities, preparedScan: scan, lease,
             write: (line) => {
               if (!options.json && !options.ndjson) return output(line);
               try { JSON.parse(line); } catch { return write(line); }
@@ -792,6 +841,7 @@ export async function runWatchCommand(options, dependencies) {
           }
           publishedDigest = digest;
           publications += 1;
+          leaseConflicts = 0;
           write(`Index verified (${scan.files.length} files). Watching for the next change.`);
         }
         failures = 0;
@@ -799,6 +849,19 @@ export async function runWatchCommand(options, dependencies) {
         await wait(options.pollMs, signal);
       } catch (error) {
         if (signal?.aborted) break;
+        if (lease && (isWatchLeaseHeld(error) || isWatchLeaseLost(error))) {
+          // Another writer owns the workspace, or this one lost the lease and
+          // its session was aborted. Back off with the existing exponential
+          // shape (honoring Retry-After) and rescan; this is not a failure.
+          leaseConflicts += 1;
+          const retryAfterMs = Number.isFinite(error?.retryAfterSeconds) ? error.retryAfterSeconds * 1000 : 0;
+          const delayMs = Math.min(30000, Math.max(retryAfterMs, 1000 * 2 ** (leaseConflicts - 1)));
+          write(isWatchLeaseLost(error)
+            ? `Workspace lease was lost; the session was aborted. Rescanning in ${formatDuration(delayMs)}.`
+            : `Another sync writer holds the workspace lease; retrying in ${formatDuration(delayMs)}.`);
+          await wait(delayMs, signal);
+          continue;
+        }
         if (!watchRetryable(error) || ++failures > 3) throw error;
         write(`Reconciliation temporarily interrupted; retry ${failures}/3. The last verified inventory is unchanged.`);
         await wait(Math.min(30000, 1000 * 2 ** (failures - 1)), signal);
@@ -983,7 +1046,9 @@ export async function runIndexCommand(options, dependencies) {
     write(`Code ready${pending.length ? `; ${pending.join("; ")}` : ""}.`);
   };
   try {
-    const result = await dependencies.client.indexWorkspace(request);
+    const result = dependencies.lease && typeof dependencies.client.indexWorkspaceWithLease === "function"
+      ? await dependencies.client.indexWorkspaceWithLease(request, { holderId: dependencies.lease.holderId })
+      : await dependencies.client.indexWorkspace(request);
     renderer.finish();
     const status = result.status ?? {};
     printIndexTerminalSummary(write, {
@@ -1018,6 +1083,10 @@ export async function runIndexCommand(options, dependencies) {
       });
       emitTrace({ scan, status: error.status, lastProgress, errorState: "cancelled" });
       return { ok: false, cancelled: true, status: error.status };
+    }
+    if (dependencies.lease && (isWatchLeaseHeld(error) || isWatchLeaseLost(error))) {
+      emitTrace({ scan, lastProgress, errorState: "lease_conflict" });
+      throw error;
     }
     const conflict = activeSessionFromError(error);
     if (conflict) {

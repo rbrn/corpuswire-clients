@@ -295,6 +295,19 @@ can abort the transport; the backend may still need verification afterward.
 Use `cw doctor` to check readiness. `watch --ndjson` includes structured
 `watch-progress/v1` lifecycle records alongside normal index progress.
 
+Two opt-in environment options coordinate the watcher with other writers:
+
+- `CORPUSWIRE_SYNC_LEASE_ENABLED=true` holds the backend's single-writer
+  workspace lease for each publication, shared with MCP sync writers that opt
+  in. While another writer holds it, watch waits with the same exponential
+  backoff (honoring `Retry-After`, at most 30 seconds) and rescans; a lease
+  lost mid-session aborts that session and rescans. Neither stops the watcher.
+- `CORPUSWIRE_SYNC_HEAD_WATCH=true` polls `.git/HEAD` and the current branch
+  ref (mtimes only, every `CORPUSWIRE_SYNC_HEAD_WATCH_INTERVAL_MS`, default
+  1000) and wakes a complete scan after a commit, checkout or reset, including
+  detached HEAD and linked worktrees. Each wake is a full filtered scan, so a
+  large branch switch needs no separate cap.
+
 ## Ingestion And Update Behavior
 
 The index command sends a complete manifest in full mode, uploads only files the
