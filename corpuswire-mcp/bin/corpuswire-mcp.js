@@ -5999,7 +5999,20 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, identity, t
       }
     }
     lines.push("", "Hits:", ...hits.map((hit, index) => formatServerPackedHit(hit, index + 1)));
-    lines.push("", "Evidence:", serverEvidence.text.replace(/\n$/, ""));
+    // maxChars still bounds the evidence text: the server budget comes from
+    // max_evidence_chars (or its default), which a caller may not have set.
+    const evidenceLines = serverEvidence.text.replace(/\n$/, "").split("\n");
+    const evidenceBudget = Math.max(0, maxChars - lines.join("\n").length);
+    const bounded = truncateAtLineBoundary(evidenceLines, evidenceBudget);
+    if (bounded && bounded.lineCount === evidenceLines.length) {
+      lines.push("", "Evidence:", bounded.text);
+    } else {
+      lines.push("", "Evidence:", ...(bounded ? [bounded.text] : []));
+      lines.push(
+        "",
+        `Evidence truncated: ${evidenceLines.length - (bounded ? bounded.lineCount : 0)} of ${evidenceLines.length} server-packed line(s) omitted to stay within maxChars (${maxChars}). Increase maxChars or lower max_evidence_chars.`,
+      );
+    }
     if (serverEvidence.citations.length > 0) {
       lines.push("", "Citations:", ...serverEvidence.citations.map((citation) => `- ${citation}`));
     }

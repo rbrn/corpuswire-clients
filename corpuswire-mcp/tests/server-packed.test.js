@@ -59,7 +59,7 @@ function packed(overrides = {}, spans = FIXTURE_SPANS) {
     evidence_spans: spans,
     packing: {
       policy: "server-v1", budget_chars: 12000, used_chars: 120, spans_total: 3,
-      spans_dropped_budget: 0, files: 2, fallback_reason: null, complete: true, unverified_hits: 0,
+      spans_dropped_budget: 0, spans_dropped_conflict: 0, files: 2, fallback_reason: null, complete: true, unverified_hits: 0,
       ...overrides,
     },
   };
@@ -269,6 +269,14 @@ test("MCP search and enhance render complete server spans and fall back byte-for
       assert.equal(await off.call(tool, args, packedResult), await off.call(tool, args, BASE_RESULT));
       assert.equal(await off.call(tool, args, BASE_RESULT), plain);
     }
+
+    // maxChars still bounds the server-packed evidence (the header stays whole).
+    const clipped = await auto.call("corpuswire_search", { ...searchArgs, maxChars: 200 }, packedResult);
+    assert.match(clipped, /Evidence truncated: \d+ of \d+ server-packed line\(s\) omitted to stay within maxChars \(200\)\./);
+    assert.equal(clipped.includes(FIXTURE_RENDER.replace(/\n$/, "")), false);
+    const roomy = await auto.call("corpuswire_search", { ...searchArgs, maxChars: 50000 }, packedResult);
+    assert.ok(roomy.includes(`Evidence:\n${FIXTURE_RENDER.replace(/\n$/, "")}`));
+    assert.equal(roomy.includes("Evidence truncated"), false);
 
     // Copilot output mode shares the same render path.
     const copilot = await auto.call("corpuswire_enhance_prompt", { ...enhanceArgs, outputMode: "copilot" }, packedResult);
