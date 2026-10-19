@@ -98,6 +98,8 @@ export interface PackingReport {
   spans_total: number;
   spans_dropped_budget: number;
   spans_dropped_conflict: number;
+  /** Selected projections clipped to the budget instead of dropped (engine >= #173). */
+  spans_clipped_budget?: number;
   files: number;
   fallback_reason: string | null;
   /** True only when every span is verified; clients use spans only then. */
