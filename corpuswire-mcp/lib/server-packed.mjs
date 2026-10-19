@@ -104,3 +104,25 @@ export function serverSpanCitations(spans) {
   return groups.flatMap((group) => group.spans
     .map((span) => `${group.sourcePath}:${span.start_line}-${span.end_line}`));
 }
+
+/**
+ * Keeps whole spans, in rendered (grouped) order, while their rendered text
+ * fits `maxChars`; the first span that does not fit ends the prefix, so a
+ * citation or packet range is never reported for text that was cut. Returns
+ * null for invalid input, otherwise `{ spans, omitted }` where `spans` is the
+ * retained prefix (possibly empty) and `omitted` counts the dropped spans.
+ */
+export function boundServerSpans(spans, maxChars) {
+  const groups = groupServerSpans(spans);
+  if (!groups) return null;
+  if (!Number.isFinite(maxChars)) return { spans: groups.flatMap((group) => group.spans), omitted: 0 };
+  const retained = [];
+  let used = 0;
+  for (const span of groups.flatMap((group) => group.spans)) {
+    const rendered = renderServerSpans([span]);
+    if (rendered === null || used + rendered.length > maxChars) break;
+    retained.push(span);
+    used += rendered.length;
+  }
+  return { spans: retained, omitted: groups.reduce((n, group) => n + group.spans.length, 0) - retained.length };
+}

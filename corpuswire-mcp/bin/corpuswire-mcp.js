@@ -9,7 +9,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { planSelectedNeighbor } from "../lib/selected-neighbor.mjs";
-import { groupServerSpans, renderServerSpans, shouldUseServerPacking } from "../lib/server-packed.mjs";
+import { boundServerSpans, groupServerSpans, renderServerSpans, shouldUseServerPacking } from "../lib/server-packed.mjs";
 import { canonicalCoalescingDeliveryComplete, planSourceRootCoalescing } from "../lib/source-root-coalescing.mjs";
 import { SERVER_INSTRUCTIONS, decorateTools, detectHost, negotiateProtocolVersion, readToolProfile } from "../lib/host-profile.mjs";
 import { createWorkspaceScope, formatIdentityLines } from "../lib/workspace-scope.mjs";
@@ -5126,7 +5126,7 @@ async function searchContextCore(args, telemetry) {
   const context = response.context ?? {};
   const hits = Array.isArray(result.retrieved_chunks) ? result.retrieved_chunks : [];
   // Complete server-packed spans replace the client-side widening below.
-  const serverEvidence = serverPackedEvidence(result);
+  const serverEvidence = serverPackedEvidence(result, maxChars);
 
   // The personal local default is v2; explicit off/unknown values retain the
   // original renderer and provide an immediate per-host rollback.
@@ -5999,18 +5999,11 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, identity, t
       }
     }
     lines.push("", "Hits:", ...hits.map((hit, index) => formatServerPackedHit(hit, index + 1)));
-    // maxChars still bounds the evidence text: the server budget comes from
-    // max_evidence_chars (or its default), which a caller may not have set.
-    const evidenceLines = serverEvidence.text.replace(/\n$/, "").split("\n");
-    const evidenceBudget = Math.max(0, maxChars - lines.join("\n").length);
-    const bounded = truncateAtLineBoundary(evidenceLines, evidenceBudget);
-    if (bounded && bounded.lineCount === evidenceLines.length) {
-      lines.push("", "Evidence:", bounded.text);
-    } else {
-      lines.push("", "Evidence:", ...(bounded ? [bounded.text] : []));
+    if (serverEvidence.text) lines.push("", "Evidence:", serverEvidence.text.replace(/\n$/, ""));
+    if (serverEvidence.omittedSpans > 0) {
       lines.push(
         "",
-        `Evidence truncated: ${evidenceLines.length - (bounded ? bounded.lineCount : 0)} of ${evidenceLines.length} server-packed line(s) omitted to stay within maxChars (${maxChars}). Increase maxChars or lower max_evidence_chars.`,
+        `Response truncated: ${serverEvidence.omittedSpans} of ${serverEvidence.spanCount} server-packed span(s) omitted because they did not fit the ${maxChars}-character evidence budget. Increase maxChars or lower max_evidence_chars.`,
       );
     }
     if (serverEvidence.citations.length > 0) {
@@ -6151,10 +6144,14 @@ function formatSearchResult({ baseUrl, query, repoPath, workspaceId, identity, t
 
 // Server-packed evidence (CRP-003): used only when shouldUseServerPacking holds
 // and every span validates; otherwise null keeps the client-side path.
-function serverPackedEvidence(result) {
+// `maxChars` (search only) bounds the evidence text by whole spans, so the
+// citations and packet ranges name only text that is actually delivered.
+function serverPackedEvidence(result, maxChars = undefined) {
   if (!shouldUseServerPacking(result, process.env)) return null;
-  const text = renderServerSpans(result.evidence_spans);
-  const groups = groupServerSpans(result.evidence_spans);
+  const bounded = boundServerSpans(result.evidence_spans, maxChars);
+  if (!bounded) return null;
+  const text = bounded.spans.length > 0 ? renderServerSpans(bounded.spans) : "";
+  const groups = bounded.spans.length > 0 ? groupServerSpans(bounded.spans) : [];
   if (text === null || !groups) return null;
   const rangesByPath = new Map(groups.map((group) => [group.sourcePath,
     group.spans.map((span) => `${span.start_line}-${span.end_line}`)]));
@@ -6164,7 +6161,9 @@ function serverPackedEvidence(result) {
     citations: groups.flatMap((group) => rangesByPath.get(group.sourcePath)
       .map((range) => `${group.sourcePath}:${range}`)),
     spanCount: result.evidence_spans.length,
-    fileCount: groups.length,
+    fileCount: groupServerSpans(result.evidence_spans).length,
+    omittedSpans: bounded.omitted,
+    maxChars,
     packing: asRecord(result.packing),
   };
 }
