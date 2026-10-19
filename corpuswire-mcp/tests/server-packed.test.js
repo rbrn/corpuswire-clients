@@ -13,6 +13,7 @@ import {
   serverPackingMode,
   serverSpanCitations,
   shouldUseServerPacking,
+  boundServerSpans,
 } from "../lib/server-packed.mjs";
 
 const digest = (value) => createHash("sha256").update(value, "utf8").digest("hex");
@@ -59,7 +60,7 @@ function packed(overrides = {}, spans = FIXTURE_SPANS) {
     evidence_spans: spans,
     packing: {
       policy: "server-v1", budget_chars: 12000, used_chars: 120, spans_total: 3,
-      spans_dropped_budget: 0, files: 2, fallback_reason: null, complete: true, unverified_hits: 0,
+      spans_dropped_budget: 0, spans_dropped_conflict: 0, files: 2, fallback_reason: null, complete: true, unverified_hits: 0,
       ...overrides,
     },
   };
@@ -72,6 +73,19 @@ test("renders spans in the harness layout, grouped by path in first-seen order",
 test("rendered fixture text has a stable sha256 for the engine regression", () => {
   const rendered = renderServerSpans(FIXTURE_SPANS);
   assert.equal(digest(rendered), FIXTURE_SHA256);
+});
+
+test("boundServerSpans keeps whole spans in rendered order within maxChars", () => {
+  const all = boundServerSpans(FIXTURE_SPANS, undefined);
+  assert.equal(all.omitted, 0);
+  assert.equal(all.spans.length, 3);
+  assert.equal(renderServerSpans(all.spans), FIXTURE_RENDER);
+  const firstTwo = FIXTURE_RENDER.split("Path: src/app.js")[0];
+  const bounded = boundServerSpans(FIXTURE_SPANS, firstTwo.length);
+  assert.equal(bounded.omitted, 1);
+  assert.equal(renderServerSpans(bounded.spans), firstTwo);
+  assert.deepEqual(boundServerSpans(FIXTURE_SPANS, 10), { spans: [], omitted: 3 });
+  assert.equal(boundServerSpans([{ ...FIXTURE_SPANS[0], end_line: 99 }], 500), null);
 });
 
 test("groupByPath=false keeps the received order", () => {
@@ -269,6 +283,22 @@ test("MCP search and enhance render complete server spans and fall back byte-for
       assert.equal(await off.call(tool, args, packedResult), await off.call(tool, args, BASE_RESULT));
       assert.equal(await off.call(tool, args, BASE_RESULT), plain);
     }
+
+    // maxChars bounds the server-packed evidence by whole spans; citations and
+    // packet ranges name only the spans that were delivered.
+    const bigText = Array.from({ length: 60 }, (_, i) => `const line${i} = ${i}; // padding padding padding`).join("\n");
+    const bigResult = { ...BASE_RESULT, ...packed({}, [FIXTURE_SPANS[0], span("src/big.js", HASH_B, 1, bigText)]) };
+    const firstSpanRender = FIXTURE_RENDER.split("Path: ")[1].replace(/\n$/, "");
+    const clipped = await auto.call("corpuswire_search", { ...searchArgs, maxChars: 200 }, bigResult);
+    assert.ok(clipped.includes(`Evidence:\nPath: ${firstSpanRender}\n\nResponse truncated: 1 of 2 server-packed span(s) omitted`), clipped);
+    assert.match(clipped, /Citations:\n- docs\/guide\.md:3-5$/);
+    assert.equal(clipped.includes("src/big.js"), false);
+    const noneResult = { ...BASE_RESULT, ...packed({}, [span("src/big.js", HASH_B, 1, bigText)]) };
+    const none = await auto.call("corpuswire_search", { ...searchArgs, maxChars: 200 }, noneResult);
+    assert.equal(none.includes("Evidence:"), false, none);
+    assert.match(none, /Response truncated: 1 of 1 server-packed span\(s\) omitted/);
+    assert.equal(none.includes("Citations:"), false);
+    assert.ok((await auto.call("corpuswire_search", { ...searchArgs, maxChars: 50000 }, bigResult)).includes("src/big.js:1-60"));
 
     // Copilot output mode shares the same render path.
     const copilot = await auto.call("corpuswire_enhance_prompt", { ...enhanceArgs, outputMode: "copilot" }, packedResult);
