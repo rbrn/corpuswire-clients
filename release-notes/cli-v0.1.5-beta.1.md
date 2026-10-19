@@ -6,6 +6,11 @@ CLI 0.1.5-beta.1 adds `cw mcp`:
 
 `cw search`, `cw enhance` and `cw health` now use the folder's configured or indexed workspace, through the SDK 0.1.5 identity rule. They fall back to the backend default with a note when the folder has no index yet.
 
-The archive bundles MCP 0.1.5-beta.1 and SDK 0.1.5, so `cw mcp serve` works from an offline install. `CORPUSWIRE_MCP_SERVER_PATH` points it at another server build.
+The archive bundles MCP 0.1.5-beta.1 and SDK 0.1.5, so `cw mcp serve` works from an offline install. `CORPUSWIRE_MCP_SERVER_PATH` points it at another server build. The bundled MCP renders the engine's server-packed evidence, and the bundled SDK indexes systems-language files as code (see the MCP and SDK notes).
+
+Known limits:
+
+- The CLI archive declares the MCP and SDK packages as local `file:` dependencies, so it cannot be installed on its own with npm. Install it together with the MCP and SDK archives from the same release.
+- Watch mode (bare `cw`, `cw --watch`) is unverified on the Mac in this build: 10 watch-mode tests fail there. One-shot commands such as `health` and `search` work.
 
 Validation: 101 CLI tests pass, including a real `cw mcp serve` handshake. On the Mac, `cw mcp doctor --host codex` passed. Download the archive with its SHA256 file. This is a GitHub prerelease; npm publication is not claimed. The coordinated runtime is v0.1.40-beta.1.
