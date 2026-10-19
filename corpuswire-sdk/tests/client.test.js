@@ -2685,8 +2685,29 @@ test("retrieval exclusions preserve source while rejecting discovery and Terrafo
   }
 });
 
+test("ingestion priority covers every code extension in the engine registry when it is checked out", async (t) => {
+  const registryUrl = new URL("../../../src/corpuswire/ingest/capabilities.py", import.meta.url);
+  const { readFile } = await import("node:fs/promises");
+  let source;
+  try {
+    source = await readFile(registryUrl, "utf8");
+  } catch {
+    t.skip("engine registry is not next to this checkout");
+    return;
+  }
+  const extensions = new Set();
+  for (const name of ["WEB_SOURCE_EXTENSIONS", "SYSTEMS_LANGUAGE_EXTENSIONS"]) {
+    const block = source.match(new RegExp(`${name}\\s*=\\s*frozenset\\(([\\s\\S]*?)\\n\\)`));
+    assert.ok(block, `${name} is declared in the engine registry`);
+    for (const match of block[1].matchAll(/"(\.[a-z0-9]+)"/g)) extensions.add(match[1]);
+  }
+  assert.ok(extensions.size >= 15, "found the registry extensions");
+  for (const extension of extensions) assert.equal(ingestionPriority(`src/main${extension}`), 1, extension);
+});
+
 test("ingestion priority matches canonical code, documentation and other categories", () => {
-  for (const extension of ["bat", "scala", "sh", "cjs", "js", "jsx", "mjs", "cts", "mts", "ts", "tsx", "java", "kt", "kts", "py", "pyi", "hcl", "tf", "html", "htm"]) {
+  for (const extension of ["bat", "scala", "sh", "cjs", "js", "jsx", "mjs", "cts", "mts", "ts", "tsx", "java", "kt", "kts", "py", "pyi", "hcl", "tf", "html", "htm",
+    "c", "cc", "cpp", "cs", "cxx", "go", "h", "hh", "hpp", "hxx", "php", "rb", "rs", "sql", "swift"]) {
     assert.equal(ingestionPriority(`src/main.${extension.toUpperCase()}`), 1);
   }
   for (const path of ["scripts/mvnw", "scripts/gradlew", "infra/main.tf.json"]) assert.equal(ingestionPriority(path), 1);
