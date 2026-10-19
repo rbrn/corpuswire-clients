@@ -49,6 +49,7 @@ const DIRECTORY_GLOB_PROBE = "__corpuswire_directory_probe__";
 const OUTPUT_MODES = new Set(["generic", "copilot", "claude-code", "sequential"]);
 // Set by initialize; CORPUSWIRE_HOST overrides detection for hosts that report no clientInfo.
 let hostProfile = detectHost(undefined, process.env.CORPUSWIRE_HOST);
+let hostClientInfo = { name: null, version: null };
 let clientCapabilities = {};
 const pendingClientRequests = new Map();
 let nextClientRequestId = 1;
@@ -2469,6 +2470,10 @@ function initialize(params) {
     ? params.protocolVersion.trim()
     : PROTOCOL_VERSION;
   hostProfile = detectHost(asRecord(params.clientInfo), process.env.CORPUSWIRE_HOST);
+  hostClientInfo = {
+    name: optionalString(asRecord(params.clientInfo).name)?.slice(0, 128) ?? null,
+    version: optionalString(asRecord(params.clientInfo).version)?.slice(0, 64) ?? null,
+  };
   clientCapabilities = asRecord(params.capabilities);
   if (process.env.CORPUSWIRE_MCP_HANDSHAKE_LOG === "1") {
     // Names only, on stderr, so a host's handshake can be recorded without content.
@@ -2639,7 +2644,48 @@ async function retrievalJournalVerifyDirectory(directory) {
     || await realpath(directory.target) !== directory.target) throw new Error("directory_changed");
 }
 
-async function writeRetrievalJournal(params, result, startedAt, elapsedMs, observation) {
+// Fixed categories only: error prose can carry private text and stays out of the journal.
+function retrievalJournalErrorSummary(error) {
+  if (error === undefined) return null;
+  const message = error instanceof Error ? error.message : String(error);
+  const status = Number.isInteger(error?.status) ? error.status : null;
+  const errorCode = typeof error?.errorCode === "string" && /^[A-Za-z0-9_.:-]{1,64}$/.test(error.errorCode)
+    ? error.errorCode : null;
+  let category = "other";
+  if (error instanceof JsonRpcError) category = "invalid_args";
+  else if (sdk.CorpusWireHttpError && error instanceof sdk.CorpusWireHttpError && status !== null) {
+    if (status === 401 || status === 403) category = "auth";
+    else if (status === 408 || status === 504) category = "timeout";
+    else if (status === 429) category = "rate_limited";
+    else if (status === 503) category = "server_unavailable";
+    else if (status >= 500) category = "http_5xx";
+    else if (status >= 400) category = "http_4xx";
+  } else if (isConnectionError(message)) category = "network";
+  else if (error?.name === "AbortError" || error?.name === "TimeoutError" || /timed? ?out/i.test(message)) {
+    category = "timeout";
+  } else if (/returned no enhanced prompt/.test(message)) category = "empty_result";
+  return { category, httpStatus: status, errorCode };
+}
+
+function retrievalRatingDirectoryTarget() {
+  const configured = process.env.CORPUSWIRE_RETRIEVAL_RATING_DIR;
+  if (configured) return configured;
+  return path.join(path.dirname(path.resolve(process.env.CORPUSWIRE_RETRIEVAL_LOG_DIR)), "retrieval-ratings");
+}
+
+function retrievalJournalEnabled() {
+  return Boolean(process.env.CORPUSWIRE_RETRIEVAL_LOG_DIR)
+    && process.env.CORPUSWIRE_RETRIEVAL_LOG_MODE !== "off";
+}
+
+function retrievalJournalStorageLimits() {
+  return {
+    events: retrievalJournalLimit("MAX_EVENTS", 10000),
+    bytes: retrievalJournalLimit("MAX_BYTES", 268435456),
+  };
+}
+
+async function writeRetrievalJournal(params, result, startedAt, elapsedMs, observation, eventId = randomUUID()) {
   const mode = process.env.CORPUSWIRE_RETRIEVAL_LOG_MODE ?? "metadata";
   if (mode !== "metadata" && mode !== "full") throw new Error("invalid_mode");
   const limits = {
@@ -2665,12 +2711,13 @@ async function writeRetrievalJournal(params, result, startedAt, elapsedMs, obser
   retrievalJournalExecutableHash ??= await readFile(new URL(import.meta.url))
     .then((bytes) => createHash("sha256").update(bytes).digest("hex"));
   const event = {
-    schemaVersion: "corpuswire-private-retrieval/v1", eventId: randomUUID(),
+    schemaVersion: "corpuswire-private-retrieval/v2", eventId,
     server: {
       name: SERVER_NAME, version: SERVER_VERSION,
       executableSha256: retrievalJournalExecutableHash,
       executableHashSemantics: "entry_file_on_disk_at_first_capture_not_loaded_dependency_identity",
     }, tool: params.name,
+    host: { id: hostProfile.id, clientName: hostClientInfo.name, clientVersion: hostClientInfo.version },
     startedAt, completedAt: new Date().toISOString(), elapsedMs,
     workspaceId: retrievalJournalRedact(String(args.workspaceId ?? process.env.CORPUSWIRE_WORKSPACE_ID ?? "")).slice(0, 1024),
     backendOrigin: retrievalJournalRedact(origin), mode, limits,
@@ -2705,6 +2752,11 @@ async function writeRetrievalJournal(params, result, startedAt, elapsedMs, obser
       sourceFilterTruncated: full && (sourceFilter.length > 32 || storedSourceFilter.some((capture) => capture.truncated)),
     },
     outcome: result?.isError || !result ? "error" : "success",
+    // Joins this record to the engine's search telemetry row when the backend returned one.
+    engineEventId: observation.engineEventId ?? null,
+    error: result?.isError || !result
+      ? retrievalJournalErrorSummary(observation.error) ?? { category: "other", httpStatus: null, errorCode: null }
+      : null,
     input: retrievalJournalCapture(input, limits.inputBytes, full),
     result: result?.isError || !result
       ? { rawSha256: retrievalJournalDigest(delivered), rawBytes: Buffer.byteLength(delivered),
@@ -2714,10 +2766,17 @@ async function writeRetrievalJournal(params, result, startedAt, elapsedMs, obser
           ? "[REDACTED]" : typeof value === "string" ? retrievalJournalRedact(value) : value)
         : undefined),
   };
-  const body = `${JSON.stringify(event)}\n`;
+  await writePrivateJournalFile(directory, RETRIEVAL_JOURNAL_PREFIX, event.eventId,
+    `${JSON.stringify(event)}\n`, limits);
+}
+
+// Atomically adds one owner-only `<prefix><id>.json` file under a per-directory lock,
+// refusing anything unexpected in the directory and never deleting old evidence.
+async function writePrivateJournalFile(directory, prefix, id, body, limits) {
   const bytes = Buffer.byteLength(body);
   if (bytes > 8 * 1024 * 1024 || bytes > limits.bytes) throw new Error("capacity_reached");
-  const lockPath = path.join(directory.target, ".cw-retrieval.lock");
+  const lockName = `.${prefix.replace(/-$/, "")}.lock`;
+  const lockPath = path.join(directory.target, lockName);
   let lock;
   let file;
   let temporary;
@@ -2739,23 +2798,23 @@ async function writeRetrievalJournal(params, result, startedAt, elapsedMs, obser
     const names = await readdir(directory.target);
     if (names.length > limits.events + 2) throw new Error("capacity_reached");
     for (const name of names) {
-      if (name === ".cw-retrieval.lock") continue;
+      if (name === lockName) continue;
       const info = await lstat(path.join(directory.target, name));
-      if (!name.startsWith(RETRIEVAL_JOURNAL_PREFIX) || !name.endsWith(".json")
+      if (!name.startsWith(prefix) || !name.endsWith(".json")
         || !info.isFile() || info.isSymbolicLink() || info.nlink !== 1
         || (info.mode & 0o777) !== 0o600) throw new Error("unsafe_contents");
       count += 1; used += info.size;
     }
     if (count >= limits.events || used + bytes > limits.bytes) throw new Error("capacity_reached");
     await retrievalJournalVerifyDirectory(directory);
-    temporary = path.join(directory.target, `.cw-retrieval-${event.eventId}.tmp`);
+    temporary = path.join(directory.target, `.${prefix}${id}.tmp`);
     file = await open(temporary, fsConstants.O_WRONLY | fsConstants.O_CREAT
       | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
     await file.chmod(0o600);
     await file.writeFile(body, "utf8");
     await file.close(); file = null;
     await retrievalJournalVerifyDirectory(directory);
-    const destination = path.join(directory.target, `${RETRIEVAL_JOURNAL_PREFIX}${event.eventId}.json`);
+    const destination = path.join(directory.target, `${prefix}${id}.json`);
     await link(temporary, destination);
   } finally {
     if (file) await file.close().catch(() => {});
@@ -2768,16 +2827,19 @@ async function writeRetrievalJournal(params, result, startedAt, elapsedMs, obser
 }
 
 async function callToolWithRetrievalJournal(params) {
-  if (!process.env.CORPUSWIRE_RETRIEVAL_LOG_DIR
-    || process.env.CORPUSWIRE_RETRIEVAL_LOG_MODE === "off"
+  if (!retrievalJournalEnabled()
     || !["corpuswire_search", "corpuswire_enhance_prompt"].includes(params.name)) return callTool(params);
   const startedAt = new Date().toISOString(), started = process.hrtime.bigint();
+  const eventId = randomUUID();
   let result;
   const observation = {};
-  try { result = await callTool(params, observation); return result; }
-  finally {
+  try {
+    result = await callTool(params, observation);
+    appendJournalEventFooter(result, eventId);
+    return result;
+  } finally {
     const elapsedMs = searchTimingMs(started);
-    const next = retrievalJournalQueue.then(() => writeRetrievalJournal(params, result, startedAt, elapsedMs, observation))
+    const next = retrievalJournalQueue.then(() => writeRetrievalJournal(params, result, startedAt, elapsedMs, observation, eventId))
       .catch((error) => {
         const safeReasons = ["invalid_limits", "invalid_mode", "unsafe_directory", "workspace_directory",
           "unsafe_permissions", "directory_changed", "capacity_reached", "directory_busy", "unsafe_contents"];
@@ -2786,6 +2848,15 @@ async function callToolWithRetrievalJournal(params) {
     retrievalJournalQueue = next;
     await next;
   }
+}
+
+// The id lets a model rate this exact call with corpuswire_rate_result(journalEventId).
+// It is part of the delivered text, so the journal stores the response as the model saw it.
+function appendJournalEventFooter(result, eventId) {
+  if (process.env.CORPUSWIRE_RETRIEVAL_LOG_EVENT_FOOTER === "false" || !result || result.isError) return;
+  const last = Array.isArray(result.content) ? result.content.findLast((item) => item?.type === "text") : null;
+  if (!last || typeof last.text !== "string") return;
+  last.text = `${last.text}\n\njournalEventId: ${eventId}`;
 }
 
 async function callTool(params, observation = undefined) {
@@ -2798,8 +2869,9 @@ async function callTool(params, observation = undefined) {
   const onProgress = createMcpProgressReporter(params);
   if (name === "corpuswire_search") {
     try {
-      return textToolResult(await searchContext(args));
+      return textToolResult(await searchContext(args, observation));
     } catch (error) {
+      if (observation) observation.error = error;
       const message = formatToolError(error, "search request");
       const reportPath = await reportToolFailureSafely(name, args, error);
       return textToolResult(appendFailureReportPath(message, reportPath), true);
@@ -2830,6 +2902,7 @@ async function callTool(params, observation = undefined) {
     try {
       return textToolResult(await enhancePrompt(args, observation));
     } catch (error) {
+      if (observation) observation.error = error;
       const message = formatToolError(error, "enhancement request");
       const reportPath = await reportToolFailureSafely(name, args, error);
       return textToolResult(appendFailureReportPath(message, reportPath), true);
@@ -3450,6 +3523,18 @@ function toolDefinitions() {
           notes: { type: "string" },
           issueUrl: { type: "string" },
           metadata: { type: "object", additionalProperties: true },
+          journalEventId: {
+            type: "string",
+            description: "The journalEventId printed at the end of the corpuswire_search or corpuswire_enhance_prompt result being rated. Saves the rating next to the private journal record for later evaluation.",
+          },
+          expectedPaths: {
+            type: "array", items: { type: "string" }, default: [],
+            description: "Workspace-relative files that should have been retrieved; used when replaying the query later.",
+          },
+          missingPaths: {
+            type: "array", items: { type: "string" }, default: [],
+            description: "Expected files the result did not include.",
+          },
         },
         required: ["workType", "engine", "relevance", "fileSpecificity", "coverage", "freshness", "actionability"],
       },
@@ -5095,7 +5180,11 @@ async function sourceRootCoalescingResult({ formatInput, formatted, selectedHits
   }
 }
 
-async function searchContextCore(args, telemetry) {
+function boundedEngineEventId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(value) ? value : null;
+}
+
+async function searchContextCore(args, telemetry, observation = undefined) {
   const query = requiredString(args, "query");
   const topK = optionalPositiveInteger(args.topK ?? process.env.CORPUSWIRE_TOP_K, DEFAULT_TOP_K);
   const minScore = optionalScore(args.minScore ?? process.env.CORPUSWIRE_MIN_SCORE);
@@ -5133,6 +5222,7 @@ async function searchContextCore(args, telemetry) {
     response = { result: await client.query(request), context: {} };
   }
   const result = response.result ?? response;
+  if (observation) observation.engineEventId = boundedEngineEventId(result?.retrieval_event_id);
   const context = response.context ?? {};
   const hits = Array.isArray(result.retrieved_chunks) ? result.retrieved_chunks : [];
   // Complete server-packed spans replace the client-side widening below.
@@ -5207,11 +5297,11 @@ async function searchContextCore(args, telemetry) {
   return appendFailureReportPath(coalesced, failureReportPath);
 }
 
-async function searchContext(args) {
+async function searchContext(args, observation = undefined) {
   const telemetry = privateSearchTelemetryState();
   let outcome = "ok";
   try {
-    return await searchContextCore(args, telemetry);
+    return await searchContextCore(args, telemetry, observation);
   } catch (error) {
     outcome = "error";
     throw error;
@@ -6589,6 +6679,7 @@ async function enhancePrompt(args, observation = undefined) {
   };
   const { result, usedLocalFallback } = await enhanceWithLocalFallback(client, request);
   if (observation) {
+    observation.engineEventId = boundedEngineEventId(result?.retrieval_event_id);
     observation.enhancementLocalFallback = usedLocalFallback;
     observation.enhancementLocalOnlyUsed = usedLocalFallback || localOnly;
   }
@@ -6710,6 +6801,14 @@ async function recordQualityResult(args) {
     freshness: qualityDimension(args.freshness, "freshness"),
     actionability: qualityDimension(args.actionability, "actionability"),
   };
+  const journalEventId = optionalString(args.journalEventId);
+  if (journalEventId !== undefined && !JOURNAL_EVENT_ID_PATTERN.test(journalEventId)) {
+    throw new JsonRpcError(-32602, "journalEventId must be the UUID printed as journalEventId in a search or enhance result.");
+  }
+  // The private rating is written first so it survives a backend outage.
+  const journalRating = journalEventId
+    ? await writeRetrievalRatingSafely({ args, journalEventId, workspaceId, workType, engine, scorecard })
+    : null;
   const client = buildClient();
   const event = await client.recordQualityEvent({
     workspaceId,
@@ -6724,7 +6823,10 @@ async function recordQualityResult(args) {
     improvement: optionalString(args.improvement),
     notes: optionalString(args.notes),
     issueUrl: optionalString(args.issueUrl),
-    metadata: isRecord(args.metadata) ? args.metadata : {},
+    metadata: {
+      ...(isRecord(args.metadata) ? args.metadata : {}),
+      ...(journalEventId ? { journalEventId } : {}),
+    },
   });
   const failureReportPath = await compareQualityRoundAndReport({
     workspaceId,
@@ -6753,7 +6855,56 @@ async function recordQualityResult(args) {
     ...(event.improvement ? [`- improvement: ${event.improvement}`] : []),
     ...(event.issue_url ? [`- issueUrl: ${event.issue_url}`] : []),
     ...(failureReportPath ? [`- failureReport: ${failureReportPath}`] : []),
+    ...(journalRating ? [`- journalRating: ${journalRating}`] : []),
   ].join("\n");
+}
+
+const JOURNAL_EVENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const RETRIEVAL_RATING_PREFIX = "cw-rating-";
+
+/** Returns "saved", "journal_off", or the fixed reason the private rating was skipped. */
+async function writeRetrievalRatingSafely(input) {
+  if (!retrievalJournalEnabled()) return "journal_off";
+  try {
+    await writeRetrievalRating(input);
+    return "saved";
+  } catch (error) {
+    const safeReasons = ["invalid_limits", "invalid_mode", "unsafe_directory", "workspace_directory",
+      "unsafe_permissions", "directory_changed", "capacity_reached", "directory_busy", "unsafe_contents"];
+    const reason = safeReasons.includes(error?.message) ? error.message : "write_failed";
+    retrievalJournalWarn(`rating ${reason}`);
+    return `skipped (${reason})`;
+  }
+}
+
+async function writeRetrievalRating({ args, journalEventId, workspaceId, workType, engine, scorecard }) {
+  const mode = process.env.CORPUSWIRE_RETRIEVAL_LOG_MODE ?? "metadata";
+  if (mode !== "metadata" && mode !== "full") throw new Error("invalid_mode");
+  const full = mode === "full";
+  const limits = retrievalJournalStorageLimits();
+  const directory = await retrievalJournalDirectory(retrievalRatingDirectoryTarget(), args);
+  const paths = (name) => {
+    const values = (() => { try { return optionalStringArray(args, name); } catch { return []; } })();
+    return { count: values.length,
+      values: full ? values.slice(0, 50).map((value) => retrievalJournalRedact(value).slice(0, 1024)) : [] };
+  };
+  const text = (name, limit) => {
+    const value = optionalString(args[name]);
+    return value === undefined ? null : retrievalJournalCapture(value, limit, full);
+  };
+  const values = Object.values(scorecard);
+  const ratingId = randomUUID();
+  const rating = {
+    schemaVersion: "corpuswire-private-rating/v1", ratingId, journalEventId,
+    ratedAt: new Date().toISOString(), mode,
+    host: { id: hostProfile.id, clientName: hostClientInfo.name, clientVersion: hostClientInfo.version },
+    workspaceId: retrievalJournalRedact(String(workspaceId)).slice(0, 1024),
+    workType, engine: engine.slice(0, 64), scorecard,
+    overall: Math.round((values.reduce((sum, value) => sum + value, 0) / values.length) * 100) / 100,
+    expectedPaths: paths("expectedPaths"), missingPaths: paths("missingPaths"), resultPaths: paths("resultPaths"),
+    query: text("query", 65536), notes: text("notes", 16384), improvement: text("improvement", 16384),
+  };
+  await writePrivateJournalFile(directory, RETRIEVAL_RATING_PREFIX, ratingId, `${JSON.stringify(rating)}\n`, limits);
 }
 
 async function compareQualityRoundAndReport({
