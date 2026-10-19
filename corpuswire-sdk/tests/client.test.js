@@ -211,6 +211,13 @@ test("toQueryPayload maps workspace-aware semantic search requests", () => {
   );
 });
 
+test("query and enhance payloads send max_evidence_chars only when set", () => {
+  assert.equal("max_evidence_chars" in toQueryPayload({ query: "q" }), false);
+  assert.equal("max_evidence_chars" in toEnhancePayload({ prompt: "p" }), false);
+  assert.equal(toQueryPayload({ query: "q", maxEvidenceChars: 20000 }).max_evidence_chars, 20000);
+  assert.equal(toEnhancePayload({ prompt: "p", maxEvidenceChars: 1 }).max_evidence_chars, 1);
+});
+
 test("toQualityEventPayload maps central scorecards to API fields", () => {
   assert.deepEqual(
     toQualityEventPayload({

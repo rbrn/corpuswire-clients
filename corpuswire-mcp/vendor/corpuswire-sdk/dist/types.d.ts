@@ -49,6 +49,32 @@ export interface AgentContextPacket {
     package_name?: string | null;
     tags: string[];
 }
+export type EvidenceSpanReason = "selected" | "projection" | "sibling" | "heading";
+/** One packed evidence span (CRP-003 `server-v1`); exact indexed source lines. */
+export interface EvidenceSpan {
+    source_path: string;
+    /** sha256 hex of the indexed file. */
+    source_hash: string;
+    start_line: number;
+    end_line: number;
+    /** Exact source lines joined by "\n". */
+    text: string;
+    from_chunk_ids: string[];
+    reason: EvidenceSpanReason;
+}
+/** Server packing report; present only when the server packs evidence. */
+export interface PackingReport {
+    policy: "server-v1";
+    budget_chars: number;
+    used_chars: number;
+    spans_total: number;
+    spans_dropped_budget: number;
+    files: number;
+    fallback_reason: string | null;
+    /** True only when every span is verified; clients use spans only then. */
+    complete?: boolean;
+    unverified_hits?: number;
+}
 export interface PromptRewriteResult {
     user_prompt: string;
     retrieval_query: string;
@@ -60,6 +86,8 @@ export interface PromptRewriteResult {
     score_semantics?: string | null;
     retrieved_chunks: SearchHit[];
     agent_context_packets?: AgentContextPacket[];
+    evidence_spans?: EvidenceSpan[];
+    packing?: PackingReport;
     task_type: PromptTaskType;
     task_type_source: PromptTaskTypeSource;
     task_type_classification_error: string | null;
@@ -90,6 +118,8 @@ export interface PromptEnhancementResult {
     score_semantics?: string | null;
     retrieved_chunks: SearchHit[];
     agent_context_packets?: AgentContextPacket[];
+    evidence_spans?: EvidenceSpan[];
+    packing?: PackingReport;
     augmented_prompt: string;
     citations: string[];
     answer: string | null;
@@ -312,6 +342,12 @@ export interface EnhancePromptRequest {
     localOnly?: boolean;
     sourceFilter?: string[];
     /**
+     * Optional server evidence budget (positive integer), sent as
+     * `max_evidence_chars` only when set. Servers that predate evidence packing
+     * reject unknown request fields, so leave it unset for them.
+     */
+    maxEvidenceChars?: number;
+    /**
      * Optional editor and chat state used by the server for retrieval and
      * rewriting only. It is sent as `session` only when it holds at least one
      * usable value, so older servers that reject the key keep working.
@@ -366,6 +402,12 @@ export interface QueryPromptRequest {
     minScore?: number;
     includeAnswer?: boolean;
     sourceFilter?: string[];
+    /**
+     * Optional server evidence budget (positive integer), sent as
+     * `max_evidence_chars` only when set. Servers that predate evidence packing
+     * reject unknown request fields, so leave it unset for them.
+     */
+    maxEvidenceChars?: number;
 }
 export interface CorpusWireClientOptions {
     baseUrl?: string;
@@ -453,6 +495,7 @@ export interface EnhancePromptPayload {
     output_mode: PromptOutputMode;
     local_only: boolean;
     source_filter?: string[];
+    max_evidence_chars?: number;
     session?: EnhanceSessionContextPayload;
 }
 export interface QueryPromptPayload {
@@ -463,6 +506,7 @@ export interface QueryPromptPayload {
     min_score?: number;
     include_answer: boolean;
     source_filter?: string[];
+    max_evidence_chars?: number;
 }
 export type QualityWorkType = "semantic_retrieval" | "prompt_enhancement" | "review_context";
 export interface QualityScorecard {
