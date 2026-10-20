@@ -1,4 +1,4 @@
-import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceSessionContext, EnhanceSessionContextPayload, EnhanceResponseEnvelope, CodebaseRepositoriesV1, CodebaseV1, CreateCodebaseRequest, GitHubProviderBindingPayload, GitHubProviderBindingRequest, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexSessionQuery, IndexWorkspaceRequest, IndexTransferSummary, CorpusWireClientOptions, LlmModelState, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, QualityEvent, QualityEventPayload, QualityEventRequest, QualityEventsQuery, QualityReview, QualityReviewQuery, QueryValueEvent, ProviderBindingResponseV1, ProviderBindingRevocationV1, ValueFeedbackRequest, ValueRollup, ValueRollupQuery, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexCodeStageResult, RemoteIndexProgressEvent, RemoteIndexPreview, RemoteIndexSession, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, ReviewContextCapabilitiesV1, ReviewContextJobV1, ReviewContextPollOptions, ReviewContextRequest, ReviewContextRequestV1, ReviewContextResult, ReviewContextCapabilitiesV2, ReviewContextJobV2, ReviewContextPollOptionsV2, ReviewContextRequestV2Input, ReviewContextRequestV2, ReviewContextResultV2, ReviewTelemetrySummaryV1, ReviewPurgeV1, ReviewStatusV1, ReviewStatusV2, SearchHit, StartRemoteIndexSessionRequest, WorkspaceDiagnosis, WorkspaceDiagnosisRequest, UpdateCodebaseRequest } from "./types.js";
+import type { EnhancePromptPayload, EnhancePromptRequest, EnhanceSessionContext, EnhanceSessionContextPayload, EnhanceResponseEnvelope, CodebaseRepositoriesV1, CodebaseV1, CreateCodebaseRequest, HealthResponse, IndexActivityQuery, IndexActivitySummary, IndexEvent, IndexEventQuery, IndexSessionQuery, IndexWorkspaceRequest, IndexTransferSummary, CorpusWireClientOptions, LlmModelState, PromptEnhancementResult, PromptRewriteResult, QueryPromptPayload, QueryPromptRequest, QueryResponseEnvelope, QualityEvent, QualityEventPayload, QualityEventRequest, QualityEventsQuery, QualityReview, QualityReviewQuery, QueryValueEvent, ValueFeedbackRequest, ValueRollup, ValueRollupQuery, RemoteFileBatchMetadata, RemoteFileBatchResult, RemoteFileContent, RemoteIndexCapabilities, RemoteIndexCommitResponse, RemoteIndexCodeStageResult, RemoteIndexProgressEvent, RemoteIndexPreview, RemoteIndexSession, RemoteIndexStatus, RemoteManifestBatchResult, RemoteManifestEntry, SearchHit, StartRemoteIndexSessionRequest, WorkspaceDiagnosis, WorkspaceDiagnosisRequest, UpdateCodebaseRequest } from "./types.js";
 export type RemoteIndexOwnedSessionIdentity = Pick<RemoteIndexSession, "session_id" | "workspace_id" | "collection_name" | "mode">;
 export declare class RemoteIndexInterruptionError extends Error {
     readonly reason: "cancel" | "detach" | "timeout";
@@ -23,15 +23,6 @@ export declare class RemoteIndexCancelledError extends Error {
     readonly sessionId: string;
     readonly status: RemoteIndexStatus;
     constructor(sessionId: string, status: RemoteIndexStatus);
-}
-export declare class ReviewContextPollingTimeoutError extends Error {
-    readonly jobId: string;
-    readonly timeoutMs: number;
-    constructor(jobId: string, timeoutMs: number);
-}
-export declare class ReviewContextPollingCancelledError extends Error {
-    readonly jobId: string;
-    constructor(jobId: string);
 }
 export declare class CorpusWireClient {
     readonly baseUrl: string;
@@ -64,27 +55,6 @@ export declare class CorpusWireClient {
     updateCodebase(codebaseId: string, request: UpdateCodebaseRequest): Promise<CodebaseV1>;
     deleteCodebase(codebaseId: string): Promise<CodebaseV1>;
     listCodebaseRepositories(codebaseId: string): Promise<CodebaseRepositoriesV1>;
-    /** Create or update a GitHub binding while preserving allowlist tri-state values. */
-    bindGitHubProvider(codebaseId: string, request: GitHubProviderBindingRequest): Promise<ProviderBindingResponseV1>;
-    revokeGitHubProvider(codebaseId: string, installationId: string, providerHost?: string): Promise<ProviderBindingRevocationV1>;
-    getReviewContextCapabilities(): Promise<ReviewContextCapabilitiesV1>;
-    getReviewTelemetrySummary(): Promise<ReviewTelemetrySummaryV1>;
-    requestReviewContext(request: ReviewContextRequest): Promise<ReviewContextResult>;
-    getReviewContextJob(jobId: string): Promise<ReviewContextResult>;
-    cancelReviewContextJob(jobId: string): Promise<ReviewContextJobV1>;
-    pollReviewContextJob(jobOrId: ReviewContextJobV1 | string, options?: ReviewContextPollOptions): Promise<ReviewContextResult>;
-    requestReviewContextAndWait(request: ReviewContextRequest, options?: ReviewContextPollOptions): Promise<ReviewContextResult>;
-    getReviewStatus(codebaseId: string, reviewId: string): Promise<ReviewStatusV1>;
-    /** Read the isolated deterministic symbol-change v2 capability envelope. */
-    getReviewContextCapabilitiesV2(): Promise<ReviewContextCapabilitiesV2>;
-    /** Request deterministic before/after symbol evidence through the v2-only route. */
-    requestReviewContextV2(request: ReviewContextRequestV2Input): Promise<ReviewContextResultV2>;
-    getReviewContextJobV2(jobId: string): Promise<ReviewContextResultV2>;
-    cancelReviewContextJobV2(jobId: string): Promise<ReviewContextJobV2>;
-    pollReviewContextJobV2(jobOrId: ReviewContextJobV2 | string, options?: ReviewContextPollOptionsV2): Promise<ReviewContextResultV2>;
-    requestReviewContextV2AndWait(request: ReviewContextRequestV2Input, options?: ReviewContextPollOptionsV2): Promise<ReviewContextResultV2>;
-    getReviewStatusV2(codebaseId: string, reviewId: string): Promise<ReviewStatusV2>;
-    purgeReviewOverlay(codebaseId: string, reviewId: string): Promise<ReviewPurgeV1>;
     getLlmModel(): Promise<LlmModelState>;
     setLlmModel(model: string): Promise<LlmModelState>;
     getIndexCapabilities(): Promise<RemoteIndexCapabilities>;
@@ -162,14 +132,7 @@ export declare function toWorkspaceRelativeSessionPath(path: unknown, workspaceR
  */
 export declare function toEnhanceSessionPayload(session: EnhanceSessionContext | null | undefined, workspaceRoot?: string | null): EnhanceSessionContextPayload | undefined;
 export declare function toQueryPayload(request: string | QueryPromptRequest): QueryPromptPayload;
-export declare function toGitHubProviderBindingPayload(request: GitHubProviderBindingRequest): GitHubProviderBindingPayload;
-export declare function toReviewContextPayload(request: ReviewContextRequest): ReviewContextRequestV1;
-export declare function isReviewContextJob(result: ReviewContextResult): result is ReviewContextJobV1;
-export declare function toReviewContextPayloadV2(request: ReviewContextRequestV2Input): ReviewContextRequestV2;
-export declare function isReviewContextJobV2(result: ReviewContextResultV2): result is ReviewContextJobV2;
 export declare function toStartIndexSessionPayload(request: StartRemoteIndexSessionRequest): Record<string, unknown>;
 export declare function manifestEntriesToJsonl(entries: RemoteManifestEntry[]): string;
-/** Fail closed on every current-v2 response/job field and semantic correlation. */
-export declare function assertReviewContextV2Result(value: unknown): asserts value is ReviewContextResultV2;
 export declare function resolveEnhancedPrompt(result: PromptRewriteResult): string | null;
 export declare function requireEnhancedPrompt(result: PromptRewriteResult): string;

@@ -16,8 +16,7 @@ health, index observability, or remote indexing.
 - `GET /v1/index/capabilities` for remote indexing limits.
 - `GET /v1/index/events` and `GET /v1/index/activity` for index observability.
 - Full remote indexing session helpers for `/v1/index/*`.
-- Typed Codebase, GitHub binding, v1 review-context, and structurally isolated
-  v2 deterministic symbol-change request/poll/status helpers.
+- Typed Codebase catalog helpers for `/v1/codebases`.
 - Bounded retries for transient `502`, `503`, `504`, connection reset, timeout,
   refused connection, pipe, and Undici socket failures.
 - Stable error parsing through `CorpusWireHttpError`, including backend request
@@ -90,89 +89,23 @@ Constructor options:
 | `fetchFn` | `globalThis.fetch` | Useful for tests or nonstandard runtimes |
 | `defaultHeaders` | `{}` | Applied to every request; request-specific headers can override |
 
-## Codebases And Review Context
+## Codebases
 
-The SDK exposes the provider-neutral review-sidecar control plane through
-`createCodebase`, `listCodebases`, `getCodebase`, `updateCodebase`,
-`deleteCodebase`, and `listCodebaseRepositories`. GitHub bindings use
-`bindGitHubProvider` and `revokeGitHubProvider`. Review work uses
-`getReviewContextCapabilities`, `requestReviewContext`,
-`requestReviewContextAndWait`, `getReviewContextJob`,
-`pollReviewContextJob`, `cancelReviewContextJob`, `getReviewTelemetrySummary`,
-`getReviewStatus`, and `purgeReviewOverlay`.
-
-Those unqualified method names are the byte-compatible v1 API. Deterministic
-before/after symbol evidence is a separate v2 surface:
-
-- `getReviewContextCapabilitiesV2`
-- `requestReviewContextV2` / `requestReviewContextV2AndWait`
-- `getReviewContextJobV2` / `pollReviewContextJobV2` /
-  `cancelReviewContextJobV2`
-- `getReviewStatusV2`
-
-V2 serializes each symbol change with exact BASE/HEAD identities, normalized
-diff hunks, relationship deltas, full required symbol extents, and explicit
-whole-bundle omissions. It makes evidence construction deterministic; it does
-not make a language model's conclusions deterministic.
-
-```ts
-const evidence = await client.requestReviewContextV2AndWait({
-  codebaseId: "codebase-payments",
-  targetRepositoryId: "repository-42",
-  providerReviewId: "314",
-  objective: "Compare exact BASE and HEAD behavior",
-  budgets: {
-    evidenceItems: 40,
-    serializedCharacters: 200_000,
-    serializedUtf8Bytes: 524_288,
-  },
-});
-```
-
-The v2 package changes are delivered as `merge_unpublished`: merging the
-clients repository commit and parent gitlink does not authorize an npm publish.
+The SDK exposes the Codebase catalog through `createCodebase`, `listCodebases`,
+`getCodebase`, `updateCodebase`, `deleteCodebase`, and
+`listCodebaseRepositories`. The routes are enabled on the server by
+`CORPUSWIRE_CODEBASES_ENABLED=true`; their failures are surfaced as
+`CorpusWireHttpError` with the stable `review-context/v1` error envelope
+(error code, request ID, retry metadata, and recovery guidance).
 
 ```ts
 const codebase = await client.createCodebase({ displayName: "Payments" });
-
-await client.bindGitHubProvider(codebase.codebase_id, {
-  installationId: "12345",
-  displayName: "Acme GitHub",
-  repositoryAllowlist: null,
-});
-
-const context = await client.requestReviewContextAndWait(
-  {
-    codebaseId: codebase.codebase_id,
-    targetRepositoryId: "repository-42",
-    providerReviewId: "314",
-    expectedHeadSha: null,
-    objective: "Find affected consumers across the Codebase",
-    budgets: { graphHops: 2, evidenceItems: 40 },
-  },
-  {
-    timeoutMs: 60_000,
-    pollIntervalMs: 1_000,
-    onJob: (job) => console.log(job.state, job.attempts),
-  },
-);
+const repositories = await client.listCodebaseRepositories(codebase.codebase_id);
 ```
 
-Repository allowlists preserve tri-state intent. On a new binding, omission or
-`null` selects all repositories. On update, omission preserves the current
-selection, `null` selects all, `[]` selects none, and a non-empty list selects
-exactly those provider repository IDs. The SDK omits fields whose value is
-`undefined`; it preserves explicit `null` and empty arrays on the wire.
-
-`requestReviewContext()` returns either an immediate `ReviewContextResponseV1`
-or a durable `ReviewContextJobV1`. `requestReviewContextAndWait()` polls queued
-and running jobs, honors server `retry_after_seconds`, supports `AbortSignal`,
-and throws `ReviewContextPollingTimeoutError` or
-`ReviewContextPollingCancelledError` for client-side termination. A terminal
-job remains a typed job result; callers should inspect its `state` and
-`partial_reasons`. Backend failures, including bounded `413` review requests,
-are surfaced as `CorpusWireHttpError` with the stable error code, request ID,
-retry metadata, and recovery guidance.
+The review-context request, polling, telemetry and GitHub binding helpers were
+removed with the archived review sidecar (engine
+`docs/history/review-sidecar/README.md`).
 
 ## Prompt Enhancement
 

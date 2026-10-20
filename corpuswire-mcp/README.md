@@ -6,11 +6,10 @@ This package is the preferred distributable MCP entrypoint for the VS Code/Copil
 
 ## Tools
 
-- `corpuswire_review_context`: the byte-compatible v1 provenance-rich review
-  evidence tool.
-- `corpuswire_review_context_v2`: deterministic, versioned symbol-change
-  evidence with atomic BASE/HEAD bundles, normalized hunks, relationship
-  deltas, and explicit whole-bundle omissions.
+- `corpuswire_codebase_status`: reads one authorized Codebase and its
+  repository selection from `GET /v1/codebases/{id}` (needs
+  `CORPUSWIRE_CODEBASES_ENABLED=true` on the server). The review-context tools
+  were removed with the archived review sidecar.
 - `corpuswire_search`: calls `POST /query` for semantic retrieval.
 - `corpuswire_enhance_prompt`: calls `POST /v1/enhance` for context-grounded prompt rewriting. It defaults to deterministic local rewriting and retries once with `localOnly=true` if backend generation setup is unavailable. Optional `conversation` (`[{ role, text }]`), `activeFile`, `selection` (`{ path, startLine, endLine, text? }`) and `recentEdits` are sent as the request `session` only when supplied; the SDK caps them and makes absolute paths under `CORPUSWIRE_SYNC_ROOT`, `repoPath` or the MCP server's working directory relative, dropping any it cannot.
 - `corpuswire_rate_result`: records a 1-5 semantic-retrieval or prompt-enhancement scorecard for any engine in the central cross-workspace quality ledger. Pass `journalEventId` from a result footer to also save the rating next to the private retrieval journal.

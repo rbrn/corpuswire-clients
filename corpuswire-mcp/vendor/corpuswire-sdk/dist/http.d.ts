@@ -1,5 +1,5 @@
-import type { EnhanceErrorEnvelope, IndexTransferSummary, FetchLike, ReviewContextErrorV1, ReviewContextErrorV2 } from "./types.js";
-type ReviewContextErrorEnvelope = ReviewContextErrorV1 | ReviewContextErrorV2;
+import type { EnhanceErrorEnvelope, IndexTransferSummary, FetchLike, ReviewContextErrorV1 } from "./types.js";
+type ReviewContextErrorEnvelope = ReviewContextErrorV1;
 export declare class CorpusWireHttpError extends Error {
     readonly transfer?: IndexTransferSummary;
     readonly status: number;
