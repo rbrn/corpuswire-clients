@@ -13,7 +13,6 @@
     "bin",
     "lib/selected-neighbor.mjs",
     "lib/server-packed.mjs",
-    "lib/source-root-coalescing.mjs",
     "lib/host-profile.mjs",
     "lib/workspace-scope.mjs",
     "examples",

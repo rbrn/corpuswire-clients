@@ -19,9 +19,9 @@ share the same backend concepts:
 | Client | Package | Main role | Indexing capability |
 | --- | --- | --- | --- |
 | SDK | `clients/corpuswire-sdk` | Reusable Node/TypeScript HTTP client and protocol types | Full and incremental remote indexing with `/v1/index/*` |
-| CLI | `clients/corpuswire-cli` | Terminal wrapper for health, search, enhance, and index observability | Does not index; reads index events/activity |
+| CLI | `clients/corpuswire-cli` | Terminal client (`cw`) for health, search, enhance, sync and index observability | Full and incremental remote indexing through the SDK (`cw index`, `reconcile`, `watch`) |
 | VS Code extension | `clients/corpuswire-vscode-extension` | Prompt enhancement plus remote workspace indexing for VS Code, Remote SSH, Dev Containers, and Codespaces | Full workspace upload and debounced incremental updates |
-| MCP server | `clients/corpuswire-mcp` | stdio MCP server exposing CorpusWire search/enhance to Codex, Copilot, Cursor and other MCP hosts | Service-local incremental `/ingest`; remote indexing must use SDK or VS Code |
+| MCP server | `clients/corpuswire-mcp` | stdio MCP server exposing CorpusWire search/enhance to Codex, Copilot, Cursor and other MCP hosts | Incremental remote indexing through the SDK (sync tools and watch) |
 
 ## Choosing The Right Ingestion Path
 
@@ -72,7 +72,7 @@ The local ingest path is a single `POST /ingest` call with an optional
 `repo_path`, `source_dir`, `recreate_collection`, `include_globs`,
 `exclude_globs`, and `max_file_size_bytes`.
 
-This path is exposed by the MCP server and Python backend CLI. It is intentionally not a remote
+This path is exposed by the Python backend (`corpuswire ingest`); none of the Node clients call it. It is intentionally not a remote
 upload protocol: the service walks its own filesystem, applies ingest filters,
 updates existing files, detects deletes, and reports counts such as
 `files_added`, `files_updated`, `files_deleted`, `files_unchanged`, and

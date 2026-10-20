@@ -2441,15 +2441,10 @@ export function sanitizeTerminalText(value) {
     .slice(0, 2_000);
 }
 
+// The static import at the top already requires @corpuswire/sdk, so a
+// relative fallback here could never be reached.
 async function loadSdk() {
-  try {
-    return await import("@corpuswire/sdk");
-  } catch (error) {
-    if (error?.code !== "ERR_MODULE_NOT_FOUND") {
-      throw error;
-    }
-    return import("../../corpuswire-sdk/dist/index.js");
-  }
+  return import("@corpuswire/sdk");
 }
 
 function requireEnhancedPromptFallback(result) {

@@ -599,14 +599,6 @@ export function activate(context: vscode.ExtensionContext): void {
     "corpuswire.openPanel",
     () => PromptEnhancerPanel.createOrShow(),
   );
-  const legacyEnhanceDisposable = vscode.commands.registerCommand(
-    "corpuswireContextEngine.enhancePrompt",
-    enhanceSelectedPrompt,
-  );
-  const legacyPanelDisposable = vscode.commands.registerCommand(
-    "corpuswireContextEngine.openPanel",
-    () => PromptEnhancerPanel.createOrShow(),
-  );
 
   const viewProvider = new PromptEnhancerViewProvider();
   const viewDisposable = vscode.window.registerWebviewViewProvider(
@@ -633,8 +625,6 @@ export function activate(context: vscode.ExtensionContext): void {
     indexDisposable,
     rebuildDisposable,
     panelDisposable,
-    legacyEnhanceDisposable,
-    legacyPanelDisposable,
     viewDisposable,
     focusPanelDisposable,
     statusBar,
