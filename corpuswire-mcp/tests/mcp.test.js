@@ -3711,6 +3711,7 @@ async function withRetrievalJournalFixture(run) {
     child.stdout.on("data", (chunk) => { state.stdout += chunk; });
     child.stderr.on("data", (chunk) => { state.stderr += chunk; });
     const rpc = createRpc(child);
+    state.rpc = rpc;
     state.call = (id, name = "corpuswire_search", args = { query: "retrieve routing evidence" }) =>
       rpc({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
     return state;
@@ -3738,10 +3739,17 @@ test("private retrieval journal captures exact delivered search and enhancement 
         const response = await host.call(id, tool, args);
         assert.equal(response.result.isError, false);
         const rows = await readEvents();
-        // Match by timestamp-independent delivered bytes rather than the random event id.
-        const captured = rows.filter(({ event }) => event.tool === tool && event.input.text === (args.query ?? args.prompt));
-        assert.ok(captured.length >= 1);
-        const saved = captured.at(-1).event;
+        // The delivered text ends with the id of the journal record that holds it.
+        const eventId = response.result.content.at(-1).text.match(/\n\njournalEventId: ([0-9a-f-]{36})$/)?.[1];
+        assert.ok(eventId);
+        const captured = rows.filter(({ event }) => event.eventId === eventId);
+        assert.equal(captured.length, 1);
+        const saved = captured[0].event;
+        assert.equal(saved.schemaVersion, "corpuswire-private-retrieval/v2");
+        assert.equal(saved.tool, tool);
+        assert.equal(saved.input.text, args.query ?? args.prompt);
+        assert.equal(saved.error, null);
+        assert.equal(saved.host.id, "unknown");
         assert.deepEqual(JSON.parse(saved.result.text), response.result);
         assert.equal(saved.result.rawSha256, createHash("sha256").update(JSON.stringify(response.result)).digest("hex"));
         assert.equal(saved.result.storedSha256, saved.result.rawSha256);
@@ -3815,7 +3823,95 @@ test("private retrieval journal errors omit unsafe exception text and cannot cha
     assert.equal(event.outcome, "error");
     assert.equal(event.result.capture, "omitted_unsafe_error");
     assert.equal(event.result.text, null);
+    assert.deepEqual(event.error, { category: "other", httpStatus: null, errorCode: null });
     assert.doesNotMatch(JSON.stringify(event), /unsafe-error-private-material/);
+    assert.doesNotMatch(response.result.content[0].text, /journalEventId/);
+  });
+});
+
+test("private retrieval journal records fixed error categories", async () => {
+  await withRetrievalJournalFixture(async ({ root, launch, readEvents }) => {
+    const sdkPath = path.join(root, "status-sdk.mjs");
+    await writeFile(sdkPath, `export class CorpusWireHttpError extends Error {
+  constructor(status) { super("private body " + status); this.status = status; this.errorCode = "index_busy"; }
+}
+export class CorpusWireClient { async queryRaw(request) {
+  if (request.query === "network") throw new Error("fetch failed ECONNREFUSED");
+  throw new CorpusWireHttpError(Number(request.query));
+} }`);
+    const host = launch({ CORPUSWIRE_SDK_PATH: sdkPath });
+    const expected = { network: ["network", null, null], 401: ["auth", 401, "index_busy"],
+      503: ["server_unavailable", 503, "index_busy"], 500: ["http_5xx", 500, "index_busy"],
+      404: ["http_4xx", 404, "index_busy"], 504: ["timeout", 504, "index_busy"] };
+    let id = 1;
+    for (const query of Object.keys(expected)) {
+      assert.equal((await host.call(id++, "corpuswire_search", { query })).result.isError, true);
+    }
+    const events = await readEvents();
+    assert.equal(events.length, Object.keys(expected).length);
+    for (const { event } of events) {
+      const [category, httpStatus, errorCode] = expected[event.input.text];
+      assert.deepEqual(event.error, { category, httpStatus, errorCode });
+      assert.doesNotMatch(JSON.stringify(event), /private body/);
+    }
+  });
+});
+
+test("private retrieval journal links host, engine event and journal-linked ratings", async () => {
+  await withRetrievalJournalFixture(async ({ root, launch, readEvents }) => {
+    const host = launch({ MOCK_RETRIEVAL_EVENT_ID: "engine-event-42" });
+    await host.rpc({ jsonrpc: "2.0", id: 1, method: "initialize", params: {
+      protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "claude-code", version: "2.9.0" } } });
+    const response = await host.call(2, "corpuswire_search", { query: "routing evidence" });
+    assert.equal(response.result.isError, false);
+    const eventId = response.result.content.at(-1).text.match(/journalEventId: ([0-9a-f-]{36})$/)[1];
+    const [{ event }] = await readEvents();
+    assert.equal(event.eventId, eventId);
+    assert.equal(event.engineEventId, "engine-event-42");
+    assert.deepEqual(event.host, { id: "claude-code", clientName: "claude-code", clientVersion: "2.9.0" });
+
+    const rate = (id, extra) => host.call(id, "corpuswire_rate_result", {
+      workType: "semantic_retrieval", engine: "corpuswire", relevance: 4, fileSpecificity: 5,
+      coverage: 3, freshness: 5, actionability: 4, query: "routing evidence", ...extra });
+    const rated = await rate(3, { journalEventId: eventId, expectedPaths: ["src/router.py"],
+      missingPaths: ["src/router.py"], notes: "missed the router" });
+    assert.equal(rated.result.isError, false);
+    assert.match(rated.result.content[0].text, /journalRating: saved/);
+    const ratingsDir = path.join(root, "retrieval-ratings");
+    assert.equal((await lstat(ratingsDir)).mode & 0o777, 0o700);
+    const [name] = await readdir(ratingsDir);
+    assert.match(name, /^cw-rating-[0-9a-f-]{36}\.json$/);
+    assert.equal((await lstat(path.join(ratingsDir, name))).mode & 0o777, 0o600);
+    const rating = JSON.parse(await readFile(path.join(ratingsDir, name), "utf8"));
+    assert.equal(rating.schemaVersion, "corpuswire-private-rating/v1");
+    assert.equal(rating.journalEventId, eventId);
+    assert.equal(rating.overall, 4.2);
+    assert.deepEqual(rating.expectedPaths, { count: 1, values: ["src/router.py"] });
+    assert.equal(rating.notes.text, "missed the router");
+    assert.equal(rating.host.id, "claude-code");
+
+    const invalid = await rate(4, { journalEventId: "not-an-id" });
+    assert.equal(invalid.result.isError, true);
+    assert.match(invalid.result.content[0].text, /journalEventId must be the UUID/);
+    assert.equal((await readdir(ratingsDir)).length, 1);
+  });
+});
+
+test("private retrieval ratings keep only scores and counts in metadata mode", async () => {
+  await withRetrievalJournalFixture(async ({ root, launch }) => {
+    const host = launch({ CORPUSWIRE_RETRIEVAL_LOG_MODE: "metadata", CORPUSWIRE_RETRIEVAL_LOG_EVENT_FOOTER: "false" });
+    const search = await host.call(1, "corpuswire_search", { query: "routing evidence" });
+    assert.doesNotMatch(search.result.content.at(-1).text, /journalEventId/);
+    const rated = await host.call(2, "corpuswire_rate_result", {
+      workType: "semantic_retrieval", engine: "corpuswire", relevance: 1, fileSpecificity: 1,
+      coverage: 1, freshness: 1, actionability: 1, query: "private-fact query",
+      journalEventId: "0b8a3f7e-1c2d-4e5f-8a9b-0c1d2e3f4a5b", expectedPaths: ["private/path.md"] });
+    assert.equal(rated.result.isError, false);
+    const ratingsDir = path.join(root, "retrieval-ratings");
+    const [name] = await readdir(ratingsDir);
+    const saved = await readFile(path.join(ratingsDir, name), "utf8");
+    assert.doesNotMatch(saved, /private-fact|private\/path/);
+    assert.deepEqual(JSON.parse(saved).expectedPaths, { count: 1, values: [] });
   });
 });
 
@@ -3988,6 +4084,7 @@ export class CorpusWireClient {
       result: {
         retrieval_query: request.query,
         retrieval_backend: "qdrant_hybrid",
+        ...(process.env.MOCK_RETRIEVAL_EVENT_ID ? { retrieval_event_id: process.env.MOCK_RETRIEVAL_EVENT_ID } : {}),
         retrieved_chunks: [
           {
             chunk_id: "chunk-router",

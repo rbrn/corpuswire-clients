@@ -13,7 +13,7 @@ This package is the preferred distributable MCP entrypoint for the VS Code/Copil
   deltas, and explicit whole-bundle omissions.
 - `corpuswire_search`: calls `POST /query` for semantic retrieval.
 - `corpuswire_enhance_prompt`: calls `POST /v1/enhance` for context-grounded prompt rewriting. It defaults to deterministic local rewriting and retries once with `localOnly=true` if backend generation setup is unavailable. Optional `conversation` (`[{ role, text }]`), `activeFile`, `selection` (`{ path, startLine, endLine, text? }`) and `recentEdits` are sent as the request `session` only when supplied; the SDK caps them and makes absolute paths under `CORPUSWIRE_SYNC_ROOT`, `repoPath` or the MCP server's working directory relative, dropping any it cannot.
-- `corpuswire_rate_result`: records a 1-5 semantic-retrieval or prompt-enhancement scorecard for any engine in the central cross-workspace quality ledger.
+- `corpuswire_rate_result`: records a 1-5 semantic-retrieval or prompt-enhancement scorecard for any engine in the central cross-workspace quality ledger. Pass `journalEventId` from a result footer to also save the rating next to the private retrieval journal.
 - `corpuswire_quality_review`: reviews central ratings by engine, workspace, work type, and quality dimension, then reports recurring improvements and recommended actions.
 - `corpuswire_health`: checks backend health.
 - `corpuswire_version`: identifies the running MCP client and Node runtime without contacting the backend. Set `checkBackend=true` to separately check the backend version with one read-only health request and a five-second deadline. Backend failure does not hide the client version.
@@ -393,6 +393,36 @@ Use `corpuswire_sync_probe_paths` before queuing uncertain edits. It applies the
 Use `corpuswire_doctor` as the quick replacement-readiness check before trusting CorpusWire in a long Codex session. It returns `ready`, `attention`, or `blocked` from backend health, workspace diagnosis, process-local sync state, active sessions, and persisted activity.
 
 For the local Docker app on an existing dense-only Qdrant collection, keep `APP_QDRANT_HYBRID_ENABLED=false` unless you intentionally recreate the collection for hybrid named vectors. A dense/hybrid mismatch raises a backend writer error; current backend builds close the failed index session so retry attempts are not blocked by a stale active-session lock.
+
+## Private retrieval journal
+
+Set `CORPUSWIRE_RETRIEVAL_LOG_DIR` to an absolute directory outside every
+workspace to save each `corpuswire_search` and `corpuswire_enhance_prompt`
+call as one owner-only `cw-retrieval-<id>.json` file
+(`corpuswire-private-retrieval/v2`). The engine's personal launcher
+`scripts/run_local_corpuswire_mcp.sh` sets it to
+`~/.local/share/corpuswire/retrieval-journal` with mode `full`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CORPUSWIRE_RETRIEVAL_LOG_MODE` | `metadata` | `full` keeps the query and the delivered text (credentials redacted); `metadata` keeps digests, timing and options only; `off` disables capture. |
+| `CORPUSWIRE_RETRIEVAL_RATING_DIR` | `retrieval-ratings` next to the journal | Where journal-linked ratings are saved. |
+| `CORPUSWIRE_RETRIEVAL_LOG_EVENT_FOOTER` | `true` | Appends `journalEventId: <id>` to successful results so a model can rate that exact call. |
+| `CORPUSWIRE_RETRIEVAL_LOG_MAX_EVENTS` / `_MAX_BYTES` | 10000 / 256 MiB | Capture stops at the cap; old evidence is never deleted. |
+
+Each v2 record also carries the detected host and its `clientInfo`, the
+engine's `retrieval_event_id` (`engineEventId`), and for failures a fixed
+`error.category` (`auth`, `timeout`, `network`, `rate_limited`,
+`server_unavailable`, `http_4xx`, `http_5xx`, `invalid_args`, `empty_result`,
+`other`) with the HTTP status and error code. Error prose is never stored.
+
+`corpuswire_rate_result` accepts `journalEventId`, `expectedPaths` and
+`missingPaths`. With a journal configured, it first saves a
+`corpuswire-private-rating/v1` file (`cw-rating-<id>.json`) in the rating
+directory, then records the scorecard in the central quality ledger with
+`journalEventId` in its metadata. In `metadata` mode the rating keeps scores
+and path counts only. The engine's `scripts/journal_eval.py` exports, reports
+on and replays these records.
 
 ## Inventory readiness compatibility note
 
