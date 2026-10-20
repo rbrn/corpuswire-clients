@@ -3,10 +3,9 @@ import type {
   IndexTransferSummary,
   FetchLike,
   ReviewContextErrorV1,
-  ReviewContextErrorV2,
 } from "./types.js";
 
-type ReviewContextErrorEnvelope = ReviewContextErrorV1 | ReviewContextErrorV2;
+type ReviewContextErrorEnvelope = ReviewContextErrorV1;
 
 const TRANSIENT_HTTP_STATUSES = new Set([429, 502, 503, 504]);
 const DEFAULT_RETRY_ATTEMPTS = 2;
@@ -271,8 +270,7 @@ function parseApiError(responseBody: string): ParsedApiError | null {
         ? payload.schema_version
         : null;
       if (schemaVersion?.startsWith("review-context/")
-        && schemaVersion !== "review-context/v1"
-        && schemaVersion !== "review-context/v2") {
+        && schemaVersion !== "review-context/v1") {
         return {
           requestId: payload.request_id,
           durationMs: null,

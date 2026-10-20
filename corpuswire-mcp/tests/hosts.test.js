@@ -126,8 +126,8 @@ test("every built-in tool carries a title and annotations; writers are never rea
   try {
     await server.initialize("Visual Studio Code");
     const { tools } = (await server.rpc("tools/list")).result;
-    assert.equal(tools.length, 23);
-    const writers = new Set(["corpuswire_review_context", "corpuswire_review_context_v2", "corpuswire_rate_result", "corpuswire_confirm_value", "corpuswire_sync_delta",
+    assert.equal(tools.length, 21);
+    const writers = new Set(["corpuswire_rate_result", "corpuswire_confirm_value", "corpuswire_sync_delta",
       "corpuswire_sync_flush", "corpuswire_sync_reconcile", "corpuswire_sync_git_delta", "corpuswire_sync_bootstrap",
       "corpuswire_sync_abort_session"]);
     for (const tool of tools) {

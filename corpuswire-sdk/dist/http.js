@@ -190,8 +190,7 @@ function parseApiError(responseBody) {
                 ? payload.schema_version
                 : null;
             if (schemaVersion?.startsWith("review-context/")
-                && schemaVersion !== "review-context/v1"
-                && schemaVersion !== "review-context/v2") {
+                && schemaVersion !== "review-context/v1") {
                 return {
                     requestId: payload.request_id,
                     durationMs: null,

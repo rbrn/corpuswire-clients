@@ -9,8 +9,6 @@ import {
   RemoteIndexCancelledError,
   RemoteIndexDetachedError,
   RemoteIndexInterruptionError,
-  ReviewContextPollingCancelledError,
-  ReviewContextPollingTimeoutError,
   WorkspaceScanIncompleteError,
   createBasicAuthHeader,
   createBearerAuthHeader,
@@ -18,20 +16,11 @@ import {
   requestJson,
   requireEnhancedPrompt,
   toEnhancePayload,
-  toGitHubProviderBindingPayload,
   toQueryPayload,
   toQualityEventPayload,
-  toReviewContextPayload,
-  toReviewContextPayloadV2,
   toStartIndexSessionPayload,
-  assertReviewContextV2Result,
   ingestionPriority,
 } from "../dist/index.js";
-
-const REVIEW_CONTEXT_V2_SCHEMA = JSON.parse(readFileSync(
-  new URL("../../../schemas/review-context/v2/review-context.schema.json", import.meta.url),
-  "utf8",
-));
 
 test("WorkspaceCoverage declares embedding and collection schema fingerprints", () => {
   const declarations = readFileSync(
@@ -48,24 +37,6 @@ test("WorkspaceCoverage declares embedding and collection schema fingerprints", 
     /collection_schema_fingerprint\?: string \| null;/,
   );
 });
-
-function canonicalExtentId(changeId, side, instance) {
-  const values = [changeId, side, instance.symbol_instance_id, instance.repository_id,
-    instance.revision, instance.path, String(instance.source_range.start_line),
-    String(instance.source_range.end_line), instance.source_content_sha256,
-    instance.symbol_extent_sha256];
-  return `symbol-extent:${createHash("sha256").update(JSON.stringify(values)).digest("hex")}`;
-}
-
-function canonicalJsonForTest(value) {
-  if (Array.isArray(value)) return `[${value.map(canonicalJsonForTest).join(",")}]`;
-  if (value !== null && typeof value === "object") {
-    return `{${Object.keys(value).sort().map((key) => (
-      `${JSON.stringify(key)}:${canonicalJsonForTest(value[key])}`
-    )).join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
 
 function jsonResponse(status, body, headers = {}) {
   return {
@@ -97,97 +68,6 @@ test("toEnhancePayload maps camelCase request fields to backend payload fields",
       min_score: 0.4,
       output_mode: "claude-code",
       local_only: true,
-    },
-  );
-});
-
-test("review sidecar payloads preserve omitted, null, empty, and selected values", () => {
-  const omitted = toGitHubProviderBindingPayload({
-    installationId: "installation-42",
-    displayName: "Acme GitHub",
-  });
-  const explicitNull = toGitHubProviderBindingPayload({
-    installationId: "installation-42",
-    displayName: "Acme GitHub",
-    repositoryAllowlist: null,
-  });
-  const empty = toGitHubProviderBindingPayload({
-    installationId: "installation-42",
-    displayName: "Acme GitHub",
-    repositoryAllowlist: [],
-  });
-  const selected = toGitHubProviderBindingPayload({
-    installationId: "installation-42",
-    displayName: "Acme GitHub",
-    repositoryAllowlist: ["repo-2", "repo-1"],
-  });
-
-  assert.equal(Object.hasOwn(omitted, "repository_allowlist"), false);
-  assert.equal(explicitNull.repository_allowlist, null);
-  assert.deepEqual(empty.repository_allowlist, []);
-  assert.deepEqual(selected.repository_allowlist, ["repo-2", "repo-1"]);
-  assert.deepEqual(
-    toReviewContextPayload({
-      codebaseId: "codebase-1",
-      targetRepositoryId: "repo-1",
-      providerReviewId: "42",
-      expectedHeadSha: null,
-      objective: "Find affected consumers",
-      strictFreshness: false,
-      budgets: { graphHops: 0, evidenceItems: 20, waitMs: 0 },
-      outputCharacterLimit: null,
-    }),
-    {
-      codebase_id: "codebase-1",
-      target_repository_id: "repo-1",
-      provider_review_id: "42",
-      expected_head_sha: null,
-      objective: "Find affected consumers",
-      strict_freshness: false,
-      budgets: { graph_hops: 0, evidence_items: 20, wait_ms: 0 },
-      output_character_limit: null,
-    },
-  );
-});
-
-test("review context v2 payloads are isolated and map all deterministic evidence budgets", () => {
-  assert.deepEqual(
-    toReviewContextPayloadV2({
-      codebaseId: "codebase-1",
-      targetRepositoryId: "repo-1",
-      providerReviewId: "42",
-      expectedHeadSha: null,
-      objective: "Compare exact BASE and HEAD symbols",
-      strictFreshness: false,
-      budgets: {
-        graphHops: 0,
-        candidateRepositories: 3,
-        preRankCandidates: 11,
-        evidenceItems: 20,
-        serializedTokens: 4_000,
-        serializedCharacters: 50_000,
-        serializedUtf8Bytes: 100_000,
-        waitMs: 0,
-      },
-    }),
-    {
-      schema_version: "review-context/v2",
-      codebase_id: "codebase-1",
-      target_repository_id: "repo-1",
-      provider_review_id: "42",
-      expected_head_sha: null,
-      objective: "Compare exact BASE and HEAD symbols",
-      strict_freshness: false,
-      budgets: {
-        graph_hops: 0,
-        candidate_repositories: 3,
-        pre_rank_candidates: 11,
-        evidence_items: 20,
-        serialized_tokens: 4_000,
-        serialized_characters: 50_000,
-        serialized_utf8_bytes: 100_000,
-        wait_ms: 0,
-      },
     },
   );
 });
@@ -1509,7 +1389,7 @@ test("CorpusWireClient sends bearer authorization and rejects ambiguous auth", a
   );
 });
 
-test("Codebase and provider management methods use dedicated operational endpoints", async () => {
+test("Codebase management methods use dedicated operational endpoints", async () => {
   const calls = [];
   const client = new CorpusWireClient({
     baseUrl: "http://example.test",
@@ -1517,11 +1397,6 @@ test("Codebase and provider management methods use dedicated operational endpoin
       calls.push({ input, method: init?.method, body: init?.body ? JSON.parse(init.body) : null });
       if (input.endsWith("/repositories")) {
         return jsonResponse(200, { repositories: [] });
-      }
-      if (input.includes("provider-bindings/github")) {
-        return jsonResponse(200, init?.method === "DELETE"
-          ? { binding: { status: "revoked" } }
-          : { container: {}, binding: {} });
       }
       return jsonResponse(init?.method === "POST" ? 201 : 200, {
         codebase_id: "codebase-1",
@@ -1533,12 +1408,6 @@ test("Codebase and provider management methods use dedicated operational endpoin
   await client.createCodebase({ displayName: "Payments" });
   await client.updateCodebase("codebase-1", { displayName: "Payment Platform" });
   await client.listCodebaseRepositories("codebase-1");
-  await client.bindGitHubProvider("codebase-1", {
-    installationId: "installation-42",
-    displayName: "Acme GitHub",
-    repositoryAllowlist: [],
-  });
-  await client.revokeGitHubProvider("codebase-1", "installation-42");
 
   assert.deepEqual(calls, [
     {
@@ -1556,825 +1425,7 @@ test("Codebase and provider management methods use dedicated operational endpoin
       method: "GET",
       body: null,
     },
-    {
-      input: "http://example.test/v1/codebases/codebase-1/provider-bindings/github",
-      method: "POST",
-      body: {
-        installation_id: "installation-42",
-        display_name: "Acme GitHub",
-        repository_allowlist: [],
-      },
-    },
-    {
-      input: "http://example.test/v1/codebases/codebase-1/provider-bindings/github"
-        + "?installation_id=installation-42&provider_host=github.com",
-      method: "DELETE",
-      body: null,
-    },
   ]);
-});
-
-test("review context request polling, timeout, and cancellation are typed", async () => {
-  let polls = 0;
-  const job = {
-    schema_version: "review-context/v1",
-    job_id: "job-1",
-    request_id: "request-1",
-    tenant_id: "tenant-a",
-    codebase_id: "codebase-1",
-    state: "running",
-    attempts: 1,
-    status_url: "/v1/review-context/jobs/job-1",
-    retry_after_seconds: 0,
-    created_at: "2026-08-02T15:00:00Z",
-    updated_at: "2026-08-02T15:00:00Z",
-    partial_reasons: [],
-  };
-  const complete = {
-    schema_version: "review-context/v1",
-    request_id: "request-1",
-    telemetry_id: "telemetry-1",
-    review_id: "42",
-    target_repository_id: "repo-1",
-    freshness: "exact",
-    evidence: [],
-  };
-  const client = new CorpusWireClient({
-    baseUrl: "http://example.test",
-    fetchFn: async (input, init) => {
-      if (init?.method === "POST") {
-        return jsonResponse(202, job, { "Retry-After": "0" });
-      }
-      polls += 1;
-      return jsonResponse(200, complete);
-    },
-  });
-
-  const result = await client.requestReviewContextAndWait(
-    {
-      codebaseId: "codebase-1",
-      targetRepositoryId: "repo-1",
-      providerReviewId: "42",
-      objective: "Find affected consumers",
-    },
-    { timeoutMs: 1_000, pollIntervalMs: 0 },
-  );
-  assert.equal(result.freshness, "exact");
-  assert.equal(polls, 1);
-
-  await assert.rejects(
-    client.pollReviewContextJob(job, { timeoutMs: 0 }),
-    ReviewContextPollingTimeoutError,
-  );
-  const controller = new AbortController();
-  controller.abort();
-  await assert.rejects(
-    client.pollReviewContextJob(job, { signal: controller.signal }),
-    ReviewContextPollingCancelledError,
-  );
-});
-
-function completeReviewResponseV2({ withBundle = false } = {}) {
-  const baseSha = "1".repeat(40);
-  const headSha = "2".repeat(40);
-  const digest = "a".repeat(64);
-  const diffDigest = "6".repeat(64);
-  const sourceRange = {
-    schema_version: "review-context/v2", start_line: 1, end_line: 1,
-    start_column: null, end_column: null,
-  };
-  const provenance = {
-    schema_version: "review-context/v2", extractor_id: "test-extractor",
-    extractor_version: "1", evidence_tier: "compiler", resolution_status: "exact",
-    confidence: 1, reason_codes: [], artifact_digest: null,
-  };
-  const makeInstance = (side, text) => ({
-    schema_version: "review-context/v2", symbol_id: "symbol-a",
-    symbol_instance_id: `${side}-instance`, repository_id: "repo-1",
-    revision: side === "base" ? baseSha : headSha,
-    layer: side === "base" ? "snapshot" : "overlay", path: "src/example.py",
-    source_range: sourceRange, language: "python", project_root: ".",
-    qualified_name: "example.target", display_name: "target", kind: "function",
-    signature: "()", source_content_sha256: digest,
-    symbol_extent_sha256: createHash("sha256").update(text).digest("hex"),
-    stable_declaration_identity: null, provenance,
-  });
-  const baseText = "BASE\n";
-  const headText = "HEAD\n";
-  const base = makeInstance("base", baseText);
-  const head = makeInstance("head", headText);
-  const makeExtent = (side, instance, text) => ({
-    schema_version: "review-context/v2", side,
-    evidence_id: canonicalExtentId("change-a", side, instance),
-    symbol_instance_id: instance.symbol_instance_id, repository_id: instance.repository_id,
-    revision: instance.revision, layer: instance.layer, path: instance.path,
-    symbol_source_range: sourceRange, extent_start_line: 1, extent_end_line: 1,
-    source_content_sha256: instance.source_content_sha256,
-    symbol_extent_sha256: instance.symbol_extent_sha256, text, token_count: 1,
-  });
-  const bundle = {
-    schema_version: "review-context/v2", ordinal: 0,
-    change_record: {
-      schema_version: "review-context/v2", change_id: "change-a",
-      logical_identity: "logical-a", base, head, change_kind: "modified",
-      pairing_status: "exact_symbol_id", continuity_status: "proven",
-      pairing_confidence: 1, pairing_group: null,
-      diff_evidence: {
-        schema_version: "review-context/v2", normalized_diff_hash: diffDigest,
-        path: "src/example.py", previous_path: null, change_kind: "modified",
-        content_kind: "text", patch_status: "complete", additions: 0, deletions: 0,
-      },
-      normalized_hunks: [], relationship_deltas: [],
-      base_observation: {
-        schema_version: "review-context/v2", path: "src/example.py",
-        path_role: "modified_base", source_state: "present", analyzer_state: "complete",
-        analyzed_scope_complete: true, source_content_sha256: digest, reason_codes: [],
-      },
-      head_observation: {
-        schema_version: "review-context/v2", path: "src/example.py",
-        path_role: "modified_head", source_state: "present", analyzer_state: "complete",
-        analyzed_scope_complete: true, source_content_sha256: digest, reason_codes: [],
-      },
-      completeness: {
-        schema_version: "review-context/v2", symbol_pair_complete: true,
-        normalized_hunks_complete: true, relationship_deltas_complete: true,
-        complete: true, reason_codes: [],
-      },
-    },
-    base_evidence: makeExtent("base", base, baseText),
-    head_evidence: makeExtent("head", head, headText), related_evidence: [],
-    completeness: {
-      schema_version: "review-context/v2", required_sides_complete: true,
-      related_evidence_complete: true, reason_codes: [],
-    },
-    evidence_item_count: 2, serialized_tokens: 2,
-    serialized_characters: 10, serialized_utf8_bytes: 10,
-  };
-  return {
-    schema_version: "review-context/v2", request_id: "request-v2",
-    telemetry_id: "telemetry-v2", job_id: "job-v2", review_id: "42",
-    target_repository_id: "repo-1",
-    review_scope: {
-      schema_version: "review-context/v2", tenant_id: "tenant-a", actor_id: "actor-a",
-      codebase_id: "codebase-1", target_repository_id: "repo-1",
-      authorized_repository_ids: ["repo-1"], repository_set_id: "set-1",
-      repository_selection_digest: digest, base_snapshot_id: "snapshot-v2",
-      base_snapshot_generation: 3, base_snapshot_refresh_sequence: 0,
-      overlay_id: "overlay-v2", overlay_generation: 4, overlay_refresh_sequence: 0,
-    },
-    base_sha: baseSha, head_sha: headSha, base_snapshot_id: "snapshot-v2",
-    base_snapshot_generation: 3, base_snapshot_refresh_sequence: 0,
-    base_artifact_contract_version: "snapshot-artifacts/v2",
-    base_snapshot_builder_version: "snapshot-builder-v2", base_build_policy_digest: digest,
-    overlay_id: "overlay-v2", overlay_generation: 4, overlay_refresh_sequence: 0,
-    artifact_contract_version: "review-artifacts/v2",
-    evidence_builder_version: "evidence-builder-v2", overlay_build_policy_digest: digest,
-    normalized_diff_hash: diffDigest, freshness: "exact",
-    bundles: withBundle ? [bundle] : [], omitted_bundles: [],
-    serialized_token_count: withBundle ? 2 : 0,
-    serialized_character_count: withBundle ? 10 : 0,
-    serialized_utf8_byte_count: withBundle ? 10 : 0,
-    partial: false, partial_reasons: [], retry_guidance: null,
-  };
-}
-
-function completeReviewJobV2() {
-  return {
-    schema_version: "review-context/v2", contract_version: "review-context/v2",
-    job_id: "job-v2", request_id: "request-v2", tenant_id: "tenant-a",
-    codebase_id: "codebase-1", repository_set_id: "set-1",
-    repository_selection_digest: "a".repeat(64), state: "running", attempts: 1,
-    status_url: "/v2/review-context/jobs/job-v2", retry_after_seconds: 0,
-    created_at: "2026-08-19T12:00:00Z", updated_at: "2026-08-19T12:00:01Z",
-    overlay_id: null, overlay_generation: null, overlay_refresh_sequence: null,
-    partial_reasons: [],
-  };
-}
-
-function completeReviewCapabilitiesV2() {
-  return {
-    schema_version: "review-context/v2", contract_version: "review-context/v2",
-    enabled: true, service_available: true, construction_enabled: true,
-    publication_enabled: true, read_enabled: true, routes_enabled: true,
-    supports_polling: true, supports_cancellation: true,
-    supports_repository_set_scoped_status: true,
-    snapshot_artifact_contract_version: "snapshot-artifacts/v2",
-    snapshot_builder_version: "snapshot-builder-v2",
-    artifact_contract_version: "review-artifacts/v2",
-    evidence_builder_version: "evidence-builder-v2", build_policy_digest: "a".repeat(64),
-    limits: {
-      schema_version: "review-context/v2", max_records: 200,
-      max_symbol_extent_utf8_bytes_per_side: 131072,
-      max_symbol_extent_utf8_bytes_per_overlay: 8388608,
-      max_serialized_bundle_bytes: 524288, max_serialized_response_bytes: 2097152,
-      construction_timeout_ms: 2000, base_rebuild_timeout_ms: 300000,
-      max_refresh_sequences_per_lineage: 3,
-    },
-  };
-}
-
-function completeReviewStatusV2() {
-  return {
-    schema_version: "review-context/v2", contract_version: "review-context/v2",
-    codebase_id: "codebase-1", review_id: "42", target_repository_id: "repo-1",
-    head_sha: "2".repeat(40),
-    publications: [{
-      schema_version: "review-context/v2", repository_set_id: "set-1",
-      repository_selection_digest: "a".repeat(64), target_repository_id: "repo-1",
-      base_sha: "1".repeat(40), head_sha: "2".repeat(40),
-      base_snapshot_id: "snapshot-v2", base_snapshot_generation: 3,
-      base_snapshot_refresh_sequence: 0, overlay_id: "overlay-v2",
-      overlay_generation: 4, overlay_refresh_sequence: 0, state: "ready",
-      freshness: "exact", evidence_state: "ready", warning_count: 0,
-      published_at: "2026-08-19T12:00:02Z",
-    }],
-    latest_jobs: [],
-  };
-}
-
-test("review context v2 uses only v2 request, poll, status, capability, and cancellation routes", async () => {
-  const calls = [];
-  let polls = 0;
-  const job = {
-    schema_version: "review-context/v2",
-    contract_version: "review-context/v2",
-    job_id: "job-v2",
-    request_id: "request-v2",
-    tenant_id: "tenant-a",
-    codebase_id: "codebase-1",
-    repository_set_id: "set-1",
-    repository_selection_digest: "a".repeat(64),
-    state: "running",
-    attempts: 1,
-    status_url: "/v2/review-context/jobs/job-v2",
-    retry_after_seconds: 0,
-    created_at: "2026-08-19T12:00:00Z",
-    updated_at: "2026-08-19T12:00:01Z",
-    overlay_id: null,
-    overlay_generation: null,
-    overlay_refresh_sequence: null,
-    partial_reasons: [],
-  };
-  const response = completeReviewResponseV2();
-  const client = new CorpusWireClient({
-    baseUrl: "http://example.test",
-    fetchFn: async (input, init) => {
-      calls.push({ input, method: init?.method, body: init?.body ? JSON.parse(init.body) : null });
-      if (input.endsWith("/capabilities")) return jsonResponse(200, {
-        schema_version: "review-context/v2",
-        contract_version: "review-context/v2",
-        enabled: true, service_available: true, construction_enabled: true,
-        publication_enabled: true, read_enabled: true, routes_enabled: true,
-        supports_polling: true, supports_cancellation: true,
-        supports_repository_set_scoped_status: true,
-        snapshot_artifact_contract_version: "snapshot-artifacts/v2",
-        snapshot_builder_version: "snapshot-builder-v2",
-        artifact_contract_version: "review-artifacts/v2",
-        evidence_builder_version: "evidence-builder-v2",
-        build_policy_digest: "a".repeat(64),
-        limits: {
-          schema_version: "review-context/v2", max_records: 200,
-          max_symbol_extent_utf8_bytes_per_side: 131072,
-          max_symbol_extent_utf8_bytes_per_overlay: 8388608,
-          max_serialized_bundle_bytes: 524288, max_serialized_response_bytes: 2097152,
-          construction_timeout_ms: 2000, base_rebuild_timeout_ms: 300000,
-          max_refresh_sequences_per_lineage: 3,
-        },
-      });
-      if (input.endsWith("/reviews/42/status")) return jsonResponse(200, {
-        schema_version: "review-context/v2",
-        contract_version: "review-context/v2",
-        codebase_id: "codebase-1", review_id: "42", target_repository_id: "repo-1",
-        head_sha: "2".repeat(40),
-        publications: [],
-        latest_jobs: [],
-      });
-      if (init?.method === "DELETE") return jsonResponse(200, { ...job, state: "cancelled", retry_after_seconds: null });
-      if (init?.method === "POST") return jsonResponse(202, job);
-      polls += 1;
-      return jsonResponse(200, response);
-    },
-  });
-
-  await client.getReviewContextCapabilitiesV2();
-  const result = await client.requestReviewContextV2AndWait({
-    codebaseId: "codebase-1",
-    targetRepositoryId: "repo-1",
-    providerReviewId: "42",
-    objective: "Compare exact symbol changes",
-  }, { timeoutMs: 1_000, pollIntervalMs: 0 });
-  assert.equal(result.freshness, "exact");
-  await client.getReviewStatusV2("codebase-1", "42");
-  const cancelled = await client.cancelReviewContextJobV2("job-v2");
-  assert.equal(cancelled.state, "cancelled");
-  assert.equal(polls, 1);
-  assert.deepEqual(calls.map(({ input, method }) => ({ input, method })), [
-    { input: "http://example.test/v2/review-context/capabilities", method: "GET" },
-    { input: "http://example.test/v2/codebases/codebase-1/reviews/context", method: "POST" },
-    { input: "http://example.test/v2/review-context/jobs/job-v2", method: "GET" },
-    { input: "http://example.test/v2/codebases/codebase-1/reviews/42/status", method: "GET" },
-    { input: "http://example.test/v2/review-context/jobs/job-v2", method: "DELETE" },
-  ]);
-  assert.equal(calls[1].body.schema_version, "review-context/v2");
-  assert.equal(calls.some((call) => call.input.includes("/v1/")), false);
-});
-
-test("review context v2 fails closed on an unknown future response contract", async () => {
-  const client = new CorpusWireClient({
-    baseUrl: "http://example.test",
-    fetchFn: async () => jsonResponse(200, {
-      schema_version: "review-context/v3",
-      request_id: "future-request",
-      bundles: [],
-    }),
-  });
-
-  await assert.rejects(
-    client.requestReviewContextV2({
-      codebaseId: "codebase-1",
-      targetRepositoryId: "repo-1",
-      providerReviewId: "42",
-      objective: "Compare exact symbol changes",
-    }),
-    /Unsupported request result schema_version: review-context\/v3/,
-  );
-});
-
-test("review context v2 rejects mismatched contract versions on capabilities and jobs", async () => {
-  const client = new CorpusWireClient({
-    baseUrl: "http://example.test",
-    fetchFn: async (input) => jsonResponse(200, input.endsWith("/capabilities")
-      ? {
-          schema_version: "review-context/v2",
-          contract_version: "review-context/v3",
-        }
-      : {
-          schema_version: "review-context/v2",
-          contract_version: "review-context/v3",
-          job_id: "future-job",
-          state: "running",
-        }),
-  });
-
-  await assert.rejects(
-    client.getReviewContextCapabilitiesV2(),
-    /Unsupported capabilities contract_version: review-context\/v3/,
-  );
-  await assert.rejects(
-    client.requestReviewContextV2({
-      codebaseId: "codebase-1",
-      targetRepositoryId: "repo-1",
-      providerReviewId: "42",
-      objective: "Compare exact symbol changes",
-    }),
-    /Unsupported request result contract_version: review-context\/v3/,
-  );
-});
-
-test("review context v2 fails closed on unknown nested discriminants and malformed bundles", async () => {
-  const validResponse = completeReviewResponseV2({ withBundle: true });
-  const cases = [
-    [
-      { ...validResponse, bundles: validResponse.bundles.map((bundle) => ({
-        ...bundle,
-        change_record: { ...bundle.change_record, change_kind: "future_kind" },
-      })) },
-      /Unsupported v2 symbol change_kind: future_kind/,
-    ],
-    [
-      { ...validResponse, bundles: validResponse.bundles.map((bundle) => ({
-        ...bundle,
-        change_record: { ...bundle.change_record, pairing_status: "future_pairing" },
-      })) },
-      /Unsupported v2 symbol pairing_status: future_pairing/,
-    ],
-    [
-      { ...validResponse, bundles: validResponse.bundles.map((bundle) => ({
-        ...bundle,
-        change_record: { ...bundle.change_record, continuity_status: "future_continuity" },
-      })) },
-      /Unsupported v2 symbol continuity_status: future_continuity/,
-    ],
-    [
-      { ...validResponse, bundles: validResponse.bundles.map((bundle) => ({
-        ...bundle,
-        change_record: {
-          ...bundle.change_record,
-          relationship_deltas: [{
-            schema_version: "review-context/v2",
-            status: "future_delta",
-            direction: "outgoing",
-            base_fact: null,
-            head_fact: null,
-          }],
-        },
-      })) },
-      /Malformed request result v2 response contract/,
-    ],
-    [
-      { ...validResponse, bundles: null },
-      /Malformed request result v2 response contract/,
-    ],
-    [
-      {
-        ...validResponse,
-        bundles: [],
-        omitted_bundles: [{
-          schema_version: "review-context/v2",
-          change_id: "change-v2",
-          ordinal: 0,
-          change_kind: "added",
-          pairing_status: "one_sided",
-          reason: "future_reason",
-          omitted_sides: ["head"],
-          minimum_required_budget: null,
-          model_evidence_available: false,
-        }],
-      },
-      /Unsupported v2 omission reason: future_reason/,
-    ],
-  ];
-
-  for (const [response, expected] of cases) {
-    const client = new CorpusWireClient({
-      baseUrl: "http://example.test",
-      fetchFn: async () => jsonResponse(200, response),
-    });
-    await assert.rejects(
-      client.requestReviewContextV2({
-        codebaseId: "codebase-1",
-        targetRepositoryId: "repo-1",
-        providerReviewId: "42",
-        objective: "Compare exact symbol changes",
-      }),
-      expected,
-    );
-  }
-});
-
-test("review context v2 validates cancellation jobs and nested status jobs", async () => {
-  for (const path of ["cancel", "status"]) {
-    const client = new CorpusWireClient({
-      baseUrl: "http://example.test",
-      fetchFn: async () => jsonResponse(200, path === "cancel"
-        ? {
-            schema_version: "review-context/v2",
-            contract_version: "review-context/v2",
-            job_id: "job-v2",
-            state: "future_state",
-            partial_reasons: [],
-          }
-        : {
-            schema_version: "review-context/v2",
-            contract_version: "review-context/v2",
-            publications: [],
-            latest_jobs: [{
-              schema_version: "review-context/v2",
-              contract_version: "review-context/v2",
-              job_id: "job-v2",
-              state: "future_state",
-              partial_reasons: [],
-            }],
-          }),
-    });
-    await assert.rejects(
-      path === "cancel"
-        ? client.cancelReviewContextJobV2("job-v2")
-        : client.getReviewStatusV2("codebase-1", "42"),
-      /(?:Unsupported .* state: future_state|Malformed status result v2 status envelope)/,
-    );
-  }
-});
-
-test("review context v2 exhaustive validator rejects required-field, enum, and extent drift", () => {
-  const valid = completeReviewResponseV2({ withBundle: true });
-  assert.doesNotThrow(() => assertReviewContextV2Result(valid));
-  const schemaObjects = [
-    ["ReviewContextResponseV2", []],
-    ["ReviewScopeV2", ["review_scope"]],
-    ["AdmittedSymbolChangeEvidenceBundleV2", ["bundles", 0]],
-    ["SymbolChangeRecordV2", ["bundles", 0, "change_record"]],
-    ["SymbolInstanceEvidenceV2", ["bundles", 0, "change_record", "base"]],
-    ["SourceRangeV2", ["bundles", 0, "change_record", "base", "source_range"]],
-    ["ExtractorProvenanceV2", ["bundles", 0, "change_record", "base", "provenance"]],
-    ["NormalizedFileDiffEvidenceV2", ["bundles", 0, "change_record", "diff_evidence"]],
-    ["ReviewSidePathObservationV2", ["bundles", 0, "change_record", "base_observation"]],
-    ["ChangeEvidenceCompletenessV2", ["bundles", 0, "change_record", "completeness"]],
-    ["SymbolExtentEvidenceV2", ["bundles", 0, "base_evidence"]],
-    ["BundleCompletenessV2", ["bundles", 0, "completeness"]],
-  ];
-  for (const [modelName, objectPath] of schemaObjects) {
-    for (const field of REVIEW_CONTEXT_V2_SCHEMA.$defs[modelName].required) {
-      const candidate = structuredClone(valid);
-      let owner = candidate;
-      for (const segment of objectPath) owner = owner[segment];
-      delete owner[field];
-      assert.throws(() => assertReviewContextV2Result(candidate), /Malformed/,
-        `accepted missing required ${modelName}.${field}`);
-    }
-  }
-  const requiredPaths = [
-    ["request_id"], ["telemetry_id"], ["review_scope"], ["base_sha"], ["head_sha"],
-    ["base_snapshot_id"], ["overlay_id"], ["normalized_diff_hash"], ["bundles"],
-    ["omitted_bundles"], ["serialized_token_count"], ["partial"], ["partial_reasons"],
-    ["review_scope", "tenant_id"], ["review_scope", "actor_id"],
-    ["review_scope", "authorized_repository_ids"], ["review_scope", "repository_set_id"],
-    ["bundles", 0, "change_record"], ["bundles", 0, "base_evidence"],
-    ["bundles", 0, "head_evidence"], ["bundles", 0, "evidence_item_count"],
-    ["bundles", 0, "change_record", "logical_identity"],
-    ["bundles", 0, "change_record", "diff_evidence"],
-    ["bundles", 0, "change_record", "base_observation"],
-    ["bundles", 0, "change_record", "head_observation"],
-    ["bundles", 0, "change_record", "completeness"],
-    ["bundles", 0, "change_record", "base", "repository_id"],
-    ["bundles", 0, "change_record", "base", "revision"],
-    ["bundles", 0, "change_record", "base", "source_range"],
-    ["bundles", 0, "change_record", "base", "provenance"],
-    ["bundles", 0, "base_evidence", "evidence_id"],
-    ["bundles", 0, "base_evidence", "repository_id"],
-    ["bundles", 0, "base_evidence", "revision"],
-    ["bundles", 0, "base_evidence", "path"],
-    ["bundles", 0, "base_evidence", "symbol_source_range"],
-    ["bundles", 0, "base_evidence", "source_content_sha256"],
-    ["bundles", 0, "base_evidence", "symbol_extent_sha256"],
-  ];
-  for (const path of requiredPaths) {
-    const candidate = structuredClone(valid);
-    let owner = candidate;
-    for (const segment of path.slice(0, -1)) owner = owner[segment];
-    delete owner[path.at(-1)];
-    assert.throws(() => assertReviewContextV2Result(candidate), /Malformed/,
-      `accepted missing ${path.join(".")}`);
-  }
-  for (const [path, replacement] of [
-    [["freshness"], "future_freshness"],
-    [["base_artifact_contract_version"], "snapshot-artifacts/v3"],
-    [["artifact_contract_version"], "review-artifacts/v3"],
-    [["bundles", 0, "change_record", "change_kind"], "future_change"],
-    [["bundles", 0, "change_record", "pairing_status"], "future_pairing"],
-    [["bundles", 0, "change_record", "continuity_status"], "future_continuity"],
-    [["bundles", 0, "change_record", "diff_evidence", "change_kind"], "future_diff"],
-    [["bundles", 0, "change_record", "diff_evidence", "content_kind"], "future_content"],
-    [["bundles", 0, "change_record", "diff_evidence", "patch_status"], "future_patch"],
-    [["bundles", 0, "change_record", "base_observation", "path_role"], "future_role"],
-    [["bundles", 0, "change_record", "base_observation", "source_state"], "future_source"],
-    [["bundles", 0, "change_record", "base_observation", "analyzer_state"], "future_analyzer"],
-    [["bundles", 0, "change_record", "base", "layer"], "future_layer"],
-    [["bundles", 0, "change_record", "base", "provenance", "evidence_tier"], "future_tier"],
-    [["bundles", 0, "change_record", "base", "provenance", "resolution_status"], "future_resolution"],
-  ]) {
-    const candidate = structuredClone(valid);
-    let owner = candidate;
-    for (const segment of path.slice(0, -1)) owner = owner[segment];
-    owner[path.at(-1)] = replacement;
-    assert.throws(() => assertReviewContextV2Result(candidate),
-      `accepted enum drift ${path.join(".")}`);
-  }
-  for (const [field, replacement] of [
-    ["evidence_id", "symbol-extent:" + "0".repeat(64)], ["repository_id", "repo-other"],
-    ["revision", "3".repeat(40)], ["layer", "overlay"], ["path", "src/other.py"],
-    ["source_content_sha256", "b".repeat(64)], ["symbol_extent_sha256", "c".repeat(64)],
-    ["text", "tampered\n"],
-  ]) {
-    const candidate = structuredClone(valid);
-    candidate.bundles[0].base_evidence[field] = replacement;
-    assert.throws(() => assertReviewContextV2Result(candidate),
-      `accepted extent drift ${field}`);
-  }
-});
-
-test("review context v2 semantic validator matches authoritative cross-field invariants", () => {
-  const interleaved = completeReviewResponseV2({ withBundle: true });
-  interleaved.bundles[0].ordinal = 1;
-  interleaved.omitted_bundles = [{
-    schema_version: "review-context/v2", change_id: "change-omitted", ordinal: 0,
-    change_kind: "added", pairing_status: "one_sided",
-    reason: "required_evidence_unavailable", omitted_sides: ["head"],
-    minimum_required_budget: null, model_evidence_available: false,
-  }];
-  interleaved.freshness = "partial";
-  interleaved.partial = true;
-  assert.doesNotThrow(() => assertReviewContextV2Result(interleaved));
-
-  const reorderedRange = completeReviewResponseV2({ withBundle: true });
-  const range = reorderedRange.bundles[0].base_evidence.symbol_source_range;
-  reorderedRange.bundles[0].base_evidence.symbol_source_range = {
-    end_column: range.end_column, start_column: range.start_column,
-    end_line: range.end_line, start_line: range.start_line,
-    schema_version: range.schema_version,
-  };
-  assert.doesNotThrow(() => assertReviewContextV2Result(reorderedRange));
-
-  const invalidLf = completeReviewResponseV2({ withBundle: true });
-  const lfExtent = invalidLf.bundles[0].base_evidence;
-  lfExtent.text = "first\nsecond\n";
-  lfExtent.symbol_extent_sha256 = createHash("sha256").update(lfExtent.text).digest("hex");
-  invalidLf.bundles[0].change_record.base.symbol_extent_sha256 = lfExtent.symbol_extent_sha256;
-  lfExtent.evidence_id = canonicalExtentId(
-    invalidLf.bundles[0].change_record.change_id,
-    "base",
-    invalidLf.bundles[0].change_record.base,
-  );
-  assert.throws(() => assertReviewContextV2Result(invalidLf), /Malformed/);
-
-  const invalidColumn = completeReviewResponseV2({ withBundle: true });
-  for (const candidateRange of [
-    invalidColumn.bundles[0].change_record.base.source_range,
-    invalidColumn.bundles[0].base_evidence.symbol_source_range,
-  ]) {
-    candidateRange.start_column = 8;
-    candidateRange.end_column = 2;
-  }
-  invalidColumn.bundles[0].base_evidence.evidence_id = canonicalExtentId(
-    invalidColumn.bundles[0].change_record.change_id,
-    "base",
-    invalidColumn.bundles[0].change_record.base,
-  );
-  assert.throws(() => assertReviewContextV2Result(invalidColumn), /Malformed/);
-
-  const invalidClassification = completeReviewResponseV2({ withBundle: true });
-  invalidClassification.bundles[0].change_record.change_kind = "ambiguous";
-  assert.throws(() => assertReviewContextV2Result(invalidClassification), /Malformed/);
-
-  const invalidObservationHash = completeReviewResponseV2({ withBundle: true });
-  invalidObservationHash.bundles[0].change_record.base_observation.source_content_sha256 = "b".repeat(64);
-  assert.throws(() => assertReviewContextV2Result(invalidObservationHash), /Malformed/);
-
-  const invalidHunkOrder = completeReviewResponseV2({ withBundle: true });
-  invalidHunkOrder.bundles[0].change_record.normalized_hunks = [1, 0].map((ordinal) => {
-    const hunk = {
-      path: "src/example.py", ordinal, old_start: 1, old_count: 0,
-      new_start: 1, new_count: 0, section: null, lines: [],
-    };
-    return {
-      schema_version: "review-context/v2", ...hunk,
-      hunk_sha256: createHash("sha256").update(canonicalJsonForTest(hunk)).digest("hex"),
-    };
-  });
-  assert.throws(() => assertReviewContextV2Result(invalidHunkOrder), /Malformed/);
-});
-
-test("review context v2 relationship facts stay incident, comparable, published, and authorized", () => {
-  const valid = completeReviewResponseV2({ withBundle: true });
-  const record = valid.bundles[0].change_record;
-  const makeFact = (side, instance, generation) => ({
-    schema_version: "review-context/v2", fact_type: "resolved", edge_id: `${side}-edge`,
-    direction: "outgoing", relationship_kind: "CALLS",
-    changed_logical_identity: record.logical_identity,
-    endpoint_logical_identity: "logical-endpoint",
-    source_repository_id: instance.repository_id, source_snapshot_id: valid.base_snapshot_id,
-    source_generation: generation, source_symbol_id: instance.symbol_id,
-    source_symbol_instance_id: instance.symbol_instance_id, source_language: instance.language,
-    target_repository_id: instance.repository_id, target_snapshot_id: valid.base_snapshot_id,
-    target_generation: generation, target_symbol_id: "target-symbol",
-    target_symbol_instance_id: `${side}-target-instance`, target_language: instance.language,
-    path: instance.path, source_range: instance.source_range, provenance: instance.provenance,
-    resolution_precedence: "local", contract_evidence_id: null,
-    contract_coordinate: null, contract_artifact_digest: null,
-    revision: instance.revision, layer: instance.layer,
-  });
-  record.relationship_deltas = [{
-    schema_version: "review-context/v2", status: "preserved", relationship_kind: "CALLS",
-    direction: "outgoing", changed_logical_identity: record.logical_identity,
-    endpoint_logical_identity: "logical-endpoint",
-    base_fact: makeFact("base", record.base, valid.base_snapshot_generation),
-    head_fact: makeFact("head", record.head, valid.overlay_generation),
-    comparison_attributes_changed: [],
-    completeness: {
-      schema_version: "review-context/v2", base_declaring_unit_observed: true,
-      head_declaring_unit_observed: true, incoming_dependents_reanalyzed: false,
-      reason_codes: [],
-    },
-  }];
-  assert.doesNotThrow(() => assertReviewContextV2Result(valid));
-  const mutations = [
-    (value) => { value.bundles[0].change_record.relationship_deltas[0].base_fact.source_generation = 99; },
-    (value) => { value.bundles[0].change_record.relationship_deltas[0].head_fact.target_repository_id = "repo-unauthorized"; },
-    (value) => { value.bundles[0].change_record.relationship_deltas[0].base_fact.source_symbol_instance_id = "wrong-instance"; },
-    (value) => { value.bundles[0].change_record.relationship_deltas[0].base_fact.endpoint_logical_identity = "wrong-endpoint"; },
-    (value) => { value.bundles[0].change_record.relationship_deltas[0].completeness.base_declaring_unit_observed = false; },
-    (value) => {
-      const delta = value.bundles[0].change_record.relationship_deltas[0];
-      delta.status = "evidence_changed";
-      delta.comparison_attributes_changed = ["zeta", "alpha"];
-    },
-  ];
-  for (const mutate of mutations) {
-    const candidate = structuredClone(valid);
-    mutate(candidate);
-    assert.throws(() => assertReviewContextV2Result(candidate), /Malformed/);
-  }
-});
-
-test("review context v2 capability, job, and status roots reject every required-field deletion", async () => {
-  const cases = [
-    ["ReviewContextCapabilitiesV2", completeReviewCapabilitiesV2(), [], "capabilities"],
-    ["ReviewContextLimitsV2", completeReviewCapabilitiesV2(), ["limits"], "capabilities"],
-    ["ReviewContextJobV2", completeReviewJobV2(), [], "job"],
-    ["ReviewStatusV2", completeReviewStatusV2(), [], "status"],
-    ["ReviewPublicationStatusV2", completeReviewStatusV2(), ["publications", 0], "status"],
-  ];
-  for (const [modelName, fixture, objectPath, route] of cases) {
-    for (const field of REVIEW_CONTEXT_V2_SCHEMA.$defs[modelName].required) {
-      const candidate = structuredClone(fixture);
-      let owner = candidate;
-      for (const segment of objectPath) owner = owner[segment];
-      delete owner[field];
-      const client = new CorpusWireClient({
-        baseUrl: "http://example.test",
-        fetchFn: async () => jsonResponse(200, candidate),
-      });
-      const call = route === "capabilities"
-        ? client.getReviewContextCapabilitiesV2()
-        : route === "job"
-          ? client.cancelReviewContextJobV2("job-v2")
-          : client.getReviewStatusV2("codebase-1", "42");
-      await assert.rejects(call, /Malformed|Unsupported/,
-        `accepted missing required ${modelName}.${field}`);
-    }
-  }
-
-  for (const mutate of [
-    (value) => { value.publication_enabled = true; value.construction_enabled = false; },
-    (value) => { value.service_available = true; value.read_enabled = false; },
-    (value) => { value.limits.max_refresh_sequences_per_lineage = 11; },
-  ]) {
-    const candidate = completeReviewCapabilitiesV2();
-    mutate(candidate);
-    const client = new CorpusWireClient({
-      baseUrl: "http://example.test", fetchFn: async () => jsonResponse(200, candidate),
-    });
-    await assert.rejects(client.getReviewContextCapabilitiesV2(), /Malformed/);
-  }
-
-  const invalidJob = completeReviewJobV2();
-  invalidJob.retry_after_seconds = 3601;
-  const jobClient = new CorpusWireClient({
-    baseUrl: "http://example.test", fetchFn: async () => jsonResponse(200, invalidJob),
-  });
-  await assert.rejects(jobClient.cancelReviewContextJobV2("job-v2"), /Malformed/);
-
-  const unsortedJob = completeReviewJobV2();
-  unsortedJob.state = "partial";
-  unsortedJob.partial_reasons = [
-    { schema_version: "review-context/v2", code: "z_reason", retryable: true, affected_side: "head" },
-    { schema_version: "review-context/v2", code: "a_reason", retryable: false, affected_side: "base" },
-  ];
-  const unsortedJobClient = new CorpusWireClient({
-    baseUrl: "http://example.test", fetchFn: async () => jsonResponse(200, unsortedJob),
-  });
-  await assert.rejects(unsortedJobClient.cancelReviewContextJobV2("job-v2"), /Malformed/);
-
-  const timezoneAwareJob = completeReviewJobV2();
-  timezoneAwareJob.created_at = "2024-02-29T12:34:56.123456789+02:30";
-  timezoneAwareJob.updated_at = "2024-02-29t10:04:56.5z";
-  const timezoneAwareClient = new CorpusWireClient({
-    baseUrl: "http://example.test", fetchFn: async () => jsonResponse(200, timezoneAwareJob),
-  });
-  await assert.doesNotReject(timezoneAwareClient.cancelReviewContextJobV2("job-v2"));
-  for (const createdAt of ["2026-02-30T12:00:00Z", "2026-01-01Z"]) {
-    const invalidTimestampJob = completeReviewJobV2();
-    invalidTimestampJob.created_at = createdAt;
-    const invalidTimestampClient = new CorpusWireClient({
-      baseUrl: "http://example.test", fetchFn: async () => jsonResponse(200, invalidTimestampJob),
-    });
-    await assert.rejects(invalidTimestampClient.cancelReviewContextJobV2("job-v2"), /Malformed/);
-  }
-
-  const extractorMismatch = completeReviewResponseV2({ withBundle: true });
-  extractorMismatch.bundles[0].change_record.base.stable_declaration_identity = {
-    schema_version: "review-context/v2", extractor_id: "other-extractor",
-    scheme_version: "1", value: "declaration-a",
-  };
-  assert.throws(() => assertReviewContextV2Result(extractorMismatch), /Malformed/);
-});
-
-test("review telemetry summary uses the operator endpoint and returns typed aggregates", async () => {
-  const calls = [];
-  const summary = {
-    schema_version: "review-context/v1",
-    event_count: 1_001,
-    by_operation: { retrieval: 1_001 },
-    by_status: { failed: 1_001 },
-    by_failure_category: { backend_unavailable: 1_001 },
-    metric_totals: { evidence_items: 3_003 },
-    p95_duration_ms: 25,
-  };
-  const client = new CorpusWireClient({
-    baseUrl: "http://example.test",
-    fetchFn: async (input, init) => {
-      calls.push({ input, method: init?.method });
-      return jsonResponse(200, summary);
-    },
-  });
-
-  const result = await client.getReviewTelemetrySummary();
-
-  assert.deepEqual(result, summary);
-  assert.deepEqual(calls, [{
-    input: "http://example.test/v1/review-context/telemetry/summary",
-    method: "GET",
-  }]);
 });
 
 test("requestJson honors explicit nonretryable errors before generic transient retries", { timeout: 1000 }, async () => {
@@ -2401,7 +1452,7 @@ test("requestJson preserves legacy transient retries when retryability is omitte
     [429, { detail: "Tenant session limit reached" }],
     [503, { detail: { code: "embedding_not_ready", message: "Warming up" } }],
     [503, { ok: false, request_id: "legacy", duration_ms: 1, error: { code: "unavailable", message: "Try later" } }],
-    [503, { schema_version: "review-context/v2", error_code: "unavailable", message: "Try later", request_id: "legacy" }],
+    [503, { schema_version: "review-context/v1", error_code: "unavailable", message: "Try later", request_id: "legacy" }],
   ];
   for (const [status, payload] of cases) {
     let attempts = 0;
@@ -4009,7 +3060,6 @@ test("one failing upload stops sibling queue retries and prevents the next batch
   assert.equal(aborts, 1);
 });
 
-
 test("detach in and after the code-ready callback aborts a fully uploaded checkpoint awaiting client commit", async () => {
   for (const deferred of [false,true]) {
   const controller = new AbortController();
@@ -4299,7 +3349,6 @@ test("adaptive polling resets after progress and detach interrupts its delay", {
   assert.ok(times[5] - times[4] < 35, "Detach wakes the pending delay");
 });
 
-
 test("large polling intervals respect absolute follow deadlines", { timeout: 1000 }, async () => {
   const client = new CorpusWireClient({ baseUrl: "http://fixture.test" });
   client.getIndexSessionStatus = async () => ({ phase: "queued", queue_depth: 1, files_indexed: 0, progress: progressEvent(1, 0, "queued") });
@@ -4307,7 +3356,6 @@ test("large polling intervals respect absolute follow deadlines", { timeout: 100
   await assert.rejects(client.followIndexSession("fixture", { pollMs: 30_000, timeoutMs: 30 }), RemoteIndexDetachedError);
   assert.ok(Date.now() - startedAt < 200);
 });
-
 
 test("configuration delay is excluded from hashing and queue heartbeat callback failure is awaited", { timeout: 3000 }, async () => {
   const fixture = priorityIndexFixture({ files: [{ relativePath: "a.py", content: "x" }], capability: false });
@@ -4327,7 +3375,6 @@ test("configuration delay is excluded from hashing and queue heartbeat callback 
   }), /Synthetic observer failure/);
   assert.equal(attempts, 1); assert.equal(retries, 0);
 });
-
 
 test("synchronous upload tiers exclude delayed code checkpoint from upload timing", { timeout: 2000 }, async () => {
   const fixture = priorityIndexFixture({ files: [
@@ -4379,7 +3426,6 @@ test("failed upload timing stops before delayed abort response cleanup", { timeo
   });
   assert.equal(fixture.calls.filter((call) => call.type === "abort").length, 1);
 });
-
 
 test("explicit code stage submits the complete manifest, publishes only code and confirms drained release", async () => {
   const fixture = priorityIndexFixture({ files: [
@@ -4663,7 +3709,6 @@ test("public capability and health declarations retain additive code-readiness f
   for (const flag of ["code_ready", "documentation_pending", "other_pending"]) assert.match(indexHealth, new RegExp(`${flag}\\?: boolean`));
 });
 
-
 test("health and indexing capabilities preserve server code readiness and processing quantum metadata", async () => {
   const metadata = { file_batch_priorities: { code: 1, documentation: 2, other: 3 },
     max_processing_files: 4, max_processing_source_bytes: 1000,
@@ -4675,7 +3720,6 @@ test("health and indexing capabilities preserve server code readiness and proces
   for (const [key, value] of Object.entries(metadata)) assert.deepEqual(capabilities[key], value);
   assert.deepEqual((await client.health()).index, { code_ready: true, documentation_pending: true, other_pending: false });
 });
-
 
 test("code stage rejects malformed pending checkpoint evidence before release success", async () => {
   for (const change of [
@@ -4715,7 +3759,6 @@ test("code-stage full fallback distinguishes verified coverage from legacy unkno
   });
 });
 
-
 test("code-stage checkpoint proof is bound to owned identity before readiness callback", async () => {
   for (const change of [
     { session_id: "another-session" }, { workspace_id: "another-workspace" },
@@ -4754,7 +3797,6 @@ test("code-stage release proof cannot confirm another session or conflicting sco
   }
 });
 
-
 test('listIndexSessions signal preserves GET query serialization and aborts without retries', async()=>{
   const calls=[];const controller=new AbortController();
   const client=new CorpusWireClient({baseUrl:'http://fixture.test',fetchFn:async(input,init)=>{
@@ -4770,7 +3812,6 @@ test('listIndexSessions signal preserves GET query serialization and aborts with
   const url=new URL(calls[0].input);assert.equal(url.pathname,'/v1/index/sessions');
   assert.deepEqual([...url.searchParams.entries()],[['workspace_id','local-docker://signal-test#main']]);
 });
-
 
 test('followIndexSession observes incomplete as terminal with one GET and no cancellation', async()=>{
   const calls=[];
