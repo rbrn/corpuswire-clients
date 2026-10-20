@@ -4,11 +4,11 @@
       "type": "stdio",
       "command": "node",
       "args": [
-        "/Users/constantinaldea/workspace/my-context-engine/clients/corpuswire-mcp/bin/corpuswire-mcp.js"
+        "/path/to/corpuswire/clients/corpuswire-mcp/bin/corpuswire-mcp.js"
       ],
       "env": {
         "CORPUSWIRE_BASE_URL": "http://127.0.0.1:8000",
-        "CORPUSWIRE_REPO_PATH": "/Users/constantinaldea/workspace/my-context-engine",
+        "CORPUSWIRE_REPO_PATH": "/path/to/your/repository",
         "CORPUSWIRE_OUTPUT_MODE": "copilot",
         "CORPUSWIRE_LOCAL_ONLY": "true",
         "CORPUSWIRE_TOP_K": "5",

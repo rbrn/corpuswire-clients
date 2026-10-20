@@ -10,7 +10,6 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { planSelectedNeighbor } from "../lib/selected-neighbor.mjs";
 import { boundServerSpans, groupServerSpans, renderServerSpans, shouldUseServerPacking } from "../lib/server-packed.mjs";
-import { canonicalCoalescingDeliveryComplete, planSourceRootCoalescing } from "../lib/source-root-coalescing.mjs";
 import { SERVER_INSTRUCTIONS, decorateTools, detectHost, negotiateProtocolVersion, readToolProfile } from "../lib/host-profile.mjs";
 import { createWorkspaceScope, formatIdentityLines } from "../lib/workspace-scope.mjs";
 import { parseJsonc, resolveWorkspaceIdentity } from "../vendor/corpuswire-sdk/dist/workspace-identity.js";
@@ -41,10 +40,6 @@ const DEFAULT_SYNC_SESSION_CONFLICT_RETRY_MAX_DELAY_MS = 5000;
 const DEFAULT_SYNC_RECENT_EVENTS_LIMIT = 25;
 const DEFAULT_SYNC_LATENCY_SAMPLE_LIMIT = 20;
 const DEFAULT_SYNC_CACHE_SCHEMA_VERSION = 2;
-const PRIVATE_SEARCH_TELEMETRY_ENV = "CORPUSWIRE_PRIVATE_SEARCH_TELEMETRY_PATH";
-const PRIVATE_SEARCH_TELEMETRY_MAX_EVENTS = 1000;
-const PRIVATE_SEARCH_TELEMETRY_MAX_FILE_BYTES = 128 * 1024;
-const PRIVATE_SEARCH_TELEMETRY_PREFIX = "cw-search-timing-";
 const DIRECTORY_GLOB_PROBE = "__corpuswire_directory_probe__";
 const OUTPUT_MODES = new Set(["generic", "copilot", "claude-code", "sequential"]);
 // Set by initialize; CORPUSWIRE_HOST overrides detection for hosts that report no clientInfo.
@@ -2728,14 +2723,14 @@ async function writeRetrievalJournal(params, result, startedAt, elapsedMs, obser
       selectedNeighborPolicy: neighborPolicy,
       headingPrefix: neighborPolicy === "selected-neighbor-v2"
         && (process.env.CORPUSWIRE_SELECTED_HEADING_PREFIX ?? "true") === "true",
-      sourceRootCoalescing: neighborPolicy === "selected-neighbor-v2"
-        && process.env.CORPUSWIRE_SOURCE_ROOT_COALESCING === "per-file-v1",
+      // Retired client-side experiment; kept as a constant for journal v2.
+      sourceRootCoalescing: false,
     },
     deliveryBehavior: {
       searchPostprocessingApplicable: params.name === "corpuswire_search",
       selectedNeighborChangedResult: params.name === "corpuswire_search" ? "unknown" : false,
       headingPrefixAdded: params.name === "corpuswire_search" ? "unknown" : false,
-      sourceRootCoalescingChangedResult: params.name === "corpuswire_search" ? "unknown" : false,
+      sourceRootCoalescingChangedResult: false,
       enhancementLocalFallback: observation.enhancementLocalFallback ?? "unknown",
       enhancementLocalOnlyUsed: observation.enhancementLocalOnlyUsed ?? "unknown",
     },
@@ -4837,115 +4832,8 @@ function nullableBoundedInteger(value, name, minimum, maximum) {
 
 const SELECTED_NEIGHBOR_MAX_FILE_BYTES = 1024 * 1024;
 
-let privateSearchTelemetryQueue = Promise.resolve();
-
 function searchTimingMs(start) {
   return Math.round(Number(process.hrtime.bigint() - start) / 1000) / 1000;
-}
-
-function privateSearchTelemetryState() {
-  const target = process.env[PRIVATE_SEARCH_TELEMETRY_ENV];
-  if (typeof target !== "string" || !target.startsWith("/private/tmp/")) return null;
-  return {
-    target, started: process.hrtime.bigint(), backendQueryRawMs: null,
-    selectedNeighborEntered: false, selectedNeighborEntryMs: null,
-    selectedNeighborMs: null, selectedNeighborSourceReadMs: null,
-    selectedNeighborProposalMs: null, treatmentProduced: false,
-  };
-}
-
-async function privateSearchTelemetryWrite(state, totalHandlerMs, outcome) {
-  const target = state.target;
-  const resolved = await realpath(target);
-  if (!resolved.startsWith("/private/tmp/") || resolved === "/private/tmp/") return;
-  const info = await lstat(target);
-  if (info.isSymbolicLink() || (typeof process.getuid === "function"
-    && info.uid !== process.getuid())) return;
-  const event = {
-    schema_version: "rqt110g-search-timing/v1",
-    totalHandlerMs,
-    backendQueryRawMs: state.backendQueryRawMs,
-    selectedNeighborEntered: state.selectedNeighborEntered,
-    selectedNeighborEntryMs: state.selectedNeighborEntryMs,
-    selectedNeighborMs: state.selectedNeighborMs,
-    selectedNeighborSourceReadMs: state.selectedNeighborSourceReadMs,
-    selectedNeighborProposalMs: state.selectedNeighborProposalMs,
-    treatmentProduced: state.treatmentProduced,
-    outcome,
-  };
-  const line = `${JSON.stringify(event)}\n`;
-  if (Buffer.byteLength(line, "utf8") > 512) return;
-  const directory = info.isDirectory();
-  if (directory) {
-    if ((info.mode & 0o777) !== 0o700) return;
-  } else if (info.isFile()) {
-    const parentInfo = await lstat(path.dirname(target));
-    if ((info.mode & 0o777) !== 0o600 || !parentInfo.isDirectory()
-      || parentInfo.isSymbolicLink() || (parentInfo.mode & 0o777) !== 0o700
-      || (typeof process.getuid === "function" && parentInfo.uid !== process.getuid())) return;
-  } else return;
-  const parent = directory ? target : path.dirname(target);
-  const temp = path.join(parent, `.${PRIVATE_SEARCH_TELEMETRY_PREFIX}${randomUUID()}.tmp`);
-  const lockPath = directory ? null : `${target}.lock`;
-  let lockHandle;
-  let handle;
-  try {
-    let body = line;
-    if (!directory) {
-      try {
-        lockHandle = await open(lockPath, fsConstants.O_WRONLY | fsConstants.O_CREAT
-          | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
-        await lockHandle.chmod(0o600);
-      } catch (error) {
-        if (error?.code === "EEXIST") return;
-        throw error;
-      }
-      if (info.size > PRIVATE_SEARCH_TELEMETRY_MAX_FILE_BYTES) return;
-      const previous = await readFile(target, "utf8");
-      const rows = previous.trimEnd() ? previous.trimEnd().split("\n") : [];
-      if (rows.length >= PRIVATE_SEARCH_TELEMETRY_MAX_EVENTS
-        || rows.some((row) => {
-          try { return JSON.parse(row).schema_version !== "rqt110g-search-timing/v1"; }
-          catch { return true; }
-        })) return;
-      body = previous + line;
-      if (Buffer.byteLength(body, "utf8") > PRIVATE_SEARCH_TELEMETRY_MAX_FILE_BYTES) return;
-    }
-    handle = await open(temp, fsConstants.O_WRONLY | fsConstants.O_CREAT
-      | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
-    await handle.chmod(0o600);
-    await handle.writeFile(body, "utf8");
-    await handle.close();
-    handle = null;
-    if (directory) {
-      for (let slot = 0; slot < PRIVATE_SEARCH_TELEMETRY_MAX_EVENTS; slot += 1) {
-        const final = path.join(target,
-          `${PRIVATE_SEARCH_TELEMETRY_PREFIX}${String(slot).padStart(4, "0")}.json`);
-        try {
-          await link(temp, final);
-          break;
-        } catch (error) {
-          if (error?.code !== "EEXIST") throw error;
-        }
-      }
-    } else await rename(temp, target);
-  } finally {
-    if (handle) await handle.close().catch(() => {});
-    await unlink(temp).catch(() => {});
-    if (lockHandle) {
-      await lockHandle.close().catch(() => {});
-      await unlink(lockPath).catch(() => {});
-    }
-  }
-}
-
-async function writePrivateSearchTelemetrySafely(state, totalHandlerMs, outcome) {
-  if (!state) return;
-  const next = privateSearchTelemetryQueue.then(
-    () => privateSearchTelemetryWrite(state, totalHandlerMs, outcome),
-  ).catch(() => {});
-  privateSearchTelemetryQueue = next;
-  await next;
 }
 
 function selectedNeighborSourcePath(value) {
@@ -5028,13 +4916,7 @@ function selectedNeighborDelivered(observed, sourceTexts) {
   return { runs, completeLines, excerptChars };
 }
 
-async function selectedNeighborResult({ formatInput, formatted, deliveredControl, telemetry, maxRadius, headingPrefix = false, onAccepted }) {
-  const neighborStarted = telemetry ? process.hrtime.bigint() : null;
-  if (telemetry) {
-    telemetry.selectedNeighborEntered = true;
-    telemetry.selectedNeighborEntryMs = searchTimingMs(telemetry.started);
-  }
-  try {
+async function selectedNeighborResult({ formatInput, formatted, deliveredControl, maxRadius, headingPrefix = false }) {
   const { result, context, hits, workspaceId, topK, maxChars, query } = formatInput;
   const rootRaw = optionalString(process.env.CORPUSWIRE_SELECTED_NEIGHBOR_ROOT
     ?? process.env.CORPUSWIRE_SYNC_ROOT);
@@ -5047,8 +4929,6 @@ async function selectedNeighborResult({ formatInput, formatted, deliveredControl
     const sourceTexts = new Map();
     let generation = null;
     let scopedPublication = null;
-    const sourceReadStarted = telemetry ? process.hrtime.bigint() : null;
-    try {
     for (const hit of hits) {
       const metadata = asRecord(hit?.metadata);
       if (!Number.isInteger(metadata.source_generation)
@@ -5071,12 +4951,8 @@ async function selectedNeighborResult({ formatInput, formatted, deliveredControl
       if (source === null) return formatted;
       sourceTexts.set(sourcePath, source);
     }
-    } finally {
-      if (telemetry) telemetry.selectedNeighborSourceReadMs = searchTimingMs(sourceReadStarted);
-    }
     const control = selectedNeighborDelivered(deliveredControl, sourceTexts);
     if (!control || control.excerptChars > maxChars) return formatted;
-    const proposalStarted = telemetry ? process.hrtime.bigint() : null;
     const proposal = planSelectedNeighbor({
       baselineHits: hits,
       deliveredRuns: control.runs,
@@ -5087,7 +4963,6 @@ async function selectedNeighborResult({ formatInput, formatted, deliveredControl
       maxRadius,
       headingPrefix,
     });
-    if (telemetry) telemetry.selectedNeighborProposalMs = searchTimingMs(proposalStarted);
     if (!proposal.usedNeighbor || !Array.isArray(proposal.hits)
       || proposal.hits.length > 5) return formatted;
     const deliveredTreatment = [];
@@ -5101,79 +4976,6 @@ async function selectedNeighborResult({ formatInput, formatted, deliveredControl
       || [...control.completeLines].some((line) => !treated.completeLines.has(line))) {
       return formatted;
     }
-    if (typeof onAccepted === "function") {
-      onAccepted({ hits: proposal.hits, delivered: deliveredTreatment });
-    }
-    if (telemetry) telemetry.treatmentProduced = true;
-    return treatment;
-  } catch {
-    return formatted;
-  }
-  } finally {
-    if (telemetry) telemetry.selectedNeighborMs = searchTimingMs(neighborStarted);
-  }
-}
-
-async function sourceRootCoalescingResult({ formatInput, formatted, selectedHits, observedControl }) {
-  const { result, context, workspaceId, topK, maxChars } = formatInput;
-  const rootRaw = optionalString(process.env.CORPUSWIRE_SELECTED_NEIGHBOR_ROOT
-    ?? process.env.CORPUSWIRE_SYNC_ROOT);
-  if (optionalString(result.retrieval_evidence_policy) !== "generic-v2"
-    || result.retrieval_not_found === true || !workspaceId
-    || context.workspace_id !== workspaceId || topK !== 5 || maxChars > 12_000
-    || selectedHits.length < 2 || selectedHits.length > 5
-    || !rootRaw || !path.isAbsolute(rootRaw)) return formatted;
-  try {
-    const root = path.resolve(rootRaw);
-    const sourceTexts = new Map();
-    let generation = null;
-    for (const hit of selectedHits) {
-      const metadata = asRecord(hit?.metadata);
-      if (metadata.index_scope != null || !Number.isInteger(metadata.source_generation)
-        || metadata.source_generation < 1) return formatted;
-      if (generation !== null && metadata.source_generation !== generation) return formatted;
-      generation = metadata.source_generation;
-      const sourcePath = metadata.source_path;
-      const sourceHash = metadata.source_hash;
-      if (sourceTexts.has(sourcePath)) {
-        if (createHash("sha256").update(sourceTexts.get(sourcePath), "utf8").digest("hex")
-          !== sourceHash) return formatted;
-        continue;
-      }
-      const source = await readSelectedNeighborSource(root, sourcePath, sourceHash);
-      if (source === null) return formatted;
-      sourceTexts.set(sourcePath, source);
-    }
-    const control = selectedNeighborDelivered(observedControl, sourceTexts);
-    if (!control || control.excerptChars > maxChars) return formatted;
-    const proposal = planSourceRootCoalescing({
-      proofMode: "per-file-source/v1",
-      baselineHits: selectedHits,
-      deliveredRuns: control.runs,
-      sourceRecords: [...sourceTexts].map(([sourcePath, source]) => ({
-        path: sourcePath,
-        sourceHash: createHash("sha256").update(source, "utf8").digest("hex"),
-        text: source,
-      })),
-      publicationFence: null,
-      topK,
-      maxChars,
-      maxRadius: 20,
-    });
-    if (!proposal.usedPacking || !Array.isArray(proposal.hits)
-      || proposal.hits.length > topK || proposal.excerptChars > maxChars) return formatted;
-    const observedTreatment = [];
-    const treatment = formatSearchResult({
-      ...formatInput,
-      hits: proposal.hits,
-      onRenderedHit: (item) => observedTreatment.push(item),
-    });
-    const treated = selectedNeighborDelivered(observedTreatment, sourceTexts);
-    if (!canonicalCoalescingDeliveryComplete(proposal, observedTreatment, treated)
-      || treated.excerptChars > maxChars
-      || [...control.completeLines].some((line) => !treated.completeLines.has(line))) {
-      return formatted;
-    }
     return treatment;
   } catch {
     return formatted;
@@ -5184,7 +4986,7 @@ function boundedEngineEventId(value) {
   return typeof value === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(value) ? value : null;
 }
 
-async function searchContextCore(args, telemetry, observation = undefined) {
+async function searchContext(args, observation = undefined) {
   const query = requiredString(args, "query");
   const topK = optionalPositiveInteger(args.topK ?? process.env.CORPUSWIRE_TOP_K, DEFAULT_TOP_K);
   const minScore = optionalScore(args.minScore ?? process.env.CORPUSWIRE_MIN_SCORE);
@@ -5212,12 +5014,7 @@ async function searchContextCore(args, telemetry, observation = undefined) {
   };
   let response;
   if (typeof client.queryRaw === "function") {
-    const queryStarted = telemetry ? process.hrtime.bigint() : null;
-    try {
-      response = await client.queryRaw(request);
-    } finally {
-      if (telemetry) telemetry.backendQueryRawMs = searchTimingMs(queryStarted);
-    }
+    response = await client.queryRaw(request);
   } else {
     response = { result: await client.query(request), context: {} };
   }
@@ -5254,29 +5051,17 @@ async function searchContextCore(args, telemetry, observation = undefined) {
     ...(serverEvidence ? { serverEvidence } : {}),
     ...(observeNeighbor ? { onRenderedHit: (item) => deliveredControl.push(item) } : {}),
   });
-  let neighborAccepted = null;
   const delivered = observeNeighbor
     ? await selectedNeighborResult({
-      formatInput, formatted, deliveredControl, telemetry,
+      formatInput, formatted, deliveredControl,
       maxRadius: selectedNeighborPolicy === "selected-neighbor-v2" ? 20 : 8,
       headingPrefix: selectedNeighborPolicy === "selected-neighbor-v2"
         && (process.env.CORPUSWIRE_SELECTED_HEADING_PREFIX ?? "true") === "true",
-      onAccepted: (accepted) => { neighborAccepted = accepted; },
     })
     : formatted;
-  const coalesced = !serverEvidence
-    && process.env.CORPUSWIRE_SOURCE_ROOT_COALESCING === "per-file-v1"
-    && selectedNeighborPolicy === "selected-neighbor-v2"
-    ? await sourceRootCoalescingResult({
-      formatInput,
-      formatted: delivered,
-      selectedHits: neighborAccepted?.hits ?? hits,
-      observedControl: neighborAccepted?.delivered ?? deliveredControl,
-    })
-    : delivered;
   const failureMode = searchFailureMode({ result, hits, readPreparation });
   if (!failureMode) {
-    return coalesced;
+    return delivered;
   }
   const failureReportPath = await writeRetrievalFailureReportSafely({
     workspaceId: workspaceId ?? optionalString(context.workspace_id),
@@ -5294,23 +5079,7 @@ async function searchContextCore(args, telemetry, observation = undefined) {
       retrievalConfidence: finiteScore(result.retrieval_confidence),
     },
   });
-  return appendFailureReportPath(coalesced, failureReportPath);
-}
-
-async function searchContext(args, observation = undefined) {
-  const telemetry = privateSearchTelemetryState();
-  let outcome = "ok";
-  try {
-    return await searchContextCore(args, telemetry, observation);
-  } catch (error) {
-    outcome = "error";
-    throw error;
-  } finally {
-    if (telemetry) {
-      const totalHandlerMs = searchTimingMs(telemetry.started);
-      await writePrivateSearchTelemetrySafely(telemetry, totalHandlerMs, outcome);
-    }
-  }
+  return appendFailureReportPath(delivered, failureReportPath);
 }
 
 async function versionInfo(args) {
@@ -7881,29 +7650,6 @@ function globToRegExp(pattern) {
 
 function escapeRegExp(value) {
   return value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
-}
-
-function isIndexableRelativePath(relativePath) {
-  const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\/+/, "");
-  if (isProtectedDiagnosticPath(normalized)) {
-    return false;
-  }
-  if (isSensitiveTerraformRelativePath(normalized)) {
-    return false;
-  }
-  if (isDiscoveryOnlyRelativePath(normalized)) {
-    return false;
-  }
-  const segments = normalized.split("/").filter(Boolean);
-  if (
-    segments.some((segment) => EXCLUDED_PATH_SEGMENTS.has(segment) || segment.startsWith("."))
-    && !SAFE_INDEXABLE_PATHS.has(normalized)
-  ) {
-    return false;
-  }
-  const effectivePath = effectiveIndexableRelativePath(normalized);
-  return INDEXABLE_EXTENSIONS.has(path.posix.extname(effectivePath).toLowerCase())
-    || INDEXABLE_FILENAMES.has(path.posix.basename(effectivePath).toLowerCase());
 }
 
 function isProtectedDiagnosticPath(relativePath) {

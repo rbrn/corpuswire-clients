@@ -14,7 +14,6 @@
   "files": [
     "dist",
     "src",
-    "examples",
     "README.md",
     "tsconfig.json"
   ],

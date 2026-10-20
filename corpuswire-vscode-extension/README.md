@@ -46,7 +46,7 @@ The extension relies on `@corpuswire/sdk` for all HTTP protocol calls.
 ## Install And Build
 
 ```bash
-cd /Users/constantinaldea/workspace/my-context-engine/clients/corpuswire-vscode-extension
+cd /path/to/corpuswire/clients/corpuswire-vscode-extension
 npm install
 npm run compile
 ```
@@ -61,7 +61,7 @@ Run during development:
 Package a VSIX:
 
 ```bash
-cd /Users/constantinaldea/workspace/my-context-engine/clients/corpuswire-vscode-extension
+cd /path/to/corpuswire/clients/corpuswire-vscode-extension
 npm run package
 ```
 
@@ -189,7 +189,7 @@ used by a deployed service instead of relying on service-local `/ingest`.
 From the repository root:
 
 ```bash
-APP_HOST_PORT=18080 bash ./scripts/vscode_docker_remote_smoke.sh /Users/constantinaldea/workspace/my-context-engine
+APP_HOST_PORT=18080 bash ./scripts/vscode_docker_remote_smoke.sh /path/to/corpuswire
 ```
 
 The smoke test starts Docker, uploads workspace files using a generated
@@ -214,7 +214,7 @@ already compatible collection.
 Optionally let the smoke test merge those keys into the workspace settings:
 
 ```bash
-WRITE_VSCODE_SETTINGS=1 APP_HOST_PORT=18080 bash ./scripts/vscode_docker_remote_smoke.sh /Users/constantinaldea/workspace/my-context-engine
+WRITE_VSCODE_SETTINGS=1 APP_HOST_PORT=18080 bash ./scripts/vscode_docker_remote_smoke.sh /path/to/corpuswire
 ```
 
 ## Complete Workspace Ingestion

@@ -50,21 +50,10 @@ not change backend retrieval or index contents. The local postprocessor
 requires `topK=5` and
 `maxChars<=12000`; it does not change prompt-enhancement output.
 
-In `0.1.4-beta.1`, eligible v2 searches also preserve one immediately
-preceding authenticated Markdown heading and up to two blank lines when the
-existing budget permits. Set `CORPUSWIRE_SELECTED_HEADING_PREFIX=false` and
-restart the MCP host to disable this addition. The pure planner and offline
-renderer still require an explicit opt-in, so experiments stay reproducible.
-
-For a bounded local experiment, set
-`CORPUSWIRE_SOURCE_ROOT_COALESCING=per-file-v1` alongside the default
-`selected-neighbor-v2` policy. When two delivered hits come from the same
-SHA-verified file of at most 4,096 characters, it can merge them into one
-complete file excerpt if the 12,000-character budget and every previously
-delivered source line survive canonical rendering. It adds no new file and
-falls back byte-for-byte on any failed check. Unset the variable or set it to
-`off` to disable this experimental path. This proves displayed file bytes,
-not the identity of the whole published index.
+Eligible v2 searches also preserve one immediately preceding authenticated
+Markdown heading and up to two blank lines when the existing budget permits.
+Set `CORPUSWIRE_SELECTED_HEADING_PREFIX=false` and restart the MCP host to
+disable this addition.
 
 When the server packs evidence (`RETRIEVAL_EVIDENCE_PACKING=server-v1`,
 CRP-003), `/query` and `/v1/enhance` responses also carry `evidence_spans`
@@ -75,8 +64,7 @@ validates (relative path, sha256 `source_hash`, line count matching `text`, one
 hash per file, no overlap). Search then lists the hits with scores, renders an
 `Evidence:` block in the engine harness layout (`Path: <path>` then
 `<line>\t<source line>` rows, grouped by path in received order) and cites the
-span ranges; `selected-neighbor`, the heading prefix and source-root
-coalescing do not run. Enhancement adds the same `Evidence:` block after
+span ranges; `selected-neighbor` and the heading prefix do not run. Enhancement adds the same `Evidence:` block after
 `Context used:`. In every other case, including `CORPUSWIRE_SERVER_PACKING=off`
 or any value other than `auto`, output is byte-identical to a response without
 packing. `max_evidence_chars` (tool argument, else
@@ -121,7 +109,7 @@ Use this when the host runs from the CorpusWire repository checkout.
 {
   "command": "node",
   "args": [
-    "/Users/constantinaldea/workspace/my-context-engine/clients/corpuswire-mcp/bin/corpuswire-mcp.js"
+    "/path/to/corpuswire/clients/corpuswire-mcp/bin/corpuswire-mcp.js"
   ]
 }
 ```
@@ -131,7 +119,7 @@ Use this when the host runs from the CorpusWire repository checkout.
 Use this when a host prefers a command name instead of a repository-relative script path.
 
 ```bash
-npm install --global /Users/constantinaldea/workspace/my-context-engine/clients/corpuswire-mcp
+npm install --global /path/to/corpuswire/clients/corpuswire-mcp
 corpuswire-mcp
 ```
 
@@ -177,7 +165,7 @@ For a local checkout without a global install, point `npx` at the local package:
   "args": [
     "--yes",
     "--package",
-    "/Users/constantinaldea/workspace/my-context-engine/clients/corpuswire-mcp",
+    "/path/to/corpuswire/clients/corpuswire-mcp",
     "corpuswire-mcp"
   ]
 }
@@ -188,7 +176,7 @@ For a local checkout without a global install, point `npx` at the local package:
 To test against a real local Docker CorpusWire API from the repository root:
 
 ```bash
-bash ./scripts/regression_local_mcp.sh /Users/constantinaldea/workspace/my-context-engine
+bash ./scripts/regression_local_mcp.sh /path/to/corpuswire
 ```
 
 That command runs the Docker/API regression gate, then exercises the Codex wrapper path and this direct Copilot-oriented MCP path against `http://127.0.0.1:${APP_HOST_PORT:-8000}`. When the repository has `.env` with `APP_HOST_PORT`, the script uses that port.

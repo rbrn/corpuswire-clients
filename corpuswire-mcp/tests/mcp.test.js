@@ -1357,7 +1357,6 @@ test("both Node hosts default to source-verified Markdown heading prefixes with 
           CORPUSWIRE_SELECTED_NEIGHBOR_ROOT: sourceRoot,
           CORPUSWIRE_SELECTED_NEIGHBOR_POLICY: policy,
           CORPUSWIRE_SELECTED_HEADING_PREFIX: headingPrefix,
-          CORPUSWIRE_SOURCE_ROOT_COALESCING: "off",
           MOCK_QUERY_FIXTURE_PATH: fixturePath,
           MOCK_REQUESTS_PATH: path.join(tempDir, "requests.jsonl"),
         },
@@ -1493,114 +1492,6 @@ test("source-verified neighbor restores a definition line just before a selected
 });
 
 // The private telemetry sink only accepts macOS /private/tmp paths by design.
-test("private search telemetry records only timings and does not alter MCP results", {
-  skip: !existsSync("/private/tmp") && "requires the macOS /private/tmp telemetry location",
-}, async () => {
-  const tempDir = await mkdtemp("/private/tmp/corpuswire-search-telemetry-");
-  await chmod(tempDir, 0o700);
-  try {
-    const { sdkPath } = await writeMockSdk(tempDir);
-    const sourceRoot = path.join(tempDir, "workspace");
-    await mkdir(path.join(sourceRoot, "src"), { recursive: true });
-    const source = "anchor line\nneighbor line\n";
-    await writeFile(path.join(sourceRoot, "src", "evidence.py"), source, "utf8");
-    const hit = withDisplayProjection({
-      chunk_id: "selected-source", score: 1, text: "anchor line",
-      metadata: {
-        source_path: "src/evidence.py", start_line: 1, end_line: 1,
-        source_generation: 1,
-      },
-    }, { text: "anchor line", startLine: 1, endLine: 1, sourceText: source });
-    const fixturePath = path.join(tempDir, "fixture.json");
-    await writeFile(fixturePath, JSON.stringify({
-      result: {
-        retrieval_query: "synthetic timing question",
-        retrieval_backend: "fixture",
-        retrieval_evidence_policy: "generic-v2",
-        retrieval_not_found: false,
-        retrieved_chunks: [hit],
-      },
-      context: { workspace_id: "fixture-timing", collection: "fixture", index: { manifest_revision: 1 } },
-    }), "utf8");
-    const eventFile = path.join(tempDir, "events.jsonl");
-    await writeFile(eventFile, "", { mode: 0o600 });
-    await chmod(eventFile, 0o600);
-    const invoke = async (server, telemetryPath, policy) => {
-      const child = spawn("node", [server], {
-        stdio: ["pipe", "pipe", "pipe"],
-        env: {
-          ...globalThis.process.env,
-          CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
-          CORPUSWIRE_SDK_PATH: sdkPath,
-          CORPUSWIRE_SYNC_ENABLED: "false",
-          CORPUSWIRE_WORKSPACE_ID: "fixture-timing",
-          CORPUSWIRE_SYNC_ROOT: sourceRoot,
-          CORPUSWIRE_SELECTED_NEIGHBOR_POLICY: policy,
-          CORPUSWIRE_PRIVATE_SEARCH_TELEMETRY_PATH: telemetryPath,
-          MOCK_QUERY_FIXTURE_PATH: fixturePath,
-          MOCK_REQUESTS_PATH: path.join(tempDir, "requests.jsonl"),
-        },
-      });
-      try {
-        const response = await createRpc(child)({
-          jsonrpc: "2.0", id: 1, method: "tools/call", params: {
-            name: "corpuswire_search",
-            arguments: {
-              query: "synthetic timing question", workspaceId: "fixture-timing",
-              topK: 5, maxChars: 12000,
-            },
-          },
-        });
-        assert.equal(response.result.isError, false);
-        return response.result.content[0].text;
-      } finally {
-        child.kill();
-      }
-    };
-    const control = await invoke(SERVER_BIN, eventFile, "off");
-    const treatment = await invoke(WRAPPER_BIN, tempDir, "selected-neighbor-v1");
-    assert.match(treatment, /neighbor line/);
-    assert.doesNotMatch(control, /neighbor line/);
-    const fileEvents = (await readFile(eventFile, "utf8")).trim().split("\n").map(JSON.parse);
-    assert.equal(fileEvents.length, 1);
-    const directoryEvents = (await readdir(tempDir)).filter((name) =>
-      /^cw-search-timing-.*\.json$/.test(name));
-    assert.equal(directoryEvents.length, 1);
-    const event = JSON.parse(await readFile(path.join(tempDir, directoryEvents[0]), "utf8"));
-    assert.equal(fileEvents[0].treatmentProduced, false);
-    assert.equal(fileEvents[0].selectedNeighborEntered, false);
-    assert.equal(event.treatmentProduced, true);
-    assert.equal(event.selectedNeighborEntered, true);
-    for (const item of [...fileEvents, event]) {
-      assert.deepEqual(Object.keys(item).sort(), [
-        "backendQueryRawMs", "outcome", "schema_version", "selectedNeighborEntered",
-        "selectedNeighborEntryMs", "selectedNeighborMs", "selectedNeighborProposalMs",
-        "selectedNeighborSourceReadMs", "totalHandlerMs", "treatmentProduced",
-      ].sort());
-      assert.equal(item.schema_version, "rqt110g-search-timing/v1");
-      assert.equal(item.outcome, "ok");
-      assert.ok(Number.isFinite(item.totalHandlerMs) && item.totalHandlerMs >= 0);
-      assert.ok(Number.isFinite(item.backendQueryRawMs) && item.backendQueryRawMs >= 0);
-      assert.doesNotMatch(JSON.stringify(item), /synthetic timing question|fixture-timing|evidence\.py|anchor line/);
-    }
-    assert.ok(Number.isFinite(event.selectedNeighborSourceReadMs));
-    assert.ok(Number.isFinite(event.selectedNeighborProposalMs));
-    const saturated = `${Array.from({ length: 1000 }, () => JSON.stringify({
-      schema_version: "rqt110g-search-timing/v1",
-    })).join("\n")}\n`;
-    await writeFile(eventFile, saturated, "utf8");
-    assert.equal(await invoke(SERVER_BIN, eventFile, "off"), control);
-    assert.equal(await readFile(eventFile, "utf8"), saturated);
-    await chmod(tempDir, 0o755);
-    assert.equal(await invoke(SERVER_BIN, tempDir, "selected-neighbor-v1"), treatment);
-    assert.equal((await readdir(tempDir)).filter((name) =>
-      /^cw-search-timing-.*\.json$/.test(name)).length, 1);
-  } finally {
-    await chmod(tempDir, 0o700).catch(() => {});
-    await rm(tempDir, { recursive: true, force: true });
-  }
-});
-
 test("generic-v2 bounds a line-aligned donor trim before reserving a short successor", async () => {
   const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-successor-reservation-"));
   try {
@@ -1793,85 +1684,6 @@ test("five-hit rendering preserves a short terminal source chunk within twelve t
           child.kill();
         }
       }
-    }
-  } finally {
-    await rm(tempDir, { recursive: true, force: true });
-  }
-});
-
-test("opt-in per-file source coalescing preserves exact lines and falls back on source drift", async () => {
-  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-per-file-coalescing-"));
-  try {
-    const { sdkPath } = await writeMockSdk(tempDir);
-    const sourceRoot = path.join(tempDir, "workspace");
-    const relativePath = "src/source.ts";
-    const sourcePath = path.join(sourceRoot, relativePath);
-    await mkdir(path.dirname(sourcePath), { recursive: true });
-    const lines = Array.from({ length: 50 }, (_, index) => `const source_${index + 1} = ${index + 1};`);
-    const source = lines.join("\n") + "\n";
-    await writeFile(sourcePath, source, "utf8");
-    const selected = [["first", 25, 30], ["second", 30, 35]].map(([id, start, end]) =>
-      withDisplayProjection({
-        chunk_id: id, score: 1,
-        text: lines.slice(start - 1, end).join("\n"),
-        metadata: { source_path: relativePath, start_line: start,
-          end_line: end, source_generation: 1, index_scope: null },
-      }, { sourceText: source }));
-    const fixturePath = path.join(tempDir, "response.json");
-    const makeResponse = (hits, notFound = false) => ({
-      result: { retrieval_query: "synthetic source boundary", retrieval_backend: "fixture",
-        retrieval_evidence_policy: "generic-v2", retrieval_not_found: notFound,
-        retrieved_chunks: hits },
-      context: { workspace_id: "fixture-per-file", collection: "fixture",
-        index: { manifest_revision: 1 } },
-    });
-    const render = async (server, mode) => {
-      const child = spawn("node", [server], {
-        stdio: ["pipe", "pipe", "pipe"],
-        env: { ...globalThis.process.env, CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000",
-          CORPUSWIRE_SDK_PATH: sdkPath, CORPUSWIRE_SYNC_ENABLED: "false",
-          CORPUSWIRE_WORKSPACE_ID: "fixture-per-file", CORPUSWIRE_SYNC_ROOT: sourceRoot,
-          CORPUSWIRE_SELECTED_NEIGHBOR_POLICY: "selected-neighbor-v2",
-          CORPUSWIRE_SOURCE_ROOT_COALESCING: mode,
-          MOCK_QUERY_FIXTURE_PATH: fixturePath,
-          MOCK_REQUESTS_PATH: path.join(tempDir, "requests.jsonl") },
-      });
-      try {
-        const response = await createRpc(child)({ jsonrpc: "2.0", id: 1,
-          method: "tools/call", params: { name: "corpuswire_search",
-            arguments: { query: "synthetic source boundary", workspaceId: "fixture-per-file",
-              topK: 5, maxChars: 12000 } } });
-        assert.equal(response.result.isError, false);
-        return response.result.content[0].text;
-      } finally {
-        child.kill();
-      }
-    };
-    await writeFile(fixturePath, JSON.stringify(makeResponse(selected)), "utf8");
-    for (const server of [SERVER_BIN, WRAPPER_BIN]) {
-      const control = await render(server, "off");
-      const treatment = await render(server, "per-file-v1");
-      assert.match(treatment, /src\/source\.ts:1-50/);
-      assert.doesNotMatch(treatment, /\n2\. src\/source\.ts/);
-      assert.match(treatment, /const source_1 = 1;/);
-      assert.match(treatment, /const source_50 = 50;/);
-      for (const line of lines.slice(24, 35)) assert.ok(treatment.includes(line));
-      assert.ok(treatment.length > control.length / 2);
-
-      await writeFile(sourcePath, source + "changed", "utf8");
-      assert.equal(await render(server, "per-file-v1"), await render(server, "off"));
-      await writeFile(sourcePath, source, "utf8");
-      const withoutHash = structuredClone(selected);
-      delete withoutHash[0].metadata.source_hash;
-      await writeFile(fixturePath, JSON.stringify(makeResponse(withoutHash)), "utf8");
-      assert.equal(await render(server, "per-file-v1"), await render(server, "off"));
-      await writeFile(fixturePath, JSON.stringify(makeResponse(selected)), "utf8");
-      await writeFile(fixturePath, JSON.stringify(makeResponse(selected, true)), "utf8");
-      const negativeTreatment = await render(server, "per-file-v1");
-      const negativeControl = await render(server, "off");
-      assert.equal(negativeTreatment.split("\nDiagnostics:\n")[0],
-        negativeControl.split("\nDiagnostics:\n")[0]);
-      await writeFile(fixturePath, JSON.stringify(makeResponse(selected)), "utf8");
     }
   } finally {
     await rm(tempDir, { recursive: true, force: true });
@@ -3698,7 +3510,6 @@ async function withRetrievalJournalFixture(run) {
       CORPUSWIRE_SYNC_ENABLED: "false", CORPUSWIRE_SYNC_ROOT: workspace,
       CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK: "false", CORPUSWIRE_REPO_PATH: workspace,
       CORPUSWIRE_SELECTED_NEIGHBOR_POLICY: "off",
-      CORPUSWIRE_PRIVATE_SEARCH_TELEMETRY_PATH: "",
       CORPUSWIRE_WORKSPACE_ID: "local-docker://journal-test#main",
       CORPUSWIRE_RETRIEVAL_LOG_DIR: journal, CORPUSWIRE_RETRIEVAL_LOG_MODE: "full",
       CORPUSWIRE_RETRIEVAL_LOG_MAX_INPUT_BYTES: "65536",
@@ -4010,7 +3821,7 @@ test("private retrieval journal records effective replay defaults and bounds sou
 test("private retrieval journal distinguishes requested profile from applied enhancement fallback", async () => {
   await withRetrievalJournalFixture(async ({ launch, readEvents }) => {
     const host = launch({ CORPUSWIRE_OUTPUT_MODE: " copilot ", CORPUSWIRE_LOCAL_ONLY: "false",
-      CORPUSWIRE_SELECTED_NEIGHBOR_POLICY: "selected-neighbor-v2", CORPUSWIRE_SOURCE_ROOT_COALESCING: "per-file-v1" });
+      CORPUSWIRE_SELECTED_NEIGHBOR_POLICY: "selected-neighbor-v2" });
     assert.equal((await host.call(1, "corpuswire_enhance_prompt", { prompt: "Honest fallback metadata" })).result.isError, false);
     const [{ event }] = await readEvents();
     assert.equal(event.profile.outputMode, "copilot");

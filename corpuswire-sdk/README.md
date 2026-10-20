@@ -34,7 +34,6 @@ The package is runtime dependency free and targets Node.js 18 or newer.
 | `src/types.ts` | Public TypeScript types for prompt, retrieval, health, and index protocol payloads |
 | `src/index.ts` | Public exports |
 | `dist/` | Committed JavaScript and declaration files used by consumers |
-| `examples/` | Integration examples |
 | `tests/client.test.js` | Node test coverage for payload mapping, retries, fallback endpoints, and remote indexing |
 
 ## Install And Build

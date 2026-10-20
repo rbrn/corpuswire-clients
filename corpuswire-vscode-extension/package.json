@@ -19,9 +19,7 @@
     "onCommand:corpuswire.indexWorkspace",
     "onCommand:corpuswire.rebuildWorkspaceIndex",
     "onCommand:corpuswire.openPanel",
-    "onCommand:corpuswire.focusPanel",
-    "onCommand:corpuswireContextEngine.enhancePrompt",
-    "onCommand:corpuswireContextEngine.openPanel"
+    "onCommand:corpuswire.focusPanel"
   ],
   "main": "./dist/extension.js",
   "contributes": {
