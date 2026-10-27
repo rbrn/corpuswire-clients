@@ -15,6 +15,7 @@
     "lib/server-packed.mjs",
     "lib/host-profile.mjs",
     "lib/workspace-scope.mjs",
+    "lib/commit-freshness.mjs",
     "examples",
     "vendor",
     "README.md"

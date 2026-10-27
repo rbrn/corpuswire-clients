@@ -12,6 +12,7 @@ import { planSelectedNeighbor } from "../lib/selected-neighbor.mjs";
 import { boundServerSpans, groupServerSpans, renderServerSpans, shouldUseServerPacking } from "../lib/server-packed.mjs";
 import { SERVER_INSTRUCTIONS, decorateTools, detectHost, negotiateProtocolVersion, readToolProfile } from "../lib/host-profile.mjs";
 import { createWorkspaceScope, formatIdentityLines } from "../lib/workspace-scope.mjs";
+import { COMMIT_CHECK_MODES, classifyCommitFreshness, formatCommitFreshnessLine } from "../lib/commit-freshness.mjs";
 import { parseJsonc, resolveWorkspaceIdentity } from "../vendor/corpuswire-sdk/dist/workspace-identity.js";
 
 const JSONRPC_VERSION = "2.0";
@@ -30,6 +31,8 @@ const DEFAULT_SYNC_HOST_WAIT_CAP_MS = 240000;
 const DEFAULT_SYNC_BOOTSTRAP_TIMEOUT_MS = 5000;
 const DEFAULT_SYNC_GIT_TIMEOUT_MS = 5000;
 const DEFAULT_SYNC_GIT_MAX_FILES = 1000;
+const DEFAULT_COMMIT_CHECK_COOLDOWN_MS = 60000;
+const COMMIT_CHECK_HEAD_CACHE_MS = 5000;
 const DEFAULT_SYNC_GIT_MAX_STATUS_BYTES = 1024 * 1024;
 const DEFAULT_SYNC_MAX_FILE_SIZE_BYTES = 512 * 1024;
 const DEFAULT_SYNC_MAX_PENDING_PATHS = 100;
@@ -210,6 +213,10 @@ class SyncManager {
     this.activeReconcile = null;
     this.activeBootstrapCheck = null;
     this.activeGitDelta = null;
+    this.activeCommitSync = null;
+    this.lastCommitSyncStartedAt = 0;
+    this.gitHeadCache = new Map();
+    this.lastIndexedCommitByWorkspace = new Map();
     this.watcher = null;
     this.reconcileTimer = null;
     this.lastResult = null;
@@ -839,6 +846,81 @@ class SyncManager {
       };
     }
     return waited.value;
+  }
+
+  commitCheckMode() {
+    const mode = optionalString(this.env.CORPUSWIRE_SYNC_READ_COMMIT_CHECK) ?? "off";
+    return COMMIT_CHECK_MODES.has(mode) ? mode : "off";
+  }
+
+  async cachedGitHead(sourceRoot) {
+    const cached = this.gitHeadCache.get(sourceRoot);
+    if (cached && Date.now() - cached.at < COMMIT_CHECK_HEAD_CACHE_MS) return cached.head;
+    const head = optionalString(await runGit(sourceRoot, ["rev-parse", "HEAD"], {
+      timeoutMs: DEFAULT_SYNC_GIT_TIMEOUT_MS,
+      maxBuffer: DEFAULT_SYNC_GIT_MAX_STATUS_BYTES,
+    }).catch(() => "")) ?? null;
+    this.gitHeadCache.set(sourceRoot, { head, at: Date.now() });
+    return head;
+  }
+
+  // CORPUSWIRE_SYNC_READ_COMMIT_CHECK: "warn" compares the index's commit with
+  // HEAD after a read; "sync" also starts a background sync of the files
+  // committed since the indexed commit. Never delays the read.
+  async checkCommitFreshness(args = {}, index = {}) {
+    const mode = this.commitCheckMode();
+    if (mode === "off") return null;
+    const sourceRoot = path.resolve(firstNonEmptyString(
+      args.sourceRoot, args.source_root, this.env.CORPUSWIRE_SYNC_ROOT,
+      this.env.CORPUSWIRE_REPO_PATH, process.cwd(),
+    ));
+    const workspaceKey = firstNonEmptyString(args.workspaceId, args.workspace_id,
+      this.env.CORPUSWIRE_WORKSPACE_ID) ?? sourceRoot;
+    let indexedCommit = optionalString(index?.indexed_commit);
+    if (index && Object.hasOwn(index, "indexed_commit")) {
+      this.lastIndexedCommitByWorkspace.set(workspaceKey, indexedCommit ?? null);
+    } else {
+      // /v1/enhance carries no index block; reuse the last search's answer.
+      indexedCommit = this.lastIndexedCommitByWorkspace.get(workspaceKey) ?? undefined;
+    }
+    const gitOptions = {
+      timeoutMs: optionalPositiveInteger(this.env.CORPUSWIRE_SYNC_GIT_TIMEOUT_MS, DEFAULT_SYNC_GIT_TIMEOUT_MS),
+      maxBuffer: optionalPositiveInteger(this.env.CORPUSWIRE_SYNC_GIT_MAX_STATUS_BYTES, DEFAULT_SYNC_GIT_MAX_STATUS_BYTES),
+    };
+    const git = (gitArgs) => runGit(sourceRoot, gitArgs, gitOptions)
+      .then((stdout) => ({ ok: true, stdout }), () => ({ ok: false, stdout: "" }));
+    const check = await classifyCommitFreshness({
+      git, indexedCommit, head: await this.cachedGitHead(sourceRoot),
+    });
+    check.mode = mode;
+    if (mode !== "sync" || check.state !== "behind") return check;
+    const files = check.changedPaths.length + check.deletedPaths.length;
+    const maxFiles = optionalPositiveInteger(this.env.CORPUSWIRE_SYNC_GIT_MAX_FILES, DEFAULT_SYNC_GIT_MAX_FILES);
+    const cooldownMs = optionalNonNegativeInteger(
+      this.env.CORPUSWIRE_SYNC_READ_COMMIT_COOLDOWN_MS, DEFAULT_COMMIT_CHECK_COOLDOWN_MS);
+    if (!this.isEnabled()) {
+      check.sync = "sync_disabled";
+    } else if (files > maxFiles) {
+      check.sync = `over ${maxFiles} files, run cw reconcile`;
+    } else if (this.activeCommitSync) {
+      check.sync = "already_running";
+    } else if (Date.now() - this.lastCommitSyncStartedAt < cooldownMs) {
+      check.sync = "cooldown";
+    } else {
+      this.lastCommitSyncStartedAt = Date.now();
+      this.activeCommitSync = this.addDelta({
+        sourceRoot,
+        workspaceId: firstNonEmptyString(args.workspaceId, args.workspace_id),
+        changedPaths: check.changedPaths,
+        deletedPaths: check.deletedPaths,
+        flush: true,
+        eventSource: "git-commit",
+      })
+        .catch((error) => this.recordError(error, "git"))
+        .finally(() => { this.activeCommitSync = null; });
+      check.sync = "started";
+    }
+    return check;
   }
 
   async runGitDelta(args = {}) {
@@ -4196,14 +4278,14 @@ async function searchContext(args, observation = undefined) {
     ...(serverEvidence ? { serverEvidence } : {}),
     ...(observeNeighbor ? { onRenderedHit: (item) => deliveredControl.push(item) } : {}),
   });
-  const delivered = observeNeighbor
+  const delivered = await withCommitFreshness(observeNeighbor
     ? await selectedNeighborResult({
       formatInput, formatted, deliveredControl,
       maxRadius: selectedNeighborPolicy === "selected-neighbor-v2" ? 20 : 8,
       headingPrefix: selectedNeighborPolicy === "selected-neighbor-v2"
         && (process.env.CORPUSWIRE_SELECTED_HEADING_PREFIX ?? "true") === "true",
     })
-    : formatted;
+    : formatted, args, asRecord(context.index));
   const failureMode = searchFailureMode({ result, hits, readPreparation });
   if (!failureMode) {
     return delivered;
@@ -5617,7 +5699,7 @@ async function enhancePrompt(args, observation = undefined) {
     : [];
 
   const serverEvidence = serverPackedEvidence(result);
-  const formatted = compactResultHeader([
+  const formattedBase = compactResultHeader([
     "Prompt augmentation preview",
     "",
     "Original prompt:",
@@ -5658,6 +5740,8 @@ async function enhancePrompt(args, observation = undefined) {
       ? ["", "Citations:", ...result.citations.map((citation) => `- ${citation}`)]
       : []),
   ]).join("\n");
+  // /v1/enhance has no index block; the check reuses the last search's commit.
+  const formatted = await withCommitFreshness(formattedBase, args, undefined);
   const failureMode = enhancementFailureMode({
     result,
     enhancedPrompt,
@@ -5685,6 +5769,14 @@ async function enhancePrompt(args, observation = undefined) {
     },
   });
   return appendFailureReportPath(formatted, failureReportPath);
+}
+
+async function withCommitFreshness(text, args, index) {
+  const check = await syncManager.checkCommitFreshness(args, index).catch(() => null);
+  const line = formatCommitFreshnessLine(check, {
+    readSnapshot: Array.isArray(index?.read_partitions),
+  });
+  return line ? `${text}\n${line}` : text;
 }
 
 function indentPreviewBlock(text) {
