@@ -327,6 +327,8 @@ Recommended prompt settings:
 - `CORPUSWIRE_SYNC_GIT_MAX_FILES`: max git status entries processed by one git delta scan, default `1000`
 - `CORPUSWIRE_SYNC_GIT_MAX_STATUS_BYTES`: max buffered output from `git status -z`, default `1048576`
 - `CORPUSWIRE_SYNC_GIT_DELTA_BEFORE_READ`: run a bounded git delta scan and flush before search/enhance, default `false`
+- `CORPUSWIRE_SYNC_READ_COMMIT_CHECK`: after each search/enhance, compare the index's `indexed_commit` with local `HEAD` and add an `indexFreshness` line (`fresh`, `behind`, `diverged` or `unknown`); `warn` only reports, `sync` also starts a background sync of the files changed between the two commits (`git diff --name-status -M`), which the plain git delta misses because it reads only `git status`. Default `off`. Needs a server that records `indexed_commit` (CRP-004 step 0); enhance reuses the last search's commit
+- `CORPUSWIRE_SYNC_READ_COMMIT_COOLDOWN_MS`: minimum time between two commit-check syncs, default `60000`; a check over `CORPUSWIRE_SYNC_GIT_MAX_FILES` changed files recommends `cw reconcile` instead
 - `CORPUSWIRE_SYNC_READ_FRESHNESS_CHECK`: refresh bootstrap freshness before search/enhance, default `false`
 - `CORPUSWIRE_SYNC_READ_FRESHNESS_TIMEOUT_MS`: max read-side freshness diagnosis wait, default `5000`
 - `CORPUSWIRE_SYNC_READ_STRICT`: block search/enhance when read freshness says reconciliation is needed, default `false`
