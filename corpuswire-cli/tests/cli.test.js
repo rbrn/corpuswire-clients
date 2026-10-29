@@ -1,7 +1,7 @@
 import test from "node:test";
 import { CorpusWireClient } from "@corpuswire/sdk";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile, readFile, readdir, chmod, symlink, rename } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readFile, readdir, chmod, symlink, rename, stat } from "node:fs/promises";
 import { EventEmitter, once } from "node:events";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
@@ -1012,9 +1012,9 @@ test("init is idempotent, preserves unrelated settings and MCP config, and write
       env: { CORPUSWIRE_BEARER_TOKEN: "must-never-be-saved" }, write: () => {},
       client: { health: () => { throw new Error("init must not call backend"); } },
     };
-    const first = await main(["init"], dependencies);
+    const first = await main(["init", "--no-index"], dependencies);
     const firstText = await readFile(settingsPath, "utf8");
-    const second = await main(["init"], dependencies);
+    const second = await main(["init", "--no-index"], dependencies);
     assert.equal(first.changed, true);
     assert.equal(second.changed, false);
     assert.equal(await readFile(settingsPath, "utf8"), firstText);
@@ -2786,4 +2786,66 @@ test("--context-file rejects malformed documents and non-enhance commands", asyn
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("a workspace the service refuses is registered once, then indexing proceeds", async () => {
+  const fixture = await syntheticWorkspace();
+  const ensured = [];
+  let lookups = 0;
+  try {
+    await runCliCommand({ ...indexOptions(fixture), yes: true }, { client: fakeIndexClient({
+      listIndexSessions: async () => {
+        lookups += 1;
+        if (lookups === 1) throw Object.assign(new Error("private detail"), { status: 403 });
+        return [];
+      },
+      ensureWorkspace: async (request) => {
+        ensured.push(request.workspaceId);
+        return { mode: "member", created: true, workspaceId: request.workspaceId, tenantId: "tenant-a" };
+      },
+    }), write: () => {}, writeRaw: () => {}, isTTY: false });
+    assert.deepEqual(ensured, ["demo://cli-synthetic#main"]);
+    assert.equal(lookups, 2);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
+test("a refusal that registration cannot fix names the next step without server text", async () => {
+  const fixture = await syntheticWorkspace();
+  let previews = 0;
+  try {
+    await assert.rejects(runCliCommand({ ...indexOptions(fixture), yes: true }, { client: fakeIndexClient({
+      listIndexSessions: async () => { throw Object.assign(new Error("private detail"), { status: 403 }); },
+      ensureWorkspace: async () => { throw Object.assign(new Error("fixed list"), { status: 403 }); },
+      previewIndexWorkspace: () => { previews += 1; },
+    }), write: () => {}, writeRaw: () => {}, isTTY: false }), (error) => error.code === "session_preflight_unavailable"
+      && error.message.includes("run cw init") && !error.message.includes("private detail"));
+    assert.equal(previews, 0);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
+test("init on a local service without credentials creates a tenant, saves its token privately and indexes", async () => {
+  const fixture = await syntheticWorkspace();
+  const onboarded = [];
+  const tokens = [];
+  class FakeClient {
+    constructor(options) {
+      tokens.push(options.bearerToken ?? "");
+      Object.assign(this, fakeIndexClient({ listIndexSessions: async () => [] }));
+      this.bearerToken = options.bearerToken ?? "";
+    }
+    async ensureWorkspace() { throw Object.assign(new Error("Authentication required."), { status: 401 }); }
+    async selfOnboard(request) { onboarded.push(request); return { tenantId: request.tenantId, token: "issued-once" }; }
+  }
+  try {
+    await main(["init"], { cwd: fixture, homeDirectory: fixture, env: {}, platform: "linux", tenantId: "test-tenant",
+      sdk: { CorpusWireClient: FakeClient }, write: () => {}, writeRaw: () => {}, isTTY: false,
+      signal: new AbortController().signal });
+    assert.equal(onboarded.length, 1);
+    assert.equal(onboarded[0].tenantId, "test-tenant");
+    const credentialPath = path.join(fixture, ".local", "share", "corpuswire", "cli-credentials.json");
+    const saved = JSON.parse(await readFile(credentialPath, "utf8"));
+    assert.equal(saved.services["http://127.0.0.1:18080"].bearerToken, "issued-once");
+    assert.equal((await stat(credentialPath)).mode & 0o777, 0o600);
+    assert.equal(tokens.at(-1), "issued-once");
+  } finally { await rm(fixture, { recursive: true, force: true }); }
 });

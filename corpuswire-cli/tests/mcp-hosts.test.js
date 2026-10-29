@@ -170,7 +170,8 @@ test("cw search queries the folder's configured or indexed workspace", async (t)
   await search(false);
   await runCliCommand(parseCliArgs(["search", "where", "--workspace-id", "explicit"], {}, box.repo),
     { client: client(false), write: () => {}, homeDirectory: box.home });
-  assert.deepEqual(requests, [derived, null, "configured", "explicit"]);
+  // An unindexed folder keeps its own workspace instead of borrowing the backend default.
+  assert.deepEqual(requests, [derived, derived, "configured", "explicit"]);
   assert.equal(notes.length, 1);
-  assert.match(notes[0], /has no index yet; using the backend default workspace/);
+  assert.match(notes[0], /has no index yet; answering without repository context/);
 });

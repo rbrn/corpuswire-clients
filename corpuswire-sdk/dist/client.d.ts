@@ -24,6 +24,25 @@ export declare class RemoteIndexCancelledError extends Error {
     readonly status: RemoteIndexStatus;
     constructor(sessionId: string, status: RemoteIndexStatus);
 }
+export interface EnsuredWorkspace {
+    mode: "anonymous-local" | "wildcard-token" | "member";
+    created: boolean;
+    workspaceId: string;
+    tenantId: string;
+}
+export interface SelfOnboardingRequest {
+    tenantId: string;
+    tenantDisplayName: string;
+    ownerDisplayName: string;
+    workspaceId: string;
+    workspaceDisplayName?: string;
+    credentialName: string;
+    scopes?: string[];
+}
+export interface SelfOnboardingResult {
+    tenantId: string;
+    token: string;
+}
 export declare class CorpusWireClient {
     readonly baseUrl: string;
     readonly basicAuth: string;
@@ -49,6 +68,13 @@ export declare class CorpusWireClient {
     reviewQuality(request?: QualityReviewQuery): Promise<QualityReview>;
     confirmQueryValue(request: ValueFeedbackRequest): Promise<QueryValueEvent>;
     valueRollup(request?: ValueRollupQuery): Promise<ValueRollup>;
+    /** Idempotently register a workspace in the caller's tenant with the caller as owner. */
+    ensureWorkspace(request: {
+        workspaceId: string;
+        displayName?: string;
+    }): Promise<EnsuredWorkspace>;
+    /** Create a tenant, its owner, a first workspace and a tenant-wide credential (shown once). */
+    selfOnboard(request: SelfOnboardingRequest): Promise<SelfOnboardingResult>;
     createCodebase(request: CreateCodebaseRequest): Promise<CodebaseV1>;
     listCodebases(): Promise<CodebaseV1[]>;
     getCodebase(codebaseId: string): Promise<CodebaseV1>;

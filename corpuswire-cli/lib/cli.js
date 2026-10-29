@@ -1,9 +1,9 @@
 import { deriveWorkspaceId, isRetrievalExcludedPath } from "@corpuswire/sdk";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { readFile, readdir, stat, lstat, mkdir, writeFile, open, realpath } from "node:fs/promises";
+import { readFile, readdir, stat, lstat, mkdir, writeFile, open, realpath, rename } from "node:fs/promises";
 import { constants as fsConstants, watch as watchFiles } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname, userInfo } from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline/promises";
@@ -39,7 +39,7 @@ Usage:
   cw                         Index and watch this folder in an interactive terminal
   cw watch [options]         Index and keep reconciling local source changes
   cw --once                  Index once and exit
-  cw init [--index] [--verify] Configure this workspace
+  cw init [--no-index] [--verify] Configure, register and index this workspace
   cw doctor [options]        Check service and code/full readiness (read-only)
   cw reconcile [options]     Full workspace indexing with confirmation
   cw "<prompt>" [options]
@@ -300,6 +300,9 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
       case "--index":
         options.indexAfterInit = true;
         break;
+      case "--no-index":
+        options.noIndex = true;
+        break;
       case "--verify":
         options.verifyAfterInit = true;
         break;
@@ -340,8 +343,8 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
   if (options.maxFileSizeBytes !== undefined && (!Number.isSafeInteger(options.maxFileSizeBytes) || options.maxFileSizeBytes <= 0)) {
     throw new Error("max-file-size must be a positive safe integer.");
   }
-  if (command !== "init" && (options.indexAfterInit || options.verifyAfterInit)) {
-    throw new Error("--index and --verify are only supported with init.");
+  if (command !== "init" && (options.indexAfterInit || options.verifyAfterInit || options.noIndex)) {
+    throw new Error("--index, --no-index and --verify are only supported with init.");
   }
   if (options.contextFile !== undefined && command !== "enhance") {
     throw new Error("--context-file is only supported with enhance/rewrite.");
@@ -371,6 +374,8 @@ export async function runCliCommand(options, dependencies = {}) {
     const interactive = dependencies.isTTY ?? Boolean(process.stdin.isTTY && process.stdout.isTTY);
     if (options.implicitIndex && configuration.profile === "local" && interactive
       && !options.once && !options.nonInteractive && !options.json && !options.ndjson) options.watch = true;
+    // Local init indexes by default; a hosted upload still needs an explicit --index.
+    if (options.command === "init" && configuration.profile === "local" && !options.noIndex) options.indexAfterInit = true;
     if (options.command === "init") {
       const result = await initializeWorkspace(options, dependencies);
       if (!options.indexAfterInit && !options.verifyAfterInit) return result;
@@ -389,7 +394,20 @@ export async function runCliCommand(options, dependencies = {}) {
     }
   }
   const sdk = dependencies.client ? undefined : dependencies.sdk ?? await loadSdk();
-  const authorization = dependencies.client ? {} : await resolveServiceAuthorization(options, dependencies);
+  let authorization = dependencies.client ? {} : await resolveServiceAuthorization(options, dependencies);
+  // `cw init` registers the folder's workspace (and, on a local service with no
+  // credential yet, its tenant) up front; other commands do it only on refusal.
+  const registersWorkspace = options.command === "init" && options.indexAfterInit;
+  if (registersWorkspace && !dependencies.client && options.workspaceId) {
+    const onboardedToken = await ensureServiceWorkspace(
+      new sdk.CorpusWireClient({ baseUrl: options.apiBaseUrl, basicAuth: options.basicAuth, ...authorization,
+        fetchFn: createServiceFetch(dependencies.fetchFn ?? globalThis.fetch, options.apiBaseUrl) }),
+      options, authorization, dependencies, write,
+    );
+    if (onboardedToken) authorization = { basicAuth: "", bearerToken: onboardedToken };
+  } else if (registersWorkspace && options.workspaceId) {
+    await ensureServiceWorkspace(dependencies.client, options, authorization, dependencies, write);
+  }
   const traceCollector = createIndexTraceCollector();
   const serviceFetch = createServiceFetch(dependencies.fetchFn ?? globalThis.fetch, options.apiBaseUrl);
   const fetchFn = options.watch
@@ -416,9 +434,8 @@ export async function runCliCommand(options, dependencies = {}) {
     });
 
   if (derivedQueryWorkspace && !(await workspaceHasIndex(client, derivedQueryWorkspace))) {
-    // A folder default nobody indexed yet would only return nothing; keep the backend default.
-    (dependencies.writeError ?? console.error)(`Note: ${derivedQueryWorkspace} has no index yet; using the backend default workspace. Run cw in this folder to index it.`);
-    options = { ...options, workspaceId: "" };
+    // Another workspace's context would be wrong here, so answer without repository context.
+    (dependencies.writeError ?? console.error)(`Note: ${derivedQueryWorkspace} has no index yet; answering without repository context. Run cw in this folder to index it.`);
   }
 
   if (options.watch) return runWatchCommand(options, { ...dependencies, client, sdk, write, traceCollector, configurationInputs });
@@ -1067,7 +1084,8 @@ export async function runIndexCommand(options, dependencies) {
     ndjson: options.ndjson || options.json,
   });
 
-  const approved = options.yes === true || (options.implicitIndex === true && configuration.profile === "local" && options.rebuild !== true)
+  const approved = options.yes === true
+    || ((options.implicitIndex === true || options.command === "init") && configuration.profile === "local" && options.rebuild !== true)
     ? true
     : options.nonInteractive === true
     ? false
@@ -1251,6 +1269,101 @@ async function resolveIndexConfiguration(options, sourceRoot, dependencies = {})
       ?? mcpValue("CORPUSWIRE_SYNC_MAX_FILE_SIZE_BYTES")
       ?? nestedValue(userSettings, "remoteIndexing.maxFileSizeBytes")),
   };
+}
+
+/**
+ * Make the folder's workspace usable before indexing: register it in the
+ * caller's tenant, or create the tenant first when a local service has no
+ * credential yet. Returns a newly issued token, if any.
+ */
+async function ensureServiceWorkspace(client, options, authorization, dependencies, write) {
+  if (typeof client?.ensureWorkspace !== "function") return "";
+  const quiet = options.json || options.ndjson;
+  const request = { workspaceId: options.workspaceId, displayName: path.basename(options.sourceRoot || "") || undefined };
+  try {
+    const result = await client.ensureWorkspace(request);
+    if (result?.created && !quiet) write(`Registered workspace ${sanitizeTerminalText(options.workspaceId)} in tenant ${sanitizeTerminalText(result.tenantId)}.`);
+    return "";
+  } catch (error) {
+    // An engine without /v1/workspaces/ensure leaves registration to its own rules.
+    if (error?.status === 404 || error?.status === 405) return "";
+    const hasCredential = Boolean(authorization?.bearerToken || authorization?.basicAuth);
+    if (error?.status !== 401 || hasCredential || !isLoopbackService(options.apiBaseUrl)) {
+      throw explainServiceRefusal(error, options);
+    }
+  }
+  const token = await onboardLocalTenant(client, options, dependencies);
+  if (!quiet) write("Created a CorpusWire tenant for this machine and saved its credential.");
+  return token;
+}
+
+async function onboardLocalTenant(client, options, dependencies) {
+  if (typeof client.selfOnboard !== "function") throw new Error("This client cannot create a tenant; save a service credential and retry.");
+  const user = (() => { try { return userInfo().username; } catch { return ""; } })();
+  const tenantId = (dependencies.tenantId ?? `${user}-${hostname()}`).toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 63).replace(/-+$/, "") || "local-dev";
+  let result;
+  try {
+    result = await client.selfOnboard({
+      tenantId: tenantId.length >= 2 ? tenantId : `${tenantId}-cw`,
+      tenantDisplayName: user || tenantId,
+      ownerDisplayName: user || tenantId,
+      workspaceId: options.workspaceId,
+      workspaceDisplayName: path.basename(options.sourceRoot || "") || undefined,
+      credentialName: `cw on ${hostname()}`,
+    });
+  } catch (error) {
+    if (error?.status === 404) throw new Error("No CorpusWire credential was found and the service has self-onboarding turned off. Save a service credential, or run the service with CORPUSWIRE_AUTH_MODE=off for local development.");
+    if (error?.status === 409) throw new Error(`Tenant ${tenantId} already exists, but no credential for it is saved here. Save its credential and retry.`);
+    throw explainServiceRefusal(error, options);
+  }
+  await saveLocalServiceToken(options.apiBaseUrl, result.token, dependencies);
+  return result.token;
+}
+
+async function saveLocalServiceToken(apiBaseUrl, token, dependencies) {
+  const url = new URL(apiBaseUrl);
+  const account = `${url.protocol}//${url.host.toLowerCase()}${url.pathname.replace(/\/+$/, "")}`;
+  const filePath = dependencies.credentialFile ?? path.join(
+    dependencies.homeDirectory ?? homedir(), ".local", "share", "corpuswire", "cli-credentials.json",
+  );
+  let current = { schemaVersion: 1, services: {} };
+  try {
+    const existing = JSON.parse(await readFile(filePath, "utf8"));
+    if (existing?.schemaVersion === 1 && existing.services && typeof existing.services === "object") current = existing;
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw new Error(`The credential file ${filePath} is unreadable; the new credential was not saved.`);
+  }
+  current.services[account] = { bearerToken: token };
+  await mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  const temporary = `${filePath}.${process.pid}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(current, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+  await rename(temporary, filePath);
+}
+
+function isLoopbackService(apiBaseUrl) {
+  try { return ["localhost", "127.0.0.1", "[::1]", "::1"].includes(new URL(apiBaseUrl).hostname); }
+  catch { return false; }
+}
+
+/** Turn a service refusal into the reason and a next step, keeping the server's own words. */
+function explainServiceRefusal(error, options) {
+  const status = error?.status;
+  const detail = sanitizeTerminalText(String(error?.errorMessage ?? error?.message ?? "").slice(0, 300));
+  const workspace = sanitizeTerminalText(options.workspaceId ?? "");
+  const message = status === 401
+    ? `The service needs credentials (401: ${detail}). Run cw init on this machine, or save a service credential.`
+    : status === 403
+    ? `The service refused workspace ${workspace} (403: ${detail}).`
+    : status === 404
+    ? `The service does not know workspace ${workspace} (404: ${detail}). Run cw init in this folder.`
+    : error?.serviceUnavailable || status === undefined
+    ? `The CorpusWire service at ${displayServiceUrl(options.apiBaseUrl)} is unreachable: ${detail}`
+    : `The service answered ${status}: ${detail}`;
+  return Object.assign(new Error(message, { cause: error }), {
+    code: status === 401 || status === 403 ? "authentication_rejected" : "service_refused",
+    status,
+  });
 }
 
 async function workspaceHasIndex(client, workspaceId) {
@@ -2107,14 +2220,27 @@ async function preflightExistingSession(options, dependencies, renderer, write) 
         lookupController.abort();
       }, dependencies.watchRequestTimeoutMs ?? DEFAULT_WATCH_REQUEST_TIMEOUT_MS);
     });
-    sessions = await Promise.race([client.listIndexSessions({ workspaceId: options.workspaceId }, { signal: lookupController.signal }), interrupted]);
+    const lookup = () => Promise.race([client.listIndexSessions({ workspaceId: options.workspaceId }, { signal: lookupController.signal }), interrupted]);
+    try {
+      sessions = await lookup();
+    } catch (refusal) {
+      // A workspace this credential may reach but nobody registered yet: register it once, then look again.
+      if (refusal?.status !== 403 || typeof client.ensureWorkspace !== "function") throw refusal;
+      try { await ensureServiceWorkspace(client, options, {}, dependencies, write); }
+      catch { throw refusal; }
+      sessions = await lookup();
+    }
   }
   catch (cause) {
     if (cause?.serviceUnavailable) {
       cause.message += "\nExisting indexing could not be checked; no files were scanned.";
       throw cause;
     }
-    throw Object.assign(new Error("Could not check existing indexing; no files were scanned. Check service/authentication and retry.", { cause }), { code: "session_preflight_unavailable" });
+    // Server text stays out of this message; the status alone says what to fix.
+    const hint = cause?.status === 401 ? " The service needs credentials: run cw init here or save a service credential."
+      : cause?.status === 403 ? " The service refused this workspace for the current credential; run cw init here to register it."
+      : " Check service/authentication and retry.";
+    throw Object.assign(new Error(`Could not check existing indexing; no files were scanned.${hint}`, { cause }), { code: "session_preflight_unavailable" });
   } finally {
     clearTimeout(lookupTimer);
     lookupSignal?.removeEventListener("abort", stopLookup);
@@ -2490,7 +2616,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     return result;
   };
   const indexingCommand = ["index", "reconcile", "watch"].includes(options.command)
-    || (options.command === "init" && options.indexAfterInit);
+    || (options.command === "init" && !options.noIndex);
   if (!indexingCommand || dependencies.signal) {
     return recordExitCode(await runCliCommand(options, dependencies));
   }

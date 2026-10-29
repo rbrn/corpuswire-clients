@@ -253,6 +253,50 @@ export class CorpusWireClient {
         });
         return response.rollup;
     }
+    /** Idempotently register a workspace in the caller's tenant with the caller as owner. */
+    async ensureWorkspace(request) {
+        const response = await requestJson({
+            baseUrl: this.baseUrl,
+            paths: ["/v1/workspaces/ensure"],
+            fetchFn: this.fetchFn,
+            defaultHeaders: this.defaultHeaders,
+            basicAuth: this.basicAuth,
+            init: {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ workspace_id: request.workspaceId, display_name: request.displayName }),
+            },
+        });
+        return {
+            mode: response.mode,
+            created: response.created,
+            workspaceId: response.workspace_id,
+            tenantId: response.tenant_id,
+        };
+    }
+    /** Create a tenant, its owner, a first workspace and a tenant-wide credential (shown once). */
+    async selfOnboard(request) {
+        const response = await requestJson({
+            baseUrl: this.baseUrl,
+            paths: ["/v1/onboarding"],
+            fetchFn: this.fetchFn,
+            defaultHeaders: {},
+            init: {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    tenant_id: request.tenantId,
+                    tenant_display_name: request.tenantDisplayName,
+                    owner_display_name: request.ownerDisplayName,
+                    workspace_id: request.workspaceId,
+                    workspace_display_name: request.workspaceDisplayName,
+                    credential_name: request.credentialName,
+                    scopes: request.scopes ?? ["index:read", "index:write", "retrieval:read"],
+                }),
+            },
+        });
+        return { tenantId: response.tenant.tenant_id, token: response.credential.token };
+    }
     async createCodebase(request) {
         return requestJson({
             baseUrl: this.baseUrl,
