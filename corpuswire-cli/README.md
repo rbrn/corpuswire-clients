@@ -13,7 +13,7 @@ The Node CLI defaults to the existing local Docker service at
 From any repository folder:
 
 ```bash
-cw init                 # Save reusable, secret-free local workspace settings
+cw init                 # Save workspace settings, register the workspace, then index it
 cw doctor               # Read-only readiness and inventory checks
 cw                      # Index, then watch this folder until Ctrl+C
 cw --once               # Index once and exit (for scripts)
@@ -23,9 +23,15 @@ cw --help               # Show supported commands without indexing
 cw version              # Show this CLI's version without contacting the service
 ```
 
-`init` configures the CLI workspace; it does not install Docker, create service
-credentials, register a new MCP server, or replace existing editor/MCP settings.
-`init --index --verify` also indexes and checks readiness. Bare local invocation
+`init` saves the workspace settings and, on a local service, registers the
+workspace in your tenant and indexes it (`--no-index` stops after the settings;
+`--verify` adds a readiness check). When the local service needs a credential
+and none is saved, `init` creates a tenant through self-onboarding and stores
+its token in the owner-only `~/.local/share/corpuswire/cli-credentials.json`.
+It does not install Docker, register a new MCP server, or replace existing
+editor/MCP settings. A hosted service still needs an explicit `init --index`.
+If the service refuses a workspace your credential may reach but nobody
+registered yet, `cw` registers it once and continues. Bare local invocation
 runs the normal full-index preview and indexing without another confirmation;
 in an interactive terminal it then watches for source changes. Piped/non-TTY bare
 calls, `--once`, and explicit `index`/`reconcile` remain one-shot; explicit
