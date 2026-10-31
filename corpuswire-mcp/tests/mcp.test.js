@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -2992,7 +2992,11 @@ test("private retrieval journal captures exact delivered search and enhancement 
         const captured = rows.filter(({ event }) => event.eventId === eventId);
         assert.equal(captured.length, 1);
         const saved = captured[0].event;
-        assert.equal(saved.schemaVersion, "corpuswire-private-retrieval/v2");
+        assert.equal(saved.schemaVersion, "corpuswire-private-retrieval/v3");
+        assert.equal(saved.stageTrace, null);
+        assert.equal(saved.traceUnavailable, "not_returned");
+        // The fixture workspace is not a git checkout.
+        assert.equal(saved.workspaceGit, null);
         assert.equal(saved.tool, tool);
         assert.equal(saved.input.text, args.query ?? args.prompt);
         assert.equal(saved.error, null);
@@ -3015,6 +3019,67 @@ test("private retrieval journal captures exact delivered search and enhancement 
     }
     assert.equal((await lstat(journal)).mode & 0o777, 0o700);
     assert.equal((await readEvents()).length, 4);
+  });
+});
+
+const MOCK_TRACE = {
+  schema: "corpuswire-stage-trace/v1",
+  paths: ["src/secret-plan/router.py"],
+  chunks: [["c1", 0, 1, 9]],
+  lanes: { vector: { skipped: null, count: 1, truncated: false, topScore: 0.7, hits: [[0, 0.7]] } },
+  stageOne: [[0, 1.2]],
+  enhancer: { retrievalQuery: "private-fact query", namedPaths: ["src/secret-plan/router.py"],
+    unsupportedIdentifiers: { count: 1, values: ["PrivateThing"] } },
+};
+
+test("private retrieval journal stores the engine stage trace and keeps it out of delivered text", async () => {
+  await withRetrievalJournalFixture(async ({ launch, readEvents }) => {
+    const host = launch({ MOCK_STAGE_TRACE: JSON.stringify(MOCK_TRACE) });
+    for (const [id, tool, args] of [[1, "corpuswire_search", { query: "routing evidence" }],
+      [2, "corpuswire_enhance_prompt", { prompt: "Improve routing evidence", localOnly: true }]]) {
+      const response = await host.call(id, tool, args);
+      assert.equal(response.result.isError, false);
+      assert.doesNotMatch(JSON.stringify(response.result), /stage_trace|stageTrace|corpuswire-stage-trace/);
+    }
+    const events = (await readEvents()).map(({ event }) => event);
+    assert.equal(events.length, 2);
+    for (const event of events) {
+      assert.equal(event.traceUnavailable, null);
+      assert.deepEqual(event.stageTrace, MOCK_TRACE);
+    }
+  });
+  await withRetrievalJournalFixture(async ({ launch, readEvents }) => {
+    const host = launch({ MOCK_STAGE_TRACE: JSON.stringify(MOCK_TRACE), CORPUSWIRE_RETRIEVAL_LOG_MODE: "metadata" });
+    assert.equal((await host.call(1)).result.isError, false);
+    const [{ event }] = await readEvents();
+    assert.doesNotMatch(JSON.stringify(event), /secret-plan|private-fact|PrivateThing/);
+    assert.match(event.stageTrace.paths[0], /^[a-f0-9]{64}$/);
+    assert.deepEqual(event.stageTrace.chunks, MOCK_TRACE.chunks);
+    assert.equal(event.stageTrace.enhancer.retrievalQuery, null);
+  });
+  await withRetrievalJournalFixture(async ({ launch, readEvents }) => {
+    const unavailable = { schema: "corpuswire-stage-trace/v1", unavailable: "trace_error" };
+    assert.equal((await launch({ MOCK_STAGE_TRACE: JSON.stringify(unavailable) }).call(1)).result.isError, false);
+    const [{ event }] = await readEvents();
+    assert.equal(event.stageTrace, null);
+    assert.equal(event.traceUnavailable, "trace_error");
+  });
+});
+
+test("private retrieval journal records the workspace HEAD and whether tracked files changed", async () => {
+  await withRetrievalJournalFixture(async ({ workspace, launch, readEvents }) => {
+    const git = (...args) => execFileSync("git", ["-C", workspace, ...args], { encoding: "utf8" }).trim();
+    git("init", "-q");
+    await writeFile(path.join(workspace, "a.txt"), "one\n");
+    git("add", "a.txt");
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init");
+    const host = launch();
+    assert.equal((await host.call(1)).result.isError, false);
+    await writeFile(path.join(workspace, "a.txt"), "two\n");
+    assert.equal((await host.call(2)).result.isError, false);
+    const states = (await readEvents()).map(({ event }) => event).sort((a, b) => a.startedAt.localeCompare(b.startedAt))
+      .map((event) => event.workspaceGit);
+    assert.deepEqual(states, [{ head: git("rev-parse", "HEAD"), dirty: false }, { head: git("rev-parse", "HEAD"), dirty: true }]);
   });
 });
 
@@ -3326,6 +3391,7 @@ export class CorpusWireClient {
         retrieval_query: request.query,
         retrieval_backend: "qdrant_hybrid",
         ...(process.env.MOCK_RETRIEVAL_EVENT_ID ? { retrieval_event_id: process.env.MOCK_RETRIEVAL_EVENT_ID } : {}),
+        ...(process.env.MOCK_STAGE_TRACE ? { stage_trace: JSON.parse(process.env.MOCK_STAGE_TRACE) } : {}),
         retrieved_chunks: [
           {
             chunk_id: "chunk-router",
@@ -3535,6 +3601,7 @@ export class CorpusWireClient {
     }
 
     return {
+      ...(process.env.MOCK_STAGE_TRACE ? { stage_trace: JSON.parse(process.env.MOCK_STAGE_TRACE) } : {}),
       retrieval_query: request.prompt,
       retrieval_backend: "qdrant_hybrid",
       retrieved_chunks: [],

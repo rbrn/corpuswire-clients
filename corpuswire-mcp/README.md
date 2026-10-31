@@ -388,9 +388,17 @@ For the local Docker app on an existing dense-only Qdrant collection, keep `APP_
 Set `CORPUSWIRE_RETRIEVAL_LOG_DIR` to an absolute directory outside every
 workspace to save each `corpuswire_search` and `corpuswire_enhance_prompt`
 call as one owner-only `cw-retrieval-<id>.json` file
-(`corpuswire-private-retrieval/v2`). The engine's personal launcher
+(`corpuswire-private-retrieval/v3`). The engine's personal launcher
 `scripts/run_local_corpuswire_mcp.sh` sets it to
 `~/.local/share/corpuswire/retrieval-journal` with mode `full`.
+
+v3 adds `stageTrace`: the engine's content-free per-stage trace when the
+server runs with `RETRIEVAL_STAGE_TRACE=on`. It is never part of the delivered
+text; in `metadata` mode its paths, retrieval query and rewrite identifiers are
+SHA-256 digests. Without one, `traceUnavailable` gives a fixed reason
+(`not_returned` from a server with the flag off). `workspaceGit` records the
+workspace HEAD and whether tracked files had uncommitted changes during the
+call (read beside it, 2 s timeout), so a judge can name the snapshot.
 
 | Variable | Default | Meaning |
 |---|---|---|
