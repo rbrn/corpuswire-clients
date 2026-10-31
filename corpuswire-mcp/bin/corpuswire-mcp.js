@@ -2622,6 +2622,54 @@ function retrievalJournalDigest(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
+const STAGE_TRACE_SCHEMA = "corpuswire-stage-trace/v1";
+const STAGE_TRACE_MAX_BYTES = 262144;
+
+// JRN-002: the engine's content-free stage trace (RETRIEVAL_STAGE_TRACE=on).
+// Metadata mode keeps ranks, line numbers and opaque chunk ids but replaces
+// paths, the retrieval query and rewrite identifiers with SHA-256 digests.
+// An oversized trace loses the deepest lane rows first and says so.
+function retrievalJournalStageTrace(trace, full) {
+  if (trace === undefined || trace === null) return { stageTrace: null, traceUnavailable: "not_returned" };
+  if (typeof trace !== "object" || Array.isArray(trace) || trace.schema !== STAGE_TRACE_SCHEMA) {
+    return { stageTrace: null, traceUnavailable: "unknown_schema" };
+  }
+  if (typeof trace.unavailable === "string") {
+    return { stageTrace: null, traceUnavailable: /^[a-z_]{1,64}$/.test(trace.unavailable) ? trace.unavailable : "other" };
+  }
+  const copy = JSON.parse(JSON.stringify(trace));
+  const text = (value) => (typeof value === "string" ? value : "");
+  if (!full) {
+    if (Array.isArray(copy.paths)) copy.paths = copy.paths.map((value) => retrievalJournalDigest(text(value)));
+    if (copy.enhancer && typeof copy.enhancer === "object") {
+      copy.enhancer.retrievalQuery = null;
+      if (Array.isArray(copy.enhancer.namedPaths)) {
+        copy.enhancer.namedPaths = copy.enhancer.namedPaths.map((value) => retrievalJournalDigest(text(value)));
+      }
+      const identifiers = copy.enhancer.unsupportedIdentifiers;
+      if (identifiers && Array.isArray(identifiers.values)) {
+        identifiers.values = identifiers.values.map((value) => retrievalJournalDigest(text(value)));
+      }
+    }
+  } else {
+    if (Array.isArray(copy.paths)) copy.paths = copy.paths.map((value) => retrievalJournalRedact(text(value)));
+    if (copy.enhancer && typeof copy.enhancer.retrievalQuery === "string") {
+      copy.enhancer.retrievalQuery = retrievalJournalRedact(copy.enhancer.retrievalQuery).slice(0, 65536);
+    }
+  }
+  const lanes = copy.lanes && typeof copy.lanes === "object" ? Object.values(copy.lanes) : [];
+  let size = Buffer.byteLength(JSON.stringify(copy));
+  while (size > STAGE_TRACE_MAX_BYTES) {
+    const deepest = lanes.filter((lane) => Array.isArray(lane?.hits) && lane.hits.length > 25)
+      .sort((a, b) => b.hits.length - a.hits.length)[0];
+    if (!deepest) return { stageTrace: null, traceUnavailable: "too_large" };
+    deepest.hits = deepest.hits.slice(0, Math.ceil(deepest.hits.length / 2));
+    deepest.truncated = true;
+    size = Buffer.byteLength(JSON.stringify(copy));
+  }
+  return { stageTrace: copy, traceUnavailable: null };
+}
+
 function retrievalJournalRedact(value) {
   const secrets = [process.env.CORPUSWIRE_BEARER_TOKEN,
     process.env.CORPUSWIRE_BASIC_AUTH].filter((item) => typeof item === "string" && item)
@@ -2765,7 +2813,7 @@ async function writeRetrievalJournal(params, result, startedAt, elapsedMs, obser
   retrievalJournalExecutableHash ??= await readFile(new URL(import.meta.url))
     .then((bytes) => createHash("sha256").update(bytes).digest("hex"));
   const event = {
-    schemaVersion: "corpuswire-private-retrieval/v2", eventId,
+    schemaVersion: "corpuswire-private-retrieval/v3", eventId,
     server: {
       name: SERVER_NAME, version: SERVER_VERSION,
       executableSha256: retrievalJournalExecutableHash,
@@ -2811,6 +2859,8 @@ async function writeRetrievalJournal(params, result, startedAt, elapsedMs, obser
     error: result?.isError || !result
       ? retrievalJournalErrorSummary(observation.error) ?? { category: "other", httpStatus: null, errorCode: null }
       : null,
+    ...retrievalJournalStageTrace(observation.stageTrace, full),
+    workspaceGit: observation.workspaceGit ?? null,
     input: retrievalJournalCapture(input, limits.inputBytes, full),
     result: result?.isError || !result
       ? { rawSha256: retrievalJournalDigest(delivered), rawBytes: Buffer.byteLength(delivered),
@@ -2880,6 +2930,25 @@ async function writePrivateJournalFile(directory, prefix, id, body, limits) {
   }
 }
 
+// JRN-002: the local tree's HEAD and whether it has uncommitted tracked
+// changes while the query runs. Synced reads include those edits, so a dirty
+// tree means the index differs from HEAD. Runs beside the tool call.
+async function retrievalJournalWorkspaceGit(args) {
+  const root = firstNonEmptyString(args.repoPath, process.env.CORPUSWIRE_SYNC_ROOT,
+    process.env.CORPUSWIRE_REPO_PATH, process.cwd());
+  const options = { timeoutMs: 2000, maxBuffer: DEFAULT_SYNC_GIT_MAX_STATUS_BYTES };
+  try {
+    const [head, status] = await Promise.all([
+      runGit(root, ["rev-parse", "HEAD"], options),
+      runGit(root, ["status", "--porcelain=v1", "--untracked-files=no", "-z"], options),
+    ]);
+    const commit = head.trim();
+    return /^[0-9a-f]{7,64}$/.test(commit) ? { head: commit, dirty: status.length > 0 } : null;
+  } catch {
+    return null;
+  }
+}
+
 async function callToolWithRetrievalJournal(params) {
   if (!retrievalJournalEnabled()
     || !["corpuswire_search", "corpuswire_enhance_prompt"].includes(params.name)) return callTool(params);
@@ -2887,12 +2956,14 @@ async function callToolWithRetrievalJournal(params) {
   const eventId = randomUUID();
   let result;
   const observation = {};
+  const workspaceGit = retrievalJournalWorkspaceGit(asRecord(params.arguments));
   try {
     result = await callTool(params, observation);
     appendJournalEventFooter(result, eventId);
     return result;
   } finally {
     const elapsedMs = searchTimingMs(started);
+    observation.workspaceGit = await workspaceGit;
     const next = retrievalJournalQueue.then(() => writeRetrievalJournal(params, result, startedAt, elapsedMs, observation, eventId))
       .catch((error) => {
         const safeReasons = ["invalid_limits", "invalid_mode", "unsafe_directory", "workspace_directory",
@@ -4246,7 +4317,10 @@ async function searchContext(args, observation = undefined) {
     response = { result: await client.query(request), context: {} };
   }
   const result = response.result ?? response;
-  if (observation) observation.engineEventId = boundedEngineEventId(result?.retrieval_event_id);
+  if (observation) {
+    observation.engineEventId = boundedEngineEventId(result?.retrieval_event_id);
+    observation.stageTrace = result?.stage_trace;
+  }
   const context = response.context ?? {};
   const hits = Array.isArray(result.retrieved_chunks) ? result.retrieved_chunks : [];
   // Complete server-packed spans replace the client-side widening below.
@@ -5676,6 +5750,7 @@ async function enhancePrompt(args, observation = undefined) {
   const { result, usedLocalFallback } = await enhanceWithLocalFallback(client, request);
   if (observation) {
     observation.engineEventId = boundedEngineEventId(result?.retrieval_event_id);
+    observation.stageTrace = result?.stage_trace;
     observation.enhancementLocalFallback = usedLocalFallback;
     observation.enhancementLocalOnlyUsed = usedLocalFallback || localOnly;
   }
