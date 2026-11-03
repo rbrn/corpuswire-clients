@@ -2,8 +2,9 @@ name: Claude PR review
 
 # Claude reviews a pull request when it opens, reopens or leaves draft, and
 # answers "@claude" comments from the repository owner. Needs the Claude GitHub
-# App on this repository and the CLAUDE_CODE_OAUTH_TOKEN secret
-# (`claude setup-token`); without the secret the jobs skip.
+# App on this repository and the ANTHROPIC_API_KEY secret (paid API). The key is
+# organization-scoped, so the ANTHROPIC_WORKSPACE_ID variable names the Console
+# workspace on every request. Without the secret the jobs skip.
 
 on:
   pull_request:
@@ -30,7 +31,8 @@ jobs:
       issues: write
       id-token: write
     env:
-      HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+      HAS_TOKEN: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+      ANTHROPIC_CUSTOM_HEADERS: "anthropic-workspace-id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}"
     steps:
       - if: env.HAS_TOKEN == 'true'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -39,7 +41,7 @@ jobs:
       - if: env.HAS_TOKEN == 'true'
         uses: anthropics/claude-code-action@4845bacbb38b3c4b15d948f035349786f678e068 # v1.0.267
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
@@ -77,7 +79,8 @@ jobs:
       issues: write
       id-token: write
     env:
-      HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+      HAS_TOKEN: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+      ANTHROPIC_CUSTOM_HEADERS: "anthropic-workspace-id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}"
     steps:
       - if: env.HAS_TOKEN == 'true'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -86,5 +89,5 @@ jobs:
       - if: env.HAS_TOKEN == 'true'
         uses: anthropics/claude-code-action@4845bacbb38b3c4b15d948f035349786f678e068 # v1.0.267
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_args: --max-turns 40
