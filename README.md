@@ -102,3 +102,13 @@ export CORPUSWIRE_BASIC_AUTH=username:password
 For the full VS Code extension, use service-specific API key or Basic Auth
 settings in VS Code user settings or the optional home config file rather than
 checking secrets into `.vscode/settings.json`.
+
+## Pull Request Review
+
+Claude reviews pull requests through `.github/workflows/claude-review.yml`
+(`anthropics/claude-code-action`, pinned by SHA): when a PR opens, reopens or
+leaves draft, and when the owner comments `@claude`. It needs the Claude GitHub
+App on this repository, the `ANTHROPIC_API_KEY` secret (paid API) and the
+`ANTHROPIC_WORKSPACE_ID` variable for the organization-scoped key; without the
+secret the jobs skip. Codex automatic review
+is switched off.
