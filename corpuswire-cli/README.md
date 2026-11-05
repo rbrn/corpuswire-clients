@@ -15,7 +15,8 @@ From any repository folder:
 ```bash
 cw init                 # Save workspace settings, register the workspace, then index it
 cw doctor               # Read-only readiness and inventory checks
-cw                      # Index, then watch this folder until Ctrl+C
+cw                      # Index and watch this folder; type a task, Ctrl+P rewrites it
+cw enhance              # Prompt editor only: Ctrl+P rewrites, Enter prints the result
 cw --once               # Index once and exit (for scripts)
 cw watch                # Explicit persistent watch, including non-TTY use
 cw reconcile            # Explicit full reconciliation, with preview/confirmation
@@ -296,6 +297,57 @@ Stream machine-readable progress or follow an existing session:
 cw index --yes --non-interactive --ndjson --trace
 cw index --attach 8a4f... --api-base-url http://127.0.0.1:18080
 ```
+
+## Prompt editor
+
+In an interactive terminal, bare `cw` opens a start screen with a prompt box
+while it indexes and watches:
+
+```
+Get started with CorpusWire
+
+  ● Watching ~/workspace/foo → local-docker://foo#main
+  ● Type a rough task and press Ctrl+P to rewrite it with this workspace's context
+  ● Enter copies the result · Ctrl+J or Shift+Enter adds a new line · ? lists shortcuts
+
+● Index ready (1219 files) · watching local-docker://foo#main
+──────────────────────────────────────────────────────────────────────
+› Try 'where is the sync lease renewed?' or press ? for shortcuts
+──────────────────────────────────────────────────────────────────────
+ ? shortcuts · Ctrl+P rewrite · Enter accept · Ctrl+C stop
+```
+
+Type a rough task and press **Ctrl+P**. The draft is replaced in place by the
+same grounded rewrite `cw enhance "<prompt>"` returns. Edit it, press Ctrl+P
+again, or press **Enter** to accept it. Enter prints the prompt above the box
+and copies it to the clipboard (`pbcopy`, `clip`, `wl-copy`, `xclip` or
+`xsel`, whichever exists). Watch and indexing messages print above the box,
+and the live progress line sits just above it.
+
+| Key | Action |
+|---|---|
+| Ctrl+P | Rewrite the draft with this workspace's context |
+| Enter | Accept the draft |
+| Ctrl+J, Shift+Enter, Alt+Enter | New line (Shift+Enter needs a terminal that reports it) |
+| Ctrl+U / Ctrl+W | Clear the draft / delete the previous word |
+| ↑ ↓ ← → Home End | Move the cursor; long drafts scroll inside the box |
+| ? | On an empty draft, list the shortcuts |
+| Esc | Close the shortcut list or cancel a scope question |
+| Ctrl+C | Cancel a running rewrite, otherwise clear the draft; on an empty draft, stop `cw` |
+
+Pasted text keeps its line breaks. A broad request such as `How does logging
+work?` gets one scope question first. Your answer is added under a labeled
+`User clarification` section, and then the rewrite runs. If you edit the draft
+while a rewrite is running, your edits are kept and the rewrite is dropped.
+
+`cw enhance` (or `cw rewrite`) with no prompt opens the same box without
+watching. The box draws on stderr, and Enter prints the accepted prompt to
+stdout and exits, so `cw enhance > task.md` works. Ctrl+C exits with status 130.
+
+The box only appears when stdin and the output are both terminals. `--once`,
+`--json`, `--ndjson`, explicit `cw watch`, and piped calls behave as before.
+Set `CORPUSWIRE_CLI_PROMPT_EDITOR=off` to restore the plain start screen and
+the "Missing prompt" error for `cw enhance` without a prompt.
 
 ## Automatic watching
 
