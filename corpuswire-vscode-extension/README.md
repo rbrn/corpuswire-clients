@@ -25,7 +25,8 @@ the MCP package is the tool surface Copilot discovers.
 - Service-specific configuration for indexer, enhancer, and semantic search
   endpoints.
 - API key, Basic Auth, and custom header support.
-- CLI OS-keyring bearer authentication when no Authorization header is configured.
+- The same bearer-token lookup as the `cw` CLI when no Authorization header is
+  configured, with the Python `corpuswire auth token` helper as a last resort.
 - Optional home config at `~/.config/corpuswire/vscode-extension.json` or
   `~/.corpuswire/vscode-extension.json`.
 - Local fallback enhancement when generation is unavailable but the backend can
@@ -117,10 +118,21 @@ or prefixed:
 
 ## Service Settings
 
-When an Authorization header is absent, the extension runs
-`corpuswire auth token --base-url <service-url>` through the configured CLI.
+When an Authorization header is absent, a trusted workspace looks for a bearer
+token in this order, stopping at the first one found:
+
+1. `CORPUSWIRE_BEARER_TOKEN` in the extension host environment;
+2. for a loopback service URL only, the `cw` CLI's owner-only credential file
+   `~/.local/share/corpuswire/cli-credentials.json` (ignored unless it is a
+   regular file with mode 0600 or stricter);
+3. for a loopback service URL on macOS, the `cw` CLI's
+   `corpuswire-service-auth-v1` keychain item;
+4. `corpuswire auth token --base-url <service-url>` through the configured CLI.
+
+So a machine where `cw` already authenticates needs no extra extension setup.
 Explicit Authorization, including Basic Auth or an API key using that header,
-takes precedence. Set an absolute `corpuswire.auth.cliPath` if the VS Code
+takes precedence. A 401 names these sources, and a 403 names the workspace ID
+that was rejected. Set an absolute `corpuswire.auth.cliPath` if the VS Code
 extension host's PATH does not contain the CLI. Token lookup has a five-second
 timeout and does not initiate login.
 Configure the executable in VS Code user or machine settings. Workspace and
