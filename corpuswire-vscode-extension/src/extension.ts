@@ -25,7 +25,7 @@ import type { ExtensionSettings, RemoteServiceSettings } from "./configuration.j
 import {
   assessEnhancementQuality,
 } from "./enhancement-quality.js";
-import { hasAuthorizationHeader, resolveCliBearerToken } from "./service-auth.js";
+import { hasAuthorizationHeader, resolveServiceBearerToken } from "./service-auth.js";
 import { INDEX_INCLUDE_GLOB } from "./index-discovery.js";
 import {
   RecentEditsTracker,
@@ -58,7 +58,7 @@ async function buildAuthenticatedServiceHeaders(
   if (vscode.workspace.isTrusted !== true) {
     return headers;
   }
-  const token = await resolveCliBearerToken(service.url, settings.auth.cliPath);
+  const token = await resolveServiceBearerToken(service.url, settings.auth.cliPath);
   if (token) {
     headers.Authorization = `Bearer ${token}`;
   }
@@ -387,7 +387,7 @@ async function runPromptEnhancement(
       qualityMessage: outcome.quality.message,
     });
   } catch (error) {
-    post({ type: "error", message: formatEnhancementError(error, enhancerService.url) });
+    post({ type: "error", message: formatEnhancementError(error, enhancerService.url, request.workspaceId) });
   } finally {
     post({ type: "loading", value: false });
   }
@@ -1202,7 +1202,7 @@ async function enhanceSelectedPrompt(): Promise<void> {
       void vscode.window.showWarningMessage(resultMessage);
     }
   } catch (error) {
-    void vscode.window.showWarningMessage(formatEnhancementError(error, enhancerService.url));
+    void vscode.window.showWarningMessage(formatEnhancementError(error, enhancerService.url, request.workspaceId));
   }
 }
 
@@ -1404,11 +1404,19 @@ function firstNonEmptyString(...values: unknown[]): string | null {
   return null;
 }
 
-function formatEnhancementError(error: unknown, baseUrl: string): string {
+function formatEnhancementError(error: unknown, baseUrl: string, workspaceId?: string): string {
   const message = error instanceof Error ? error.message : String(error);
 
   if (isConnectionErrorMessage(message)) {
     return `Could not connect to the configured corpuswire enhancer service at ${baseUrl}. Check the remote service URL and credentials. ${message}`;
+  }
+
+  if (error instanceof CorpusWireHttpError && error.status === 401) {
+    return `corpuswire at ${baseUrl} needs a bearer token and none was found. Add one the way the cw CLI finds it (CORPUSWIRE_BEARER_TOKEN, ~/.local/share/corpuswire/cli-credentials.json or the macOS keychain), set corpuswire.serviceDefaults.apiKey, or point corpuswire.auth.cliPath at a working corpuswire CLI.`;
+  }
+
+  if (error instanceof CorpusWireHttpError && error.status === 403 && workspaceId) {
+    return `corpuswire rejected workspace ${workspaceId}: ${error.errorMessage ?? message}. Set corpuswire.remoteIndexing.workspaceId for this folder to a workspace your token can use.`;
   }
 
   if (error instanceof CorpusWireHttpError) {

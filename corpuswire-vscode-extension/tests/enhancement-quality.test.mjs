@@ -4,7 +4,9 @@ import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 
 import { assessEnhancementQuality } from "../dist/enhancement-quality.js";
-import { hasAuthorizationHeader } from "../dist/service-auth.js";
+import { hasAuthorizationHeader, loopbackServiceAccount, resolveServiceBearerToken } from "../dist/service-auth.js";
+import { mkdtemp, writeFile, chmod, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 
 const authSource = (await readFile(new URL("../dist/service-auth.js", import.meta.url), "utf8"))
   .replace(/^import .*;\n/gm, "").replace(/^export /gm, "");
@@ -19,7 +21,7 @@ function cliResolver(execFile) {
 
 function headerResolver(resolveToken, ...trust) {
   const isTrusted = trust.length ? trust[0] : true;
-  return new Function("buildRemoteServiceHeaders", "hasAuthorizationHeader", "resolveCliBearerToken", "vscode",
+  return new Function("buildRemoteServiceHeaders", "hasAuthorizationHeader", "resolveServiceBearerToken", "vscode",
     `${extensionSource.slice(authStart, authEnd)}; return buildAuthenticatedServiceHeaders;`)(
     (service) => ({ ...service.headers }), hasAuthorizationHeader, resolveToken, { workspace: { isTrusted } },
   );
@@ -160,4 +162,58 @@ test("workspace, folder and workspace-selected config files cannot choose the CL
   assert.equal(readSettings(folder.uri).auth.cliPath, "/fixture/trusted-user-cli");
   globalCliPath = undefined;
   assert.equal(readSettings(folder.uri).auth.cliPath, "corpuswire");
+});
+
+async function credentialHome(services, mode = 0o600) {
+  const home = await mkdtemp(path.join(tmpdir(), "cw-vscode-auth-"));
+  const dir = path.join(home, ".local", "share", "corpuswire");
+  await import("node:fs/promises").then((fs) => fs.mkdir(dir, { recursive: true }));
+  const file = path.join(dir, "cli-credentials.json");
+  await writeFile(file, JSON.stringify({ schemaVersion: 1, services }));
+  await chmod(file, mode);
+  return home;
+}
+
+const noExec = (_file, _args, _options, callback) => callback(new Error("synthetic: not available"));
+
+test("loopback account keys match the cw CLI credential format", () => {
+  assert.equal(loopbackServiceAccount("http://127.0.0.1:18080/"), "http://127.0.0.1:18080");
+  assert.equal(loopbackServiceAccount("http://LOCALHOST:8000/api/"), "http://localhost:8000/api");
+  assert.equal(loopbackServiceAccount("https://fixture.example"), null);
+  assert.equal(loopbackServiceAccount("http://user:pw@127.0.0.1:1"), null);
+  assert.equal(loopbackServiceAccount("not a url"), null);
+});
+
+test("service token prefers CORPUSWIRE_BEARER_TOKEN, then the cw credential file, then the CLI helper", async () => {
+  const home = await credentialHome({ "http://127.0.0.1:18080": { bearerToken: " file-fixture-token " } });
+  try {
+    const base = { homeDirectory: home, platform: "linux", execFile: noExec };
+    assert.equal(await resolveServiceBearerToken("http://127.0.0.1:18080", "corpuswire", { ...base, env: { CORPUSWIRE_BEARER_TOKEN: " env-fixture " } }), "env-fixture");
+    assert.equal(await resolveServiceBearerToken("http://127.0.0.1:18080/", "corpuswire", { ...base, env: {} }), "file-fixture-token");
+    // A remote URL never reads the local credential file.
+    assert.equal(await resolveServiceBearerToken("https://fixture.example", "corpuswire", { ...base, env: {} }), null);
+    const cli = (_file, args, _options, callback) => callback(null, args[0] === "auth" ? "cli-fixture\n" : "");
+    assert.equal(await resolveServiceBearerToken("http://127.0.0.1:9999", "corpuswire", { ...base, env: {}, execFile: cli }), "cli-fixture");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a group- or world-readable credential file is ignored", async () => {
+  const home = await credentialHome({ "http://127.0.0.1:18080": { bearerToken: "leaky" } }, 0o644);
+  try {
+    assert.equal(await resolveServiceBearerToken("http://127.0.0.1:18080", "corpuswire", { homeDirectory: home, platform: "linux", env: {}, execFile: noExec }), null);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("on macOS a loopback service falls back to the cw keychain item", async () => {
+  const calls = [];
+  const exec = (file, args, _options, callback) => { calls.push({ file, args }); callback(null, file === "/usr/bin/security" ? "keychain-fixture\n" : ""); };
+  const token = await resolveServiceBearerToken("http://127.0.0.1:18080", "corpuswire", {
+    homeDirectory: "/nonexistent-fixture-home", platform: "darwin", env: {}, execFile: exec,
+  });
+  assert.equal(token, "keychain-fixture");
+  assert.deepEqual(calls[0], { file: "/usr/bin/security", args: ["find-generic-password", "-s", "corpuswire-service-auth-v1", "-a", "http://127.0.0.1:18080", "-w"] });
 });
