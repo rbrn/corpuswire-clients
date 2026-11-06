@@ -8,6 +8,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline/promises";
 import { promisify } from "node:util";
+import { copyToClipboard, createPromptBox, promptEditorEnabled } from "./prompt-box.js";
 import { MCP_HELP, doctorHostConfig, formatMcpResult, installHostConfig, locateMcpServer, parseMcpArgs } from "./mcp-hosts.js";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:18080";
@@ -36,7 +37,7 @@ export function printHelp(write = console.log) {
   write(`cw
 
 Usage:
-  cw                         Index and watch this folder in an interactive terminal
+  cw                         Index and watch this folder; type a task, Ctrl+P rewrites it
   cw watch [options]         Index and keep reconciling local source changes
   cw --once                  Index once and exit
   cw init [--no-index] [--verify] Configure, register and index this workspace
@@ -44,6 +45,7 @@ Usage:
   cw reconcile [options]     Full workspace indexing with confirmation
   cw "<prompt>" [options]
   cw enhance "<prompt>" [options]
+  cw enhance                 Interactive: type a task, Ctrl+P rewrites, Enter prints it
   cw rewrite "<prompt>" [--context-file <path>] [options]
   cw search "<query>" [options]
   cw health [options]
@@ -438,7 +440,36 @@ export async function runCliCommand(options, dependencies = {}) {
     (dependencies.writeError ?? console.error)(`Note: ${derivedQueryWorkspace} has no index yet; answering without repository context. Run cw in this folder to index it.`);
   }
 
-  if (options.watch) return runWatchCommand(options, { ...dependencies, client, sdk, write, traceCollector, configurationInputs });
+  const promptInput = dependencies.promptInput ?? process.stdin;
+  const promptOutput = dependencies.promptOutput ?? process.stdout;
+  const promptBoxAvailable = (boxOutput) => !options.json && !options.ndjson
+    && promptEditorEnabled(dependencies.env ?? process.env)
+    && Boolean(promptInput.isTTY && boxOutput.isTTY) && typeof promptInput.setRawMode === "function";
+  const enhanceDraft = async (draft, warn) => {
+    const response = await client.enhanceRaw({
+      prompt: draft,
+      repoPath: options.repoPath || undefined,
+      workspaceId: options.workspaceId || undefined,
+      outputMode: options.outputMode,
+      topK: options.topK,
+      minScore: options.minScore,
+      localOnly: options.localOnly,
+    });
+    const result = response.result ?? {};
+    const warnings = [result.retrieval_warning, result.generation_error,
+      result.retrieval_not_found === true ? "No repository context was found; the rewrite is not grounded in retrieved files." : ""];
+    for (const warning of new Set(warnings.filter(Boolean))) warn(`Warning: ${sanitizeTerminalText(warning)}`);
+    return (sdk?.requireEnhancedPrompt ?? requireEnhancedPromptFallback)(result);
+  };
+
+  if (options.watch) {
+    if (!(options.implicitIndex && promptBoxAvailable(promptOutput))) {
+      return runWatchCommand(options, { ...dependencies, client, sdk, write, traceCollector, configurationInputs });
+    }
+    return runWatchWithPromptBox(options, {
+      ...dependencies, client, sdk, traceCollector, configurationInputs, promptInput, promptOutput, enhanceDraft,
+    });
+  }
 
   if (["index", "reconcile"].includes(options.command) || (options.command === "init" && options.indexAfterInit)) {
     const result = await runIndexCommand(options, {
@@ -520,6 +551,10 @@ export async function runCliCommand(options, dependencies = {}) {
   }
 
   const prompt = options.promptParts.join(" ").trim();
+  const editorOutput = dependencies.promptOutput ?? process.stderr;
+  if (!prompt && options.command === "enhance" && !options.nonInteractive && promptBoxAvailable(editorOutput)) {
+    return runInteractiveEnhance(options, { ...dependencies, write, promptInput, promptOutput: editorOutput, enhanceDraft });
+  }
   if (!prompt) {
     throw new Error("Missing prompt. Pass a prompt directly or use the enhance/search command.");
   }
@@ -767,6 +802,70 @@ function watcherFallbackDetails(error, stage) {
 }
 
 // The watcher is a wake-up hint; complete, content-hashed scans are the source of truth.
+function startScreenHints(options, root) {
+  return [
+    "Get started with CorpusWire",
+    "",
+    `  ● Watching ${sanitizeTerminalText(root)} → ${sanitizeTerminalText(options.workspaceId)}`,
+    "  ● Type a rough task and press Ctrl+P to rewrite it with this workspace's context",
+    "  ● Enter copies the result · Ctrl+J or Shift+Enter adds a new line · ? lists shortcuts",
+    "",
+  ].join("\n");
+}
+
+/** Bare `cw` in a terminal: the watcher runs while a prompt box takes input. */
+async function runWatchWithPromptBox(options, dependencies) {
+  const output = dependencies.promptOutput;
+  const copy = dependencies.copyToClipboard ?? copyToClipboard;
+  let box;
+  box = createPromptBox({
+    input: dependencies.promptInput,
+    output,
+    status: `Indexing ${sanitizeTerminalText(options.workspaceId)}…`,
+    placeholder: "Try 'where is the sync lease renewed?' or press ? for shortcuts",
+    enhance: (draft) => dependencies.enhanceDraft(draft, (line) => box.log(line)),
+    accept: async (draft) => {
+      box.log(`\n── Prompt ${"─".repeat(40)}\n${draft}\n${"─".repeat(50)}`);
+      const tool = await copy(draft);
+      return tool ? "Copied to the clipboard and printed above." : "Printed above (no clipboard tool found).";
+    },
+    onExit: () => (dependencies.interrupt ? dependencies.interrupt() : process.kill(process.pid, "SIGINT")),
+  });
+  box.log(startScreenHints(options, options.sourceRoot));
+  box.start();
+  try {
+    return await runWatchCommand(options, {
+      ...dependencies,
+      write: (line) => box.log(line),
+      writeRaw: (value) => box.raw(value),
+      onWatchState: (state) => box.setStatus(state),
+    });
+  } finally {
+    box.stop();
+  }
+}
+
+/** `cw enhance` without a prompt: edit and rewrite a draft, then print it. */
+async function runInteractiveEnhance(options, dependencies) {
+  const output = dependencies.promptOutput;
+  return new Promise((resolve) => {
+    let box;
+    box = createPromptBox({
+      input: dependencies.promptInput,
+      output,
+      status: options.workspaceId ? `Context: ${sanitizeTerminalText(options.workspaceId)}` : "",
+      enhance: (draft) => dependencies.enhanceDraft(draft, (line) => box.log(line)),
+      accept: (draft) => {
+        box.stop();
+        dependencies.write(draft);
+        resolve({ ok: true, prompt: draft });
+      },
+      onExit: () => resolve({ ok: false, cancelled: true, exitCode: 130 }),
+    });
+    box.start();
+  });
+}
+
 export async function runWatchCommand(options, dependencies) {
   if (options.configuration.profile !== "local" || options.mode !== "full" || options.rebuild || options.attachSessionId) {
     throw new Error("Watching supports local full reconciliation only, without --rebuild or --attach.");
@@ -882,6 +981,7 @@ export async function runWatchCommand(options, dependencies) {
     }
     if (signal?.aborted) return { ok: true, stopped: true, publications, exitCode: 0 };
     write(`Watching ${sanitizeTerminalText(root)} → ${sanitizeTerminalText(options.workspaceId)} at ${displayServiceUrl(options.apiBaseUrl)}. Press Ctrl+C to stop.`);
+    dependencies.onWatchState?.(`Checking ${sanitizeTerminalText(options.workspaceId)} for changes…`);
     while (!signal?.aborted) {
       try {
         await assertFence();
@@ -948,6 +1048,7 @@ export async function runWatchCommand(options, dependencies) {
           publishedDigest = digest;
           publications += 1;
           write(`Index verified (${scan.files.length} files). Watching for the next change.`);
+          dependencies.onWatchState?.(`Index ready (${scan.files.length} files) · watching ${sanitizeTerminalText(options.workspaceId)}`);
         }
         failures = 0;
         if (generation !== scanGeneration) continue;
@@ -956,6 +1057,7 @@ export async function runWatchCommand(options, dependencies) {
         if (signal?.aborted) break;
         if (!watchRetryable(error) || ++failures > 3) throw error;
         write(`Reconciliation temporarily interrupted; retry ${failures}/3. The last verified inventory is unchanged.`);
+        dependencies.onWatchState?.(`Sync interrupted; retry ${failures}/3`);
         await wait(Math.min(30000, 1000 * 2 ** (failures - 1)), signal);
       }
     }
@@ -2649,6 +2751,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       signal: controller.signal,
       detachSignal: detachController.signal,
       onObservationChange: (value) => { observingExisting = value; dependencies.onObservationChange?.(value); },
+      interrupt: onInterrupt,
       output: options.ndjson || options.json ? runtimeProcess.stderr : dependencies.output,
     }));
   } finally {
