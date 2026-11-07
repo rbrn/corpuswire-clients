@@ -1,3 +1,7 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
 import { appendPromptClarification, assessPromptSufficiency, isUsefulClarification } from "./prompt-clarification.js";
 
 /**
@@ -6,12 +10,14 @@ import { appendPromptClarification, assessPromptSufficiency, isUsefulClarificati
  * The box is a small live region drawn at the bottom of the terminal: a status
  * line, a ruled multiline input with a placeholder, and a shortcut line. Other
  * output goes through log()/raw() so it prints above the box instead of
- * through it. Keys: Ctrl+P rewrites the draft, Enter accepts it, Ctrl+J,
+ * through it. Keys: Ctrl+P rewrites the draft, Ctrl+S saves it to a file,
+ * Enter accepts it, Ctrl+J,
  * Shift+Enter or Alt+Enter adds a new line, ? on an empty draft lists the
  * shortcuts, Ctrl+C clears a draft or exits when the draft is empty.
  *
  * It never runs the prompt. enhance(draft) must resolve to the rewritten text;
  * accept(draft) decides what Enter does (print and copy, or return it).
+ * save(draft), when given, writes the draft somewhere and resolves to the path.
  */
 
 const ESC = "\u001b";
@@ -24,6 +30,7 @@ const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
 
 export const PROMPT_BOX_SHORTCUTS = [
   ["Ctrl+P", "rewrite the draft with this workspace's context"],
+  ["Ctrl+S", "save the draft to a file"],
   ["Enter", "accept the draft"],
   ["Ctrl+J / Shift+Enter", "new line"],
   ["Ctrl+U", "clear the draft"],
@@ -58,6 +65,7 @@ export function createPromptBox({
   output = process.stdout,
   enhance,
   accept,
+  save,
   onExit = () => {},
   assessPrompt = assessPromptSufficiency,
   placeholder = "Describe a task, then press Ctrl+P to rewrite it",
@@ -142,7 +150,7 @@ export function createPromptBox({
     if (helpOpen) {
       for (const [key, description] of PROMPT_BOX_SHORTCUTS) rows.push({ text: dim(truncate(` ${key.padEnd(22)} ${description}`, width - 1)) });
     } else {
-      const footer = pending ? " Rewriting… · Ctrl+C cancels" : " ? shortcuts · Ctrl+P rewrite · Enter accept · Ctrl+C stop";
+      const footer = pending ? " Rewriting… · Ctrl+C cancels" : " ? shortcuts · Ctrl+P rewrite · Ctrl+S save · Enter accept · Ctrl+C stop";
       rows.push({ text: dim(truncate(footer, width - 1)) });
     }
     return { rows, cursorAt };
@@ -276,6 +284,19 @@ export function createPromptBox({
     }
   }
 
+  async function saveDraft() {
+    // During a scope question the draft being worked on is the original one.
+    const text = clarification ? clarification.draft : draft();
+    if (!text.trim()) return setMessage("Type a task first.");
+    if (typeof save !== "function") return setMessage("Saving is not available here.");
+    try {
+      const saved = await save(text);
+      if (active) setMessage(`Saved to ${displayPath(saved)}`);
+    } catch (error) {
+      if (active) setMessage(`Save failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   function insert(text) {
     const inserted = Array.from(text.replace(/\r\n?/g, "\n").replace(/\t/g, "  ").replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, ""));
     if (!inserted.length) return;
@@ -308,6 +329,8 @@ export function createPromptBox({
         return submit();
       case "\u0010": // Ctrl+P
         return requestRewrite();
+      case "\u0013": // Ctrl+S (raw mode turns off XON/XOFF, so it reaches us)
+        return saveDraft();
       case "\u0003": // Ctrl+C
         if (pending) {
           rewriteToken += 1;
@@ -477,6 +500,61 @@ export function createPromptBox({
     handleInput: onData,
   };
   return box;
+}
+
+/** Show a saved path relative to the current folder or home when that is shorter. */
+export function displayPath(filePath, { cwd = process.cwd(), home = os.homedir() } = {}) {
+  const value = String(filePath ?? "");
+  if (!path.isAbsolute(value)) return value;
+  const relative = path.relative(cwd, value);
+  if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) return relative;
+  if (home && (value === home || value.startsWith(`${home}${path.sep}`))) return `~${value.slice(home.length)}`;
+  return value;
+}
+
+/**
+ * Folder for saved prompts: $CORPUSWIRE_PROMPT_DIR, else `.corpuswire/prompts`
+ * under the workspace root. Hidden folders are never indexed.
+ */
+export function promptSaveDirectory({ env = process.env, root = process.cwd(), home = os.homedir() } = {}) {
+  const configured = String(env.CORPUSWIRE_PROMPT_DIR ?? "").trim();
+  if (configured) {
+    const expanded = configured === "~" || configured.startsWith("~/") ? path.join(home, configured.slice(1)) : configured;
+    return { directory: path.resolve(root, expanded), configured: true };
+  }
+  return { directory: path.join(root, ".corpuswire", "prompts"), configured: false };
+}
+
+function timestamp(date) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+/**
+ * Write a prompt to a new owner-only Markdown file and resolve to its path.
+ * Never overwrites: a second save in the same second gets a -2, -3… suffix.
+ * The default folder gets a `.gitignore` so saved prompts stay out of git.
+ */
+export async function savePromptToFile(text, { env = process.env, root = process.cwd(), home = os.homedir(), now = new Date() } = {}) {
+  const { directory, configured } = promptSaveDirectory({ env, root, home });
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  if (!configured) {
+    await writeFile(path.join(path.dirname(directory), ".gitignore"), "*\n", { flag: "wx" }).catch((error) => {
+      if (error?.code !== "EEXIST") throw error;
+    });
+  }
+  const base = `prompt-${timestamp(now)}`;
+  const body = `${String(text).replace(/\s+$/, "")}\n`;
+  for (let attempt = 1; attempt <= 100; attempt += 1) {
+    const filePath = path.join(directory, `${base}${attempt === 1 ? "" : `-${attempt}`}.md`);
+    try {
+      await writeFile(filePath, body, { flag: "wx", mode: 0o600 });
+      return filePath;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+  }
+  throw new Error(`Too many saved prompts named ${base} in ${directory}.`);
 }
 
 /** Copy text to the system clipboard. Resolves to the tool used, or null. */

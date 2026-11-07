@@ -1,0 +1,1 @@
+- Prompt editor: Ctrl+S saves the draft to a new Markdown file and shows the path on the status line. The draft stays in the box. Files go to `.corpuswire/prompts/` under the workspace root (with a `.gitignore` so they stay out of git), or to `$CORPUSWIRE_PROMPT_DIR` when set. Files are owner-only and never overwritten. The key is listed in the shortcut row and the `?` list.

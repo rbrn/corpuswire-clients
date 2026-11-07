@@ -308,13 +308,13 @@ Get started with CorpusWire
 
   ● Watching ~/workspace/foo → local-docker://foo#main
   ● Type a rough task and press Ctrl+P to rewrite it with this workspace's context
-  ● Enter copies the result · Ctrl+J or Shift+Enter adds a new line · ? lists shortcuts
+  ● Enter copies the result · Ctrl+S saves it to a file · Ctrl+J adds a new line · ? lists shortcuts
 
 ● Index ready (1219 files) · watching local-docker://foo#main
 ──────────────────────────────────────────────────────────────────────
 › Try 'where is the sync lease renewed?' or press ? for shortcuts
 ──────────────────────────────────────────────────────────────────────
- ? shortcuts · Ctrl+P rewrite · Enter accept · Ctrl+C stop
+ ? shortcuts · Ctrl+P rewrite · Ctrl+S save · Enter accept · Ctrl+C stop
 ```
 
 Type a rough task and press **Ctrl+P**. The draft is replaced in place by the
@@ -327,6 +327,7 @@ and the live progress line sits just above it.
 | Key | Action |
 |---|---|
 | Ctrl+P | Rewrite the draft with this workspace's context |
+| Ctrl+S | Save the draft to a new Markdown file and show its path |
 | Enter | Accept the draft |
 | Ctrl+J, Shift+Enter, Alt+Enter | New line (Shift+Enter needs a terminal that reports it) |
 | Ctrl+U / Ctrl+W | Clear the draft / delete the previous word |
@@ -334,6 +335,13 @@ and the live progress line sits just above it.
 | ? | On an empty draft, list the shortcuts |
 | Esc | Close the shortcut list or cancel a scope question |
 | Ctrl+C | Cancel a running rewrite, otherwise clear the draft; on an empty draft, stop `cw` |
+
+**Ctrl+S** writes the draft to a new file and keeps it in the box, so you can
+keep editing. Files go to `.corpuswire/prompts/` under the workspace root as
+`prompt-YYYYMMDD-HHMMSS.md`, owner-only, and are never overwritten. The first
+save adds `.corpuswire/.gitignore` so saved prompts stay out of git; hidden
+folders are never indexed. Set `CORPUSWIRE_PROMPT_DIR` to save somewhere else
+(`~` is expanded). During a scope question, Ctrl+S saves the original draft.
 
 Pasted text keeps its line breaks. A broad request such as `How does logging
 work?` gets one scope question first. Your answer is added under a labeled
