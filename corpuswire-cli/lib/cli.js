@@ -8,7 +8,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline/promises";
 import { promisify } from "node:util";
-import { copyToClipboard, createPromptBox, promptEditorEnabled } from "./prompt-box.js";
+import { copyToClipboard, createPromptBox, promptEditorEnabled, savePromptToFile } from "./prompt-box.js";
 import { MCP_HELP, doctorHostConfig, formatMcpResult, installHostConfig, locateMcpServer, parseMcpArgs } from "./mcp-hosts.js";
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:18080";
@@ -808,7 +808,7 @@ function startScreenHints(options, root) {
     "",
     `  ● Watching ${sanitizeTerminalText(root)} → ${sanitizeTerminalText(options.workspaceId)}`,
     "  ● Type a rough task and press Ctrl+P to rewrite it with this workspace's context",
-    "  ● Enter copies the result · Ctrl+J or Shift+Enter adds a new line · ? lists shortcuts",
+    "  ● Enter copies the result · Ctrl+S saves it to a file · Ctrl+J adds a new line · ? lists shortcuts",
     "",
   ].join("\n");
 }
@@ -829,6 +829,7 @@ async function runWatchWithPromptBox(options, dependencies) {
       const tool = await copy(draft);
       return tool ? "Copied to the clipboard and printed above." : "Printed above (no clipboard tool found).";
     },
+    save: (draft) => (dependencies.savePrompt ?? savePromptToFile)(draft, { env: dependencies.env ?? process.env, root: options.sourceRoot }),
     onExit: () => (dependencies.interrupt ? dependencies.interrupt() : process.kill(process.pid, "SIGINT")),
   });
   box.log(startScreenHints(options, options.sourceRoot));
@@ -860,6 +861,10 @@ async function runInteractiveEnhance(options, dependencies) {
         dependencies.write(draft);
         resolve({ ok: true, prompt: draft });
       },
+      save: (draft) => (dependencies.savePrompt ?? savePromptToFile)(draft, {
+        env: dependencies.env ?? process.env,
+        root: path.resolve(options.sourceRoot || process.cwd()),
+      }),
       onExit: () => resolve({ ok: false, cancelled: true, exitCode: 130 }),
     });
     box.start();

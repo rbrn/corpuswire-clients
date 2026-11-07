@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
-import { copyToClipboard, createPromptBox, promptEditorEnabled } from "../lib/prompt-box.js";
+import { copyToClipboard, createPromptBox, displayPath, promptEditorEnabled, promptSaveDirectory, savePromptToFile } from "../lib/prompt-box.js";
 import { runCliCommand } from "../lib/cli.js";
 
 function fakeTerminal() {
@@ -195,4 +198,104 @@ test("a long draft scrolls inside the box instead of overflowing the screen", ()
   assert.ok(frame.split("\r\n").length <= 12, `frame has ${frame.split("\r\n").length} rows`);
   assert.match(frame, /more lines/);
   box.stop();
+});
+
+test("Ctrl+S saves the draft, keeps it in the box and shows the path", async () => {
+  const { input, output } = fakeTerminal();
+  const saved = [];
+  const box = createPromptBox({
+    input, output, color: false, enhance: async () => "x", accept: () => {},
+    save: async (draft) => { saved.push(draft); return path.join(process.cwd(), ".corpuswire", "prompts", "prompt-1.md"); },
+  });
+  box.start();
+  assert.match(output.text(), /Ctrl\+S save/);
+  input.emit("data", "\u0013");
+  await tick();
+  assert.match(output.text(), /Type a task first/);
+  assert.deepEqual(saved, []);
+  input.emit("data", "line one\nline two");
+  input.emit("data", "\u0013");
+  await tick();
+  assert.deepEqual(saved, ["line one\nline two"]);
+  assert.equal(box.draft, "line one\nline two");
+  assert.match(output.text(), /Saved to \.corpuswire\/prompts\/prompt-1\.md/);
+  box.setDraft("");
+  input.emit("data", "?");
+  assert.match(output.text(), /Ctrl\+S\s+save the draft to a file/);
+  box.stop();
+});
+
+test("Ctrl+S reports a failed save and saves the original draft during a scope question", async () => {
+  const { input, output } = fakeTerminal();
+  const saved = [];
+  let fail = true;
+  const box = createPromptBox({
+    input, output, color: false, enhance: async () => "x", accept: () => {},
+    assessPrompt: () => ({ status: "needs_clarification", questions: [{ question: "Which part?" }] }),
+    save: async (draft) => { if (fail) throw new Error("disk full"); saved.push(draft); return "/tmp/p.md"; },
+  });
+  box.start();
+  input.emit("data", "How does logging work");
+  input.emit("data", "\u0013");
+  await tick();
+  assert.match(output.text(), /Save failed: disk full/);
+  fail = false;
+  input.emit("data", "\u0010");
+  input.emit("data", "the sync");
+  input.emit("data", "\u0013");
+  await tick();
+  assert.deepEqual(saved, ["How does logging work"]);
+  box.stop();
+});
+
+test("savePromptToFile writes owner-only files under .corpuswire/prompts and never overwrites", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cw-prompt-save-"));
+  try {
+    const now = new Date(2026, 10, 7, 18, 1, 2);
+    const first = await savePromptToFile("fix the lease\n\n", { env: {}, root, now });
+    const second = await savePromptToFile("second", { env: {}, root, now });
+    assert.equal(first, path.join(root, ".corpuswire", "prompts", "prompt-20261107-180102.md"));
+    assert.equal(second, path.join(root, ".corpuswire", "prompts", "prompt-20261107-180102-2.md"));
+    assert.equal(await readFile(first, "utf8"), "fix the lease\n");
+    assert.equal(await readFile(path.join(root, ".corpuswire", ".gitignore"), "utf8"), "*\n");
+    if (process.platform !== "win32") assert.equal((await stat(first)).mode & 0o777, 0o600);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("CORPUSWIRE_PROMPT_DIR picks the folder, with ~ expanded and no .gitignore", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cw-prompt-dir-"));
+  try {
+    assert.deepEqual(promptSaveDirectory({ env: { CORPUSWIRE_PROMPT_DIR: "~/notes" }, root, home: "/home/me" }),
+      { directory: "/home/me/notes", configured: true });
+    const saved = await savePromptToFile("hi", { env: { CORPUSWIRE_PROMPT_DIR: path.join(root, "out") }, root, now: new Date(2026, 0, 2, 3, 4, 5) });
+    assert.equal(saved, path.join(root, "out", "prompt-20260102-030405.md"));
+    await assert.rejects(stat(path.join(root, ".gitignore")));
+    await assert.rejects(stat(path.join(root, ".corpuswire")));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("displayPath shortens to the current folder or home", () => {
+  assert.equal(displayPath("/w/repo/.corpuswire/prompts/a.md", { cwd: "/w/repo", home: "/h" }), ".corpuswire/prompts/a.md");
+  assert.equal(displayPath("/h/notes/a.md", { cwd: "/w/repo", home: "/h" }), "~/notes/a.md");
+  assert.equal(displayPath("/elsewhere/a.md", { cwd: "/w/repo", home: "/h" }), "/elsewhere/a.md");
+});
+
+test("cw enhance without a prompt saves with Ctrl+S into the workspace folder", async () => {
+  const { input, output } = fakeTerminal();
+  const calls = [];
+  const run = runCliCommand(
+    { command: "enhance", promptParts: [], outputMode: "generic", workspaceId: "local-docker://x#main", apiBaseUrl: "http://127.0.0.1:18080", sourceRoot: "/w/repo" },
+    { client: {}, write: () => {}, promptInput: input, promptOutput: output, env: { CORPUSWIRE_PROMPT_DIR: "/p" },
+      savePrompt: async (text, options) => { calls.push({ text, ...options }); return "/p/prompt.md"; } },
+  );
+  await tick();
+  input.emit("data", "draft text");
+  input.emit("data", "\u0013");
+  await tick();
+  assert.deepEqual(calls, [{ text: "draft text", env: { CORPUSWIRE_PROMPT_DIR: "/p" }, root: path.resolve("/w/repo") }]);
+  assert.match(output.text(), /Saved to \/p\/prompt\.md/);
+  input.emit("data", "\u0003");
+  input.emit("data", "\u0003");
+  const result = await run;
+  assert.equal(result.cancelled, true);
 });
