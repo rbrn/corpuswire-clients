@@ -14,6 +14,10 @@ import { MCP_HELP, doctorHostConfig, formatMcpResult, installHostConfig, locateM
 const DEFAULT_BASE_URL = "http://127.0.0.1:18080";
 const DEFAULT_WATCH_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_WATCH_PUBLICATION_TIMEOUT_MS = 600_000;
+// Ctrl+P rewrites on the watch start screen call /v1/enhance through the watch
+// client. Model-backed rewrites of long prompts can take 30 s or more, so they
+// get their own deadline instead of the short watch request timeout.
+const DEFAULT_WATCH_GENERATION_TIMEOUT_MS = 180_000;
 const execFileAsync = promisify(execFile);
 const SUPPORTED_OUTPUT_MODES = new Set(["generic", "copilot", "claude-code", "sequential"]);
 const DEFAULT_EXCLUDED_DIRECTORIES = new Set([
@@ -420,6 +424,7 @@ export async function runCliCommand(options, dependencies = {}) {
       publicationTimeoutMs: options.timeoutMs === undefined
         ? dependencies.watchPublicationTimeoutMs ?? DEFAULT_WATCH_PUBLICATION_TIMEOUT_MS
         : Math.max(1, options.timeoutMs),
+      generationTimeoutMs: dependencies.watchGenerationTimeoutMs ?? DEFAULT_WATCH_GENERATION_TIMEOUT_MS,
     }) : serviceFetch;
   const client =
     dependencies.client ??
@@ -686,6 +691,7 @@ export async function readSessionContextFile(filePath, workspaceRoot) {
 export function createWatchFetch(fetchFn, {
   baseUrl, signal, detachSignal, timeoutMs = DEFAULT_WATCH_REQUEST_TIMEOUT_MS,
   publicationTimeoutMs = DEFAULT_WATCH_PUBLICATION_TIMEOUT_MS,
+  generationTimeoutMs = DEFAULT_WATCH_GENERATION_TIMEOUT_MS,
 } = {}) {
   const apiBaseUrl = baseUrl === undefined ? null : new URL(baseUrl);
   const basePathname = apiBaseUrl?.pathname.replace(/\/+$/, "") ?? "";
@@ -701,7 +707,8 @@ export function createWatchFetch(fetchFn, {
     const mutation = ["POST", "DELETE"].includes(method)
       && /^\/v1\/index\/sessions(?:\/|$)/.test(apiPathname);
     const sessionId = /^\/v1\/index\/sessions\/([^/]+)(?:\/|$)/.exec(apiPathname)?.[1];
-    const requestTimeoutMs = publication ? publicationTimeoutMs : timeoutMs;
+    const generation = method === "POST" && ["/v1/enhance", "/enhance"].includes(apiPathname);
+    const requestTimeoutMs = publication ? publicationTimeoutMs : generation ? generationTimeoutMs : timeoutMs;
     const signals = [init.signal, detachSignal];
     if (["/v1/index/capabilities", "/v1/index/preview", "/v1/health", "/v1/context/diagnose", "/health", "/context/diagnose"].includes(apiPathname)) signals.push(signal);
     const abort = () => controller.abort();
@@ -723,7 +730,9 @@ export function createWatchFetch(fetchFn, {
           ? `Watch ${publication ? "publication" : "indexing"} request timed out after ${formatDuration(requestTimeoutMs)}; `
             + `backend work may still be running${sessionId ? ` for session ${sanitizeTerminalText(sessionId)}` : ""}. `
             + "The outcome is unknown. Watch will stop without starting another reconciliation. Run cw doctor to check serving readiness before restarting."
-          : "Watch HTTP request timed out.";
+          : generation
+            ? `Rewrite request timed out after ${formatDuration(requestTimeoutMs)}.`
+            : "Watch HTTP request timed out.";
         throw Object.assign(new Error(message), {
           name: "AbortError", code: mutation ? "watch_mutation_timeout" : "ETIMEDOUT",
           ...(sessionId ? { sessionId } : {}),

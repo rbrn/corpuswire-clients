@@ -1885,6 +1885,36 @@ for (const endpoint of ["commit", "checkpoint/code"]) {
   });
 }
 
+test("watch rewrite (/v1/enhance) outlives the short request deadline and has its own finite deadline", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let transportSignal;
+  let finish;
+  const hanging = (_input, init) => {
+    transportSignal = init.signal;
+    return new Promise((resolve, reject) => {
+      finish = resolve;
+      init.signal.addEventListener("abort", () => reject(new DOMException("Synthetic abort", "AbortError")), { once: true });
+    });
+  };
+  const wrapped = createWatchFetch(hanging, { baseUrl: "http://127.0.0.1:18080" });
+  const pending = wrapped("http://127.0.0.1:18080/v1/enhance", { method: "POST" });
+  context.mock.timers.tick(45_000);
+  assert.equal(transportSignal.aborted, false, "A slow model rewrite must not hit the 30 s watch request timeout");
+  finish(new Response('{"ok":true}', { headers: { "content-type": "application/json" } }));
+  assert.deepEqual(await (await pending).json(), { ok: true });
+
+  const stalled = wrapped("http://127.0.0.1:18080/v1/enhance", { method: "POST" });
+  const rejection = assert.rejects(stalled, { code: "ETIMEDOUT", message: /^Rewrite request timed out after/ });
+  context.mock.timers.tick(180_000);
+  await rejection;
+  assert.equal(transportSignal.aborted, true);
+
+  const health = wrapped("http://127.0.0.1:18080/v1/health");
+  const healthRejection = assert.rejects(health, { message: "Watch HTTP request timed out." });
+  context.mock.timers.tick(30_000);
+  await healthRejection;
+});
+
 test("watch publication has a finite ten-minute deadline and an unknown outcome with service path prefixes", async (context) => {
   context.mock.timers.enable({ apis: ["setTimeout"] });
   for (const [baseUrl, endpoint] of [
