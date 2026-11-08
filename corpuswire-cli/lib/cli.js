@@ -2269,6 +2269,12 @@ async function handleSessionConflict({ conflict, client, renderer, options, depe
     "Safe choices: attach/follow, cancel with confirmation, or exit.",
   ].join("\n"));
   if (options.configuration?.profile === "local" && conflict.workspace_id === options.workspaceId) {
+    const conflictPhase = conflict.progress?.phase ?? conflict.phase;
+    if (conflictPhase === "failed" && typeof client.abortIndexSession === "function") {
+      // A failed session cannot finish, but it keeps the workspace lock until it is aborted;
+      // following it only repeats its failure on every run (engine #291).
+      return abortFailedSession(client, conflict, write);
+    }
     return followExistingSession(client, conflict.session_id, renderer, options, dependencies);
   }
   if (options.nonInteractive) {
@@ -2289,6 +2295,18 @@ async function handleSessionConflict({ conflict, client, renderer, options, depe
     }
   }
   return { ok: false, conflict, attached: false };
+}
+
+async function abortFailedSession(client, conflict, write) {
+  const sessionId = sanitizeTerminalText(conflict.session_id ?? "unknown");
+  try {
+    await client.abortIndexSession(conflict.session_id);
+  } catch (error) {
+    write(`Could not cancel failed session ${sessionId}: ${sanitizeTerminalText(error instanceof Error ? error.message : String(error))}`);
+    return { ok: false, conflict, attached: false, failedSessionCancelled: false };
+  }
+  write(`Cancelled failed session ${sessionId}, which held the workspace lock. Run cw again to index.`);
+  return { ok: false, conflict, attached: false, failedSessionCancelled: true };
 }
 
 async function readChoice(dependencies, prompt) {
