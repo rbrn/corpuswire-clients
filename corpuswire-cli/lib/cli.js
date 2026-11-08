@@ -35,7 +35,7 @@ const INDEX_TRACE_STAGES = new Set([
   "session_lock_wait", "session_lock_hold", "session_catalog",
   "writer_creation", "schema_preflight", "session_persistence",
 ]);
-const CLI_VERSION = "0.1.5-beta.3";
+const CLI_VERSION = "0.1.5-beta.4";
 
 export function printHelp(write = console.log) {
   write(`cw
