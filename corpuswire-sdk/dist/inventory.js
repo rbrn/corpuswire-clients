@@ -2,11 +2,16 @@ const encoder = new TextEncoder();
 export const INVENTORY_VERSION = "workspace-inventory/v1";
 // Keep in sync with corpuswire.ingest.capabilities.CODE_EXTENSIONS.
 const CODE_EXTENSIONS = new Set([".bat", ".scala", ".sh", ".cjs", ".js", ".jsx", ".mjs", ".cts", ".mts", ".ts", ".tsx", ".java", ".kt", ".kts", ".py", ".pyi", ".hcl", ".tf", ".html", ".htm", ".c", ".cc", ".cpp", ".cs", ".cxx", ".go", ".h", ".hh", ".hpp", ".hxx", ".php", ".rb", ".rs", ".sql", ".swift"]);
+// Keep in sync with corpuswire.ingest.capabilities.SUPPORTED_FILENAME_TYPES and
+// SUPPORTED_FILENAME_PREFIX_TYPES: the server's code checkpoint counts these as code,
+// so uploading them in a later tier makes the checkpoint fail with 409.
+const CODE_FILENAMES = new Set(["gradlew", "mvnw", "dockerfile"]);
 /** Scheduling tiers match the server's canonical supported-file registry. */
 export function ingestionPriority(relativePath) {
     const name = relativePath.replaceAll("\\", "/").split("/").at(-1).toLowerCase();
     const extension = name.slice(name.lastIndexOf("."));
-    if (CODE_EXTENSIONS.has(extension) || name === "mvnw" || name === "gradlew" || name.endsWith(".tf.json"))
+    if (CODE_EXTENSIONS.has(extension) || CODE_FILENAMES.has(name) || name.endsWith(".tf.json")
+        || (name.startsWith("dockerfile.") && name.length > "dockerfile.".length))
         return 1;
     if ([".md", ".txt", ".pdf"].includes(extension))
         return 2;
