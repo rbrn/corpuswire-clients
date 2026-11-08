@@ -1,7 +1,7 @@
 import test from "node:test";
 import { CorpusWireClient } from "@corpuswire/sdk";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile, readFile, readdir, chmod, symlink, rename, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readFile, readdir, chmod, symlink, rename, stat, realpath } from "node:fs/promises";
 import { EventEmitter, once } from "node:events";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
@@ -1340,7 +1340,8 @@ function fakeIndexClient(overrides = {}) {
 }
 
 async function syntheticWorkspace() {
-  const root = await mkdtemp(path.join(tmpdir(), "corpuswire-cli-test-"));
+  // The CLI canonicalises the workspace root; on macOS tmpdir() is a /var -> /private/var symlink.
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "corpuswire-cli-test-")));
   await mkdir(path.join(root, "src"));
   await mkdir(path.join(root, "node_modules"));
   await writeFile(path.join(root, "README.md"), "# Synthetic\n");
