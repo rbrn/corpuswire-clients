@@ -2388,13 +2388,13 @@ test("review: watch does not adopt an alias retargeted during client setup", asy
   assert.match(state.error.message, /replaced/);
 });
 
-async function existingSessionSdkFixture({ command = 'index', phase = 'completed', interrupt = false, onStatus, preflight, race = false, noList = false, timeoutMs, interruptEvent, ndjson = false, unreadable = false, readTimeoutMs, hanging = false, extraArgs = [] } = {}) {
+async function existingSessionSdkFixture({ command = 'index', phase = 'completed', interrupt = false, onStatus, preflight, race = false, noList = false, timeoutMs, interruptEvent, ndjson = false, unreadable = false, readTimeoutMs, hanging = false, extraArgs = [], racePhase = 'committing', abortError } = {}) {
   const root = await syntheticWorkspace();
   const workspaceId = 'demo://existing-session#main';
   const controller = new AbortController();
   const runtimeProcess = new EventEmitter();
   const errorWrites = [];
-  const calls = []; const writes = []; const indexRequests = []; let starts = 0; let previews = 0; let reads = 0;
+  const calls = []; const writes = []; const indexRequests = []; const aborts = []; let starts = 0; let previews = 0; let reads = 0;
   let listCalls = 0; let statusCalls = 0;
   const client = new CorpusWireClient({ baseUrl: 'http://fixture.test', fetchFn: async (input, init) => {
     const url = new URL(input); calls.push({ method: init.method ?? 'GET', path: url.pathname });
@@ -2417,13 +2417,14 @@ async function existingSessionSdkFixture({ command = 'index', phase = 'completed
     previewIndexWorkspace: async request => { previews++; reads += request.files.length; return {workspace_id:workspaceId,collection_name:'synthetic',requested_mode:'full',expected_mode:'full',included:request.files.length,candidates:request.files.length,changed:0,unchanged:request.files.length,deleted:0,excluded:0,candidate_bytes:0,destructive_risk:false}; },
     indexWorkspace: async (request) => {
       starts++; indexRequests.push(request);
-      if (race && starts === 1) throw Object.assign(new Error('Synthetic race'),{status:409,errorDetail:{active_session:{session_id:'existing',workspace_id:workspaceId,phase:'committing'}}});
+      if (race && starts === 1) throw Object.assign(new Error('Synthetic race'),{status:409,errorDetail:{active_session:{session_id:'existing',workspace_id:workspaceId,phase:racePhase}}});
       return {ok:true,status:{phase:'completed',coverage:{state:'verified'}},transfer:{complete:true}};
     },
     health: async()=>({ok:true,index:{coverage:{state:'verified'}}}),
     diagnoseWorkspace: async()=>({status:'ready',can_retrieve:true,resolved_workspace_id:workspaceId,index:{health_status:'ok',coverage:{state:'verified'}}}),
   });
   Object.assign(client,other);
+  client.abortIndexSession=async(id)=>{aborts.push(id);if(abortError) throw abortError;return {session_id:id,phase:'cancelled'};};
   if(noList) client.listIndexSessions=undefined;
   let result; let error;
   try {
@@ -2442,7 +2443,7 @@ async function existingSessionSdkFixture({ command = 'index', phase = 'completed
     });
   } catch(caught) {error=caught;}
   finally {await rm(root,{recursive:true,force:true});}
-  return {result,error,calls,writes,errorWrites,indexRequests,starts,previews,reads,listCalls,statusCalls,processExitCode:runtimeProcess.exitCode};
+  return {result,error,calls,writes,errorWrites,indexRequests,aborts,starts,previews,reads,listCalls,statusCalls,processExitCode:runtimeProcess.exitCode};
 }
 
 test('existing workspace sessions are observed before file reads in index, watch and bare cw', async()=>{
@@ -2879,4 +2880,28 @@ test("init on a local service without credentials creates a tenant, saves its to
     assert.equal((await stat(credentialPath)).mode & 0o777, 0o600);
     assert.equal(tokens.at(-1), "issued-once");
   } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
+test('a failed session that holds the workspace lock is cancelled instead of followed', async()=>{
+  const state=await existingSessionSdkFixture({command:'index',race:true,racePhase:'failed'});
+  assert.ifError(state.error);
+  assert.deepEqual(state.aborts,['existing']);
+  assert.equal(state.statusCalls,0);
+  assert.equal(state.result?.failedSessionCancelled,true);
+  assert.match(state.writes.join('\n'),/Cancelled failed session existing/);
+  assert.equal(state.writes.some(line=>line.includes('Following existing indexing')),false);
+});
+
+test('a failed session that cannot be cancelled is reported, not followed', async()=>{
+  const state=await existingSessionSdkFixture({command:'index',race:true,racePhase:'failed',abortError:new Error('owned by another process')});
+  assert.ifError(state.error);
+  assert.deepEqual(state.aborts,['existing']);
+  assert.equal(state.result?.failedSessionCancelled,false);
+  assert.match(state.writes.join('\n'),/Could not cancel failed session existing: owned by another process/);
+});
+
+test('a running session that holds the workspace lock is still followed, not cancelled', async()=>{
+  const state=await existingSessionSdkFixture({command:'index',race:true,racePhase:'committing'});
+  assert.deepEqual(state.aborts,[]);
+  assert.ok(state.statusCalls>=1);
 });

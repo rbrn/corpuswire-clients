@@ -1754,6 +1754,11 @@ test("ingestion priority covers every code extension in the engine registry when
   }
   assert.ok(extensions.size >= 15, "found the registry extensions");
   for (const extension of extensions) assert.equal(ingestionPriority(`src/main${extension}`), 1, extension);
+  const filenames = source.match(/SUPPORTED_FILENAME_TYPES[^=]*=\s*\{([\s\S]*?)\}/);
+  assert.ok(filenames, "SUPPORTED_FILENAME_TYPES is declared in the engine registry");
+  for (const match of filenames[1].matchAll(/"([a-z0-9_.-]+)":\s*DocumentType\.CODE/g)) {
+    assert.equal(ingestionPriority(`build/${match[1]}`), 1, match[1]);
+  }
 });
 
 test("ingestion priority matches canonical code, documentation and other categories", () => {
@@ -1761,7 +1766,9 @@ test("ingestion priority matches canonical code, documentation and other categor
     "c", "cc", "cpp", "cs", "cxx", "go", "h", "hh", "hpp", "hxx", "php", "rb", "rs", "sql", "swift"]) {
     assert.equal(ingestionPriority(`src/main.${extension.toUpperCase()}`), 1);
   }
-  for (const path of ["scripts/mvnw", "scripts/gradlew", "infra/main.tf.json"]) assert.equal(ingestionPriority(path), 1);
+  for (const path of ["scripts/mvnw", "scripts/gradlew", "infra/main.tf.json", "Dockerfile", "docker/app/Dockerfile",
+    "runtime/dockerfile", "docker/Dockerfile.dev"]) assert.equal(ingestionPriority(path), 1, path);
+  for (const path of ["docker/Dockerfile.", "docker/Dockerfiles", "docker/my.dockerfile"]) assert.notEqual(ingestionPriority(path), 1, path);
   for (const path of ["README.md", "guide.txt", "manual.pdf"]) assert.equal(ingestionPriority(path), 2);
   for (const path of ["settings.json", "data.csv", "config.yml"]) assert.equal(ingestionPriority(path), 3);
 });
