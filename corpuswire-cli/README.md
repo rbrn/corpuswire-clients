@@ -450,4 +450,4 @@ error code (for example `watch_limit_reached` / `ENOSPC`). Unknown codes become
 raw exception messages, filenames, and stacks are omitted. Periodic complete
 scans continue with the configured bounded scan interval.
 
-Watch commit and code-checkpoint requests have a ten-minute default deadline; `--timeout-ms` overrides it. Short preflight requests retain a 30-second deadline. A timed-out indexing mutation has an unknown backend outcome: watch stops without rescanning, and `cw doctor` reports serving readiness before restart.
+Watch commit and code-checkpoint requests have a ten-minute default deadline; `--timeout-ms` overrides it. Short preflight requests retain a 30-second deadline. Ctrl+P rewrites on the watch start screen (`/v1/enhance`) get a three-minute deadline, because model-backed rewrites of long prompts can take more than 30 seconds. A timed-out indexing mutation has an unknown backend outcome: watch stops without rescanning, and `cw doctor` reports serving readiness before restart.
