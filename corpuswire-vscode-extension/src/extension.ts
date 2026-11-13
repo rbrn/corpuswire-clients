@@ -27,6 +27,7 @@ import {
 } from "./enhancement-quality.js";
 import { hasAuthorizationHeader, resolveServiceBearerToken } from "./service-auth.js";
 import { INDEX_INCLUDE_GLOB } from "./index-discovery.js";
+import { GIT_MOVE_GLOB, isGitMovePath } from "./git-move.js";
 import {
   RecentEditsTracker,
   buildEditorSession,
@@ -879,6 +880,7 @@ function registerRemoteIndexWatchers(context: vscode.ExtensionContext): void {
     deleted: Set<string>;
     timer?: ReturnType<typeof setTimeout>;
     due: boolean;
+    reconcile: boolean;
     running: boolean;
     controller?: AbortController;
   }
@@ -904,6 +906,30 @@ function registerRemoteIndexWatchers(context: vscode.ExtensionContext): void {
       if (!pending.due || pending.running) continue;
       pending.due = false;
       const settings = readSettings(pending.folder.uri);
+      if (pending.reconcile) {
+        // A bulk git move: one full reconciliation covers every pending file event.
+        pending.reconcile = false;
+        pending.changed.clear();
+        pending.deleted.clear();
+        if (!settings.remoteIndexing.enabled || !settings.remoteIndexing.autoWatch) continue;
+        pending.running = true;
+        activeRoots += 1;
+        pending.controller = new AbortController();
+        void reconcileFolderIndex(pending.folder, pending.controller.signal)
+          .catch((error) => {
+            if (!disposed) void vscode.window.showWarningMessage(
+              `${pending.folder.name}: CorpusWire reconciliation after a git change failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          })
+          .finally(() => {
+            activeRoots -= 1;
+            pending.running = false;
+            pending.controller = undefined;
+            if (pending.reconcile || pending.changed.size > 0 || pending.deleted.size > 0) schedule(pending);
+            pump();
+          });
+        continue;
+      }
       const changedUris = [...pending.changed.values()];
       const deletedPaths = [...pending.deleted];
       pending.changed.clear();
@@ -930,10 +956,33 @@ function registerRemoteIndexWatchers(context: vscode.ExtensionContext): void {
           activeRoots -= 1;
           pending.running = false;
           pending.controller = undefined;
-          if (pending.changed.size > 0 || pending.deleted.size > 0) schedule(pending);
+          if (pending.reconcile || pending.changed.size > 0 || pending.deleted.size > 0) schedule(pending);
           pump();
         });
     }
+  };
+
+  const pendingFor = (folder: vscode.WorkspaceFolder): PendingRoot => {
+    const key = indexRootKey(folder);
+    let pending = pendingRoots.get(key);
+    if (!pending) {
+      pending = { folder, changed: new Map(), deleted: new Set(), due: false, reconcile: false, running: false };
+      pendingRoots.set(key, pending);
+    }
+    return pending;
+  };
+
+  const enqueueGitMove = (uri: vscode.Uri): void => {
+    if (disposed) return;
+    const folder = vscode.workspace.getWorkspaceFolder(uri);
+    if (!folder) return;
+    const relativePath = relativePathForUri(uri);
+    if (!relativePath || !isGitMovePath(relativePath)) return;
+    const settings = readSettings(folder.uri);
+    if (!settings.remoteIndexing.enabled || !settings.remoteIndexing.autoWatch) return;
+    const pending = pendingFor(folder);
+    pending.reconcile = true;
+    schedule(pending);
   };
 
   const enqueue = (uri: vscode.Uri, deleted: boolean): void => {
@@ -944,12 +993,7 @@ function registerRemoteIndexWatchers(context: vscode.ExtensionContext): void {
     if (!settings.remoteIndexing.enabled || !settings.remoteIndexing.autoWatch) return;
     const relativePath = relativePathForUri(uri);
     if (!relativePath || isIndexExcludedPath(relativePath)) return;
-    const key = indexRootKey(folder);
-    let pending = pendingRoots.get(key);
-    if (!pending) {
-      pending = { folder, changed: new Map(), deleted: new Set(), due: false, running: false };
-      pendingRoots.set(key, pending);
-    }
+    const pending = pendingFor(folder);
     if (deleted) {
       pending.deleted.add(relativePath);
       pending.changed.delete(uri.toString());
@@ -963,8 +1007,11 @@ function registerRemoteIndexWatchers(context: vscode.ExtensionContext): void {
   watcher.onDidCreate((uri) => enqueue(uri, false));
   watcher.onDidChange((uri) => enqueue(uri, false));
   watcher.onDidDelete((uri) => enqueue(uri, true));
+  const gitWatcher = vscode.workspace.createFileSystemWatcher(GIT_MOVE_GLOB);
+  gitWatcher.onDidCreate(enqueueGitMove);
+  gitWatcher.onDidChange(enqueueGitMove);
 
-  context.subscriptions.push(watcher, {
+  context.subscriptions.push(watcher, gitWatcher, {
     dispose: () => {
       disposed = true;
       for (const pending of pendingRoots.values()) {
@@ -974,6 +1021,51 @@ function registerRemoteIndexWatchers(context: vscode.ExtensionContext): void {
       pendingRoots.clear();
     },
   });
+}
+
+// Full-mode session without UI: the server compares sha256 values, so unchanged files upload nothing
+// and files that disappeared are removed. Used after bulk working-tree moves (checkout, reset, pull).
+async function reconcileFolderIndex(folder: vscode.WorkspaceFolder, signal: AbortSignal): Promise<void> {
+  const settings = readSettings(folder.uri);
+  if (!settings.remoteIndexing.enabled || !settings.remoteIndexing.autoWatch || !settings.remoteIndexing.workspaceId) {
+    return;
+  }
+  const roots = (vscode.workspace.workspaceFolders ?? []).map((root) => ({ folder: root, settings: readSettings(root.uri) }))
+    .filter(({ settings: rootSettings }) => rootSettings.remoteIndexing.enabled);
+  if (!roots.some((root) => indexRootKey(root.folder) === indexRootKey(folder))) return;
+  assertDistinctIndexRoots(roots);
+  const indexerService = settings.services.indexer;
+  const client = new CorpusWireClient({
+    baseUrl: indexerService.url,
+    endpointMode: "v1-only",
+    defaultHeaders: await buildAuthenticatedServiceHeaders(settings, indexerService),
+  });
+  const capabilities = await client.getIndexCapabilities();
+  if (signal.aborted) throw new Error("Reconciliation cancelled before scan started.");
+  const maxFileSizeBytes = Math.min(settings.remoteIndexing.maxFileSizeBytes, capabilities.max_file_size_bytes);
+  const collected = await collectWorkspaceFiles(folder, maxFileSizeBytes, signal);
+  if (signal.aborted) throw new Error("Reconciliation cancelled before upload started.");
+  await client.indexWorkspace({
+    workspace: {
+      workspaceId: settings.remoteIndexing.workspaceId,
+      displayRoot: folder.uri.toString(),
+      name: folder.name,
+    },
+    mode: "full",
+    client: {
+      name: "corpuswire-vscode-extension",
+      transport: "vscode.workspace.fs",
+      maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
+      batchBytes: settings.remoteIndexing.batchBytes,
+      maxFileSizeBytes,
+    },
+    maxConcurrentUploads: settings.remoteIndexing.maxConcurrentUploads,
+    batchBytes: settings.remoteIndexing.batchBytes,
+    maxFileSizeBytes,
+    files: collected.files,
+    inventoryScan: collected.inventoryScan,
+    signal,
+  } satisfies IndexWorkspaceRequest);
 }
 
 async function sendIncrementalIndexUpdate(

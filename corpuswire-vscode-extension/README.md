@@ -314,6 +314,14 @@ watcher for the same include glob used by full indexing. It batches events for
 - Files above `remoteIndexing.maxFileSizeBytes` are skipped before the extension
   reads file bytes.
 
+A second watcher follows `.git/HEAD` (checkout, switch) and `.git/ORIG_HEAD`
+(reset, merge, pull, rebase) at the workspace root. Per-file events are not
+reliable after such bulk moves, so a change there triggers one quiet
+`mode: "full"` reconciliation of that root instead: the server skips unchanged
+files by sha256, uploads the changed ones and removes files that disappeared.
+It supersedes any queued file events for that root. Nested repositories and
+worktrees whose `.git` is a file are not watched.
+
 Incremental mode updates only mentioned files and deleted paths. It does not
 remove stale files that were never mentioned in the update batch. Run
 `CorpusWire: Index Workspace` again when you need complete stale-file

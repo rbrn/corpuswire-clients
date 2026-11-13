@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import minimatch from 'minimatch';
 import { INDEX_INCLUDE_GLOB as includeGlob } from '../dist/index-discovery.js';
+import { GIT_MOVE_GLOB, isGitMovePath } from '../dist/git-move.js';
 
 // Exercise the compiled production scanner with injected VS Code filesystem IO.
 const source = await readFile(new URL('../dist/extension.js', import.meta.url), 'utf8');
@@ -137,7 +138,7 @@ function extensionHarness(folders, overrides = new Map()) {
   };
   let scan = async (root) => ({ files: [{ relativePath: 'src/shared.ts', content: root.name }],
     skippedLargeFiles: 0, inventoryScan: { complete: true } });
-  const callbacks = {};
+  const callbacks = {}, gitCallbacks = {};
   const subscriptions = [];
   const cancelHandlers = [];
   const token = { isCancellationRequested: false, onCancellationRequested(handler) {
@@ -157,6 +158,10 @@ function extensionHarness(folders, overrides = new Map()) {
         return uri.toString().slice(root.uri.toString().length + 1);
       },
       createFileSystemWatcher(glob) {
+        if (glob === GIT_MOVE_GLOB) {
+          return { onDidCreate: (handler) => { gitCallbacks.create = handler; },
+            onDidChange: (handler) => { gitCallbacks.change = handler; }, dispose() {} };
+        }
         watcherGlob = glob;
         return { onDidCreate: (handler) => { callbacks.create = handler; },
           onDidChange: (handler) => { callbacks.change = handler; },
@@ -200,10 +205,13 @@ function extensionHarness(folders, overrides = new Map()) {
     function formatIndexingError(error) { return error.message; }
     function formatIndexProgressMessage() { return 'upload progress'; }
     const INDEX_INCLUDE_GLOB = ${JSON.stringify(includeGlob)};
+    const GIT_MOVE_GLOB = ${JSON.stringify(GIT_MOVE_GLOB)};
+    const GIT_MOVE_PATHS = new Set(['.git/HEAD', '.git/ORIG_HEAD']);
+    const isGitMovePath = ${isGitMovePath.toString()};
     return { indexCurrentWorkspace, rebuildCurrentWorkspaceIndex, registerRemoteIndexWatchers, sendIncrementalIndexUpdate, relativePathForUri, runIndexStatusCheck, indexRootStatus };
   `)(vscode, readSettings, Client, () => { authenticationCalls += 1; return {}; }, collectWorkspaceFiles, collectUriFiles, excludedPath,
     (handler) => { const id = ++nextTimer; timers.set(id, handler); return id; }, (id) => timers.delete(id));
-  return { ...functions, warnings, information, progress, requests, stageRequests, scans, diagnoses, callbacks, settings, subscriptions, confirmations,
+  return { ...functions, warnings, information, progress, requests, stageRequests, scans, diagnoses, callbacks, settings, subscriptions, confirmations, gitCallbacks,
     setConfirmation(selection) { confirmationSelection = selection; },
     get capabilities() { return capabilities; }, setUpload(handler) { upload = handler; },
     get clientConstructions() { return clientConstructions; }, get authenticationCalls() { return authenticationCalls; },
@@ -1120,4 +1128,51 @@ test('discovery glob stays within the native VS Code non-nested brace contract',
     }
   }
   assert.equal(depth, 0);
+});
+
+test('a git move reconciles the whole root once and supersedes queued file events', async () => {
+  const root = folder('git-move');
+  const harness = extensionHarness([root]);
+  harness.registerRemoteIndexWatchers({ subscriptions: harness.subscriptions });
+  harness.callbacks.change(file(root, 'src/a.ts'));
+  harness.gitCallbacks.change(file(root, '.git/ORIG_HEAD'));
+  harness.gitCallbacks.change(file(root, '.git/HEAD'));
+  harness.flushTimers();
+  await tick();
+  assert.equal(harness.requests.length, 1);
+  assert.equal(harness.requests[0].mode, 'full');
+  assert.equal(harness.requests[0].inventoryScan.complete, true);
+  assert.deepEqual(harness.scans, ['git-move']);
+  assert.equal(harness.requests[0].deletedPaths, undefined);
+});
+
+test('git move events outside the root git directory or with auto-watch off are ignored', async () => {
+  const root = folder('git-move-ignored'), off = folder('git-move-off');
+  const harness = extensionHarness([root, off], new Map([['git-move-off', { autoWatch: false }]]));
+  harness.registerRemoteIndexWatchers({ subscriptions: harness.subscriptions });
+  harness.gitCallbacks.change(file(root, 'vendor/lib/.git/HEAD'));
+  harness.gitCallbacks.change(file(root, '.git/index'));
+  harness.gitCallbacks.create(file(off, '.git/HEAD'));
+  harness.flushTimers();
+  await tick();
+  assert.equal(harness.requests.length, 0);
+  assert.equal(harness.clientConstructions, 0);
+  assert.deepEqual(harness.scans, []);
+});
+
+test('file events that arrive during a git-move reconciliation are replayed afterwards', async () => {
+  const root = folder('git-move-inflight');
+  const harness = extensionHarness([root]);
+  const gate = deferred();
+  harness.setUpload(async (request) => { if (request.mode === 'full') await gate.promise; return { status: { coverage: { state: 'verified' } } }; });
+  harness.registerRemoteIndexWatchers({ subscriptions: harness.subscriptions });
+  harness.gitCallbacks.change(file(root, '.git/HEAD'));
+  harness.flushTimers();
+  await tick();
+  harness.callbacks.change(file(root, 'src/late.ts'));
+  gate.resolve();
+  await tick();
+  harness.flushTimers();
+  await tick();
+  assert.deepEqual(harness.requests.map((request) => request.mode), ['full', 'incremental']);
 });
