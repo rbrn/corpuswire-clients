@@ -1310,7 +1310,7 @@ export async function runIndexCommand(options, dependencies) {
   const refuse = (type, lines, extra = {}) => {
     write(options.ndjson || options.json ? JSON.stringify({ type, mutated: false, ...extra }) : lines.join("\n"));
     emitTrace({ scan });
-    return { ok: false, started: false, mutated: false, refused: type, preview };
+    return { ok: false, started: false, mutated: false, refused: type, preview, exitCode: 1 };
   };
   if (preview.source_root_conflict === true && options.allowSourceSwitch !== true) {
     const owner = sanitizeTerminalText(preview.published_source_root ?? "another folder");
