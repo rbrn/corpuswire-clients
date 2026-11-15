@@ -1416,6 +1416,8 @@ export function toStartIndexSessionPayload(request) {
         exclude_globs: request.excludeGlobs,
         max_file_size_bytes: request.maxFileSizeBytes,
         recreate_collection: request.recreateCollection ?? false,
+        // Sent only when set: servers without the source-root guard reject unknown fields.
+        allow_source_switch: request.allowSourceSwitch === true ? true : undefined,
         snapshot_scope: toRemoteIndexScopePayload(request.snapshotScope),
         inventory: request.inventory,
         evaluation_inventory_attestation: request.evaluationInventoryAttestation,
