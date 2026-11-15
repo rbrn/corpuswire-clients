@@ -92,6 +92,8 @@ Options:
   --verify                 Run doctor after init
   --non-interactive        Never prompt; requires --yes to mutate
   --timeout-ms <number>    Explicit caller wait budget; backend continues on expiry
+  --allow-source-switch    Publish this folder to a workspace another folder owns
+  --include-ignored        Also index files git ignores (default: skip them)
   --rebuild                Allow destructive collection recreation (second confirmation)
   --confirm-rebuild <id>   Required in non-interactive mode; must equal workspace ID
   --attach <session-id>    Follow an existing session; no total deadline unless --timeout-ms
@@ -321,6 +323,12 @@ export function parseCliArgs(argv, env = process.env, currentFolder = process.cw
         break;
       case "--rebuild":
         options.rebuild = true;
+        break;
+      case "--allow-source-switch":
+        options.allowSourceSwitch = true;
+        break;
+      case "--include-ignored":
+        options.includeIgnored = true;
         break;
       case "--confirm-rebuild":
         options.confirmRebuild = requireValue(args, index, arg);
@@ -785,6 +793,87 @@ function watchRetryable(error) {
     || error.name === "TypeError" || ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ENOENT"].includes(error.code);
 }
 
+const GIT_OPERATION_MARKERS = [
+  ["index.lock", "git command"], ["rebase-merge", "rebase"], ["rebase-apply", "rebase"], ["MERGE_HEAD", "merge"],
+  ["CHERRY_PICK_HEAD", "cherry-pick"], ["REVERT_HEAD", "revert"], ["BISECT_LOG", "bisect"],
+];
+const LARGE_REWRITE_MIN_FILES = 50;
+const LARGE_REWRITE_SHARE = 0.2;
+
+/** Find the git directory of the work tree that contains `root`, following a worktree's `.git` file. */
+async function resolveGitDirectory(root) {
+  for (let directory = root; ; directory = path.dirname(directory)) {
+    const candidate = path.join(directory, ".git");
+    const stats = await lstat(candidate).catch(() => null);
+    if (stats?.isDirectory()) return candidate;
+    if (stats?.isFile()) {
+      const pointer = /^gitdir:\s*(.+)$/m.exec(await readFile(candidate, "utf8").catch(() => ""));
+      return pointer ? path.resolve(directory, pointer[1].trim()) : null;
+    }
+    if (path.dirname(directory) === directory) return null;
+  }
+}
+
+/** Name the git operation that has the work tree in an intermediate state, if any. */
+export async function gitOperationInProgress(root) {
+  const gitDirectory = await resolveGitDirectory(root);
+  if (!gitDirectory) return null;
+  for (const [marker, name] of GIT_OPERATION_MARKERS) {
+    if (await lstat(path.join(gitDirectory, marker)).then(() => true, () => false)) return name;
+  }
+  return null;
+}
+
+async function runGit(root, args, dependencies = {}) {
+  const result = await (dependencies.gitExecFile ?? execFileAsync)("git", ["-C", root, ...args],
+    { maxBuffer: 256 * 1024 * 1024, timeout: 15000, windowsHide: true });
+  return String(result.stdout ?? "");
+}
+
+/**
+ * List the files git treats as source under `root`: tracked files (submodules
+ * included) plus untracked files that no ignore rule covers. Null when `root`
+ * is not in a git work tree or git is unavailable; the caller then keeps every
+ * scanned file.
+ */
+export async function listGitSourceFiles(root, dependencies = {}) {
+  try {
+    if ((await runGit(root, ["rev-parse", "--is-inside-work-tree"], dependencies)).trim() !== "true") return null;
+    const [tracked, untracked] = await Promise.all([
+      runGit(root, ["ls-files", "-z", "--cached", "--recurse-submodules"], dependencies),
+      runGit(root, ["ls-files", "-z", "--others", "--exclude-standard"], dependencies),
+    ]);
+    return new Set(`${tracked}${untracked}`.split("\0").filter(Boolean).map((file) => file.normalize("NFC")));
+  } catch {
+    return null;
+  }
+}
+
+/** Best-effort commit, branch and dirty-file count of the source tree, for the index record. */
+export async function describeGitSource(root, dependencies = {}) {
+  try {
+    const [commit, branch, status] = await Promise.all([
+      runGit(root, ["rev-parse", "HEAD"], dependencies),
+      runGit(root, ["rev-parse", "--abbrev-ref", "HEAD"], dependencies),
+      runGit(root, ["status", "--porcelain", "--untracked-files=no"], dependencies),
+    ]);
+    if (!/^[0-9a-f]{40,64}$/.test(commit.trim())) return {};
+    return { git_commit: commit.trim(), git_branch: branch.trim() || "HEAD",
+      git_dirty_files: status.split("\n").filter(Boolean).length };
+  } catch {
+    return {};
+  }
+}
+
+/** An unconfirmed publish that would rewrite a large share of an existing index. */
+export function isLargeRewrite(preview) {
+  const rewritten = (preview?.changed ?? 0) + (preview?.deleted ?? 0);
+  const published = (preview?.unchanged ?? 0) + (preview?.deleted ?? 0);
+  if (published === 0) return false;
+  return rewritten > LARGE_REWRITE_MIN_FILES
+    && rewritten > LARGE_REWRITE_SHARE * (published + (preview?.changed ?? 0));
+}
+
 function watchFailure(message, code = "watch_fence") {
   return Object.assign(new Error(message), { code });
 }
@@ -910,6 +999,7 @@ export async function runWatchCommand(options, dependencies) {
   let publishedDigest = null;
   let failures = 0;
   let publications = 0;
+  let reportedGitOperation = null;
   let stopped = false;
   let watcherErrorReported = false;
 
@@ -1009,15 +1099,27 @@ export async function runWatchCommand(options, dependencies) {
           capabilities, includeGlobs: options.includeGlobs, excludeGlobs: options.excludeGlobs,
           maxFileSizeBytes: Math.min(options.maxFileSizeBytes ?? capabilities.max_file_size_bytes, capabilities.max_file_size_bytes),
           onProgress: () => {}, signal, workspaceId: options.workspaceId, startedAt: Date.now(),
+          includeIgnored: options.includeIgnored === true, gitDependencies: dependencies,
         });
         await assertFence();
         await validateWatchFiles(root, scan);
         if (generation !== scanGeneration) continue;
+        const gitOperation = await gitOperationInProgress(root);
+        if (gitOperation) {
+          if (gitOperation !== reportedGitOperation) {
+            write(`A git ${gitOperation} is in progress; publishing when it finishes.`);
+            dependencies.onWatchState?.(`Waiting for git ${gitOperation} to finish`);
+          }
+          reportedGitOperation = gitOperation;
+          await wait(Math.min(options.pollMs, 1000), signal);
+          continue;
+        }
+        reportedGitOperation = null;
         const digest = createHash("sha256").update(JSON.stringify(scan.files.map((file) => [file.relativePath, file.sha256]).sort((a, b) => a[0].localeCompare(b[0])))).digest("hex");
         if (digest !== publishedDigest) {
           const initialExplicitIndex = publications === 0 && ["index", "reconcile"].includes(options.command) && !options.implicitIndex;
           const result = await runIndexCommand({ ...options, sourceRoot: root,
-            yes: initialExplicitIndex ? options.yes : true,
+            yes: initialExplicitIndex ? options.yes : true, explicitYes: options.yes === true,
             nonInteractive: initialExplicitIndex ? options.nonInteractive : true }, {
             ...dependencies, capabilities, preparedScan: scan, assertObserveFence: assertFence,
             write: (line) => {
@@ -1032,6 +1134,7 @@ export async function runWatchCommand(options, dependencies) {
             },
           });
           if (signal?.aborted) break;
+          if (result.refused) return { ...result, stopped: true, publications, exitCode: 1 };
           if (result.started === false) return { ...result, stopped: true, publications, exitCode: 0 };
           if (result.observedExisting && result.phase === "completed") {
             // A borrowed publication cannot attest this process's local inventory.
@@ -1170,6 +1273,8 @@ export async function runIndexCommand(options, dependencies) {
     signal: dependencies.signal,
     workspaceId: configuration.workspaceId,
     startedAt,
+    includeIgnored: options.includeIgnored === true,
+    gitDependencies: dependencies,
   });
   const request = {
     workspace: {
@@ -1181,7 +1286,9 @@ export async function runIndexCommand(options, dependencies) {
     client: {
       name: "@corpuswire/cli",
       transport: options.ndjson || options.json ? "cli-ndjson" : "cli-terminal",
+      ...await describeGitSource(sourceRoot, dependencies),
     },
+    allowSourceSwitch: options.allowSourceSwitch === true ? true : undefined,
     includeGlobs: options.includeGlobs ?? [],
     excludeGlobs: options.excludeGlobs ?? [],
     maxFileSizeBytes: Math.min(options.maxFileSizeBytes ?? capabilities.max_file_size_bytes, capabilities.max_file_size_bytes),
@@ -1200,12 +1307,37 @@ export async function runIndexCommand(options, dependencies) {
     ndjson: options.ndjson || options.json,
   });
 
+  const refuse = (type, lines, extra = {}) => {
+    write(options.ndjson || options.json ? JSON.stringify({ type, mutated: false, ...extra }) : lines.join("\n"));
+    emitTrace({ scan });
+    return { ok: false, started: false, mutated: false, refused: type, preview };
+  };
+  if (preview.source_root_conflict === true && options.allowSourceSwitch !== true) {
+    const owner = sanitizeTerminalText(preview.published_source_root ?? "another folder");
+    return refuse("source_root_changed", [
+      `Not indexed: ${sanitizeTerminalText(configuration.workspaceId)} is published from ${owner}.`,
+      `Publishing ${sanitizeTerminalText(sourceRoot)} would replace that folder's files in the index (${preview.changed} changed, ${preview.deleted} removed).`,
+      "Use a separate workspace for this folder (--workspace-id <id>), or pass --allow-source-switch to make this folder the owner.",
+      "No index mutation was made.",
+    ], { published_source_root: preview.published_source_root ?? null, source_root: sourceRoot });
+  }
+  const explicitYes = options.explicitYes ?? options.yes === true;
+  const largeRewrite = !explicitYes && options.rebuild !== true && isLargeRewrite(preview);
+  if (largeRewrite && (options.nonInteractive === true || options.yes === true)) {
+    return refuse("large_rewrite_unconfirmed", [
+      `Not indexed: this would rewrite a large part of ${sanitizeTerminalText(configuration.workspaceId)} (${preview.changed} changed, ${preview.deleted} removed, ${preview.unchanged} unchanged).`,
+      "Run cw reconcile to review and confirm it, or repeat the command with --yes.",
+      "No index mutation was made.",
+    ], { changed: preview.changed, deleted: preview.deleted, unchanged: preview.unchanged });
+  }
   const approved = options.yes === true
-    || ((options.implicitIndex === true || options.command === "init") && configuration.profile === "local" && options.rebuild !== true)
+    || (!largeRewrite && (options.implicitIndex === true || options.command === "init") && configuration.profile === "local" && options.rebuild !== true)
     ? true
     : options.nonInteractive === true
     ? false
-    : await confirmIndexing(dependencies, "Start indexing this workspace? [y/N]");
+    : await confirmIndexing(dependencies, largeRewrite
+      ? `This rewrites a large part of the index (${preview.changed} changed, ${preview.deleted} removed). Continue? [y/N]`
+      : "Start indexing this workspace? [y/N]");
   if (!approved) {
     write(options.ndjson || options.json
       ? JSON.stringify({ type: "cancelled_before_mutation", mutated: false })
@@ -1783,8 +1915,15 @@ async function scanWorkspaceComplete(sourceRoot, options) {
   const supportedNames = new Set(options.capabilities.supported_filenames ?? []);
   const selected = [];
   let excluded = 0;
+  let gitIgnored = 0;
   let candidateBytes = 0;
+  const gitSourceFiles = options.includeIgnored === true ? null : await listGitSourceFiles(sourceRoot, options.gitDependencies);
   for (const [index, candidate] of scannedPaths.entries()) {
+    if (gitSourceFiles && !gitSourceFiles.has(candidate.relativePath.normalize("NFC"))) {
+      excluded += 1;
+      gitIgnored += 1;
+      continue;
+    }
     const extension = path.posix.extname(candidate.relativePath).toLowerCase();
     const basename = path.posix.basename(candidate.relativePath).toLowerCase();
     const includedByType = supportedExtensions.has(extension) || supportedNames.has(basename);
@@ -1846,10 +1985,11 @@ async function scanWorkspaceComplete(sourceRoot, options) {
     inventoryScan: {
       complete: true, startedAt: scanStartedAt, completedAt: new Date().toISOString(),
       excludedFileCount: excluded, producer: "corpuswire-cli-scan/v1",
-      ignoreDigest: createHash("sha256").update(JSON.stringify({ directories: [...DEFAULT_EXCLUDED_DIRECTORIES].sort(), hiddenPaths: "exclude", retrievalExclusions: "discovery-and-terraform/v1" })).digest("hex"),
+      ignoreDigest: createHash("sha256").update(JSON.stringify({ directories: [...DEFAULT_EXCLUDED_DIRECTORIES].sort(), hiddenPaths: "exclude", retrievalExclusions: "discovery-and-terraform/v2", gitIgnore: gitSourceFiles ? "exclude-standard" : "off" })).digest("hex"),
     },
     files,
     scanned,
+    gitIgnored,
     included: selected.length,
     excluded,
     candidateBytes,
@@ -2139,6 +2279,7 @@ function printIndexPreview(write, { configuration, sourceRoot, scan, preview, nd
     profile: configuration.profile,
     configuration_source: configuration.source,
     files_scanned: scan.scanned,
+    git_ignored_files: scan.gitIgnored ?? 0,
     candidate_files: preview.included,
     excluded_files: scan.excluded + preview.excluded,
     candidate_bytes: preview.candidate_bytes,
@@ -2161,7 +2302,9 @@ function printIndexPreview(write, { configuration, sourceRoot, scan, preview, nd
     `  Files: ${payload.candidate_files} candidate, ${payload.excluded_files} excluded, ${payload.files_scanned} scanned`,
     `  Candidate bytes: ${formatBytes(payload.candidate_bytes)}`,
     `  Expected mode: ${payload.expected_mode} (${payload.changed_files} changed, ${payload.unchanged_files} unchanged, ${payload.deleted_files} deleted)`,
-    `  Destructive risk: ${payload.destructive_risk ? "YES — collection recreation requested" : "none"}`,
+    ...(payload.git_ignored_files > 0 ? [`  Skipped as ignored by git: ${payload.git_ignored_files} (use --include-ignored to index them)`] : []),
+    `  Destructive risk: ${payload.destructive_risk ? "YES — collection recreation requested"
+      : payload.deleted_files > 0 ? `${payload.deleted_files} indexed files will be removed` : "none"}`,
   ].join("\n"));
 }
 

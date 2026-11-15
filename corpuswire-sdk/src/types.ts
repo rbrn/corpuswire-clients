@@ -905,6 +905,8 @@ export interface StartRemoteIndexSessionRequest {
   excludeGlobs?: string[];
   maxFileSizeBytes?: number;
   recreateCollection?: boolean;
+  /** Publish a full inventory to a workspace whose baseline came from another source folder. */
+  allowSourceSwitch?: boolean;
   snapshotScope?: RemoteIndexScopeV2 | null;
 }
 
@@ -1016,6 +1018,10 @@ export interface RemoteIndexPreview {
   deleted: number;
   candidate_bytes: number;
   destructive_risk: boolean;
+  /** The source folder whose full inventory the workspace currently holds, when the server records it. */
+  published_source_root?: string | null;
+  /** True when this request's folder differs from it and the switch was not allowed. */
+  source_root_conflict?: boolean;
 }
 
 export interface RemoteIndexSessionsResponse {
