@@ -19,5 +19,5 @@ export declare function inventorySha256(content: Uint8Array | string): Promise<s
 export declare function inventoryDigest(entries: ReadonlyArray<readonly [string, string, number]>): Promise<string>;
 export declare function selectionPolicyDigest(policy: InventorySelectionPolicy): Promise<string>;
 export declare function buildWorkspaceInventory(entries: ReadonlyArray<readonly [string, string, number]>, policy: InventorySelectionPolicy, scan: InventoryScan): Promise<WorkspaceInventory>;
-/** Exclude raw discovery metadata and Terraform values from source uploads. */
+/** Exclude raw discovery metadata, Terraform values and CorpusWire's own diagnostics from source uploads. */
 export declare function isRetrievalExcludedPath(relativePath: string): boolean;

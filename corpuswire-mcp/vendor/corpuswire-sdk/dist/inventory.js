@@ -2,11 +2,16 @@ const encoder = new TextEncoder();
 export const INVENTORY_VERSION = "workspace-inventory/v1";
 // Keep in sync with corpuswire.ingest.capabilities.CODE_EXTENSIONS.
 const CODE_EXTENSIONS = new Set([".bat", ".scala", ".sh", ".cjs", ".js", ".jsx", ".mjs", ".cts", ".mts", ".ts", ".tsx", ".java", ".kt", ".kts", ".py", ".pyi", ".hcl", ".tf", ".html", ".htm", ".c", ".cc", ".cpp", ".cs", ".cxx", ".go", ".h", ".hh", ".hpp", ".hxx", ".php", ".rb", ".rs", ".sql", ".swift"]);
+// Keep in sync with corpuswire.ingest.capabilities.SUPPORTED_FILENAME_TYPES and
+// SUPPORTED_FILENAME_PREFIX_TYPES: the server's code checkpoint counts these as code,
+// so uploading them in a later tier makes the checkpoint fail with 409.
+const CODE_FILENAMES = new Set(["gradlew", "mvnw", "dockerfile"]);
 /** Scheduling tiers match the server's canonical supported-file registry. */
 export function ingestionPriority(relativePath) {
     const name = relativePath.replaceAll("\\", "/").split("/").at(-1).toLowerCase();
     const extension = name.slice(name.lastIndexOf("."));
-    if (CODE_EXTENSIONS.has(extension) || name === "mvnw" || name === "gradlew" || name.endsWith(".tf.json"))
+    if (CODE_EXTENSIONS.has(extension) || CODE_FILENAMES.has(name) || name.endsWith(".tf.json")
+        || (name.startsWith("dockerfile.") && name.length > "dockerfile.".length))
         return 1;
     if ([".md", ".txt", ".pdf"].includes(extension))
         return 2;
@@ -83,10 +88,17 @@ export async function buildWorkspaceInventory(entries, policy, scan) {
     };
 }
 const DISCOVERY_ONLY_FILENAMES = new Set([".terraform.lock.hcl", "angular.json", "build.gradle", "build.gradle.kts", "bun.lock", "bun.lockb", "dependencies.lock", "gradle.lockfile", "gradle.properties", "jsconfig.json", "libs.versions.toml", "npm-shrinkwrap.json", "nx.json", "package-lock.json", "package.json", "pdm.lock", "pipfile", "pipfile.lock", "pnpm-lock.yaml", "poetry.lock", "pom.xml", "project.json", "pyproject.toml", "settings.gradle", "settings.gradle.kts", "setup.cfg", "setup.py", "uv.lock", "workspace.json", "yarn.lock"]);
-/** Exclude raw discovery metadata and Terraform values from source uploads. */
+/** CorpusWire clients write failure diagnostics here; the retriever never serves them. */
+function isRetrievalDiagnosticPath(parts) {
+    const directories = parts.slice(0, -1);
+    return directories.some((part, index) => part === "reports" && directories[index + 1] === "retrieval-failures");
+}
+/** Exclude raw discovery metadata, Terraform values and CorpusWire's own diagnostics from source uploads. */
 export function isRetrievalExcludedPath(relativePath) {
-    const name = relativePath.replaceAll("\\", "/").split("/").at(-1).toLowerCase();
-    return DISCOVERY_ONLY_FILENAMES.has(name)
+    const parts = relativePath.replaceAll("\\", "/").toLowerCase().split("/");
+    const name = parts.at(-1);
+    return isRetrievalDiagnosticPath(parts)
+        || DISCOVERY_ONLY_FILENAMES.has(name)
         || /\.(gradle|properties|tfvars|xml)$/.test(name)
         || (name.startsWith("tsconfig") && name.endsWith(".json"))
         || /^(requirements|constraints)([-_].*)?\.txt$/.test(name)
