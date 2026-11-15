@@ -1728,10 +1728,12 @@ test("partial upload error retains acknowledgements observed before sibling canc
 
 test("retrieval exclusions preserve source while rejecting discovery and Terraform inputs", async () => {
   const { isRetrievalExcludedPath } = await import("../dist/index.js");
-  for (const path of ["package.json", "src/tsconfig.build.json", "requirements.txt", "requirements-dev.txt", "constraints_prod.txt", "SETUP.PY", "nx.json", "project.json", "state.tfstate.json", "values.tfvars.json", "out.plan.json", "pom.xml"]) {
+  for (const path of ["package.json", "src/tsconfig.build.json", "requirements.txt", "requirements-dev.txt", "constraints_prod.txt", "SETUP.PY", "nx.json", "project.json", "state.tfstate.json", "values.tfvars.json", "out.plan.json", "pom.xml",
+    "reports/retrieval-failures/a.json", "clients/mcp/Reports/Retrieval-Failures/b.json", "reports\\retrieval-failures\\c.json"]) {
     assert.equal(isRetrievalExcludedPath(path), true, path);
   }
-  for (const path of ["src/main.py", "README.md", "settings.json", "requirements-guide.md", "main.tf", "model.tf.json"]) {
+  for (const path of ["src/main.py", "README.md", "settings.json", "requirements-guide.md", "main.tf", "model.tf.json",
+    "reports/summary.json", "reports/retrieval-failures", "docs/retrieval-failures/notes.md"]) {
     assert.equal(isRetrievalExcludedPath(path), false, path);
   }
 });

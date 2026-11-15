@@ -14,7 +14,10 @@ import {
   createIndexTraceCollector,
   createProgressRenderer,
   createWatchFetch,
+  describeGitSource,
   formatProgressLine,
+  gitOperationInProgress,
+  isLargeRewrite,
   main,
   parseCliArgs,
   runCliCommand,
@@ -1427,8 +1430,8 @@ async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, 
     },
     previewIndexWorkspace: async (request) => {
       state.calls.preview += 1;
-      await onPreview?.(state, request);
-      return { workspace_id: request.workspace.workspaceId, collection_name: "synthetic-watch", requested_mode: "full", expected_mode: "full", included: request.files.length, candidates: request.files.length, changed: request.files.length, unchanged: 0, deleted: 0, excluded: 0, candidate_bytes: 0, destructive_risk: false };
+      const previewOverrides = await onPreview?.(state, request);
+      return { workspace_id: request.workspace.workspaceId, collection_name: "synthetic-watch", requested_mode: "full", expected_mode: "full", included: request.files.length, candidates: request.files.length, changed: request.files.length, unchanged: 0, deleted: 0, excluded: 0, candidate_bytes: 0, destructive_risk: false, ...(previewOverrides ?? {}) };
     },
     indexWorkspace: async (request) => {
       state.requests.push({
@@ -2904,4 +2907,165 @@ test('a running session that holds the workspace lock is still followed, not can
   const state=await existingSessionSdkFixture({command:'index',race:true,racePhase:'committing'});
   assert.deepEqual(state.aborts,[]);
   assert.ok(state.statusCalls>=1);
+});
+
+// IDX-002: source-tree ownership, git-ignored files, large rewrites and in-progress git operations.
+function previewWith(overrides) {
+  return async (request) => ({ workspace_id: request.workspace.workspaceId, collection_name: "collection-cli",
+    requested_mode: request.mode, expected_mode: "full", candidates: request.files.length, included: request.files.length,
+    excluded: 0, changed: request.files.length, unchanged: 0, deleted: 0, candidate_bytes: 0, destructive_risk: false, ...overrides });
+}
+
+async function runSyntheticIndex(argv, overrides, extra = {}) {
+  const fixture = await syntheticWorkspace();
+  const state = { writes: [], requests: [], confirmations: [] };
+  try {
+    state.result = await main(argv, {
+      cwd: fixture, env: {}, homeDirectory: fixture,
+      client: fakeIndexClient({ previewIndexWorkspace: previewWith(overrides),
+        indexWorkspace: async (request) => { state.requests.push(request); return { ok: true, result: {}, status: {} }; } }),
+      write: (line) => state.writes.push(line), writeRaw: () => {},
+      confirm: async (prompt) => { state.confirmations.push(prompt); return extra.answer ?? ""; },
+    });
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+  return state;
+}
+
+test("a workspace owned by another source folder is not overwritten, even with --yes", async () => {
+  const conflict = { source_root_conflict: true, published_source_root: "/srv/mirror", changed: 3, deleted: 7 };
+  const refused = await runSyntheticIndex(["reconcile", "--yes"], conflict);
+  assert.equal(refused.requests.length, 0);
+  assert.equal(refused.confirmations.length, 0);
+  assert.match(refused.writes.join("\n"), /is published from \/srv\/mirror/);
+  assert.match(refused.writes.join("\n"), /--allow-source-switch/);
+  assert.match(refused.writes.join("\n"), /No index mutation was made/);
+
+  const allowed = await runSyntheticIndex(["reconcile", "--yes", "--allow-source-switch"], conflict);
+  assert.equal(allowed.requests.length, 1);
+  assert.equal(allowed.requests[0].allowSourceSwitch, true);
+
+  const sameOwner = await runSyntheticIndex(["reconcile", "--yes"], { published_source_root: "/srv/mirror" });
+  assert.equal(sameOwner.requests.length, 1);
+  assert.equal(sameOwner.requests[0].allowSourceSwitch, undefined);
+});
+
+test("a large rewrite of an existing index is never auto-approved", async () => {
+  const large = { changed: 60, deleted: 40, unchanged: 100 };
+  assert.equal(isLargeRewrite(large), true);
+  assert.equal(isLargeRewrite({ changed: 500, deleted: 0, unchanged: 0 }), false, "first index of an empty workspace");
+  assert.equal(isLargeRewrite({ changed: 40, deleted: 10, unchanged: 5 }), false, "50 files or fewer");
+  assert.equal(isLargeRewrite({ changed: 60, deleted: 0, unchanged: 1000 }), false, "under a fifth of the index");
+
+  const implicit = await runSyntheticIndex([], large);
+  assert.equal(implicit.requests.length, 0);
+  assert.equal(implicit.confirmations.length, 1);
+  assert.match(implicit.confirmations[0], /rewrites a large part of the index \(60 changed, 40 removed\)/);
+
+  const confirmed = await runSyntheticIndex([], large, { answer: "y" });
+  assert.equal(confirmed.requests.length, 1);
+
+  const scripted = await runSyntheticIndex(["reconcile", "--non-interactive"], large);
+  assert.equal(scripted.requests.length, 0);
+  assert.match(scripted.writes.join("\n"), /repeat the command with --yes/);
+
+  const explicit = await runSyntheticIndex(["reconcile", "--yes"], large);
+  assert.equal(explicit.requests.length, 1);
+
+  const small = await runSyntheticIndex([], { changed: 2, deleted: 1, unchanged: 100 });
+  assert.equal(small.requests.length, 1);
+  assert.equal(small.confirmations.length, 0);
+  assert.match(small.writes.join("\n"), /Destructive risk: 1 indexed files will be removed/);
+});
+
+test("watch stops instead of republishing a large rewrite", { timeout: 5000 }, async () => {
+  const state = await watchFixture({
+    onPreview: (current) => (current.calls.preview > 1 ? { changed: 60, deleted: 40, unchanged: 100 } : undefined),
+    onWait: async (current) => {
+      if (current.requests.length === 1 && current.calls.preview === 1) {
+        await writeFile(path.join(current.root, "README.md"), "# Switched\n");
+        current.notify("README.md");
+      }
+    },
+  });
+  assert.ifError(state.error);
+  assert.equal(state.requests.length, 1);
+  assert.equal(state.result.refused, "large_rewrite_unconfirmed");
+  assert.equal(state.result.exitCode, 1);
+  assert.match(state.writes.join("\n"), /Run cw reconcile to review and confirm it/);
+});
+
+test("watch publishes once after an in-progress git operation finishes", { timeout: 5000 }, async () => {
+  let previewsWhileMerging = 0;
+  let stage = 0;
+  const state = await watchFixture({
+    onPreview: (current) => { if (stage === 1) previewsWhileMerging += 1; },
+    onWait: async (current) => {
+      if (stage === 0 && current.requests.length === 1) {
+        stage = 1;
+        await mkdir(path.join(current.root, ".git"));
+        await writeFile(path.join(current.root, ".git", "MERGE_HEAD"), "0".repeat(40));
+        await writeFile(path.join(current.root, "README.md"), "<<<<<<< ours\n");
+        current.notify("README.md");
+        current.mergeStartedAtWait = current.waits;
+      } else if (stage === 1 && current.waits > current.mergeStartedAtWait + 5) {
+        stage = 2;
+        assert.equal(await gitOperationInProgress(current.root), "merge");
+        await writeFile(path.join(current.root, "README.md"), "# Merged\n");
+        await rm(path.join(current.root, ".git", "MERGE_HEAD"));
+        current.notify("README.md");
+      } else if (stage === 2 && current.requests.length === 2) current.controller.abort();
+    },
+  });
+  assert.ifError(state.error);
+  assert.equal(previewsWhileMerging, 0);
+  assert.equal(state.requests.length, 2);
+  assert.equal(state.requests[1].files.find((file) => file.path === "README.md").content, "# Merged\n");
+  assert.equal(state.writes.filter((line) => /A git merge is in progress/.test(line)).length, 1);
+});
+
+async function git(root, ...args) {
+  const child = spawn("git", ["-C", root, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", ...args], { stdio: "ignore" });
+  const [code] = await once(child, "close");
+  assert.equal(code, 0, `git ${args.join(" ")}`);
+}
+
+test("a git work tree indexes tracked and untracked files but not ignored ones", async () => {
+  const fixture = await syntheticWorkspace();
+  const run = async (argv) => {
+    const requests = [];
+    const writes = [];
+    await main(argv, { cwd: fixture, env: {}, homeDirectory: fixture, write: (line) => writes.push(line), writeRaw: () => {},
+      client: fakeIndexClient({ indexWorkspace: async (request) => { requests.push(request); return { ok: true, result: {}, status: {} }; } }) });
+    return { request: requests[0], output: writes.join("\n") };
+  };
+  try {
+    await git(fixture, "init", "--quiet");
+    await mkdir(path.join(fixture, "reports", "local"), { recursive: true });
+    await writeFile(path.join(fixture, ".gitignore"), "reports/local/\nscratch.md\n");
+    await writeFile(path.join(fixture, "reports", "local", "run.md"), "ignored directory\n");
+    await writeFile(path.join(fixture, "scratch.md"), "ignored file\n");
+    await writeFile(path.join(fixture, "untracked.md"), "new work\n");
+    await git(fixture, "add", "README.md", "src/index.js", ".gitignore");
+    await git(fixture, "commit", "--quiet", "-m", "initial");
+
+    const filtered = await run(["reconcile", "--yes"]);
+    assert.deepEqual(filtered.request.files.map((file) => file.relativePath).sort(), ["README.md", "src/index.js", "untracked.md"]);
+    assert.match(filtered.output, /Skipped as ignored by git: 2 \(use --include-ignored to index them\)/);
+    assert.match(filtered.request.client.git_commit, /^[0-9a-f]{40}$/);
+    assert.equal(filtered.request.client.git_dirty_files, 0);
+    assert.equal(typeof filtered.request.client.git_branch, "string");
+
+    const everything = await run(["reconcile", "--yes", "--include-ignored"]);
+    assert.deepEqual(everything.request.files.map((file) => file.relativePath).sort(),
+      ["README.md", "reports/local/run.md", "scratch.md", "src/index.js", "untracked.md"]);
+    assert.notEqual(everything.request.inventoryScan.ignoreDigest, filtered.request.inventoryScan.ignoreDigest);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
+test("a folder that is not a git work tree keeps every scanned file and sends no commit", async () => {
+  const fixture = await syntheticWorkspace();
+  try {
+    assert.deepEqual(await describeGitSource(fixture), {});
+    assert.equal(await gitOperationInProgress(fixture), null);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
 });

@@ -88,10 +88,17 @@ export async function buildWorkspaceInventory(entries, policy, scan) {
     };
 }
 const DISCOVERY_ONLY_FILENAMES = new Set([".terraform.lock.hcl", "angular.json", "build.gradle", "build.gradle.kts", "bun.lock", "bun.lockb", "dependencies.lock", "gradle.lockfile", "gradle.properties", "jsconfig.json", "libs.versions.toml", "npm-shrinkwrap.json", "nx.json", "package-lock.json", "package.json", "pdm.lock", "pipfile", "pipfile.lock", "pnpm-lock.yaml", "poetry.lock", "pom.xml", "project.json", "pyproject.toml", "settings.gradle", "settings.gradle.kts", "setup.cfg", "setup.py", "uv.lock", "workspace.json", "yarn.lock"]);
-/** Exclude raw discovery metadata and Terraform values from source uploads. */
+/** CorpusWire clients write failure diagnostics here; the retriever never serves them. */
+function isRetrievalDiagnosticPath(parts) {
+    const directories = parts.slice(0, -1);
+    return directories.some((part, index) => part === "reports" && directories[index + 1] === "retrieval-failures");
+}
+/** Exclude raw discovery metadata, Terraform values and CorpusWire's own diagnostics from source uploads. */
 export function isRetrievalExcludedPath(relativePath) {
-    const name = relativePath.replaceAll("\\", "/").split("/").at(-1).toLowerCase();
-    return DISCOVERY_ONLY_FILENAMES.has(name)
+    const parts = relativePath.replaceAll("\\", "/").toLowerCase().split("/");
+    const name = parts.at(-1);
+    return isRetrievalDiagnosticPath(parts)
+        || DISCOVERY_ONLY_FILENAMES.has(name)
         || /\.(gradle|properties|tfvars|xml)$/.test(name)
         || (name.startsWith("tsconfig") && name.endsWith(".json"))
         || /^(requirements|constraints)([-_].*)?\.txt$/.test(name)

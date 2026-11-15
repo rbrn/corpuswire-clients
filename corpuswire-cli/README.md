@@ -386,6 +386,30 @@ can abort the transport; the backend may still need verification afterward.
 Use `cw doctor` to check readiness. `watch --ndjson` includes structured
 `watch-progress/v1` lifecycle records alongside normal index progress.
 
+## Source safety
+
+`cw` protects an index from the ways a git checkout changes under it:
+
+- **Files git ignores are not indexed.** In a git work tree the candidates are
+  tracked files (submodules included) plus untracked files that no ignore rule
+  covers. The preview prints how many files were skipped. `--include-ignored`
+  restores the plain directory walk. A folder that is not a git work tree is
+  walked as before. CorpusWire's own `reports/retrieval-failures/` diagnostics
+  are always skipped.
+- **One folder owns a workspace.** A server with the source-root guard refuses a
+  full index from a folder other than the one the workspace was published from,
+  before anything changes. Give the second folder its own `--workspace-id`, or
+  pass `--allow-source-switch` when the clone really moved.
+- **Large rewrites are confirmed.** A publish that changes or removes more than
+  50 files and more than a fifth of an existing index is not auto-approved:
+  an interactive run asks, a watch or scripted run stops and says so. `--yes`
+  accepts it.
+- **Git operations finish first.** While a rebase, merge, cherry-pick, revert or
+  bisect is in progress, or git holds its index lock, the watcher waits and
+  publishes once afterwards.
+- **The index records where it came from.** Sessions carry the commit, branch
+  and number of modified tracked files of the source tree.
+
 ## Ingestion And Update Behavior
 
 The index command sends a complete manifest in full mode, uploads only files the
