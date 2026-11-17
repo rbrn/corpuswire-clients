@@ -1,4 +1,4 @@
-import type { InventoryScan, InventorySelectionPolicy, WorkspaceInventory } from "./types.js";
+import type { InventoryScan, InventorySelectionPolicy, RemoteIndexCapabilities, WorkspaceInventory } from "./types.js";
 
 const encoder = new TextEncoder();
 export const INVENTORY_VERSION = "workspace-inventory/v1" as const;
@@ -11,13 +11,19 @@ const CODE_EXTENSIONS = new Set([".bat", ".scala", ".sh", ".cjs", ".js", ".jsx",
 // so uploading them in a later tier makes the checkpoint fail with 409.
 const CODE_FILENAMES = new Set(["gradlew", "mvnw", "dockerfile"]);
 
+// IDX-004: build manifests scheduled with documentation when the server indexes build files.
+// Manifests with a code extension (build.gradle.kts, settings.gradle.kts, setup.py) stay in the
+// code tier because the server's code checkpoint counts them as code regardless of the flag.
+const BUILD_MANIFEST_FILENAMES = new Set(["build.gradle", "package.json", "pom.xml", "pyproject.toml", "settings.gradle"]);
+
 /** Scheduling tiers match the server's canonical supported-file registry. */
-export function ingestionPriority(relativePath: string): 1 | 2 | 3 {
+export function ingestionPriority(relativePath: string, fileTypes?: RetrievalFileTypes): 1 | 2 | 3 {
   const name = relativePath.replaceAll("\\", "/").split("/").at(-1)!.toLowerCase();
   const extension = name.slice(name.lastIndexOf("."));
   if (CODE_EXTENSIONS.has(extension) || CODE_FILENAMES.has(name) || name.endsWith(".tf.json")
     || (name.startsWith("dockerfile.") && name.length > "dockerfile.".length)) return 1;
   if ([".md", ".txt", ".pdf"].includes(extension)) return 2;
+  if (fileTypes?.buildFilesEnabled === true && BUILD_MANIFEST_FILENAMES.has(name)) return 2;
   return 3;
 }
 
@@ -118,10 +124,66 @@ function isRetrievalDiagnosticPath(parts: string[]): boolean {
   return directories.some((part, index) => part === "reports" && directories[index + 1] === "retrieval-failures");
 }
 
-/** Exclude raw discovery metadata, Terraform values and CorpusWire's own diagnostics from source uploads. */
-export function isRetrievalExcludedPath(relativePath: string): boolean {
+// IDX-004: file names that are excluded even when the server indexes build files. The server's
+// discovery_only_filenames lists the same set; this local copy keeps them out if it is incomplete.
+const BUILD_EXCLUDED_FILENAMES = new Set<string>([".terraform.lock.hcl", "bun.lock", "bun.lockb", "dependencies.lock", "gradle.lockfile", "npm-shrinkwrap.json", "package-lock.json", "pdm.lock", "pipfile.lock", "pnpm-lock.yaml", "poetry.lock", "uv.lock", "yarn.lock", "settings.xml", "settings-security.xml"]);
+const BUILD_FILENAMES = new Set<string>(["angular.json", "build.gradle", "build.gradle.kts", "gradle.properties", "jsconfig.json", "libs.versions.toml", "nx.json", "package.json", "pipfile", "pom.xml", "project.json", "pyproject.toml", "settings.gradle", "settings.gradle.kts", "setup.cfg", "setup.py", "workspace.json"]);
+
+/** Which build files the server indexes, derived from `GET /v1/index/capabilities`. */
+export interface RetrievalFileTypes {
+  /** True only when the server reports `build_files_enabled: true` (IDX-004). */
+  readonly buildFilesEnabled: boolean;
+  /** Lowercase file names whose content the server never indexes. */
+  readonly discoveryOnlyFilenames: ReadonlySet<string>;
+  /** Lowercase extensions (with leading dot) whose content the server never indexes. */
+  readonly discoveryOnlyExtensions: readonly string[];
+}
+
+function lowercaseStrings(values: unknown): string[] {
+  return Array.isArray(values)
+    ? values.filter((value): value is string => typeof value === "string" && value.length > 0).map((value) => value.toLowerCase())
+    : [];
+}
+
+/** Derive the retrieval file-type policy from server capabilities; missing fields mean build files are off. */
+export function retrievalFileTypesFromCapabilities(
+  capabilities: Partial<RemoteIndexCapabilities> | null | undefined,
+): RetrievalFileTypes {
+  return {
+    buildFilesEnabled: capabilities?.build_files_enabled === true,
+    discoveryOnlyFilenames: new Set(lowercaseStrings(capabilities?.discovery_only_filenames)),
+    discoveryOnlyExtensions: lowercaseStrings(capabilities?.discovery_only_extensions),
+  };
+}
+
+function isBuildTierName(name: string): boolean {
+  return BUILD_FILENAMES.has(name)
+    || /\.(gradle|properties|xml)$/.test(name)
+    || (name.startsWith("tsconfig") && name.endsWith(".json"))
+    || /^(requirements|constraints)([-_].*)?\.txt$/.test(name);
+}
+
+function isSensitiveTerraformName(name: string): boolean {
+  return name.endsWith(".tfvars") || name.endsWith(".tfvars.json") || name.includes(".tfstate")
+    || name === "crash.log" || name === "tfplan"
+    || /\.(tfplan|plan)(\.json)?$/.test(name);
+}
+
+/**
+ * Exclude raw discovery metadata, Terraform values and CorpusWire's own diagnostics from source uploads.
+ * Without `fileTypes`, or when the server does not index build files, the built-in floor applies.
+ */
+export function isRetrievalExcludedPath(relativePath: string, fileTypes?: RetrievalFileTypes): boolean {
   const parts = relativePath.replaceAll("\\", "/").toLowerCase().split("/");
   const name = parts.at(-1)!;
+  if (fileTypes?.buildFilesEnabled === true) {
+    return isRetrievalDiagnosticPath(parts)
+      || isSensitiveTerraformName(name)
+      || BUILD_EXCLUDED_FILENAMES.has(name)
+      || fileTypes.discoveryOnlyFilenames.has(name)
+      || fileTypes.discoveryOnlyExtensions.some((extension) => name.endsWith(extension))
+      || (isBuildTierName(name) && /secret|credential|password/.test(name));
+  }
   return isRetrievalDiagnosticPath(parts)
     || DISCOVERY_ONLY_FILENAMES.has(name)
     || /\.(gradle|properties|tfvars|xml)$/.test(name)

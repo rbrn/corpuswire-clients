@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import {
   CorpusWireClient,
   isRetrievalExcludedPath,
+  retrievalFileTypesFromCapabilities,
   CorpusWireHttpError,
 } from "@corpuswire/sdk";
 import type {
@@ -15,6 +16,7 @@ import type {
   RemoteIndexCommitResponse,
   RemoteIndexCodeStageResult,
   RemoteIndexStatus,
+  RetrievalFileTypes,
   WorkspaceDiagnosis,
 } from "@corpuswire/sdk";
 import {
@@ -26,7 +28,7 @@ import {
   assessEnhancementQuality,
 } from "./enhancement-quality.js";
 import { hasAuthorizationHeader, resolveServiceBearerToken } from "./service-auth.js";
-import { INDEX_INCLUDE_GLOB } from "./index-discovery.js";
+import { INDEX_INCLUDE_GLOB, INDEX_INCLUDE_GLOB_WITH_BUILD_FILES } from "./index-discovery.js";
 import { GIT_MOVE_GLOB, isGitMovePath } from "./git-move.js";
 import {
   RecentEditsTracker,
@@ -759,7 +761,8 @@ async function indexCurrentWorkspace(options: IndexWorkspaceOptions = {}, confir
                   if (controller.signal.aborted) throw new Error("Indexing cancelled before scan started.");
                   const maxFileSizeBytes = Math.min(settings.remoteIndexing.maxFileSizeBytes, capabilities.max_file_size_bytes);
                   progress.report({ message: `${folder.name} · scanning workspace` });
-                  const collected = await collectWorkspaceFiles(folder, maxFileSizeBytes, controller.signal);
+                  const collected = await collectWorkspaceFiles(folder, maxFileSizeBytes, controller.signal,
+                    retrievalFileTypesFromCapabilities(capabilities));
                   if (controller.signal.aborted) throw new Error("Indexing cancelled before upload started.");
                   let codeReadyMessage = "";
                   const request = {
@@ -1043,7 +1046,7 @@ async function reconcileFolderIndex(folder: vscode.WorkspaceFolder, signal: Abor
   const capabilities = await client.getIndexCapabilities();
   if (signal.aborted) throw new Error("Reconciliation cancelled before scan started.");
   const maxFileSizeBytes = Math.min(settings.remoteIndexing.maxFileSizeBytes, capabilities.max_file_size_bytes);
-  const collected = await collectWorkspaceFiles(folder, maxFileSizeBytes, signal);
+  const collected = await collectWorkspaceFiles(folder, maxFileSizeBytes, signal, retrievalFileTypesFromCapabilities(capabilities));
   if (signal.aborted) throw new Error("Reconciliation cancelled before upload started.");
   await client.indexWorkspace({
     workspace: {
@@ -1130,8 +1133,12 @@ async function collectWorkspaceFiles(
   workspaceFolder: vscode.WorkspaceFolder,
   maxFileSizeBytes: number,
   signal?: AbortSignal,
+  fileTypes?: RetrievalFileTypes,
 ): Promise<CollectedWorkspaceFiles> {
   const startedAt = new Date().toISOString();
+  // IDX-004: without build files on, the glob and ignore digest stay byte-for-byte unchanged.
+  const buildFilesEnabled = fileTypes?.buildFilesEnabled === true;
+  const includeGlob = buildFilesEnabled ? INDEX_INCLUDE_GLOB_WITH_BUILD_FILES : INDEX_INCLUDE_GLOB;
   const checkRoot = async (before?: vscode.FileStat): Promise<vscode.FileStat> => {
     if (signal?.aborted) throw new Error("Indexing cancelled during scan");
     const stat = await vscode.workspace.fs.stat(workspaceFolder.uri);
@@ -1151,7 +1158,7 @@ async function collectWorkspaceFiles(
   try {
     const rootStat = await checkRoot();
     const uris = await vscode.workspace.findFiles(
-      new vscode.RelativePattern(workspaceFolder, INDEX_INCLUDE_GLOB),
+      new vscode.RelativePattern(workspaceFolder, includeGlob),
       new vscode.RelativePattern(workspaceFolder, INDEX_EXCLUDE_GLOB),
     );
     await checkRoot(rootStat);
@@ -1161,12 +1168,12 @@ async function collectWorkspaceFiles(
       if (!actualRoot) throw new Error("File left workspace during scan");
       return indexRootKey(actualRoot) === indexRootKey(workspaceFolder);
     });
-    const collected = await collectUriFiles(rootUris, maxFileSizeBytes, true, signal);
+    const collected = await collectUriFiles(rootUris, maxFileSizeBytes, true, signal, fileTypes);
     await checkRoot(rootStat);
     return { ...collected, inventoryScan: {
       complete: true, startedAt, completedAt: new Date().toISOString(),
       excludedFileCount: collected.skippedLargeFiles + collected.skippedPolicyFiles + uris.length - rootUris.length, producer: "corpuswire-vscode-scan/v1",
-      ignoreDigest: createHash("sha256").update(JSON.stringify({ include: INDEX_INCLUDE_GLOB, exclude: INDEX_EXCLUDE_GLOB, hiddenPaths: "exclude", retrievalExclusions: "discovery-terraform-and-retrieval-diagnostics/v2", workspaceRootIsolation: "v1" })).digest("hex"),
+      ignoreDigest: createHash("sha256").update(JSON.stringify({ include: includeGlob, exclude: INDEX_EXCLUDE_GLOB, hiddenPaths: "exclude", retrievalExclusions: buildFilesEnabled ? "discovery-terraform-and-retrieval-diagnostics/v2+build1" : "discovery-terraform-and-retrieval-diagnostics/v2", workspaceRootIsolation: "v1" })).digest("hex"),
     } };
   } catch (cause) {
     throw Object.assign(new Error(signal?.aborted ? "Workspace scan incomplete: indexing cancelled during scan."
@@ -1174,7 +1181,7 @@ async function collectWorkspaceFiles(
   }
 }
 
-async function collectUriFiles(uris: vscode.Uri[], maxFileSizeBytes: number, strict = false, signal?: AbortSignal): Promise<CollectedWorkspaceFiles> {
+async function collectUriFiles(uris: vscode.Uri[], maxFileSizeBytes: number, strict = false, signal?: AbortSignal, fileTypes?: RetrievalFileTypes): Promise<CollectedWorkspaceFiles> {
   const files: RemoteWorkspaceFile[] = [];
   let skippedLargeFiles = 0;
   let skippedPolicyFiles = 0;
@@ -1185,7 +1192,7 @@ async function collectUriFiles(uris: vscode.Uri[], maxFileSizeBytes: number, str
       if (strict) throw Object.assign(new Error("Workspace scan incomplete"), { code: "scan_incomplete" });
       continue;
     }
-    if (isIndexExcludedPath(relativePath)) {
+    if (isIndexExcludedPath(relativePath, fileTypes)) {
       skippedPolicyFiles += 1;
       continue;
     }
@@ -1223,12 +1230,13 @@ function relativePathForUri(uri: vscode.Uri): string | null {
   return vscode.workspace.asRelativePath(uri, false).replaceAll("\\", "/");
 }
 
-function isIndexExcludedPath(relativePath: string): boolean {
+/** Without `fileTypes` (watcher events, incremental updates, prompt context) the conservative built-in floor applies. */
+function isIndexExcludedPath(relativePath: string, fileTypes?: RetrievalFileTypes): boolean {
   const normalizedPath = relativePath.replaceAll("\\", "/");
   const parts = normalizedPath.split("/");
   return parts.some((part) => part.startsWith(".") || ["node_modules", "dist", "build", "target", "__pycache__"].includes(part))
     || parts.some((part, index) => part === "reports" && parts[index + 1] === "retrieval-failures")
-    || isRetrievalExcludedPath(normalizedPath);
+    || isRetrievalExcludedPath(normalizedPath, fileTypes);
 }
 
 async function enhanceSelectedPrompt(): Promise<void> {

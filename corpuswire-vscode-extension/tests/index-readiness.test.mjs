@@ -1,10 +1,10 @@
-import { ingestionPriority, isRetrievalExcludedPath } from "../../corpuswire-sdk/dist/index.js";
+import { ingestionPriority, isRetrievalExcludedPath, retrievalFileTypesFromCapabilities } from "../../corpuswire-sdk/dist/index.js";
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import minimatch from 'minimatch';
-import { INDEX_INCLUDE_GLOB as includeGlob } from '../dist/index-discovery.js';
+import { INDEX_INCLUDE_GLOB as includeGlob, INDEX_INCLUDE_GLOB_WITH_BUILD_FILES as buildIncludeGlob } from '../dist/index-discovery.js';
 import { GIT_MOVE_GLOB, isGitMovePath } from '../dist/git-move.js';
 
 // Exercise the compiled production scanner with injected VS Code filesystem IO.
@@ -79,13 +79,14 @@ function workspaceScanner(root, hooks = {}) {
         readFile: async (uri) => hooks.readFile?.(uri) ?? new Uint8Array(3),
         readDirectory: async () => hooks.readDirectory?.() ?? [],
       },
-      findFiles: async () => hooks.findFiles?.() ?? [],
+      findFiles: async (include) => hooks.findFiles?.(include) ?? [],
       getWorkspaceFolder: () => root,
       asRelativePath: (uri) => uri.toString().slice(root.uri.toString().length + 1),
     },
   };
   return new Function('vscode', 'isIndexExcludedPath', 'createHash', `
     const INDEX_INCLUDE_GLOB = ${JSON.stringify(includeGlob)};
+    const INDEX_INCLUDE_GLOB_WITH_BUILD_FILES = ${JSON.stringify(buildIncludeGlob)};
     const INDEX_EXCLUDE_GLOB = ${JSON.stringify(excludeGlob)};
     function indexRootKey(root) { return root.uri.toString(); }
     ${source.slice(workspaceScanStart, workspaceScanEnd)}
@@ -194,7 +195,7 @@ function extensionHarness(folders, overrides = new Map()) {
     return scan(root, signal);
   };
   const functions = new Function('vscode', 'readSettings', 'CorpusWireClient', 'buildAuthenticatedServiceHeaders',
-    'collectWorkspaceFiles', 'collectUriFiles', 'isIndexExcludedPath', 'setTimeout', 'clearTimeout', `
+    'collectWorkspaceFiles', 'collectUriFiles', 'isIndexExcludedPath', 'setTimeout', 'clearTimeout', 'retrievalFileTypesFromCapabilities', `
     const MAX_CONCURRENT_INDEX_ROOTS = 2;
     ${rootsHelpers}
     ${source.slice(relativeStart, relativeEnd)}
@@ -210,7 +211,7 @@ function extensionHarness(folders, overrides = new Map()) {
     const isGitMovePath = ${isGitMovePath.toString()};
     return { indexCurrentWorkspace, rebuildCurrentWorkspaceIndex, registerRemoteIndexWatchers, sendIncrementalIndexUpdate, relativePathForUri, runIndexStatusCheck, indexRootStatus };
   `)(vscode, readSettings, Client, () => { authenticationCalls += 1; return {}; }, collectWorkspaceFiles, collectUriFiles, excludedPath,
-    (handler) => { const id = ++nextTimer; timers.set(id, handler); return id; }, (id) => timers.delete(id));
+    (handler) => { const id = ++nextTimer; timers.set(id, handler); return id; }, (id) => timers.delete(id), retrievalFileTypesFromCapabilities);
   return { ...functions, warnings, information, progress, requests, stageRequests, scans, diagnoses, callbacks, settings, subscriptions, confirmations, gitCallbacks,
     setConfirmation(selection) { confirmationSelection = selection; },
     get capabilities() { return capabilities; }, setUpload(handler) { upload = handler; },
@@ -1175,4 +1176,45 @@ test('file events that arrive during a git-move reconciliation are replayed afte
   harness.flushTimers();
   await tick();
   assert.deepEqual(harness.requests.map((request) => request.mode), ['full', 'incremental']);
+});
+
+test('IDX-004 full scans admit build files only when the server reports build_files_enabled', async () => {
+  const admitted = ['pom.xml', 'src/main/resources/application.properties', 'build.gradle.kts', 'package.json', 'tsconfig.app.json', 'requirements-dev.txt'];
+  const excluded = ['package-lock.json', 'yarn.lock', 'settings.xml', 'app-secrets.properties', 'prod.tfvars', 'terraform.tfstate'];
+  for (const path of ['pom.xml', 'Pom.XML', 'src/main/resources/application.properties', 'app/build.gradle', 'build.gradle.kts']) {
+    assert.equal(minimatch(path, buildIncludeGlob, { dot: true }), true, path);
+  }
+  for (const path of ['pom.xml', 'src/main/resources/application.properties', 'app/build.gradle']) {
+    assert.equal(minimatch(path, includeGlob, { dot: true }), false, path);
+  }
+  const buildOn = retrievalFileTypesFromCapabilities({ build_files_enabled: true, discovery_only_extensions: ['.tfvars'],
+    discovery_only_filenames: ['package-lock.json', 'yarn.lock', 'settings.xml', 'settings-security.xml'] });
+  const scan = async (fileTypes) => {
+    const root = folder('build-files');
+    let glob;
+    // Every candidate is offered so that the exclusion policy, not the glob, decides.
+    const collect = workspaceScanner(root, { findFiles: (include) => {
+      glob = include.glob;
+      return [...admitted, ...excluded, 'src/a.ts'].map((path) => file(root, path));
+    } });
+    const result = await collect(root, 100, undefined, fileTypes);
+    return { glob, paths: result.files.map((entry) => entry.relativePath).sort(), ignoreDigest: result.inventoryScan.ignoreDigest };
+  };
+  const legacyDigest = createHash('sha256').update(JSON.stringify({
+    include: includeGlob, exclude: excludeGlob, hiddenPaths: 'exclude',
+    retrievalExclusions: 'discovery-terraform-and-retrieval-diagnostics/v2', workspaceRootIsolation: 'v1',
+  })).digest('hex');
+  for (const fileTypes of [undefined, retrievalFileTypesFromCapabilities({}), retrievalFileTypesFromCapabilities({ build_files_enabled: false })]) {
+    const off = await scan(fileTypes);
+    assert.equal(off.glob, includeGlob);
+    assert.deepEqual(off.paths, ['src/a.ts']);
+    assert.equal(off.ignoreDigest, legacyDigest);
+  }
+  for (const path of [...admitted, ...excluded]) assert.equal(excludedPath(path), true, path);
+  const on = await scan(buildOn);
+  assert.equal(on.glob, buildIncludeGlob);
+  assert.deepEqual(on.paths, [...admitted, 'src/a.ts'].sort());
+  assert.notEqual(on.ignoreDigest, legacyDigest);
+  for (const path of admitted) assert.equal(excludedPath(path, buildOn), false, path);
+  for (const path of excluded) assert.equal(excludedPath(path, buildOn), true, path);
 });

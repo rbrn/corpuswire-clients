@@ -16,6 +16,21 @@ const patterns = [
   "**/*.json.example",
 ];
 
-export const INDEX_INCLUDE_GLOB = `{${patterns.map((pattern) =>
-  pattern.replace(/[a-z]/g, (letter) => `[${letter}${letter.toUpperCase()}]`),
-).join(",")}}`;
+function caseInsensitiveGlob(globPatterns: readonly string[]): string {
+  return `{${globPatterns.map((pattern) =>
+    pattern.replace(/[a-z]/g, (letter) => `[${letter}${letter.toUpperCase()}]`),
+  ).join(",")}}`;
+}
+
+// Kept byte-for-byte: the scan's ignore digest embeds this glob, and the server
+// rejects deltas whose selection policy digest differs from its coverage.
+export const INDEX_INCLUDE_GLOB = caseInsensitiveGlob(patterns);
+
+// IDX-004: build files (`build.gradle.kts` is already covered by `kts`). Full scans use this
+// glob only when the server reports build_files_enabled; isRetrievalExcludedPath still
+// removes lockfiles, Maven settings and secret-named build files.
+const buildFileExtensions = ["xml", "properties", "gradle"];
+export const INDEX_INCLUDE_GLOB_WITH_BUILD_FILES = caseInsensitiveGlob([
+  ...patterns,
+  ...buildFileExtensions.map((extension) => `**/*.${extension}`),
+]);
