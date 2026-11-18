@@ -1,4 +1,4 @@
-import { ingestionPriority, isRetrievalExcludedPath, retrievalFileTypesFromCapabilities } from "../../corpuswire-sdk/dist/index.js";
+import { ingestionPriority, isPipelineDotPath, isRetrievalExcludedPath, retrievalFileTypesFromCapabilities } from "../../corpuswire-sdk/dist/index.js";
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -20,7 +20,7 @@ function scanner(fs) {
 
 const excludedStart = source.indexOf('function isIndexExcludedPath(');
 const excludedEnd = source.indexOf('\nasync function enhanceSelectedPrompt', excludedStart);
-const excludedPath = new Function('isRetrievalExcludedPath', `${source.slice(excludedStart, excludedEnd)}; return isIndexExcludedPath;`)(isRetrievalExcludedPath);
+const excludedPath = new Function('isRetrievalExcludedPath', 'isPipelineDotPath', `${source.slice(excludedStart, excludedEnd)}; return isIndexExcludedPath;`)(isRetrievalExcludedPath, isPipelineDotPath);
 
 test('full scanner rejects unreadable/disappearing files while incremental watcher stays explicit', async () => {
   const collect = scanner({ stat: async () => ({ type: 1, size: 3, mtime: 1 }),
@@ -1217,4 +1217,44 @@ test('IDX-004 full scans admit build files only when the server reports build_fi
   assert.notEqual(on.ignoreDigest, legacyDigest);
   for (const path of admitted) assert.equal(excludedPath(path, buildOn), false, path);
   for (const path of excluded) assert.equal(excludedPath(path, buildOn), true, path);
+});
+
+test('IDX-005 full scans admit pipeline dot files only when the server reports pipeline_files_enabled', async () => {
+  const admitted = ['.github/workflows/ci.yml', '.github/actions/setup/action.yml', '.gitlab-ci.yml', '.gitlab/ci/build.yaml',
+    '.circleci/config.yml', '.buildkite/pipeline.yml', '.azure-pipelines.yml', '.drone.yml', '.travis.yml', '.woodpecker/test.yml',
+    '.tekton/pipeline.yaml'];
+  const excluded = ['.github/dependabot.yml', '.github/ISSUE_TEMPLATE/x.yml', '.github/workflows/nested/ci.yml', '.github/actions/setup/other.yml',
+    '.env', '.npmrc', '.circleci/secrets.yml', '.pre-commit-config.yaml', 'src/.github/workflows/ci.yml'];
+  // The unchanged include glob already reaches .yml/.yaml files under dot directories.
+  for (const path of admitted) assert.equal(minimatch(path, includeGlob, { dot: true }), true, path);
+  const scan = async (fileTypes) => {
+    const root = folder('pipeline-files');
+    let glob;
+    // Every candidate is offered so that the exclusion policy, not the glob, decides.
+    const collect = workspaceScanner(root, { findFiles: (include) => {
+      glob = include.glob;
+      return [...admitted, ...excluded, 'src/a.ts'].map((path) => file(root, path));
+    } });
+    const result = await collect(root, 100, undefined, fileTypes);
+    return { glob, paths: result.files.map((entry) => entry.relativePath).sort(), ignoreDigest: result.inventoryScan.ignoreDigest };
+  };
+  const legacyDigest = createHash('sha256').update(JSON.stringify({
+    include: includeGlob, exclude: excludeGlob, hiddenPaths: 'exclude',
+    retrievalExclusions: 'discovery-terraform-and-retrieval-diagnostics/v2', workspaceRootIsolation: 'v1',
+  })).digest('hex');
+  for (const fileTypes of [undefined, retrievalFileTypesFromCapabilities({}), retrievalFileTypesFromCapabilities({ pipeline_files_enabled: false })]) {
+    const off = await scan(fileTypes);
+    assert.equal(off.glob, includeGlob);
+    assert.deepEqual(off.paths, ['src/a.ts']);
+    assert.equal(off.ignoreDigest, legacyDigest);
+  }
+  const pipelineOn = retrievalFileTypesFromCapabilities({ pipeline_files_enabled: true });
+  const on = await scan(pipelineOn);
+  assert.equal(on.glob, includeGlob);
+  assert.deepEqual(on.paths, [...admitted, 'src/a.ts'].sort());
+  assert.notEqual(on.ignoreDigest, legacyDigest);
+  // Watcher events and incremental updates pass no file types and keep the conservative floor.
+  for (const path of [...admitted, ...excluded]) assert.equal(excludedPath(path), true, path);
+  for (const path of admitted) assert.equal(excludedPath(path, pipelineOn), false, path);
+  for (const path of excluded) assert.equal(excludedPath(path, pipelineOn), true, path);
 });

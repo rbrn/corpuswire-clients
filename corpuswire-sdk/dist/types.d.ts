@@ -926,6 +926,8 @@ export interface RemoteIndexCapabilities {
     discovery_only_filenames?: string[];
     /** IDX-004: true when the server indexes build files and manifests; older servers omit it. */
     build_files_enabled?: boolean;
+    /** IDX-005: true when the server indexes CI pipeline files under dot directories; older servers omit it. */
+    pipeline_files_enabled?: boolean;
     manifest_compression: string[];
     file_batch_content_types: string[];
     payload_compression: string[];

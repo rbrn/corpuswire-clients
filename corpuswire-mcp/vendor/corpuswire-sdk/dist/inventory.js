@@ -114,7 +114,34 @@ export function retrievalFileTypesFromCapabilities(capabilities) {
         buildFilesEnabled: capabilities?.build_files_enabled === true,
         discoveryOnlyFilenames: new Set(lowercaseStrings(capabilities?.discovery_only_filenames)),
         discoveryOnlyExtensions: lowercaseStrings(capabilities?.discovery_only_extensions),
+        pipelineFilesEnabled: capabilities?.pipeline_files_enabled === true,
     };
+}
+// IDX-005: keep in sync with the engine's pipeline-file allow-list (INDEX_PIPELINE_FILES).
+// Case-sensitive, workspace-relative POSIX paths ending in .yml or .yaml.
+const PIPELINE_DOT_PATH = /^(?:\.github\/workflows\/[^/]+|\.github\/actions\/(?:.+\/)?action|\.gitlab-ci|\.gitlab\/ci\/.+|\.circleci\/config|\.buildkite\/.+|\.azure-pipelines(?:\/.+)?|\.drone|\.travis|\.woodpecker(?:\/.+)?|\.tekton\/.+)\.ya?ml$/;
+// Dot directories whose whole subtree (without further dot segments) can hold allowed files.
+const PIPELINE_DOT_SUBTREES = [".github/actions", ".gitlab/ci", ".buildkite", ".azure-pipelines", ".woodpecker", ".tekton"];
+// Dot directories that can hold allowed files only directly, or only through a listed child.
+const PIPELINE_DOT_DIRECTORIES = new Set([".github", ".github/workflows", ".gitlab", ".circleci"]);
+/**
+ * True when a CI pipeline definition under a dot path is on the IDX-005 allow-list. Clients that
+ * skip hidden paths admit these only when the server reports `pipeline_files_enabled: true`.
+ */
+export function isPipelineDotPath(relativePath) {
+    return PIPELINE_DOT_PATH.test(relativePath)
+        && !relativePath.split("/").slice(1).some((segment) => segment.startsWith("."));
+}
+/**
+ * True when a workspace-relative directory can contain a path accepted by {@link isPipelineDotPath},
+ * so directory walkers know which hidden directories to descend into.
+ */
+export function isPipelineDotPathAncestor(relativeDirectory) {
+    const normalized = relativeDirectory.replace(/\/+$/, "");
+    if (normalized.split("/").slice(1).some((segment) => segment.startsWith(".") || segment.length === 0))
+        return false;
+    return PIPELINE_DOT_DIRECTORIES.has(normalized)
+        || PIPELINE_DOT_SUBTREES.some((subtree) => normalized === subtree || normalized.startsWith(`${subtree}/`));
 }
 function isBuildTierName(name) {
     return BUILD_FILENAMES.has(name)

@@ -2656,6 +2656,97 @@ test("IDX-004 sync path probe admits build files only when the server indexes th
   }
 });
 
+// IDX-005 fixtures: allowed CI pipeline files from several systems, and dot paths that stay excluded.
+const PIPELINE_ADMITTED = [".github/workflows/ci.yml", ".github/actions/setup/action.yml", ".gitlab-ci.yml", ".gitlab/ci/build.yaml",
+  ".circleci/config.yml", ".buildkite/pipeline.yml", ".azure-pipelines.yml", ".drone.yml", ".travis.yml", ".woodpecker/test.yml",
+  ".tekton/pipeline.yaml"];
+const PIPELINE_EXCLUDED = [".github/dependabot.yml", ".github/ISSUE_TEMPLATE/x.yml", ".github/workflows/nested/ci.yml",
+  ".github/actions/setup/other.yml", ".env", ".npmrc", ".circleci/secrets.yml", ".pre-commit-config.yaml", "src/.github/workflows/ci.yml"];
+const PIPELINE_BASE_CAPABILITIES = { ok: true, supported_file_registry_version: "supported-files/v3",
+  supported_extensions: [".md", ".py", ".yml", ".yaml"], supported_filenames: ["dockerfile"] };
+
+function pipelineServerEnv(tempDir, sdkPath, requestsPath, capabilities) {
+  const env = { ...globalThis.process.env, CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000", CORPUSWIRE_SDK_PATH: sdkPath,
+    CORPUSWIRE_WORKSPACE_ID: "workspace-pipeline-files", CORPUSWIRE_REPO_PATH: tempDir, CORPUSWIRE_SYNC_ENABLED: "true",
+    MOCK_REQUESTS_PATH: requestsPath, MOCK_RECORD_IGNORE_DIGEST: "true" };
+  if (capabilities) env.MOCK_INDEX_CAPABILITIES_JSON = JSON.stringify(capabilities);
+  else delete env.MOCK_INDEX_CAPABILITIES_JSON;
+  return env;
+}
+
+test("IDX-005 sync path probe admits pipeline dot files only when the server indexes them", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-pipeline-probe-"));
+  const probe = async (capabilities) => {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], { stdio: ["pipe", "pipe", "pipe"],
+      env: pipelineServerEnv(tempDir, sdkPath, requestsPath, capabilities) });
+    try {
+      const response = await createRpc(child)({ jsonrpc: "2.0", id: 42, method: "tools/call", params: {
+        name: "corpuswire_sync_probe_paths", arguments: { paths: [...PIPELINE_ADMITTED, ...PIPELINE_EXCLUDED] },
+      } });
+      return response.result.content[0].text;
+    } finally {
+      child.kill();
+    }
+  };
+  const decisions = (text) => Object.fromEntries([...text.matchAll(
+    /rawPath: (\S+)\n[\s\S]*?pathAccepted: (true|false)\n[\s\S]*?reason: (\S+)/g,
+  )].map(([, rawPath, accepted, reason]) => [rawPath, { accepted: accepted === "true", reason }]));
+  try {
+    for (const capabilities of [null, PIPELINE_BASE_CAPABILITIES, { ...PIPELINE_BASE_CAPABILITIES, pipeline_files_enabled: false }]) {
+      const result = decisions(await probe(capabilities));
+      for (const candidate of [...PIPELINE_ADMITTED, ...PIPELINE_EXCLUDED]) assert.equal(result[candidate]?.accepted, false, candidate);
+      assert.equal(result[".github/workflows/ci.yml"].reason, "excluded_segment");
+    }
+    const result = decisions(await probe({ ...PIPELINE_BASE_CAPABILITIES, pipeline_files_enabled: true }));
+    for (const candidate of PIPELINE_ADMITTED) assert.equal(result[candidate]?.accepted, true, candidate);
+    for (const candidate of PIPELINE_EXCLUDED) assert.equal(result[candidate]?.accepted, false, candidate);
+    assert.equal(result[".github/dependabot.yml"].reason, "excluded_segment");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("IDX-005 reconcile walks pipeline dot directories only when the server indexes them", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-pipeline-reconcile-"));
+  // The mock SDK and its request log live beside the workspace so the walk sees only fixtures.
+  const workspace = path.join(tempDir, "workspace");
+  const reconcile = async (capabilities) => {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const child = spawn("node", [SERVER_BIN], { stdio: ["pipe", "pipe", "pipe"],
+      env: pipelineServerEnv(workspace, sdkPath, requestsPath, capabilities) });
+    try {
+      const response = await createRpc(child)({ jsonrpc: "2.0", id: 43, method: "tools/call", params: {
+        name: "corpuswire_sync_reconcile", arguments: { maxFiles: 100, maxWaitMs: 5000 },
+      } });
+      assert.equal(response.result.isError, false, response.result.content[0].text);
+    } finally {
+      child.kill();
+    }
+    const call = (await readFile(requestsPath, "utf8")).trim().split("\n").map(JSON.parse).filter((entry) => entry.kind === "indexWorkspace").at(-1);
+    return { files: [...call.files].sort(), ignoreDigest: call.ignoreDigest };
+  };
+  try {
+    await mkdir(workspace);
+    await writeFile(path.join(workspace, "README.md"), "# Root\n", "utf8");
+    for (const file of [...PIPELINE_ADMITTED, ...PIPELINE_EXCLUDED]) {
+      await mkdir(path.dirname(path.join(workspace, file)), { recursive: true });
+      await writeFile(path.join(workspace, file), "synthetic: true\n", "utf8");
+    }
+    const absent = await reconcile(PIPELINE_BASE_CAPABILITIES);
+    const off = await reconcile({ ...PIPELINE_BASE_CAPABILITIES, pipeline_files_enabled: false });
+    assert.deepEqual(absent.files, ["README.md"]);
+    assert.deepEqual(off.files, absent.files);
+    assert.equal(typeof absent.ignoreDigest, "string");
+    assert.equal(off.ignoreDigest, absent.ignoreDigest);
+    const on = await reconcile({ ...PIPELINE_BASE_CAPABILITIES, pipeline_files_enabled: true });
+    assert.deepEqual(on.files, [...PIPELINE_ADMITTED, "README.md"].sort());
+    assert.notEqual(on.ignoreDigest, absent.ignoreDigest);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("reconcile includes root and nested files using only leading globstar patterns", async () => {
   const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-glob-reconcile-"));
   try {
@@ -3737,6 +3828,7 @@ export class CorpusWireClient {
       processingTimeoutMs: request.processingTimeoutMs,
       files: request.files.map((file) => file.relativePath),
       deletedPaths: request.deletedPaths ?? [],
+      ...(process.env.MOCK_RECORD_IGNORE_DIGEST === "true" ? { ignoreDigest: request.inventoryScan?.ignoreDigest } : {}),
     }) + "\\n", "utf8");
     request.onProgress?.({
       schema_version: "index-progress/v1",

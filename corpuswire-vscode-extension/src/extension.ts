@@ -2,6 +2,7 @@ import { randomUUID, createHash } from "node:crypto";
 import * as vscode from "vscode";
 import {
   CorpusWireClient,
+  isPipelineDotPath,
   isRetrievalExcludedPath,
   retrievalFileTypesFromCapabilities,
   CorpusWireHttpError,
@@ -1139,6 +1140,9 @@ async function collectWorkspaceFiles(
   // IDX-004: without build files on, the glob and ignore digest stay byte-for-byte unchanged.
   const buildFilesEnabled = fileTypes?.buildFilesEnabled === true;
   const includeGlob = buildFilesEnabled ? INDEX_INCLUDE_GLOB_WITH_BUILD_FILES : INDEX_INCLUDE_GLOB;
+  // IDX-005: the include glob already matches .yml/.yaml under dot directories; only the
+  // exclusion check and the ignore digest change when the server indexes pipeline files.
+  const pipelineFilesEnabled = fileTypes?.pipelineFilesEnabled === true;
   const checkRoot = async (before?: vscode.FileStat): Promise<vscode.FileStat> => {
     if (signal?.aborted) throw new Error("Indexing cancelled during scan");
     const stat = await vscode.workspace.fs.stat(workspaceFolder.uri);
@@ -1173,7 +1177,7 @@ async function collectWorkspaceFiles(
     return { ...collected, inventoryScan: {
       complete: true, startedAt, completedAt: new Date().toISOString(),
       excludedFileCount: collected.skippedLargeFiles + collected.skippedPolicyFiles + uris.length - rootUris.length, producer: "corpuswire-vscode-scan/v1",
-      ignoreDigest: createHash("sha256").update(JSON.stringify({ include: includeGlob, exclude: INDEX_EXCLUDE_GLOB, hiddenPaths: "exclude", retrievalExclusions: buildFilesEnabled ? "discovery-terraform-and-retrieval-diagnostics/v2+build1" : "discovery-terraform-and-retrieval-diagnostics/v2", workspaceRootIsolation: "v1" })).digest("hex"),
+      ignoreDigest: createHash("sha256").update(JSON.stringify({ include: includeGlob, exclude: INDEX_EXCLUDE_GLOB, hiddenPaths: pipelineFilesEnabled ? "exclude+pipeline1" : "exclude", retrievalExclusions: buildFilesEnabled ? "discovery-terraform-and-retrieval-diagnostics/v2+build1" : "discovery-terraform-and-retrieval-diagnostics/v2", workspaceRootIsolation: "v1" })).digest("hex"),
     } };
   } catch (cause) {
     throw Object.assign(new Error(signal?.aborted ? "Workspace scan incomplete: indexing cancelled during scan."
@@ -1234,7 +1238,9 @@ function relativePathForUri(uri: vscode.Uri): string | null {
 function isIndexExcludedPath(relativePath: string, fileTypes?: RetrievalFileTypes): boolean {
   const normalizedPath = relativePath.replaceAll("\\", "/");
   const parts = normalizedPath.split("/");
-  return parts.some((part) => part.startsWith(".") || ["node_modules", "dist", "build", "target", "__pycache__"].includes(part))
+  // IDX-005: allowed CI pipeline files under dot directories pass only when the server indexes them.
+  const pipelinePath = fileTypes?.pipelineFilesEnabled === true && isPipelineDotPath(normalizedPath);
+  return parts.some((part) => (part.startsWith(".") && !pipelinePath) || ["node_modules", "dist", "build", "target", "__pycache__"].includes(part))
     || parts.some((part, index) => part === "reports" && parts[index + 1] === "retrieval-failures")
     || isRetrievalExcludedPath(normalizedPath, fileTypes);
 }

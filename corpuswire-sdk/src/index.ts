@@ -137,7 +137,7 @@ export type {
 export { INVENTORY_VERSION, WorkspaceScanIncompleteError, canonicalInventoryPath, inventoryDigest, inventorySha256, selectionPolicyDigest, buildWorkspaceInventory } from "./inventory.js";
 export type { InventoryScan, InventorySelectionPolicy, WorkspaceInventory, WorkspaceCoverage, IndexTransferSummary } from "./types.js";
 
-export { isRetrievalExcludedPath, ingestionPriority, retrievalFileTypesFromCapabilities } from "./inventory.js";
+export { isRetrievalExcludedPath, ingestionPriority, isPipelineDotPath, isPipelineDotPathAncestor, retrievalFileTypesFromCapabilities } from "./inventory.js";
 export type { RetrievalFileTypes } from "./inventory.js";
 export {
   WORKSPACE_IDENTITY_VERSION,

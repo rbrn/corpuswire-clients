@@ -1,4 +1,4 @@
-import { deriveWorkspaceId, isRetrievalExcludedPath, retrievalFileTypesFromCapabilities } from "@corpuswire/sdk";
+import { deriveWorkspaceId, isPipelineDotPath, isPipelineDotPathAncestor, isRetrievalExcludedPath, retrievalFileTypesFromCapabilities } from "@corpuswire/sdk";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { readFile, readdir, stat, lstat, mkdir, writeFile, open, realpath, rename } from "node:fs/promises";
@@ -1009,7 +1009,9 @@ export async function runWatchCommand(options, dependencies) {
     if (stopped) return;
     const relative = filename?.toString().split(path.sep).join("/");
     const controlPath = [".vscode/settings.json", ".vscode/mcp.json", ".mcp.json"].includes(relative);
-    if (relative && !controlPath && (relative.split("/").some((part) => part.startsWith(".") || DEFAULT_EXCLUDED_DIRECTORIES.has(part))
+    // IDX-005: allowed CI pipeline files under dot directories pass only when the server indexes them.
+    const pipelinePath = watchFileTypes?.pipelineFilesEnabled === true && Boolean(relative) && isPipelineDotPath(relative);
+    if (relative && !controlPath && (relative.split("/").some((part) => (part.startsWith(".") && !pipelinePath) || DEFAULT_EXCLUDED_DIRECTORIES.has(part))
       || matchesAnyGlob(relative, options.excludeGlobs) || isRetrievalExcludedPath(relative, watchFileTypes))) return;
     generation += 1;
     lastEventAt = Date.now();
@@ -1875,6 +1877,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
   const scannedPaths = [];
   let scanned = 0;
   const discoveryStartedAt = performance.now();
+  const fileTypes = retrievalFileTypesFromCapabilities(options.capabilities);
   async function walk(directory) {
     if (options.signal?.aborted) throw Object.assign(new Error("Workspace scan cancelled"), { code: "scan_incomplete" });
     const directoryStats = await lstat(directory);
@@ -1884,8 +1887,14 @@ async function scanWorkspaceComplete(sourceRoot, options) {
     for (const entry of entries) {
       const absolutePath = path.join(directory, entry.name);
       const relativePath = path.relative(sourceRoot, absolutePath).split(path.sep).join("/");
-      if (entry.isSymbolicLink() || entry.name.startsWith(".")) {
+      if (entry.isSymbolicLink()) {
         continue;
+      }
+      // Hidden paths stay out, except IDX-005 pipeline files when the server reports pipeline_files_enabled.
+      // Without it nothing below a dot entry is reached, so this matches the plain dot-name check.
+      if (relativePath.split("/").some((part) => part.startsWith("."))) {
+        if (!fileTypes.pipelineFilesEnabled) continue;
+        if (entry.isDirectory() ? !isPipelineDotPathAncestor(relativePath) : !isPipelineDotPath(relativePath)) continue;
       }
       if (entry.isDirectory()) {
         if (!DEFAULT_EXCLUDED_DIRECTORIES.has(entry.name) && !matchesAnyGlob(relativePath, options.excludeGlobs)) {
@@ -1916,7 +1925,6 @@ async function scanWorkspaceComplete(sourceRoot, options) {
   const filteringStartedAt = performance.now();
   const supportedExtensions = new Set(options.capabilities.supported_extensions ?? []);
   const supportedNames = new Set(options.capabilities.supported_filenames ?? []);
-  const fileTypes = retrievalFileTypesFromCapabilities(options.capabilities);
   const selected = [];
   let excluded = 0;
   let gitIgnored = 0;
@@ -1989,7 +1997,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
     inventoryScan: {
       complete: true, startedAt: scanStartedAt, completedAt: new Date().toISOString(),
       excludedFileCount: excluded, producer: "corpuswire-cli-scan/v1",
-      ignoreDigest: createHash("sha256").update(JSON.stringify({ directories: [...DEFAULT_EXCLUDED_DIRECTORIES].sort(), hiddenPaths: "exclude", retrievalExclusions: fileTypes.buildFilesEnabled ? "discovery-and-terraform/v2+build1" : "discovery-and-terraform/v2", gitIgnore: gitSourceFiles ? "exclude-standard" : "off" })).digest("hex"),
+      ignoreDigest: createHash("sha256").update(JSON.stringify({ directories: [...DEFAULT_EXCLUDED_DIRECTORIES].sort(), hiddenPaths: fileTypes.pipelineFilesEnabled ? "exclude+pipeline1" : "exclude", retrievalExclusions: fileTypes.buildFilesEnabled ? "discovery-and-terraform/v2+build1" : "discovery-and-terraform/v2", gitIgnore: gitSourceFiles ? "exclude-standard" : "off" })).digest("hex"),
     },
     files,
     scanned,
