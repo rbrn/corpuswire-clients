@@ -1415,6 +1415,40 @@ test("CLI complete scan carries inventory evidence and cancellation cannot reach
   } finally { await rm(fixture, { recursive: true, force: true }); }
 });
 
+test("IDX-004 CLI scan admits build files only when the server reports build_files_enabled", async () => {
+  const fixture = await syntheticWorkspace();
+  const admitted = ["pom.xml", "src/main/resources/application.properties", "build.gradle.kts", "package.json", "tsconfig.app.json", "requirements-dev.txt"];
+  const excluded = ["package-lock.json", "yarn.lock", "settings.xml", "app-secrets.properties", "prod.tfvars", "terraform.tfstate"];
+  await mkdir(path.join(fixture, "src", "main", "resources"), { recursive: true });
+  for (const file of [...admitted, ...excluded]) await writeFile(path.join(fixture, file), "synthetic\n");
+  // The same broad type lists in every arm, so only the retrieval exclusion decides.
+  const base = {
+    supported_extensions: [".md", ".js", ".kts", ".json", ".txt", ".xml", ".properties", ".gradle", ".tfvars", ".tfstate"],
+    supported_filenames: ["package.json", "pom.xml", "package-lock.json", "yarn.lock", "settings.xml", "terraform.tfstate"],
+    max_file_size_bytes: 1024 * 1024,
+  };
+  const scan = async (capabilities) => {
+    let captured;
+    const client = fakeIndexClient({ getIndexCapabilities: async () => capabilities, indexWorkspace: async (request) => {
+      captured = request;
+      return { ok: true, result: {}, status: {} };
+    } });
+    await runCliCommand({ ...indexOptions(fixture), yes: true }, { client, write: () => {}, writeRaw: () => {}, isTTY: false });
+    return { paths: captured.files.map((file) => file.relativePath).sort(), ignoreDigest: captured.inventoryScan.ignoreDigest };
+  };
+  try {
+    const absent = await scan(base);
+    const off = await scan({ ...base, build_files_enabled: false, discovery_only_extensions: [".gradle", ".properties", ".tfvars", ".xml"], discovery_only_filenames: ["pom.xml"] });
+    assert.deepEqual(absent.paths, ["README.md", "src/index.js"]);
+    assert.deepEqual(off.paths, absent.paths);
+    assert.equal(off.ignoreDigest, absent.ignoreDigest);
+    const on = await scan({ ...base, build_files_enabled: true, discovery_only_extensions: [".tfvars"],
+      discovery_only_filenames: ["package-lock.json", "yarn.lock", "settings.xml", "settings-security.xml"] });
+    assert.deepEqual(on.paths, [...admitted, "README.md", "src/index.js"].sort());
+    assert.notEqual(on.ignoreDigest, absent.ignoreDigest);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
 async function watchFixture({ argv = ["watch"], isTTY = false, onWait, onIndex, onPreview, onDiagnosis, onSetup, onConfirm, onClientSetup, watcherUnavailable = false, watcherError } = {}) {
   const root = await syntheticWorkspace();
   const controller = new AbortController();

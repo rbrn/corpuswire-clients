@@ -1,4 +1,4 @@
-import { deriveWorkspaceId, isRetrievalExcludedPath } from "@corpuswire/sdk";
+import { deriveWorkspaceId, isRetrievalExcludedPath, retrievalFileTypesFromCapabilities } from "@corpuswire/sdk";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { readFile, readdir, stat, lstat, mkdir, writeFile, open, realpath, rename } from "node:fs/promises";
@@ -1002,13 +1002,15 @@ export async function runWatchCommand(options, dependencies) {
   let reportedGitOperation = null;
   let stopped = false;
   let watcherErrorReported = false;
+  // Until capabilities arrive, change events use the conservative built-in exclusions.
+  let watchFileTypes;
 
   const onChange = (_event, filename) => {
     if (stopped) return;
     const relative = filename?.toString().split(path.sep).join("/");
     const controlPath = [".vscode/settings.json", ".vscode/mcp.json", ".mcp.json"].includes(relative);
     if (relative && !controlPath && (relative.split("/").some((part) => part.startsWith(".") || DEFAULT_EXCLUDED_DIRECTORIES.has(part))
-      || matchesAnyGlob(relative, options.excludeGlobs) || isRetrievalExcludedPath(relative))) return;
+      || matchesAnyGlob(relative, options.excludeGlobs) || isRetrievalExcludedPath(relative, watchFileTypes))) return;
     generation += 1;
     lastEventAt = Date.now();
     wake?.();
@@ -1084,6 +1086,7 @@ export async function runWatchCommand(options, dependencies) {
       }
     }
     if (signal?.aborted) return { ok: true, stopped: true, publications, exitCode: 0 };
+    watchFileTypes = retrievalFileTypesFromCapabilities(capabilities);
     write(`Watching ${sanitizeTerminalText(root)} → ${sanitizeTerminalText(options.workspaceId)} at ${displayServiceUrl(options.apiBaseUrl)}. Press Ctrl+C to stop.`);
     dependencies.onWatchState?.(`Checking ${sanitizeTerminalText(options.workspaceId)} for changes…`);
     while (!signal?.aborted) {
@@ -1913,6 +1916,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
   const filteringStartedAt = performance.now();
   const supportedExtensions = new Set(options.capabilities.supported_extensions ?? []);
   const supportedNames = new Set(options.capabilities.supported_filenames ?? []);
+  const fileTypes = retrievalFileTypesFromCapabilities(options.capabilities);
   const selected = [];
   let excluded = 0;
   let gitIgnored = 0;
@@ -1931,7 +1935,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
     const excludedByGlob = matchesAnyGlob(candidate.relativePath, options.excludeGlobs);
     const fileStats = await lstat(candidate.absolutePath);
     if (!fileStats.isFile() || fileStats.isSymbolicLink()) throw Object.assign(new Error("Workspace changed during scan"), { code: "scan_incomplete" });
-    if (isRetrievalExcludedPath(candidate.relativePath) || !includedByType || !includedByGlob || excludedByGlob || fileStats.size > options.maxFileSizeBytes) {
+    if (isRetrievalExcludedPath(candidate.relativePath, fileTypes) || !includedByType || !includedByGlob || excludedByGlob || fileStats.size > options.maxFileSizeBytes) {
       excluded += 1;
       continue;
     }
@@ -1985,7 +1989,7 @@ async function scanWorkspaceComplete(sourceRoot, options) {
     inventoryScan: {
       complete: true, startedAt: scanStartedAt, completedAt: new Date().toISOString(),
       excludedFileCount: excluded, producer: "corpuswire-cli-scan/v1",
-      ignoreDigest: createHash("sha256").update(JSON.stringify({ directories: [...DEFAULT_EXCLUDED_DIRECTORIES].sort(), hiddenPaths: "exclude", retrievalExclusions: "discovery-and-terraform/v2", gitIgnore: gitSourceFiles ? "exclude-standard" : "off" })).digest("hex"),
+      ignoreDigest: createHash("sha256").update(JSON.stringify({ directories: [...DEFAULT_EXCLUDED_DIRECTORIES].sort(), hiddenPaths: "exclude", retrievalExclusions: fileTypes.buildFilesEnabled ? "discovery-and-terraform/v2+build1" : "discovery-and-terraform/v2", gitIgnore: gitSourceFiles ? "exclude-standard" : "off" })).digest("hex"),
     },
     files,
     scanned,

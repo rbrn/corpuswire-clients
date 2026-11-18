@@ -1,4 +1,4 @@
-import { INVENTORY_VERSION, WorkspaceScanIncompleteError, buildWorkspaceInventory, canonicalInventoryPath, ingestionPriority, inventoryDigest } from "./inventory.js";
+import { INVENTORY_VERSION, WorkspaceScanIncompleteError, buildWorkspaceInventory, canonicalInventoryPath, ingestionPriority, inventoryDigest, retrievalFileTypesFromCapabilities, type RetrievalFileTypes } from "./inventory.js";
 import { CorpusWireHttpError, createBearerAuthHeader, requestJson, waitForAbortableDelay } from "./http.js";
 import type {
   EnhancePromptPayload,
@@ -1042,9 +1042,12 @@ export class CorpusWireClient {
     await inventoryDigest(triples);
     phaseClock.pause();
     phaseClock.enter("resolving_configuration");
+    // Upload-tier ordering only; code-tier membership never depends on it.
+    let retrievalFileTypes: RetrievalFileTypes | undefined;
     if (request.inventoryScan) {
       if (request.mode !== "full" || request.snapshotScope) throw new WorkspaceScanIncompleteError("Inventory requires a v1 full scan");
       const capabilities = await this.getIndexCapabilities();
+      retrievalFileTypes = retrievalFileTypesFromCapabilities(capabilities);
       if (request.inventoryScan.complete !== true) throw new WorkspaceScanIncompleteError();
       if (capabilities.inventory_coverage_versions?.includes(INVENTORY_VERSION)) {
         if (!capabilities.supported_file_registry_version) throw new WorkspaceScanIncompleteError("Missing supported file registry version");
@@ -1168,7 +1171,7 @@ export class CorpusWireClient {
           if (clientOwnedCheckpoint) throw new DOMException("Caller wait timeout elapsed", "TimeoutError");
           throw new IndexProcessingInterruptedError("timeout");
         }
-        const tierFiles = filesToUpload.filter(({ file }) => ingestionPriority(file.relativePath) === priority);
+        const tierFiles = filesToUpload.filter(({ file }) => ingestionPriority(file.relativePath, retrievalFileTypes) === priority);
         let tierQueued = false;
         const uploadBatches = tierFiles.length === 0 ? [] : buildUploadBatches(
           tierFiles,

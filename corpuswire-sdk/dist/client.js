@@ -1,4 +1,4 @@
-import { INVENTORY_VERSION, WorkspaceScanIncompleteError, buildWorkspaceInventory, canonicalInventoryPath, ingestionPriority, inventoryDigest } from "./inventory.js";
+import { INVENTORY_VERSION, WorkspaceScanIncompleteError, buildWorkspaceInventory, canonicalInventoryPath, ingestionPriority, inventoryDigest, retrievalFileTypesFromCapabilities } from "./inventory.js";
 import { CorpusWireHttpError, createBearerAuthHeader, requestJson, waitForAbortableDelay } from "./http.js";
 const RUNTIME_ENV = globalThis.process?.env ?? {};
 const DEFAULT_BASE_URL = RUNTIME_ENV.CORPUSWIRE_BASE_URL ?? "http://127.0.0.1:8000";
@@ -828,10 +828,13 @@ export class CorpusWireClient {
         await inventoryDigest(triples);
         phaseClock.pause();
         phaseClock.enter("resolving_configuration");
+        // Upload-tier ordering only; code-tier membership never depends on it.
+        let retrievalFileTypes;
         if (request.inventoryScan) {
             if (request.mode !== "full" || request.snapshotScope)
                 throw new WorkspaceScanIncompleteError("Inventory requires a v1 full scan");
             const capabilities = await this.getIndexCapabilities();
+            retrievalFileTypes = retrievalFileTypesFromCapabilities(capabilities);
             if (request.inventoryScan.complete !== true)
                 throw new WorkspaceScanIncompleteError();
             if (capabilities.inventory_coverage_versions?.includes(INVENTORY_VERSION)) {
@@ -929,7 +932,7 @@ export class CorpusWireClient {
                         throw new DOMException("Caller wait timeout elapsed", "TimeoutError");
                     throw new IndexProcessingInterruptedError("timeout");
                 }
-                const tierFiles = filesToUpload.filter(({ file }) => ingestionPriority(file.relativePath) === priority);
+                const tierFiles = filesToUpload.filter(({ file }) => ingestionPriority(file.relativePath, retrievalFileTypes) === priority);
                 let tierQueued = false;
                 const uploadBatches = tierFiles.length === 0 ? [] : buildUploadBatches(tierFiles, clampUploadLimit(request.batchBytes, session.max_batch_bytes, "batchBytes"), session.max_batch_files);
                 if (uploadBatches.length)

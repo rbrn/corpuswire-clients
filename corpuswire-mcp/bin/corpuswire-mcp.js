@@ -133,6 +133,19 @@ const DISCOVERY_ONLY_FILENAMES = new Set([
   "uv.lock",
   "yarn.lock",
 ]);
+// IDX-004: names excluded even when the server indexes build files; the server's
+// discovery_only_filenames lists the same set, this copy covers an incomplete list.
+const BUILD_EXCLUDED_FILENAMES = new Set([
+  ".terraform.lock.hcl", "bun.lock", "bun.lockb", "dependencies.lock", "gradle.lockfile",
+  "npm-shrinkwrap.json", "package-lock.json", "pdm.lock", "pipfile.lock", "pnpm-lock.yaml",
+  "poetry.lock", "uv.lock", "yarn.lock", "settings.xml", "settings-security.xml",
+]);
+const BUILD_FILENAMES = new Set([
+  "angular.json", "build.gradle", "build.gradle.kts", "gradle.properties", "jsconfig.json",
+  "libs.versions.toml", "nx.json", "package.json", "pipfile", "pom.xml", "project.json",
+  "pyproject.toml", "settings.gradle", "settings.gradle.kts", "setup.cfg", "setup.py", "workspace.json",
+]);
+const BUILD_EXTENSIONS = new Set([".gradle", ".properties", ".xml"]);
 const EXCLUDED_PATH_SEGMENTS = new Set([
   ".git",
   ".vscode",
@@ -251,6 +264,9 @@ class SyncManager {
     this.supportedFileRegistryVersion = "fallback-v1";
     this.indexableExtensions = new Set(INDEXABLE_EXTENSIONS);
     this.indexableFilenames = new Set(INDEXABLE_FILENAMES);
+    this.buildFilesEnabled = false;
+    this.discoveryOnlyFilenames = new Set();
+    this.discoveryOnlyExtensions = [];
     this.supportedFileCapabilitiesPromise = null;
   }
 
@@ -399,6 +415,21 @@ class SyncManager {
         }
         if (typeof capabilities.supported_file_registry_version === "string") {
           this.supportedFileRegistryVersion = capabilities.supported_file_registry_version.slice(0, 128);
+        }
+        if (capabilities.build_files_enabled === true) {
+          // IDX-004: the server indexes build files; only its remaining discovery-only floor applies.
+          this.buildFilesEnabled = true;
+          this.discoveryOnlyFilenames = new Set(boundedSupportedFileValues(
+            capabilities.discovery_only_filenames,
+            /^[a-z0-9.][a-z0-9._-]*$/,
+          ));
+          this.discoveryOnlyExtensions = boundedSupportedFileValues(
+            capabilities.discovery_only_extensions,
+            /^\.[a-z0-9.]+$/,
+          );
+          for (const extension of boundedSupportedFileValues(capabilities.supported_extensions, /^\.[a-z0-9.]+$/)) {
+            if (BUILD_EXTENSIONS.has(extension)) this.indexableExtensions.add(extension);
+          }
         }
       } catch {
         // The local fallback remains safe when an older server lacks capabilities.
@@ -1575,7 +1606,7 @@ class SyncManager {
         producer: "corpuswire-mcp-scan/v1",
         ignoreDigest: createHash("sha256").update(JSON.stringify({
           excludedSegments: [...EXCLUDED_PATH_SEGMENTS].sort(), hiddenDirectories: "except-safe-ancestors",
-          sensitiveTerraform: "skip/v1", discoveryOnly: "skip/v1",
+          sensitiveTerraform: "skip/v1", discoveryOnly: context.buildFilesEnabled === true ? "skip/v1+build1" : "skip/v1",
         })).digest("hex"),
       },
       client: removeUndefinedValues({
@@ -2057,6 +2088,9 @@ class SyncManager {
       excludeGlobs: resolveSyncGlobList(args, this.env.CORPUSWIRE_SYNC_EXCLUDE_GLOBS, "excludeGlobs", "exclude_globs"),
       indexableExtensions: this.indexableExtensions,
       indexableFilenames: this.indexableFilenames,
+      buildFilesEnabled: this.buildFilesEnabled === true,
+      discoveryOnlyFilenames: this.discoveryOnlyFilenames,
+      discoveryOnlyExtensions: this.discoveryOnlyExtensions,
     };
   }
 
@@ -6818,7 +6852,7 @@ function classifySyncRelativePath(relativePath, context) {
   if (isSensitiveTerraformRelativePath(normalized)) {
     return { accepted: false, reason: "sensitive_terraform_artifact" };
   }
-  if (isDiscoveryOnlyRelativePath(normalized)) {
+  if (isDiscoveryOnlyRelativePath(normalized, context)) {
     return { accepted: false, reason: "discovery_only_metadata" };
   }
   const segments = normalized.split("/").filter(Boolean);
@@ -6871,8 +6905,14 @@ function isSensitiveTerraformRelativePath(relativePath) {
     || name.endsWith(".plan.json");
 }
 
-function isDiscoveryOnlyRelativePath(relativePath) {
+function isDiscoveryOnlyRelativePath(relativePath, context) {
   const name = path.posix.basename(relativePath).toLowerCase();
+  if (context?.buildFilesEnabled === true) {
+    return BUILD_EXCLUDED_FILENAMES.has(name)
+      || Boolean(context.discoveryOnlyFilenames?.has(name))
+      || (context.discoveryOnlyExtensions ?? []).some((extension) => name.endsWith(extension))
+      || (isBuildTierName(name) && /secret|credential|password/.test(name));
+  }
   return DISCOVERY_ONLY_FILENAMES.has(name)
     || (name.startsWith("tsconfig") && name.endsWith(".json"))
     || (name.endsWith(".txt") && (
@@ -6883,6 +6923,13 @@ function isDiscoveryOnlyRelativePath(relativePath) {
       || name.startsWith("constraints-")
       || name.startsWith("constraints_")
     ));
+}
+
+function isBuildTierName(name) {
+  return BUILD_FILENAMES.has(name)
+    || BUILD_EXTENSIONS.has(path.posix.extname(name))
+    || (name.startsWith("tsconfig") && name.endsWith(".json"))
+    || /^(requirements|constraints)([-_].*)?\.txt$/.test(name);
 }
 
 function isSafeIndexableDirectoryAncestor(relativePath) {

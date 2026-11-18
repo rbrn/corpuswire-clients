@@ -920,6 +920,12 @@ export interface RemoteIndexCapabilities {
     supported_extensions: string[];
     supported_filenames?: string[];
     supported_file_registry_version?: string;
+    /** Extensions whose content the server never indexes (IDX-004: lists the remaining floor when build files are on). */
+    discovery_only_extensions?: string[];
+    /** File names whose content the server never indexes (IDX-004: lockfiles and Maven settings when build files are on). */
+    discovery_only_filenames?: string[];
+    /** IDX-004: true when the server indexes build files and manifests; older servers omit it. */
+    build_files_enabled?: boolean;
     manifest_compression: string[];
     file_batch_content_types: string[];
     payload_compression: string[];

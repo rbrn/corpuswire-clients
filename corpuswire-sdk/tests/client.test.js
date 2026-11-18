@@ -1738,6 +1738,68 @@ test("retrieval exclusions preserve source while rejecting discovery and Terrafo
   }
 });
 
+// IDX-004 server capabilities with INDEX_BUILD_FILES=on (lists copied from the engine registry).
+const BUILD_ON_CAPABILITIES = Object.freeze({
+  build_files_enabled: true,
+  discovery_only_extensions: [".tfvars"],
+  discovery_only_filenames: [".terraform.lock.hcl", "bun.lock", "bun.lockb", "dependencies.lock", "gradle.lockfile", "npm-shrinkwrap.json",
+    "package-lock.json", "pdm.lock", "pipfile.lock", "pnpm-lock.yaml", "poetry.lock", "uv.lock", "yarn.lock", "settings.xml", "settings-security.xml"],
+});
+const CURRENTLY_EXCLUDED_PATHS = Object.freeze(["package.json", "src/tsconfig.build.json", "tsconfig.app.json", "requirements.txt", "requirements-dev.txt",
+  "constraints_prod.txt", "SETUP.PY", "nx.json", "project.json", "state.tfstate.json", "terraform.tfstate", "values.tfvars.json", "prod.tfvars",
+  "out.plan.json", "tfplan", "crash.log", "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle.kts", "gradle.properties",
+  "src/main/resources/application.properties", "app-secrets.properties", "config/beans.xml", "settings.xml", "package-lock.json", "yarn.lock",
+  "Pipfile", "pyproject.toml", "libs.versions.toml", "reports/retrieval-failures/a.json"]);
+
+test("IDX-004 retrieval exclusions keep today's floor when build files are off or unknown", async () => {
+  const { isRetrievalExcludedPath, retrievalFileTypesFromCapabilities } = await import("../dist/index.js");
+  const policies = [undefined, retrievalFileTypesFromCapabilities(undefined), retrievalFileTypesFromCapabilities({}),
+    retrievalFileTypesFromCapabilities({ build_files_enabled: false, discovery_only_filenames: [], discovery_only_extensions: [] }),
+    retrievalFileTypesFromCapabilities({ ...BUILD_ON_CAPABILITIES, build_files_enabled: "true" })];
+  for (const policy of policies) {
+    for (const path of CURRENTLY_EXCLUDED_PATHS) assert.equal(isRetrievalExcludedPath(path, policy), true, `${path} ${JSON.stringify(policy)}`);
+    for (const path of ["src/main.py", "README.md", "settings.json"]) assert.equal(isRetrievalExcludedPath(path, policy), false, path);
+  }
+});
+
+test("IDX-004 retrieval exclusions admit build files when the server indexes them", async () => {
+  const { isRetrievalExcludedPath, retrievalFileTypesFromCapabilities } = await import("../dist/index.js");
+  const policy = retrievalFileTypesFromCapabilities(BUILD_ON_CAPABILITIES);
+  assert.equal(policy.buildFilesEnabled, true);
+  for (const path of ["pom.xml", "src/main/resources/application.properties", "build.gradle.kts", "package.json", "tsconfig.app.json",
+    "requirements-dev.txt", "Pipfile", "pyproject.toml", "gradle.properties", "config/beans.xml", "app/build.gradle", "setup.py", "src/main.py"]) {
+    assert.equal(isRetrievalExcludedPath(path, policy), false, path);
+  }
+  for (const path of ["package-lock.json", "yarn.lock", "settings.xml", "m2/settings-security.xml", "app-secrets.properties", "db-password.xml",
+    "aws-credentials.properties", "prod.tfvars", "values.tfvars.json", "terraform.tfstate", "state.tfstate.json", "out.plan.json", "tfplan",
+    "crash.log", "reports/retrieval-failures/a.json", "Pipfile.lock", "poetry.lock"]) {
+    assert.equal(isRetrievalExcludedPath(path, policy), true, path);
+  }
+  // Lockfiles and Maven settings stay out even when an older server's lists are empty.
+  const sparse = retrievalFileTypesFromCapabilities({ build_files_enabled: true });
+  for (const path of ["package-lock.json", "yarn.lock", "settings.xml", "prod.tfvars"]) assert.equal(isRetrievalExcludedPath(path, sparse), true, path);
+  // Secret-named files outside the build tier follow the normal source rules.
+  assert.equal(isRetrievalExcludedPath("src/secret_rotation.py", policy), false);
+});
+
+test("IDX-004 ingestion priority schedules manifests with documentation only when build files are on", async () => {
+  const { retrievalFileTypesFromCapabilities } = await import("../dist/index.js");
+  const on = retrievalFileTypesFromCapabilities(BUILD_ON_CAPABILITIES);
+  const off = retrievalFileTypesFromCapabilities({ build_files_enabled: false });
+  for (const path of ["package.json", "pom.xml", "pyproject.toml", "app/build.gradle", "settings.gradle"]) {
+    assert.equal(ingestionPriority(path), 3, path);
+    assert.equal(ingestionPriority(path, off), 3, path);
+    assert.equal(ingestionPriority(path, on), 2, path);
+  }
+  // Code-extension manifests stay in the code tier: the server's code checkpoint counts them as code.
+  for (const path of ["build.gradle.kts", "settings.gradle.kts", "setup.py"]) assert.equal(ingestionPriority(path, on), 1, path);
+  for (const path of ["src/main/resources/application.properties", "config/beans.xml", "tsconfig.json", "gradle.properties"]) {
+    assert.equal(ingestionPriority(path, on), 3, path);
+  }
+  assert.equal(ingestionPriority("requirements-dev.txt", on), 2);
+  assert.equal(ingestionPriority("README.md", on), 2);
+});
+
 test("ingestion priority covers every code extension in the engine registry when it is checked out", async (t) => {
   const registryUrl = new URL("../../../src/corpuswire/ingest/capabilities.py", import.meta.url);
   const { readFile } = await import("node:fs/promises");
@@ -1775,7 +1837,7 @@ test("ingestion priority matches canonical code, documentation and other categor
   for (const path of ["settings.json", "data.csv", "config.yml"]) assert.equal(ingestionPriority(path), 3);
 });
 
-function priorityIndexFixture({ files, unchanged = [], capability = true, batchBytes = 1024, concurrency = 1, onUpload } = {}) {
+function priorityIndexFixture({ files, unchanged = [], capability = true, batchBytes = 1024, concurrency = 1, onUpload, capabilities = {} } = {}) {
   const calls = [], uploaded = new Set(), uploadRequired = files.map((file) => file.relativePath).filter((path) => !unchanged.includes(path));
   let released = false;
   const status = (coverage) => ({
@@ -1788,7 +1850,7 @@ function priorityIndexFixture({ files, unchanged = [], capability = true, batchB
   const client = new CorpusWireClient({ baseUrl: "http://fixture.test", fetchFn: async (url, init) => {
     if (url.endsWith("/capabilities")) return jsonResponse(200, {
       ok: true, inventory_coverage_versions: ["workspace-inventory/v1"],
-      supported_file_registry_version: "fixture/v1", max_file_size_bytes: 1024,
+      supported_file_registry_version: "fixture/v1", max_file_size_bytes: 1024, ...capabilities,
     });
     if (url.endsWith("/sessions")) return jsonResponse(200, { ok: true, result: {
       session_id: "priority", workspace_id: "fixture", collection_name: "fixture", manifest_revision: 1,
@@ -1827,6 +1889,19 @@ function priorityIndexFixture({ files, unchanged = [], capability = true, batchB
   };
   return { client, request, calls };
 }
+
+test("IDX-004 uploads build manifests with documentation only when the server indexes build files", async () => {
+  const files = [{ relativePath: "data.json", content: "{}" }, { relativePath: "pom.xml", content: "<project/>" },
+    { relativePath: "README.md", content: "guide" }, { relativePath: "src/main.py", content: "x=1" }];
+  const uploads = async (capabilities) => {
+    const fixture = priorityIndexFixture({ files, capability: false, capabilities });
+    await fixture.client.indexWorkspace(fixture.request);
+    return fixture.calls.filter((call) => call.type === "upload").map((call) => call.paths.sort());
+  };
+  assert.deepEqual(await uploads({}), [["src/main.py"], ["README.md"], ["data.json", "pom.xml"]]);
+  assert.deepEqual(await uploads({ build_files_enabled: false }), [["src/main.py"], ["README.md"], ["data.json", "pom.xml"]]);
+  assert.deepEqual(await uploads({ build_files_enabled: true }), [["src/main.py"], ["README.md", "pom.xml"], ["data.json"]]);
+});
 
 test("code drains and publishes while documentation remains missing, before later tiers upload", async () => {
   const fixture = priorityIndexFixture({ files: [

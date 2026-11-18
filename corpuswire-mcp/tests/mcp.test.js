@@ -2606,6 +2606,56 @@ test("sync path probe applies leading globstar, basename, and exclusion semantic
   }
 });
 
+test("IDX-004 sync path probe admits build files only when the server indexes them", async () => {
+  const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-build-files-"));
+  const admitted = ["pom.xml", "src/main/resources/application.properties", "build.gradle.kts", "package.json",
+    "tsconfig.app.json", "requirements-dev.txt"];
+  const excluded = ["package-lock.json", "yarn.lock", "settings.xml", "app-secrets.properties", "prod.tfvars", "terraform.tfstate"];
+  const buildOn = {
+    ok: true, build_files_enabled: true, supported_file_registry_version: "supported-files/v3+build1",
+    supported_extensions: [".md", ".py", ".json", ".kts", ".txt", ".xml", ".properties", ".gradle"],
+    supported_filenames: ["gradlew", "mvnw", "dockerfile", "pom.xml", "package.json", "build.gradle.kts", "pipfile"],
+    discovery_only_extensions: [".tfvars"],
+    discovery_only_filenames: [".terraform.lock.hcl", "package-lock.json", "yarn.lock", "poetry.lock", "settings.xml", "settings-security.xml"],
+  };
+  const probe = async (capabilities) => {
+    const { sdkPath, requestsPath } = await writeMockSdk(tempDir);
+    const env = { ...globalThis.process.env, CORPUSWIRE_BASE_URL: "http://127.0.0.1:8000", CORPUSWIRE_SDK_PATH: sdkPath,
+      CORPUSWIRE_WORKSPACE_ID: "workspace-build-files", CORPUSWIRE_REPO_PATH: tempDir, CORPUSWIRE_SYNC_ENABLED: "true",
+      MOCK_REQUESTS_PATH: requestsPath };
+    if (capabilities) env.MOCK_INDEX_CAPABILITIES_JSON = JSON.stringify(capabilities);
+    else delete env.MOCK_INDEX_CAPABILITIES_JSON;
+    const child = spawn("node", [SERVER_BIN], { stdio: ["pipe", "pipe", "pipe"], env });
+    try {
+      const response = await createRpc(child)({ jsonrpc: "2.0", id: 41, method: "tools/call", params: {
+        name: "corpuswire_sync_probe_paths", arguments: { paths: [...admitted, ...excluded] },
+      } });
+      return response.result.content[0].text;
+    } finally {
+      child.kill();
+    }
+  };
+  // Each probe result is "N. rawPath: <path>" followed by its "pathAccepted:" and "reason:" lines.
+  const decisions = (text) => Object.fromEntries([...text.matchAll(
+    /rawPath: (\S+)\n[\s\S]*?pathAccepted: (true|false)\n[\s\S]*?reason: (\S+)/g,
+  )].map(([, rawPath, accepted, reason]) => [rawPath, { accepted: accepted === "true", reason }]));
+  try {
+    for (const capabilities of [null, { ...buildOn, build_files_enabled: false, supported_file_registry_version: "supported-files/v3",
+      discovery_only_extensions: [".gradle", ".properties", ".tfvars", ".xml"], discovery_only_filenames: ["package.json", "pom.xml"] }]) {
+      const result = decisions(await probe(capabilities));
+      for (const candidate of [...admitted, ...excluded]) assert.equal(result[candidate]?.accepted, false, candidate);
+    }
+    const result = decisions(await probe(buildOn));
+    for (const candidate of admitted) assert.equal(result[candidate]?.accepted, true, candidate);
+    for (const candidate of excluded) assert.equal(result[candidate]?.accepted, false, candidate);
+    assert.equal(result["package-lock.json"].reason, "discovery_only_metadata");
+    assert.equal(result["app-secrets.properties"].reason, "discovery_only_metadata");
+    assert.equal(result["prod.tfvars"].reason, "sensitive_terraform_artifact");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("reconcile includes root and nested files using only leading globstar patterns", async () => {
   const tempDir = await mkdtemp(path.join(tmpdir(), "corpuswire-mcp-glob-reconcile-"));
   try {
@@ -3352,6 +3402,9 @@ export class CorpusWireClient {
     this.fetchFn = options.fetchFn;
     if (process.env.MOCK_MISSING_VALUE_ROLLUP === "true") {
       this.valueRollup = undefined;
+    }
+    if (process.env.MOCK_INDEX_CAPABILITIES_JSON) {
+      this.getIndexCapabilities = async () => JSON.parse(process.env.MOCK_INDEX_CAPABILITIES_JSON);
     }
     if (process.env.MOCK_CLIENT_OPTIONS_PATH) {
       appendFileSync(process.env.MOCK_CLIENT_OPTIONS_PATH, JSON.stringify({
