@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 
@@ -1446,6 +1447,46 @@ test("IDX-004 CLI scan admits build files only when the server reports build_fil
       discovery_only_filenames: ["package-lock.json", "yarn.lock", "settings.xml", "settings-security.xml"] });
     assert.deepEqual(on.paths, [...admitted, "README.md", "src/index.js"].sort());
     assert.notEqual(on.ignoreDigest, absent.ignoreDigest);
+  } finally { await rm(fixture, { recursive: true, force: true }); }
+});
+
+test("IDX-005 CLI scan admits pipeline dot files only when the server reports pipeline_files_enabled", async () => {
+  const fixture = await syntheticWorkspace();
+  const admitted = [".github/workflows/ci.yml", ".github/actions/setup/action.yml", ".gitlab-ci.yml", ".gitlab/ci/build.yaml",
+    ".circleci/config.yml", ".buildkite/pipeline.yml", ".azure-pipelines.yml", ".drone.yml", ".travis.yml", ".woodpecker/test.yml",
+    ".tekton/pipeline.yaml"];
+  const excluded = [".github/dependabot.yml", ".github/ISSUE_TEMPLATE/x.yml", ".github/workflows/nested/ci.yml", ".github/actions/setup/other.yml",
+    ".env", ".npmrc", ".circleci/secrets.yml", ".pre-commit-config.yaml", ".github/workflows/node_modules/ci.yml", "src/.github/workflows/ci.yml"];
+  for (const file of [...admitted, ...excluded]) {
+    await mkdir(path.dirname(path.join(fixture, file)), { recursive: true });
+    await writeFile(path.join(fixture, file), "synthetic: true\n");
+  }
+  const base = { supported_extensions: [".md", ".js", ".yml", ".yaml"], max_file_size_bytes: 1024 * 1024 };
+  const scan = async (capabilities) => {
+    let captured;
+    const client = fakeIndexClient({ getIndexCapabilities: async () => capabilities, indexWorkspace: async (request) => {
+      captured = request;
+      return { ok: true, result: {}, status: {} };
+    } });
+    await runCliCommand({ ...indexOptions(fixture), yes: true }, { client, write: () => {}, writeRaw: () => {}, isTTY: false });
+    return { paths: captured.files.map((file) => file.relativePath).sort(), ignoreDigest: captured.inventoryScan.ignoreDigest };
+  };
+  try {
+    const absent = await scan(base);
+    const off = await scan({ ...base, pipeline_files_enabled: false });
+    assert.deepEqual(absent.paths, ["README.md", "src/index.js"]);
+    assert.deepEqual(off.paths, absent.paths);
+    assert.equal(off.ignoreDigest, absent.ignoreDigest);
+    // The digest stays the pre-IDX-005 value so existing coverage is not re-checked while the flag is off.
+    assert.equal(absent.ignoreDigest, createHash("sha256").update(JSON.stringify({ directories: [".git", ".mypy_cache", ".pytest_cache",
+      ".qdrant", ".ruff_cache", ".venv", "__pycache__", "build", "dist", "node_modules", "target", "venv"].sort(),
+      hiddenPaths: "exclude", retrievalExclusions: "discovery-and-terraform/v2", gitIgnore: "off" })).digest("hex"));
+    const on = await scan({ ...base, pipeline_files_enabled: true });
+    assert.deepEqual(on.paths, [...admitted, "README.md", "src/index.js"].sort());
+    assert.notEqual(on.ignoreDigest, absent.ignoreDigest);
+    // Build files and pipeline files are independent markers in the digest.
+    const both = await scan({ ...base, pipeline_files_enabled: true, build_files_enabled: true });
+    assert.notEqual(both.ignoreDigest, on.ignoreDigest);
   } finally { await rm(fixture, { recursive: true, force: true }); }
 });
 

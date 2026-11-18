@@ -27,9 +27,21 @@ export interface RetrievalFileTypes {
     readonly discoveryOnlyFilenames: ReadonlySet<string>;
     /** Lowercase extensions (with leading dot) whose content the server never indexes. */
     readonly discoveryOnlyExtensions: readonly string[];
+    /** True only when the server reports `pipeline_files_enabled: true` (IDX-005); see {@link isPipelineDotPath}. */
+    readonly pipelineFilesEnabled: boolean;
 }
 /** Derive the retrieval file-type policy from server capabilities; missing fields mean build files are off. */
 export declare function retrievalFileTypesFromCapabilities(capabilities: Partial<RemoteIndexCapabilities> | null | undefined): RetrievalFileTypes;
+/**
+ * True when a CI pipeline definition under a dot path is on the IDX-005 allow-list. Clients that
+ * skip hidden paths admit these only when the server reports `pipeline_files_enabled: true`.
+ */
+export declare function isPipelineDotPath(relativePath: string): boolean;
+/**
+ * True when a workspace-relative directory can contain a path accepted by {@link isPipelineDotPath},
+ * so directory walkers know which hidden directories to descend into.
+ */
+export declare function isPipelineDotPathAncestor(relativeDirectory: string): boolean;
 /**
  * Exclude raw discovery metadata, Terraform values and CorpusWire's own diagnostics from source uploads.
  * Without `fileTypes`, or when the server does not index build files, the built-in floor applies.

@@ -1782,6 +1782,39 @@ test("IDX-004 retrieval exclusions admit build files when the server indexes the
   assert.equal(isRetrievalExcludedPath("src/secret_rotation.py", policy), false);
 });
 
+// IDX-005 pipeline-file allow-list fixtures (must match the engine's INDEX_PIPELINE_FILES regex).
+const PIPELINE_ALLOWED_PATHS = Object.freeze([".github/workflows/ci.yml", ".github/workflows/release.yaml", ".github/actions/setup/action.yml",
+  ".github/actions/action.yaml", ".github/actions/deep/nested/action.yml", ".gitlab-ci.yml", ".gitlab-ci.yaml", ".gitlab/ci/build.yml",
+  ".gitlab/ci/stages/test.yaml", ".circleci/config.yml", ".circleci/config.yaml", ".buildkite/pipeline.yml", ".buildkite/steps/deploy.yaml",
+  ".azure-pipelines.yml", ".azure-pipelines/build.yml", ".drone.yml", ".travis.yaml", ".woodpecker.yml", ".woodpecker/test.yml",
+  ".tekton/pipeline.yaml"]);
+const PIPELINE_EXCLUDED_PATHS = Object.freeze([".github/dependabot.yml", ".github/ISSUE_TEMPLATE/x.yml", ".github/workflows/nested/ci.yml",
+  ".github/workflows/ci.json", ".github/workflows/.hidden.yml", ".github/actions/setup/other.yml", ".github/actions/.cache/action.yml",
+  ".env", ".npmrc", ".circleci/secrets.yml", ".circleci/sub/config.yml", ".pre-commit-config.yaml", ".GITHUB/workflows/ci.yml",
+  ".github/workflows/CI.YML", ".gitlab/other.yml", ".buildkite/.secrets/x.yml", "src/.github/workflows/ci.yml", ".travis.yml.bak",
+  "github/workflows/ci.yml", ".tekton.yml"]);
+
+test("IDX-005 pipeline dot paths follow the engine allow-list exactly", async () => {
+  const { isPipelineDotPath, isPipelineDotPathAncestor, isRetrievalExcludedPath, retrievalFileTypesFromCapabilities } = await import("../dist/index.js");
+  for (const path of PIPELINE_ALLOWED_PATHS) assert.equal(isPipelineDotPath(path), true, path);
+  for (const path of PIPELINE_EXCLUDED_PATHS) assert.equal(isPipelineDotPath(path), false, path);
+  for (const directory of [".github", ".github/workflows", ".github/actions", ".github/actions/setup", ".github/actions/a/b", ".gitlab",
+    ".gitlab/ci", ".gitlab/ci/stages", ".circleci", ".buildkite", ".buildkite/steps", ".azure-pipelines", ".woodpecker", ".tekton/x"]) {
+    assert.equal(isPipelineDotPathAncestor(directory), true, directory);
+  }
+  for (const directory of [".git", ".vscode", ".github/ISSUE_TEMPLATE", ".github/workflows/nested", ".github/actions/.cache", ".gitlab/other",
+    ".circleci/sub", ".buildkite/.secrets", ".idea", "src", "src/.github"]) {
+    assert.equal(isPipelineDotPathAncestor(directory), false, directory);
+  }
+  for (const capabilities of [undefined, {}, { pipeline_files_enabled: false }, { pipeline_files_enabled: "true" }]) {
+    assert.equal(retrievalFileTypesFromCapabilities(capabilities).pipelineFilesEnabled, false, JSON.stringify(capabilities));
+  }
+  assert.equal(retrievalFileTypesFromCapabilities({ pipeline_files_enabled: true }).pipelineFilesEnabled, true);
+  // Pipeline files are not retrieval-excluded by name, so only the hidden-path rule kept them out.
+  const on = retrievalFileTypesFromCapabilities({ pipeline_files_enabled: true });
+  for (const path of PIPELINE_ALLOWED_PATHS) assert.equal(isRetrievalExcludedPath(path, on), false, path);
+});
+
 test("IDX-004 ingestion priority schedules manifests with documentation only when build files are on", async () => {
   const { retrievalFileTypesFromCapabilities } = await import("../dist/index.js");
   const on = retrievalFileTypesFromCapabilities(BUILD_ON_CAPABILITIES);

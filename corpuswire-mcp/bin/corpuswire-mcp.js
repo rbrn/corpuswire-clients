@@ -146,6 +146,11 @@ const BUILD_FILENAMES = new Set([
   "pyproject.toml", "settings.gradle", "settings.gradle.kts", "setup.cfg", "setup.py", "workspace.json",
 ]);
 const BUILD_EXTENSIONS = new Set([".gradle", ".properties", ".xml"]);
+// IDX-005: CI pipeline files under dot directories, admitted only when the server reports
+// pipeline_files_enabled. Same allow-list as the SDK's isPipelineDotPath and the engine.
+const PIPELINE_DOT_PATH = /^(?:\.github\/workflows\/[^/]+|\.github\/actions\/(?:.+\/)?action|\.gitlab-ci|\.gitlab\/ci\/.+|\.circleci\/config|\.buildkite\/.+|\.azure-pipelines(?:\/.+)?|\.drone|\.travis|\.woodpecker(?:\/.+)?|\.tekton\/.+)\.ya?ml$/;
+const PIPELINE_DOT_SUBTREES = [".github/actions", ".gitlab/ci", ".buildkite", ".azure-pipelines", ".woodpecker", ".tekton"];
+const PIPELINE_DOT_DIRECTORIES = new Set([".github", ".github/workflows", ".gitlab", ".circleci"]);
 const EXCLUDED_PATH_SEGMENTS = new Set([
   ".git",
   ".vscode",
@@ -265,6 +270,7 @@ class SyncManager {
     this.indexableExtensions = new Set(INDEXABLE_EXTENSIONS);
     this.indexableFilenames = new Set(INDEXABLE_FILENAMES);
     this.buildFilesEnabled = false;
+    this.pipelineFilesEnabled = false;
     this.discoveryOnlyFilenames = new Set();
     this.discoveryOnlyExtensions = [];
     this.supportedFileCapabilitiesPromise = null;
@@ -431,6 +437,8 @@ class SyncManager {
             if (BUILD_EXTENSIONS.has(extension)) this.indexableExtensions.add(extension);
           }
         }
+        // IDX-005: the server indexes the allow-listed CI pipeline files under dot directories.
+        this.pipelineFilesEnabled = capabilities.pipeline_files_enabled === true;
       } catch {
         // The local fallback remains safe when an older server lacks capabilities.
       }
@@ -1605,7 +1613,8 @@ class SyncManager {
         excludedFileCount: (changedPaths.excludedFileCount ?? 0) + skippedPaths.length,
         producer: "corpuswire-mcp-scan/v1",
         ignoreDigest: createHash("sha256").update(JSON.stringify({
-          excludedSegments: [...EXCLUDED_PATH_SEGMENTS].sort(), hiddenDirectories: "except-safe-ancestors",
+          excludedSegments: [...EXCLUDED_PATH_SEGMENTS].sort(),
+          hiddenDirectories: context.pipelineFilesEnabled === true ? "except-safe-ancestors+pipeline1" : "except-safe-ancestors",
           sensitiveTerraform: "skip/v1", discoveryOnly: context.buildFilesEnabled === true ? "skip/v1+build1" : "skip/v1",
         })).digest("hex"),
       },
@@ -2031,7 +2040,14 @@ class SyncManager {
           if (
             (EXCLUDED_PATH_SEGMENTS.has(entry.name) || entry.name.startsWith("."))
             && !isSafeIndexableDirectoryAncestor(relativePath)
+            && !(context.pipelineFilesEnabled === true && !EXCLUDED_PATH_SEGMENTS.has(entry.name)
+              && isPipelineDotPathAncestor(relativePath))
           ) {
+            continue;
+          }
+          // IDX-005: inside a pipeline dot directory, descend only where an allowed path can follow.
+          if (context.pipelineFilesEnabled === true && isUnderPipelineDotRoot(relativePath)
+            && !isPipelineDotPathAncestor(relativePath)) {
             continue;
           }
           if (isExcludedDirectory(relativePath, context.excludeGlobs)) {
@@ -2089,6 +2105,7 @@ class SyncManager {
       indexableExtensions: this.indexableExtensions,
       indexableFilenames: this.indexableFilenames,
       buildFilesEnabled: this.buildFilesEnabled === true,
+      pipelineFilesEnabled: this.pipelineFilesEnabled === true,
       discoveryOnlyFilenames: this.discoveryOnlyFilenames,
       discoveryOnlyExtensions: this.discoveryOnlyExtensions,
     };
@@ -6857,7 +6874,8 @@ function classifySyncRelativePath(relativePath, context) {
   }
   const segments = normalized.split("/").filter(Boolean);
   if (
-    segments.some((segment) => EXCLUDED_PATH_SEGMENTS.has(segment) || segment.startsWith("."))
+    segments.some((segment) => EXCLUDED_PATH_SEGMENTS.has(segment)
+      || (segment.startsWith(".") && !(context?.pipelineFilesEnabled === true && isPipelineDotPath(normalized))))
     && !SAFE_INDEXABLE_PATHS.has(normalized)
   ) {
     return { accepted: false, reason: "excluded_segment" };
@@ -6930,6 +6948,23 @@ function isBuildTierName(name) {
     || BUILD_EXTENSIONS.has(path.posix.extname(name))
     || (name.startsWith("tsconfig") && name.endsWith(".json"))
     || /^(requirements|constraints)([-_].*)?\.txt$/.test(name);
+}
+
+function isPipelineDotPath(relativePath) {
+  return PIPELINE_DOT_PATH.test(relativePath)
+    && !relativePath.split("/").slice(1).some((segment) => segment.startsWith("."));
+}
+
+function isUnderPipelineDotRoot(relativePath) {
+  const root = relativePath.split("/")[0];
+  return root.startsWith(".") && [...PIPELINE_DOT_DIRECTORIES, ...PIPELINE_DOT_SUBTREES].some((entry) => entry.split("/")[0] === root);
+}
+
+function isPipelineDotPathAncestor(relativePath) {
+  const normalized = relativePath.replace(/\/+$/, "");
+  if (normalized.split("/").slice(1).some((segment) => segment.startsWith(".") || segment.length === 0)) return false;
+  return PIPELINE_DOT_DIRECTORIES.has(normalized)
+    || PIPELINE_DOT_SUBTREES.some((subtree) => normalized === subtree || normalized.startsWith(`${subtree}/`));
 }
 
 function isSafeIndexableDirectoryAncestor(relativePath) {
